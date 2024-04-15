@@ -44,7 +44,8 @@ scenarios:
             valid-signer: 
 ---
 
-/** Our "coupon" (the SignedContext array) will be:
+/** 
+ *  Our "coupon" (the SignedContext array) will be:
  *  [0] recipient address
  *  [1] amount
  *  [2] expiry timestamp in seconds
@@ -54,7 +55,7 @@ scenarios:
  *  [5] orderbook address
  *  [6] token address
  *  [7] output vault id
- */
+ */ 
 
 #orderbook-subparser !subparser on this network
 #valid-signer !the trusted signer of the claims coupon - this would be the Fireblocks wallet
@@ -72,9 +73,10 @@ using-words-from orderbook-subparser
 :ensure(eq(context<6 6>() output-token()) "Wrong output token"),
 :ensure(eq(context<6 7>() output-vault-id()) "Wrong output vault id"),
 
-output-amount: context<6 1>(),
+output-amount: context<6 1>(), 
 io-ratio: 0;
 :;
 
 #handle-io
+:ensure(eq(output-vault-balance-decrease() context<6 1>()) "Wrong output amount"),
 :;
