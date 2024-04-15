@@ -1,6 +1,6 @@
 networks:
   mainnet: 
-    rpc:  
+    rpc: https://1rpc.io/eth
     chain-id: 1 
     currency: ETH
 
@@ -30,6 +30,7 @@ tokens:
 
 orders:
   mainnet:
+    deployer: mainnet
     inputs:
       - token: mainnet-usdt
         vault-id: 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b
@@ -38,10 +39,18 @@ orders:
         vault-id: 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b
 
 scenarios:
-    mainnet:
-        bindings:
-            orderbook-subparser: 0xFCe5E9F48049f3D8850C2C5fd7AD792F10B36326
-            valid-signer: 
+  mainnet:
+    deployer: mainnet
+    runs: 10
+    bindings:
+        orderbook-subparser: 0xFCe5E9F48049f3D8850C2C5fd7AD792F10B36326
+        valid-signer: 0x8E72b7568738da52ca3DCd9b24E178127A4E7d37
+
+deployments:
+  mainnet:
+    scenario: mainnet
+    order: mainnet
+
 ---
 
 /** 
@@ -64,19 +73,17 @@ scenarios:
 using-words-from orderbook-subparser
 
 /* do the checks */
-:ensure(eq(context<5 0>() valid-signer()) "Wrong signer"),
-:ensure(eq(context<6 0>() order-counterparty()) "Wrong recipient"),
-:ensure(less-than(block-timestamp() context<6 2>()) "Order expired"),
-:ensure(eq(context<6 3>() order-hash()) "Wrong order hash"),
-:ensure(eq(context<6 4>() order-owner()) "Wrong order owner"),
-:ensure(eq(context<6 5>() orderbook()) "Wrong orderbook"),
-:ensure(eq(context<6 6>() output-token()) "Wrong output token"),
-:ensure(eq(context<6 7>() output-vault-id()) "Wrong output vault id"),
+:ensure(equal-to(signer<0>() valid-signer) "Wrong signer"),
+:ensure(equal-to(signed-context<0 0>() order-counterparty()) "Wrong recipient"),
+:ensure(less-than(block-timestamp() signed-context<0 2>()) "Order expired"),
+:ensure(equal-to(signed-context<0 3>() order-hash()) "Wrong order hash"),
+:ensure(equal-to(signed-context<0 4>() order-owner()) "Wrong order owner"),
+:ensure(equal-to(signed-context<0 5>() orderbook()) "Wrong orderbook"),
+:ensure(equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
+:ensure(equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
 
-output-amount: context<6 1>(), 
+output-amount: signed-context<0 1>(),
 io-ratio: 0;
-:;
 
 #handle-io
-:ensure(eq(output-vault-balance-decrease() context<6 1>()) "Wrong output amount"),
-:;
+:ensure(equal-to(output-vault-balance-decrease() signed-context<0 1>()) "Wrong output amount");
