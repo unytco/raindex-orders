@@ -1,0 +1,80 @@
+networks:
+  mainnet: 
+    rpc:  
+    chain-id: 1 
+    currency: ETH
+
+subgraphs:
+  mainnet: https://api.thegraph.com/subgraphs/name/h20liquidity/ethereum-0xf1224a48
+  
+orderbooks:
+  mainnet:
+    address: 0xf1224A483ad7F1E9aA46A8CE41229F32d7549A74
+    network: mainnet
+    subgraph: mainnet
+
+deployers:
+  mainnet:
+    address: 0x56Fa1748867fD547F3cc6C064B809ab84bc7e9B9
+    network: mainnet
+
+tokens:
+  mainnet-usdt:
+    network: mainnet
+    address: 0xdAC17F958D2ee523a2206206994597C13D831ec7
+    decimals: 6
+  mainnet-hot:
+    network: mainnet
+    address: 0x6c6EE5e31d828De241282B9606C8e98Ea48526E2
+    decimals: 18
+
+orders:
+  mainnet:
+    inputs:
+      - token: mainnet-usdt
+        vault-id: 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b
+    outputs:
+      - token: mainnet-hot
+        vault-id: 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b
+
+scenarios:
+    mainnet:
+        bindings:
+            orderbook-subparser: 0xFCe5E9F48049f3D8850C2C5fd7AD792F10B36326
+            valid-signer: 
+---
+
+/** Our "coupon" (the SignedContext array) will be:
+ *  [0] recipient address
+ *  [1] amount
+ *  [2] expiry timestamp in seconds
+ *  Plus some domain separators
+ *  [3] order hash
+ *  [4] order owner
+ *  [5] orderbook address
+ *  [6] token address
+ *  [7] output vault id
+ */
+
+#orderbook-subparser !subparser on this network
+#valid-signer !the trusted signer of the claims coupon - this would be the Fireblocks wallet
+
+#calculate-io
+using-words-from orderbook-subparser
+
+/* do the checks */
+:ensure(eq(context<5 0>() valid-signer()) "Wrong signer"),
+:ensure(eq(context<6 0>() order-counterparty()) "Wrong recipient"),
+:ensure(less-than(block-timestamp() context<6 2>()) "Order expired"),
+:ensure(eq(context<6 3>() order-hash()) "Wrong order hash"),
+:ensure(eq(context<6 4>() order-owner()) "Wrong order owner"),
+:ensure(eq(context<6 5>() orderbook()) "Wrong orderbook"),
+:ensure(eq(context<6 6>() output-token()) "Wrong output token"),
+:ensure(eq(context<6 7>() output-vault-id()) "Wrong output vault id"),
+
+output-amount: context<6 1>(),
+io-ratio: 0;
+:;
+
+#handle-io
+:;
