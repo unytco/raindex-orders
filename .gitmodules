@@ -4,3 +4,6 @@
 [submodule "lib/rain.interpreter.interface"]
 	path = lib/rain.interpreter.interface
 	url = https://github.com/rainlanguage/rain.interpreter.interface
+[submodule "lib/rain.orderbook"]
+	path = lib/rain.orderbook
+	url = https://github.com/rainlanguage/rain.orderbook
