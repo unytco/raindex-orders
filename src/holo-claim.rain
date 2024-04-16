@@ -3,20 +3,32 @@ networks:
     rpc: https://1rpc.io/eth
     chain-id: 1 
     currency: ETH
+  sepolia:
+    rpc: https://1rpc.io/sepolia
+    chain-id: 11155111
+    currency: ETH
 
 subgraphs:
   mainnet: https://api.thegraph.com/subgraphs/name/h20liquidity/ethereum-0xf1224a48
+  sepolia: https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob-sepolia-0xfca89cD1/0.0.2/gn
   
 orderbooks:
   mainnet:
     address: 0xf1224A483ad7F1E9aA46A8CE41229F32d7549A74
     network: mainnet
     subgraph: mainnet
+  sepolia:
+    address: 0xfca89cD12Ba1346b1ac570ed988AB43b812733fe
+    network: sepolia
+    subgraph: sepolia
 
 deployers:
   mainnet:
     address: 0x56Fa1748867fD547F3cc6C064B809ab84bc7e9B9
     network: mainnet
+  sepolia:
+    address: 0xd19581a021f4704ad4eBfF68258e7A0a9DB1CD77
+    network: sepolia
 
 tokens:
   mainnet-usdt:
@@ -27,15 +39,33 @@ tokens:
     network: mainnet
     address: 0x6c6EE5e31d828De241282B9606C8e98Ea48526E2
     decimals: 18
+  sepolia-trot:
+    network: sepolia
+    address: 0x72bBeF0c3d23C196D324cF7cF59C083760fFae5b
+    decimals: 18
+  sepolia-noop:
+    network: sepolia
+    address: 0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028
+    decimals: 18
 
 orders:
   mainnet:
     deployer: mainnet
+    orderbook: mainnet
     inputs:
       - token: mainnet-usdt
         vault-id: 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b
     outputs:
       - token: mainnet-hot
+        vault-id: 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b
+  sepolia:
+    deployer: sepolia
+    orderbook: sepolia
+    inputs:
+      - token: sepolia-noop
+        vault-id: 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b
+    outputs:
+      - token: sepolia-trot
         vault-id: 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b
 
 scenarios:
@@ -45,11 +75,20 @@ scenarios:
     bindings:
         orderbook-subparser: 0xFCe5E9F48049f3D8850C2C5fd7AD792F10B36326
         valid-signer: 0x8E72b7568738da52ca3DCd9b24E178127A4E7d37
+  sepolia:
+    deployer: sepolia
+    runs: 10
+    bindings:
+        orderbook-subparser: 0xe6A589716d5a72276C08E0e08bc941a28005e55A
+        valid-signer: 0x8E72b7568738da52ca3DCd9b24E178127A4E7d37
 
 deployments:
   mainnet:
     scenario: mainnet
     order: mainnet
+  sepolia:
+    scenario: sepolia
+    order: sepolia
 
 ---
 
