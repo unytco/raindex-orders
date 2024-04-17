@@ -18,7 +18,7 @@
 	import { onMount } from 'svelte';
 	import { setupWeb3Modal } from '$lib/web3modal';
 	import transactionStore from '$lib/stores/transactionStore';
-	import {formatDate} from '$lib/utils';
+	import { formatDate, truncateEthAddress } from '$lib/utils';
 
 	let config, modal;
 
@@ -74,21 +74,18 @@
 	$: orderJSONString = $query?.data?.order?.orderJSONString;
 	$: order = orderJSONString ? (JSON.parse(orderJSONString) as Order) : undefined;
 	$: order ? (order = { ...order, handleIO: order.handleIo }) : undefined;
-	$: console.log(order)
-	let mappedContext
-	let signedContext
+	$: console.log(order);
+	let mappedContext;
+	let signedContext;
 
 	$: if ($query.data) {
-		getCoupon()
+		getCoupon();
 	}
 
-
 	const handleClaim = async () => {
-		let hash
+		let hash;
 		if (order) {
-
 			const signedContext = await getCoupon();
-
 
 			const takeOrderConfig = {
 				order: order,
@@ -111,20 +108,16 @@
 
 			transactionStore.awaitWalletConfirmation();
 			try {
- hash = await writeContract(config, {
-				abi: orderbookAbi,
-				address: '0xfca89cD12Ba1346b1ac570ed988AB43b812733fe',
-				functionName: 'takeOrders',
-				args: [takeOrdersConfig],
-				chainId: sepolia.id
-			});
+				hash = await writeContract(config, {
+					abi: orderbookAbi,
+					address: '0xfca89cD12Ba1346b1ac570ed988AB43b812733fe',
+					functionName: 'takeOrders',
+					args: [takeOrdersConfig],
+					chainId: sepolia.id
+				});
 			} catch {
 				transactionStore.transactionError('User denied transaction.');
-
-
-
 			}
-			
 
 			if (hash) {
 				console.log('HASH!', hash);
@@ -144,7 +137,6 @@
 	};
 
 	export const getCoupon = async (): Promise<SignedContextV1Struct> => {
-
 		const coupon: [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint] = [
 			BigInt(getAccount(config).address as string),
 			BigInt(parseEther(withdrawAmount.toString())),
@@ -195,10 +187,11 @@
 		};
 
 		console.log('result', signedContext);
- mappedContext = {
-    amount: signedContext.context[1],
-    expiryTimestamp: formatDate(signedContext.context[2]),
-};
+		mappedContext = {
+			"Recipient Address": getAccount(config).address,
+			"Withdraw Amount": withdrawAmount,
+			"Order Expires": formatDate(signedContext.context[2])
+		};
 
 		return signedContext;
 	};
@@ -206,20 +199,23 @@
 
 <Card size="xl" class="flex flex-col  gap-4">
 	{#if $query.isFetching || $query.isLoading || $query.isRefetching}
-	<div class='items-center justify-center self-center'>
-		<Spinner size="16"/>
-		
-	</div>
+		<div class="items-center justify-center self-center">
+			<Spinner size="16" />
+		</div>
 	{:else if $query.data && mappedContext}
-	<h1 class="text-2xl">Order</h1>
-	{#each Object.entries(mappedContext) as [key, value]}
-		<p>{key}: {value}</p>
-	{/each}
+		<h1 class="text-2xl">Order</h1>
+		<div>
+		{#each Object.entries(mappedContext) as [key, value]}
+		{#if key === "Recipient Address"}
+		<p>{key}: <a class="hover:underline font-semibold" href={`https://sepolia.etherscan.io/address/${value}`}>{truncateEthAddress(value)}</a></p> 
+			{:else}
+			<p>{key}: <span class="font-semibold">{value}</span></p>
+			{/if}
+		{/each}
+		</div>
 		<!-- <p class="truncate">{JSON.stringify($query.data, null, 2)}</p> -->
 
 
-	<Label for="withdraw_amount" class="text-sm">Withdraw Amount</Label>
-		<Input id="withdraw_amount" bind:value={withdrawAmount} type="number" label="Withdraw Amount" />
 
 		<div class="flex flex-row gap-2">
 			<Button class="w-fit" on:click={() => modal.open()}>Connect</Button>
