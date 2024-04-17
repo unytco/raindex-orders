@@ -46,6 +46,7 @@
 		"@wagmi/connectors": "^4.1.26",
 		"@wagmi/core": "^2.6.17",
 		"ethers": "^6.11.1",
+		"moment": "^2.30.1",
 		"svelte-wagmi": "^1.0.1",
 		"viem": "^2.9.19",
 		"wagmi": "^2.5.20"
