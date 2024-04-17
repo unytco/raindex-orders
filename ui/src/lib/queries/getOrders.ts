@@ -1,13 +1,13 @@
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const getOrders = async (subgraphUrl: string): Promise<any> => {
+export const getOrders = async (orderHash: string, subgraphUrl: string): Promise<any> => {
 	const query = `
   query MyQuery {
-  orders {
-    id
-    orderJSONString
-  }
-}
-    `;
+	order (id: "${orderHash}") {
+		id
+		orderJSONString
+	}
+	}
+`;
 
 	const response = await fetch(subgraphUrl, {
 		method: 'POST',
@@ -15,6 +15,7 @@ export const getOrders = async (subgraphUrl: string): Promise<any> => {
 		body: JSON.stringify({ query })
 	});
 	const json = await response.json();
+	console.log(json);
 	if (json.errors) {
 		console.error(json.errors);
 	}
