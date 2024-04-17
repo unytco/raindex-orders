@@ -1,28 +1,22 @@
 <script lang="ts">
-	import { 
-		defaultConfig, 
-		WC, 
-		connected,
-		signerAddress,
-		configuredConnectors,
-	} from 'svelte-wagmi';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { getOrders } from '$lib/queries/getOrders';
-	import { onMount } from 'svelte';
-
 	import {
-		PUBLIC_WALLETCONNECT_ID,
-		PUBLIC_ALCHEMY_ID,
 		PUBLIC_SUBGRAPH_URL
 	} from '$env/static/public';
 	import { Button, Card, Badge, Indicator } from 'flowbite-svelte';
 	import { orderbookAbi } from '../generated';
-	import { writeContract } from '@wagmi/core';
+	import { getAccount, switchChain, watchAccount, writeContract } from '@wagmi/core';
 	import { sepolia } from 'viem/chains';
-	import { createWalletClient, http, parseEther, encodePacked, keccak256} from 'viem'
+	import { createWalletClient, http, parseEther, encodePacked, keccak256, type Hex} from 'viem'
 	import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts'
-	import { createConfig } from '@wagmi/core';
-	import { injected } from 'wagmi/connectors'
+	import { onMount } from 'svelte';
+	import { setupWeb3Modal } from '$lib/web3modal';
+
+	let config, modal;
+	onMount(() => {
+		({config, modal} = setupWeb3Modal());
+	});
 
 
 	const ORDER_HASH = "0x20d5f8aeaf824361c7d3dd2c7daf8f71ea3e1d0aef7393a8628d66ace63b509c";
@@ -31,22 +25,22 @@
 	const OUTPUT_VAULT_ID = '0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b';
 
 	type Order = {
-		owner: string;
-		handleIo: boolean;
+		owner: Hex;
+		handleIO: boolean;
 		evaluable: {
-			interpreter: string;
-			store: string;
-			expression: string;
+			interpreter: Hex;
+			store: Hex;
+			expression: Hex;
 		};
 		validInputs: Array<{
-			token: string;
-			decimals: string;
-			vaultId: string;
+			token: Hex;
+			decimals: number;
+			vaultId: bigint;
 		}>;
 		validOutputs: Array<{
-			token: string;
-			decimals: string;
-			vaultId: string;
+			token: Hex;
+			decimals: number;
+			vaultId: bigint;
 		}>;
 	};
 
@@ -63,75 +57,48 @@
 	let finalWithdrawAmount: number;
 	let receipt;
 
-	/**
-	 *  Our "coupon" (the SignedContext array) will be:
-	 *  [0] recipient address
-	 *  [1] amount
-	 *  [2] expiry timestamp in seconds
-	 *  Plus some domain separators
-	 *  [3] order hash
-	 *  [4] order owner
-	 *  [5] orderbook address
-	 *  [6] token address
-	 *  [7] output vault id
-	 */
-	$: console.log('connectors', $configuredConnectors);
-
-	$: orderJSONString = $query?.data?.order?.orderJSONString;
-	$: order = orderJSONString ? (JSON.parse(orderJSONString) as Order) : undefined;
-	
-	onMount(async () => {
-		const erckit = defaultConfig({
-			chains: [sepolia],
-			appName: 'erc.kit',
-			walletConnectProjectId: PUBLIC_WALLETCONNECT_ID,
-			alchemyId: PUBLIC_ALCHEMY_ID,
-			connectors: [injected()]
-		});
-		
-		erckit.init();
-	});
-
 	$: query = createQuery({
 		queryKey: ['orders', getOrders, ORDER_HASH, PUBLIC_SUBGRAPH_URL],
 		queryFn: () => getOrders(ORDER_HASH, PUBLIC_SUBGRAPH_URL)
 	});
+	$: orderJSONString = $query?.data?.order?.orderJSONString;
+	$: order = orderJSONString ? (JSON.parse(orderJSONString) as Order) : undefined;
+	$: order ? order = {...order, handleIO: order.handleIo} : undefined;
+	
 
 	const handleClaim = async () => {
 		if (order) {
 			const signedContext = await getCoupon();
 
-			const takeOrderConfig: TakeOrderConfigStruct = {
+			const takeOrderConfig = {
 				order: order,
-				inputIOIndex: 0,
-				outputIOIndex: 0,
+				inputIOIndex: BigInt(0),
+				outputIOIndex: BigInt(0),
 				signedContext: [signedContext]
 			};
 
-			const takeOrdersConfig: TakeOrdersConfigStruct = {
-				minimumInput: signedContext.context[0],
-				maximumInput: signedContext.context[0],
-				maximumIORatio: 0,
+			const takeOrdersConfig = {
+				minimumInput: signedContext.context[1],
+				maximumInput: signedContext.context[1],
+				maximumIORatio: BigInt(0),
 				orders: [takeOrderConfig],
-				output: order.validInputs[0].token,
-				input: order.validOutputs[0].token
+				data: "" as Hex
 			};
 
 			finalWithdrawAmount = withdrawAmount;
 
+			console.log({takeOrdersConfig})
+
+			await switchChain(config, { chainId: sepolia.id })
+
 			const result = await writeContract(
-				createConfig({
-					chains: [sepolia],
-					transports: {
-						[sepolia.id]: http(),
-					},
-					connectors: $configuredConnectors,
-				}), 
+				config, 
 				{
 					abi: orderbookAbi,
 					address: '0xfca89cD12Ba1346b1ac570ed988AB43b812733fe',
 					functionName: 'takeOrders',
-					args: [takeOrdersConfig]
+					args: [takeOrdersConfig],
+					chainId: sepolia.id
 				}
 			);
 		}
@@ -150,10 +117,11 @@
 		 *  [5] orderbook address
 		 *  [6] token address
 		 *  [7] output vault id
+		 *  [8] nonce
 		 */
 
 		const coupon: [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint] = [
-			BigInt($signerAddress as string),
+			BigInt(getAccount(config).address as string),
 			BigInt(parseEther(withdrawAmount.toString())),
 			BigInt(2687375409),
 			BigInt(ORDER_HASH),
@@ -174,15 +142,15 @@
 			transport: http()
 		})
 			
-		const account = privateKeyToAccount('0x8d25755a3b9cea364e1e682f3892699c36a2dad1f087f772b349edca72bf842e')
+		const account = privateKeyToAccount('0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd')
 			
 		const signature = await client.signMessage({
 			account,
 			message: { raw: message },
 		})
 
-		const signedContext: SignedContextV1Struct = {
-			signer: $signerAddress,
+		const signedContext = {
+			signer: "0x8E72b7568738da52ca3DCd9b24E178127A4E7d37",
 			signature,
 			context: coupon
 		};
@@ -195,9 +163,9 @@
 </script>
 
 <Card size="xl">
-	{#if $connected}
+	<!-- {#if $connected}
 		<Badge color="green" class="w-fit gap-1"><Indicator color="green" />Connected to Sepolia</Badge>
-	{/if}
+	{/if} -->
 	{#if $query.data}
 	<pre>
 		{JSON.stringify($query.data, null, 2)}
@@ -227,7 +195,7 @@
 				</ul>
 			</div>
 		{/each} -->
-		<Button on:click={async () => await WC('Sign in to the app with Ethereum')()}>Connect</Button>
+		<Button on:click={() => modal.open()}>Connect</Button>
 
 		<Button on:click={() => handleClaim()}>Claim</Button>
 	{/if}
