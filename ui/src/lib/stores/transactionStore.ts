@@ -17,7 +17,7 @@ export type TxError = {
 
 const initialState = {
 	status: TransactionStatus.IDLE,
-	error: { code: null, message: '', details: '' },
+	error: { message: '', details: '' },
 	hash: '',
 	message: '',
 	data: null

@@ -20,7 +20,7 @@
 				<a
 					class="font-blue-500 hover:underline"
 					href={`https://sepolia.etherscan.io/tx/${$transactionStore.hash}`}
-					target="_blank">View transaction on Etherscan</a
+					target="_blank">View pending transaction on Etherscan</a
 				>
 			{/if}
 
