@@ -1,16 +1,15 @@
-<script>
+<script lang='ts'>
 	import '../app.pcss';
 	import { setContext } from 'svelte';
 	import { QueryClient, QueryClientProvider } from '@tanstack/svelte-query';
 	import { setupWeb3Modal } from '$lib/web3modal';
 	import {type Web3Modal } from '@web3modal/wagmi';
 	import {type Config} from "@wagmi/core";
-	import {Web3Context} '$lib/types'
+	import {type Web3Context} from "$lib/types"
 
 	const queryClient = new QueryClient();
 	let config: Config
 	let modal: Web3Modal
-
 
 	const web3ContextKey = 'web3Context';
 
