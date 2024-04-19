@@ -1,23 +1,25 @@
 <script>
-	import { setContext, getContext } from 'svelte';
 	import '../app.pcss';
+	import { setContext } from 'svelte';
 	import { QueryClient, QueryClientProvider } from '@tanstack/svelte-query';
-	import { onMount } from 'svelte';
 	import { setupWeb3Modal } from '$lib/web3modal';
+	import {type Web3Modal } from '@web3modal/wagmi';
+	import {type Config} from "@wagmi/core";
+	import {Web3Context} '$lib/types'
+
 	const queryClient = new QueryClient();
-	let config, modal;
+	let config: Config
+	let modal: Web3Modal
 
 
 	const web3ContextKey = 'web3Context';
 
-		({ config, modal } =  setupWeb3Modal()); 
-		setContext(web3ContextKey, { config, modal });
-
+	({ config, modal } = setupWeb3Modal());
+	setContext(web3ContextKey, { config, modal });
 </script>
-
 
 <QueryClientProvider client={queryClient}>
 	<main class="m-12 flex flex-col items-center justify-center">
-		<slot></slot>
+		<slot />
 	</main>
 </QueryClientProvider>

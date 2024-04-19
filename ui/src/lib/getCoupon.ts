@@ -5,7 +5,8 @@ import { createWalletClient, http } from 'viem'
 import { sepolia } from 'viem/chains'
 import { getAccount } from '@wagmi/core'
 import { getContext } from 'svelte'
-import { formatDate } from './utils'
+import { formatDate } from '$lib/utils'
+import { type Web3Context } from '$lib/types'
 
 export type Order = {
 	owner: Hex
@@ -45,9 +46,9 @@ type SignedContextV1Struct = {
 type FullContext = {
 	signedContext: SignedContextV1Struct
 	renderedValues: {
-		'Recipient Address': string
-		'Withdraw Amount': number
-		'Order Expires': string
+		'Recipient Address'?: string
+		'Withdraw Amount'?: number
+		'Order Expires'?: string
 	}
 }
 export const getCoupon = async ({
@@ -60,7 +61,7 @@ export const getCoupon = async ({
 }: CouponConfig): Promise<FullContext> => {
 	console.log('coupon', order)
 	const web3ContextKey = 'web3Context'
-	const { config, modal } = getContext(web3ContextKey)
+	const { config } = getContext<Web3Context>(web3ContextKey)
 	console.log('hi!')
 	console.log(getAccount(config).address)
 	const coupon: [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint] = [
@@ -112,12 +113,14 @@ export const getCoupon = async ({
 		context: coupon
 	}
 
+	console.log('date', signedContext.context[2])
+
 	const fullContext = {
 		signedContext,
 		renderedValues: {
 			'Recipient Address': getAccount(config).address,
 			'Withdraw Amount': withdrawAmount,
-			'Order Expires': formatDate(signedContext.context[2])
+			'Order Expires': formatDate(signedContext.context[2].toString())
 		}
 	}
 
