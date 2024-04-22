@@ -17,7 +17,7 @@ export type TxError = {
 
 const initialState = {
 	status: TransactionStatus.IDLE,
-	error: { message: '', details: '' },
+	error: { message: '' },
 	hash: '',
 	message: '',
 	data: null
@@ -31,15 +31,18 @@ const transactionStore = () => {
 		update(state => ({ ...state, status: TransactionStatus.PENDING_WALLET }))
 	const awaitTxReceipt = (txHash: string) =>
 		update(state => ({ ...state, status: TransactionStatus.PENDING_TX, hash: txHash }))
-	const transactionSuccess = (hash: string, address: string) =>
+	const transactionSuccess = (hash: string) =>
 		update(state => ({
 			...state,
 			status: TransactionStatus.SUCCESS,
-			hash: hash,
-			newVaultAddress: address
+			hash: hash
 		}))
 	const transactionError = (txError: TxError) =>
-		update(state => ({ ...state, status: TransactionStatus.ERROR, error: txError }))
+		update(state => ({
+			...state,
+			status: TransactionStatus.ERROR,
+			error: { message: txError.message }
+		}))
 
 	return {
 		subscribe,

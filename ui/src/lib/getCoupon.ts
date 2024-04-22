@@ -37,13 +37,13 @@ type CouponConfig = {
 	order: Order
 }
 
-type SignedContextV1Struct = {
+export type SignedContextV1Struct = {
 	signer: string
 	signature: string
 	context: bigint[]
 }
 
-type FullContext = {
+export type FullContext = {
 	signedContext: SignedContextV1Struct
 	renderedValues: {
 		'Recipient Address'?: string
@@ -59,11 +59,9 @@ export const getCoupon = async ({
 	OUTPUT_VAULT_ID,
 	order
 }: CouponConfig): Promise<FullContext> => {
-	console.log('coupon', order)
 	const web3ContextKey = 'web3Context'
 	const { config } = getContext<Web3Context>(web3ContextKey)
-	console.log('hi!')
-	console.log(getAccount(config).address)
+
 	const coupon: [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint] = [
 		BigInt(getAccount(config).address as string),
 		BigInt(parseEther(withdrawAmount.toString())),
@@ -112,8 +110,6 @@ export const getCoupon = async ({
 		signature,
 		context: coupon
 	}
-
-	console.log('date', signedContext.context[2])
 
 	const fullContext = {
 		signedContext,

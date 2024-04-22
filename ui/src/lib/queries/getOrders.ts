@@ -7,18 +7,18 @@ export const getOrders = async (orderHash: string, subgraphUrl: string): Promise
 		orderJSONString
 	}
 	}
-`;
+`
 
 	const response = await fetch(subgraphUrl, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ query })
-	});
-	const json = await response.json();
-	console.log(json);
+	})
+	const json = await response.json()
+
 	if (json.errors) {
-		console.error(json.errors);
+		console.error(json.errors)
 	}
 
-	return json.data;
-};
+	return json.data
+}

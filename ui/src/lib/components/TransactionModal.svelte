@@ -1,7 +1,7 @@
-<script lang='ts'>
-    import { TransactionStatus } from '$lib/types.ts';
-    import { Button, Modal, Spinner } from 'flowbite-svelte';
-    import transactionStore from '$lib/stores/transactionStore';
+<script lang="ts">
+	import { TransactionStatus } from '$lib/types'
+	import { Button, Modal, Spinner } from 'flowbite-svelte'
+	import transactionStore from '$lib/stores/transactionStore'
 </script>
 
 <Modal
@@ -11,7 +11,7 @@
 	<div class="p-4">
 		<div class="flex flex-col items-center justify-center gap-2">
 			{#if $transactionStore.status === TransactionStatus.PENDING_WALLET}
-				<Spinner size="10" color="orange" />
+				<Spinner size="10" color="blue" />
 				{$transactionStore.status}
 			{/if}
 			{#if $transactionStore.status === TransactionStatus.PENDING_TX}
@@ -48,7 +48,7 @@
 				<div class="flex flex-col">
 					{$transactionStore.error}
 				</div>
-				<Button  on:click={() => transactionStore.reset()}>Close</Button>
+				<Button on:click={() => transactionStore.reset()}>Close</Button>
 			{/if}
 		</div>
 	</div>
