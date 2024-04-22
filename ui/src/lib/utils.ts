@@ -4,7 +4,6 @@ export function formatDate(timestamp: string): string {
 	return moment(parseInt(timestamp) * 1000).fromNow()
 }
 
-
 export function truncateEthAddress(address: string, length: number = 3): string {
 	if (!address.startsWith('0x') || address.length !== 42) {
 		throw new Error('Invalid Ethereum address')

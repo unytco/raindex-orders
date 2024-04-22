@@ -46,7 +46,7 @@
 					<h1 class="text-2xl">❌</h1>
 				</div>
 				<div class="flex flex-col">
-					{$transactionStore.error}
+					{JSON.stringify($transactionStore.error)}
 				</div>
 				<Button on:click={() => transactionStore.reset()}>Close</Button>
 			{/if}

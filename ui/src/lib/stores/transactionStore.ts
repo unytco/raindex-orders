@@ -41,7 +41,7 @@ const transactionStore = () => {
 		update(state => ({
 			...state,
 			status: TransactionStatus.ERROR,
-			error: { message: txError.message }
+			error: { message: JSON.stringify(txError.message) }
 		}))
 
 	return {
