@@ -19,7 +19,6 @@
 		queryKey: ['orders', getOrders, orderHash, PUBLIC_SUBGRAPH_URL],
 		queryFn: () => getOrders(orderHash, PUBLIC_SUBGRAPH_URL)
 	})
-
 	$: orderJSONString = $query?.data?.order?.orderJSONString
 
 	const handleGenerateCoupon = async () => {

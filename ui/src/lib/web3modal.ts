@@ -4,7 +4,9 @@ import { createWeb3Modal, defaultWagmiConfig } from '@web3modal/wagmi'
 import { mainnet, sepolia } from 'viem/chains'
 import { reconnect } from '@wagmi/core'
 
-export const setupWeb3Modal = () => {
+export type Web3Context = { modal: ReturnType<typeof createWeb3Modal>; config: ReturnType<typeof defaultWagmiConfig> }
+
+export const setupWeb3Modal = (): Web3Context => {
 	// 1. Get a project ID at https://cloud.walletconnect.com
 	const projectId = PUBLIC_WALLETCONNECT_ID
 

@@ -17,8 +17,8 @@ export type CouponConfig = {
 }
 
 export type SignedContextV1Struct = {
-	signer: string
-	signature: string
+	signer: Hex
+	signature: Hex
 	context: bigint[]
 }
 	
@@ -44,7 +44,7 @@ export const generateSignedContext = async ({
 		BigInt(orderbookAddress),
 		BigInt(claimTokenAddress),
 		BigInt(outputVaultId),
-		BigInt(nonce) // getting a random 32 bytes to use as a nonce
+		BigInt(nonce)
 	]
 
 	const message = keccak256(

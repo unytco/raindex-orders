@@ -3,7 +3,7 @@
 	import { orderbookAbi } from '../generated'
 	import { writeContract, waitForTransactionReceipt } from '@wagmi/core'
 	import { sepolia } from 'viem/chains'
-	import { formatUnits, type Hex } from 'viem'
+	import { formatUnits, type Hex, isAddress } from 'viem'
 	import transactionStore from '$lib/stores/transactionStore'
 	import { getOrders } from '$lib/queries/getOrders'
 	import { getContext } from 'svelte'
@@ -11,9 +11,10 @@
 	import { PUBLIC_ORDERBOOK_ADDRESS, PUBLIC_SUBGRAPH_URL } from '$env/static/public'
 	import { createQuery } from '@tanstack/svelte-query'
 	import { deserializeSignedContext, parseCoupon } from '$lib/coupon'
+	import type { Web3Context } from '$lib/types'
 
 	const web3ContextKey = 'web3Context'
-	const { config, modal } = getContext(web3ContextKey)
+	const { config, modal } = getContext(web3ContextKey) as Web3Context
 
 	// get the context from the url query param "c" and parse it
 	const urlParam = new URL(window.location.href).searchParams.get('c')
@@ -30,6 +31,7 @@
 	const handleClaim = async () => {
 		if (!signedContext) return
 		if (!orderJSONString) return
+		if (!isAddress(PUBLIC_ORDERBOOK_ADDRESS)) return
 
 		const order = JSON.parse(orderJSONString)
 		order.handleIO = order.handleIo
@@ -62,8 +64,11 @@
 				args: [takeOrdersConfig],
 				chainId: sepolia.id
 			})
-		} catch (e) {
-			transactionStore.transactionError(e)
+		} catch (e: unknown) {
+			transactionStore.transactionError({
+				message: e instanceof Error ? e.message : 'Unknown error',
+				details: JSON.stringify(e)
+			})
 			return
 		}
 
@@ -93,7 +98,7 @@
 							href={`https://sepolia.etherscan.io/address/${value}`}>{value}</a
 						>
 					</p>
-				{:else if key === 'withdrawAmount'}
+				{:else if key === 'withdrawAmount' && typeof value === 'bigint'}
 					<p>
 						{key}:
 						<span class="font-semibold"
@@ -103,7 +108,7 @@
 							)}</span
 						>
 					</p>
-				{:else if key === 'expiryTimestamp'}
+				{:else if key === 'expiryTimestamp' && typeof value === 'number'}
 					<p>
 						{key}:
 						<span class="font-semibold">{new Date(value * 1000).toLocaleString()}</span>
