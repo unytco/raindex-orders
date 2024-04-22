@@ -4,14 +4,14 @@
 	import { writeContract, waitForTransactionReceipt } from '@wagmi/core'
 	import { sepolia } from 'viem/chains'
 	import { formatUnits, type Hex, isAddress } from 'viem'
-	import transactionStore from '$lib/stores/transactionStore'
+	import { transactionStore } from '$lib/stores/transactionStore'
 	import { getOrders } from '$lib/queries/getOrders'
 	import { getContext } from 'svelte'
 	import TransactionModal from '$lib/components/TransactionModal.svelte'
 	import { PUBLIC_ORDERBOOK_ADDRESS, PUBLIC_SUBGRAPH_URL } from '$env/static/public'
 	import { createQuery } from '@tanstack/svelte-query'
 	import { deserializeSignedContext, parseCoupon } from '$lib/coupon'
-	import type { Web3Context } from '$lib/types'
+	import type { Web3Context } from '$lib/web3modal'
 
 	const web3ContextKey = 'web3Context'
 	const { config, modal } = getContext(web3ContextKey) as Web3Context

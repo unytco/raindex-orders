@@ -1,7 +1,6 @@
 <script lang="ts">
-	import { TransactionStatus } from '$lib/types'
 	import { Button, Modal, Spinner } from 'flowbite-svelte'
-	import transactionStore from '$lib/stores/transactionStore'
+	import { transactionStore, TransactionStatus } from '$lib/stores/transactionStore'
 </script>
 
 <Modal

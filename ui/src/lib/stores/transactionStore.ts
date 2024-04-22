@@ -32,7 +32,7 @@ const initialState = {
 }
 
 // TODO: Add a timeout on all transactions
-const transactionStore = () => {
+export const createTransactionStore = () => {
 	const { subscribe, set, update } = writable(initialState)
 	const reset = () => set(initialState)
 	const awaitWalletConfirmation = () =>
@@ -62,4 +62,4 @@ const transactionStore = () => {
 	}
 }
 
-export default transactionStore()
+export const transactionStore = createTransactionStore()
