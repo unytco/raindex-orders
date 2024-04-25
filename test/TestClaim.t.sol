@@ -93,7 +93,7 @@ contract TestClaim is Test, SignContext {
              *  [6] token address
              *  [7] output vault id
              */
-            uint256[] memory context = new uint256[](8);
+            uint256[] memory context = new uint256[](9);
 
             context[0] = uint256(uint160(taker));
             context[1] = amount;
@@ -103,6 +103,7 @@ contract TestClaim is Test, SignContext {
             context[5] = uint256(uint160(address(MAINNET_ORDERBOOK)));
             context[6] = uint256(uint160(address(MAINNET_HOT)));
             context[7] = 1;
+            context[8] = 10;
 
             SignedContextV1[] memory signedContexts = new SignedContextV1[](1);
             signedContexts[0] = signContext(privateKey, context);

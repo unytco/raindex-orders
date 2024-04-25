@@ -11,9 +11,11 @@
 
 	let claimAmount = 0
 	let recipient = ''
-	let orderHash: Hex = '0x20d5f8aeaf824361c7d3dd2c7daf8f71ea3e1d0aef7393a8628d66ace63b509c'
+	let orderHash: Hex = ''
 	let expiryHours = 24
 	let couponUrl = ''
+
+	let coupon: CouponConfig
 
 	$: query = createQuery({
 		queryKey: ['orders', getOrders, orderHash, PUBLIC_SUBGRAPH_URL],
@@ -29,7 +31,7 @@
 		if (!isAddress(PUBLIC_ORDERBOOK_ADDRESS)) throw new Error('Invalid orderbook address')
 		if (!isHex(order.validOutputs[0].vaultId)) throw new Error('Invalid output vault ID')
 
-		const coupon: CouponConfig = {
+		coupon = {
 			recipient,
 			orderHash,
 			orderbookAddress: PUBLIC_ORDERBOOK_ADDRESS,
@@ -79,6 +81,15 @@
 	<Button disabled={!ready} on:click={handleGenerateCoupon}>Generate coupon</Button>
 	{#if couponUrl}
 		<span>Copied to clipboard</span>
-		<span>{couponUrl}</span>
+		<span class="truncate">{couponUrl}</span>
+	{/if}
+	{#if coupon}
+		<pre>
+			{JSON.stringify(
+				coupon,
+				(key, value) => (typeof value === 'bigint' ? value.toString() : value), // return everything else unchanged
+				2
+			)}
+		</pre>
 	{/if}
 </Card>

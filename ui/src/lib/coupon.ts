@@ -58,7 +58,7 @@ export const generateSignedContext = async ({
 				'uint256',
 				'uint256',
 				'uint256',
-				'uint256'
+				'uint256',
 			],
 			coupon
 		)
@@ -79,7 +79,7 @@ export const generateSignedContext = async ({
 	})
 
 	const signedContext = {
-		signer: '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37',
+		signer: account.address,
 		signature,
 		context: coupon
 	}
@@ -123,8 +123,8 @@ export const serializeSignedContext = (signedContext: SignedContextV1Struct): st
 export const deserializeSignedContext = (serialized: string): SignedContextV1Struct => {
 	const [signer, signature, ...context] = serialized.split(',')
 	return {
-		signer,
-		signature,
+		signer: signer as Hex,
+		signature: signature as Hex,
 		context: context.map((n) => BigInt(n))
 	}
 }

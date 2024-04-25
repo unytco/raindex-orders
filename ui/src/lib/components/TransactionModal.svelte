@@ -1,6 +1,14 @@
 <script lang="ts">
 	import { Button, Modal, Spinner } from 'flowbite-svelte'
 	import { transactionStore, TransactionStatus } from '$lib/stores/transactionStore'
+
+	function unescapeString(str) {
+		return str
+			.replace(/\\n/g, '\n')
+			.replace(/\\'/g, "'")
+			.replace(/\\"/g, '"')
+			.replace(/\\\\/g, '\\')
+	}
 </script>
 
 <Modal
@@ -45,7 +53,7 @@
 					<h1 class="text-2xl">❌</h1>
 				</div>
 				<div class="flex flex-col">
-					{JSON.stringify($transactionStore.error)}
+					{unescapeString($transactionStore.error.message)}
 				</div>
 				<Button on:click={() => transactionStore.reset()}>Close</Button>
 			{/if}

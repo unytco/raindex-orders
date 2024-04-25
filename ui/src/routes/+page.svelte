@@ -3,7 +3,7 @@
 	import { orderbookAbi } from '../generated'
 	import { writeContract, waitForTransactionReceipt } from '@wagmi/core'
 	import { sepolia } from 'viem/chains'
-	import { formatUnits, type Hex, isAddress } from 'viem'
+	import { formatUnits, type Hex, isAddress, ContractFunctionExecutionError } from 'viem'
 	import { transactionStore } from '$lib/stores/transactionStore'
 	import { getOrders } from '$lib/queries/getOrders'
 	import { getContext } from 'svelte'
@@ -19,6 +19,8 @@
 	// get the context from the url query param "c" and parse it
 	const urlParam = new URL(window.location.href).searchParams.get('c')
 	$: signedContext = urlParam ? deserializeSignedContext(urlParam) : undefined
+
+	// parse it back to the original coupon so we can render it
 	$: coupon = signedContext ? parseCoupon(signedContext) : undefined
 
 	// get the order from the subgraph based on the orderHash from the coupon
@@ -66,9 +68,11 @@
 			})
 		} catch (e: unknown) {
 			transactionStore.transactionError({
-				message: e instanceof Error ? e.message : 'Unknown error',
-				details: JSON.stringify(e)
+				message:
+					e instanceof ContractFunctionExecutionError ? e?.cause.shortMessage : 'Unknown error'
 			})
+			console.log(e.cause.shortMessage)
+			console.error(e)
 			return
 		}
 

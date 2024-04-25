@@ -103,6 +103,7 @@ deployments:
  *  [5] orderbook address
  *  [6] token address
  *  [7] output vault id
+ *  [8] nonce (to prevent replay attacks)
  */ 
 
 #orderbook-subparser !subparser on this network
@@ -120,6 +121,10 @@ using-words-from orderbook-subparser
 :ensure(equal-to(signed-context<0 5>() orderbook()) "Wrong orderbook"),
 :ensure(equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
 :ensure(equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
+
+/* check the nonce has not been used before */
+:ensure(is-zero(get(hash(order-hash() signed-context<0 8>()))) "Nonce already used"),
+:set(hash(order-hash() signed-context<0 8>()) 1),
 
 output-amount: signed-context<0 1>(),
 io-ratio: 0;
