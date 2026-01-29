@@ -1,12 +1,12 @@
 {
-  description = "Flake for development workflows.";
+  description = "Raindex Orders - Holo Claims";
 
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
-    rainix.url = "github:rainprotocol/rainix";
+    rainix.url = "github:rainlanguage/rainix";
   };
 
-  outputs = {self, rainix, flake-utils, ... }:
+  outputs = { self, rainix, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = rainix.pkgs.${system};
@@ -15,5 +15,4 @@
         devShells = rainix.devShells.${system};
       }
     );
-
 }
