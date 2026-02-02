@@ -1,10 +1,13 @@
 # Holo Bridge - Sepolia Deployment Guide
 
+This guide covers deploying and testing the complete HOT <> HoloFuel bridge infrastructure on Sepolia testnet.
+
 ## Prerequisites
 
-1. MetaMask wallet with Sepolia ETH
+1. MetaMask wallet with Sepolia ETH (get from [Sepolia Faucet](https://sepoliafaucet.com/))
 2. Foundry installed (`forge`, `cast` commands available)
-3. Nix installed (for running tests/rain CLI)
+3. Rust toolchain (for lock-watcher and coupon-signer)
+4. Node.js 20+ (for UI)
 
 ## Quick Start
 
@@ -15,155 +18,213 @@
 cp .env.example .env
 
 # Edit .env and add your private key
-# Export from MetaMask: Account Details -> Export Private Key
-nano .env  # or your preferred editor
+nano .env
 ```
 
 Your `.env` should have:
-```
+```bash
 PRIVATE_KEY=0x<your-private-key-here>
 SEPOLIA_RPC_URL=https://1rpc.io/sepolia
 ```
 
-### 2. Deploy Contracts
+### 2. Deploy All Contracts
+
+The `deploy-sepolia.sh` script handles all deployment steps:
 
 ```bash
 # Check your wallet and balance
 ./deploy-sepolia.sh status
 
-# Step 1: Deploy MockHOT token (or skip if using existing TROT)
+# Step 1: Deploy MockHOT token
 ./deploy-sepolia.sh token
-
-# Update .env with the TOKEN_ADDRESS from output
-# Then run step 2:
+# Note: Updates .env with TOKEN_ADDRESS automatically
 
 # Step 2: Deploy HoloLockVault
 ./deploy-sepolia.sh vault
-
-# Update .env with LOCK_VAULT_ADDRESS from output
+# Note: Updates .env with LOCK_VAULT_ADDRESS automatically
 
 # Step 3: Mint test tokens to your wallet
 ./deploy-sepolia.sh mint
+
+# Step 4: Fund the vault (deposit tokens for claims)
+./deploy-sepolia.sh fund
+
+# Step 5: Deploy claim order via HoloLockVault
+./deploy-sepolia.sh order-via-vault
+# Note: Updates .env with ORDER_HASH and ORDER_OWNER automatically
 ```
 
-### 3. Deploy Claim Order (via Web Interface)
+### 3. Verify Deployment
 
-Since the Raindex order requires the rain CLI which has complex setup, use the web interface:
-
-1. Go to https://app.rainlang.xyz
-2. Connect your wallet to Sepolia
-3. Click "New Order"
-4. Paste the Rainlang code (everything after `---` in `src/holo-claim.rain`):
-
-```rainlang
-#orderbook-subparser 0xe6A589716d5a72276C08E0e08bc941a28005e55A
-#valid-signer 0x8E72b7568738da52ca3DCd9b24E178127A4E7d37
-
-#calculate-io
-using-words-from orderbook-subparser
-
-/* do the checks */
-:ensure(equal-to(signer<0>() valid-signer) "Wrong signer"),
-:ensure(equal-to(signed-context<0 0>() order-counterparty()) "Wrong recipient"),
-:ensure(less-than(block-timestamp() signed-context<0 2>()) "Order expired"),
-:ensure(equal-to(signed-context<0 3>() order-hash()) "Wrong order hash"),
-:ensure(equal-to(signed-context<0 4>() order-owner()) "Wrong order owner"),
-:ensure(equal-to(signed-context<0 5>() orderbook()) "Wrong orderbook"),
-:ensure(equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
-:ensure(equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
-
-/* check the nonce has not been used before */
-:ensure(is-zero(get(hash(order-hash() signed-context<0 8>()))) "Nonce already used"),
-:set(hash(order-hash() signed-context<0 8>()) 1),
-
-output-amount: signed-context<0 1>(),
-io-ratio: 0;
-
-#handle-io
-:ensure(equal-to(output-vault-balance-decrease() signed-context<0 1>()) "Wrong output amount");
+```bash
+# Show all deployed addresses and configuration
+./deploy-sepolia.sh status
 ```
 
-5. Configure the order:
-   - **Input token**: NOOP (0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028) or any placeholder
-   - **Input vault ID**: `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b`
-   - **Output token**: Your TOKEN_ADDRESS (or TROT: 0x72bBeF0c3d23C196D324cF7cF59C083760fFae5b)
-   - **Output vault ID**: `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b`
+## Deployed Contract Addresses (Current Sepolia)
 
-6. Deploy the order and note the **Order Hash** from the transaction
+| Contract | Address |
+|----------|---------|
+| MockHOT Token | `0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749` |
+| HoloLockVault | `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6` |
+| Orderbook | `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe` |
+| Claim Order Hash | `0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9` |
+| NOOP Token (placeholder) | `0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028` |
+| Test Signer | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` |
 
-7. **Fund the order vault**: Deposit tokens into the orderbook vault
-   - Go to the Orderbook contract on Etherscan
-   - Call `deposit(token, vaultId, amount)` with your tokens
+## Testing the Complete Flow
 
-8. Update `.env`:
-```
-ORDER_HASH=0x<order-hash-from-deployment>
-ORDER_OWNER=<your-wallet-address>
-```
+### Lock Flow (HOT -> HoloFuel)
 
-## Using Existing Infrastructure
-
-If you want to skip deploying new contracts, you can use existing Sepolia contracts:
-
-```
-TOKEN_ADDRESS=0x72bBeF0c3d23C196D324cF7cF59C083760fFae5b  # TROT
-ORDERBOOK_ADDRESS=0xfca89cD12Ba1346b1ac570ed988AB43b812733fe
-```
-
-## Testing the Flow
-
-### Lock Flow (HOT → HoloFuel)
-
-1. Start the lock watcher:
+1. **Start the lock watcher:**
 ```bash
 cd lock-watcher-rs
 cp .env.example .env
-# Edit .env with your SEPOLIA_LOCK_VAULT_ADDRESS
+# Edit .env: set SEPOLIA_LOCK_VAULT_ADDRESS=0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6
 cargo run
 ```
 
-2. Run the UI:
+2. **Start the UI:**
 ```bash
 cd ui
-cp .env.example .env
-# Edit .env with PUBLIC_LOCK_VAULT_ADDRESS and PUBLIC_TOKEN_ADDRESS
 npm install
 npm run dev
 ```
 
-3. Open http://localhost:5173, connect wallet, and lock tokens
+3. **Lock tokens:**
+   - Open http://localhost:5173
+   - Connect MetaMask to Sepolia
+   - Select "Lock HOT -> HoloFuel" tab
+   - Enter amount and Holochain agent public key
+   - Approve and lock tokens
+   - Watch the lock-watcher detect the event
 
-### Claim Flow (HoloFuel → HOT)
+### Claim Flow (HoloFuel -> HOT)
 
-1. Generate a coupon:
+1. **Generate a claim coupon:**
 ```bash
 cd coupon-signer
-cp .env.example .env  # Uses test signer key
+cp .env.example .env
+# .env already configured with test values
 
+# Generate coupon for 10 tokens to a recipient
 cargo run -- \
   --amount "10" \
-  --recipient "0x<claimer-address>" \
-  --order-hash "$ORDER_HASH" \
-  --order-owner "$ORDER_OWNER" \
-  --orderbook "0xfca89cD12Ba1346b1ac570ed988AB43b812733fe" \
-  --token "$TOKEN_ADDRESS" \
-  --vault-id "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b"
+  --recipient "0xYourRecipientAddress" \
+  --format ui
 ```
 
-2. Use the coupon in the claim UI or directly call `takeOrders` on the orderbook
+2. **Claim via UI:**
+   - Open http://localhost:5173/claim
+   - Paste the coupon string into the input field
+   - Or use URL: `http://localhost:5173/claim?c=<coupon>`
+   - Click "Claim HOT"
 
-## Contract Addresses Summary
+3. **Claim via URL parameter:**
+   - The coupon-signer outputs a URL-safe format
+   - Share: `http://localhost:5173/claim?c=<signer>,<signature>,<ctx0>,<ctx1>,...`
 
-| Contract | Sepolia Address |
-|----------|-----------------|
-| Orderbook | 0xfca89cD12Ba1346b1ac570ed988AB43b812733fe |
-| Expression Deployer | 0xd19581a021f4704ad4eBfF68258e7A0a9DB1CD77 |
-| Orderbook Subparser | 0xe6A589716d5a72276C08E0e08bc941a28005e55A |
-| TROT (test token) | 0x72bBeF0c3d23C196D324cF7cF59C083760fFae5b |
-| NOOP (placeholder) | 0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028 |
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SHARED LIQUIDITY POOL                         │
+│         (Raindex Orderbook Vault owned by HoloLockVault)        │
+│                                                                  │
+│   LOCK (HOT→HF)              HOT Tokens              CLAIM (HF→HOT)
+│   ─────────────────►    ┌───────────────┐    ◄─────────────────
+│   Deposits INTO         │   Balance: N   │         Withdraws FROM
+│                         └───────────────┘                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Design**: The HoloLockVault contract owns both:
+1. The vault where locked HOT is deposited
+2. The claim order that allows withdrawals via signed coupons
+
+This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of tokens**.
+
+## Component Details
+
+### HoloLockVault Contract (`src/HoloLockVault.sol`)
+
+Functions:
+- `lock(amount, holochainAgent)` - Lock tokens, emit event for Holochain bridge
+- `addOrder(config)` - Deploy claim order (admin only)
+- `removeOrder(order)` - Remove claim order (admin only)
+- `adminWithdraw(amount, to)` - Emergency withdrawal (admin only)
+- `vaultBalance()` - Check vault balance
+
+### Coupon Signer (`coupon-signer/`)
+
+Rust CLI that generates signed claim coupons:
+```bash
+cargo run -- \
+  --amount "10" \
+  --recipient "0x..." \
+  --format ui    # Output format: ui (default), json, or hex
+```
+
+Output formats:
+- `ui`: `signer,signature,ctx0,ctx1,...,ctx8` (decimal values, URL-safe)
+- `json`: Full JSON with all fields
+- `hex`: Raw hex-encoded signed context
+
+### Lock Watcher (`lock-watcher-rs/`)
+
+Rust service that monitors Lock events:
+```bash
+cargo run
+```
+
+Features:
+- Polls for new Lock events
+- SQLite database for tracking processed locks
+- Configurable polling interval
+- Ready for Holochain integration
+
+### UI (`ui/`)
+
+SvelteKit web interface:
+- `/` - Home page with lock/claim selector
+- `/lock` - Lock HOT to receive HoloFuel
+- `/claim` - Claim HOT with coupon
+- `/claim?c=<coupon>` - Direct claim via URL parameter
+
+## Coupon Format
+
+The signed coupon contains 9 context values:
+| Index | Field | Description |
+|-------|-------|-------------|
+| 0 | recipient | Ethereum address to receive tokens |
+| 1 | amount | Token amount in wei |
+| 2 | expiry | Unix timestamp when coupon expires |
+| 3 | orderHash | Hash of the claim order |
+| 4 | orderOwner | HoloLockVault address |
+| 5 | orderbook | Orderbook contract address |
+| 6 | outputToken | Token address (MockHOT) |
+| 7 | outputVaultId | Vault ID |
+| 8 | nonce | Unique nonce (prevents replay) |
+
+## Troubleshooting
+
+### "Order not found" in UI
+The UI reads order status directly from the blockchain via RPC. If you see this error:
+1. Verify the order was deployed: `./deploy-sepolia.sh status`
+2. Check ORDER_HASH in `.env` matches the deployed order
+3. Ensure `ui/src/lib/orderConfig.ts` has the correct order configuration
+
+### Transaction fails with "Wrong signer"
+The coupon was signed with a different key than the one configured in the Rainlang order.
+- Check `valid-signer` in `src/holo-claim.rain`
+- Ensure `SIGNER_PRIVATE_KEY` in coupon-signer matches
+
+### "Nonce already used"
+Each coupon can only be used once. Generate a new coupon with a fresh nonce.
 
 ## Security Notes
 
 - Never commit `.env` files with private keys
 - The test signer key in this repo is for testing only
-- In production, use a secure key management solution (e.g., Fireblocks)
+- In production, use Fireblocks MPC or similar secure key management
+- The admin key controls emergency withdrawals - protect it carefully
