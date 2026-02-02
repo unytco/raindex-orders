@@ -25,11 +25,13 @@ import {
 ///   forge script script/DeployHoloLockVault.s.sol:DeployMainnetHoloLockVault --rpc-url $ETH_RPC_URL
 contract DeploySepoliaHoloLockVault is Script {
     function run() external {
+        // Read token address from environment, fallback to SEPOLIA_TROT
+        address token = vm.envOr("TOKEN_ADDRESS", address(SEPOLIA_TROT));
         // Read admin address from environment or use deployer
         address admin = vm.envOr("ADMIN_ADDRESS", msg.sender);
 
         console2.log("Deploying HoloLockVault to Sepolia...");
-        console2.log("Token (TROT):", address(SEPOLIA_TROT));
+        console2.log("Token:", token);
         console2.log("Orderbook:", address(SEPOLIA_ORDERBOOK));
         console2.log("Vault ID:", HOLO_VAULT_ID);
         console2.log("Admin:", admin);
@@ -38,7 +40,7 @@ contract DeploySepoliaHoloLockVault is Script {
         vm.startBroadcast();
 
         HoloLockVault lockVault = new HoloLockVault(
-            address(SEPOLIA_TROT),
+            token,
             address(SEPOLIA_ORDERBOOK),
             HOLO_VAULT_ID,
             admin,
