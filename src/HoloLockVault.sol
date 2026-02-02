@@ -3,7 +3,7 @@ pragma solidity =0.8.19;
 
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
-import {IOrderBookV3} from "rain.orderbook.interface/interface/IOrderBookV3.sol";
+import {IOrderBookV3, OrderConfigV2, OrderV2} from "rain.orderbook.interface/interface/IOrderBookV3.sol";
 
 /// @title HoloLockVault
 /// @notice A wrapper contract that accepts HOT token deposits and forwards them
@@ -162,5 +162,20 @@ contract HoloLockVault {
     /// @param _minLockAmount New minimum amount
     function setMinLockAmount(uint256 _minLockAmount) external onlyAdmin {
         minLockAmount = _minLockAmount;
+    }
+
+    /// @notice Admin function to add an order to the orderbook
+    /// @dev This makes HoloLockVault the order owner, so claim outputs come from its vault
+    /// @param config The order configuration
+    /// @return stateChanged True if the order was added
+    function addOrder(OrderConfigV2 calldata config) external onlyAdmin returns (bool stateChanged) {
+        return orderbook.addOrder(config);
+    }
+
+    /// @notice Admin function to remove an order from the orderbook
+    /// @param order The order to remove
+    /// @return stateChanged True if the order was removed
+    function removeOrder(OrderV2 calldata order) external onlyAdmin returns (bool stateChanged) {
+        return orderbook.removeOrder(order);
     }
 }

@@ -13,11 +13,13 @@
 #   ./deploy-sepolia.sh [step]
 #
 # Steps:
-#   1 or token     - Deploy MockHOT token
-#   2 or vault     - Deploy HoloLockVault
-#   3 or mint      - Mint test tokens to your wallet
-#   all            - Run all steps
-#   status         - Show current deployment status
+#   1 or token          - Deploy MockHOT token
+#   2 or vault          - Deploy HoloLockVault
+#   3 or mint           - Mint test tokens to your wallet
+#   4 or order          - Deploy claim order (you as owner)
+#   5 or order-via-vault - Deploy claim order via vault (recommended)
+#   all                 - Run all steps
+#   status              - Show current deployment status
 
 set -e
 
@@ -141,7 +143,8 @@ mint_tokens() {
 }
 
 deploy_order() {
-    echo -e "${YELLOW}=== Step 4: Deploying Claim Order ===${NC}"
+    echo -e "${YELLOW}=== Step 4: Deploying Claim Order (direct) ===${NC}"
+    echo -e "${YELLOW}NOTE: This deploys with YOUR wallet as owner. Use 'order-via-vault' for production.${NC}"
 
     if [ -z "$TOKEN_ADDRESS" ]; then
         echo -e "${RED}Error: TOKEN_ADDRESS not set in .env${NC}"
@@ -155,16 +158,15 @@ deploy_order() {
     echo "Using token: $TOKEN_ADDRESS"
     echo "Valid signer: $VALID_SIGNER"
 
-    # Use dotrain via nix to compose the rainlang properly
-    echo "Composing rainlang with dotrain (via nix)..."
-    RAINLANG=$(nix run github:rainlanguage/dotrain -- compose --input src/holo-claim.rain --entrypoints calculate-io --entrypoints handle-io 2>&1)
+    # Use Node.js dotrain package to compose the rainlang
+    echo "Composing rainlang with @rainlanguage/dotrain..."
+    RAINLANG=$(node compose-rainlang.mjs 2>&1)
 
     if [ $? -ne 0 ]; then
         echo -e "${RED}dotrain compose failed:${NC}"
         echo "$RAINLANG"
         echo ""
-        echo "If dotrain is not available, you can deploy the order manually via:"
-        echo "  https://app.rainlang.xyz"
+        echo "Make sure @rainlanguage/dotrain is installed: npm install @rainlanguage/dotrain"
         exit 1
     fi
 
@@ -197,17 +199,113 @@ deploy_order() {
         echo -e "${RED}Forge script failed with exit code $FORGE_EXIT_CODE${NC}"
     fi
 
-    # Try to extract order hash from logs (look for AddOrder event)
-    # The order hash appears in the transaction logs
-    ORDER_HASH_VAL=$(echo "$OUTPUT" | grep -oP "orderHash: \K0x[a-fA-F0-9]{64}" || true)
+    # Try to extract order hash from broadcast JSON
+    BROADCAST_FILE="broadcast/DeployClaimOrder.s.sol/11155111/run-latest.json"
 
-    if [ -n "$ORDER_HASH_VAL" ]; then
+    if [ -f "$BROADCAST_FILE" ]; then
+        # Find the AddOrder event from the orderbook (topic 0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf)
+        # Data layout: 0x + sender(64) + deployer(64) + offset(64) + orderHash(64) = chars 195-258
+        ORDER_HASH_VAL=$(jq -r '.receipts[0].logs[] | select(.topics[0] == "0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf") | .data' "$BROADCAST_FILE" 2>/dev/null | cut -c195-258 | sed 's/^/0x/')
+    fi
+
+    if [ -n "$ORDER_HASH_VAL" ] && [ "$ORDER_HASH_VAL" != "0x" ]; then
         echo -e "${GREEN}Order deployed! Hash: $ORDER_HASH_VAL${NC}"
         sed -i "s|^ORDER_HASH=.*|ORDER_HASH=$ORDER_HASH_VAL|" .env
         echo -e "${GREEN}Updated .env with ORDER_HASH${NC}"
     else
-        echo -e "${YELLOW}Order deployed but could not extract hash from output${NC}"
+        echo -e "${YELLOW}Order deployed but could not extract hash from broadcast file${NC}"
         echo "Check the transaction on Etherscan to get the order hash"
+    fi
+}
+
+deploy_order_via_vault() {
+    echo -e "${YELLOW}=== Deploying Claim Order via HoloLockVault ===${NC}"
+    echo -e "${GREEN}This makes the vault the order owner, so claims use the same vault as locks.${NC}"
+
+    if [ -z "$TOKEN_ADDRESS" ]; then
+        echo -e "${RED}Error: TOKEN_ADDRESS not set in .env${NC}"
+        exit 1
+    fi
+
+    if [ -z "$LOCK_VAULT_ADDRESS" ]; then
+        echo -e "${RED}Error: LOCK_VAULT_ADDRESS not set in .env${NC}"
+        echo "Deploy the vault first with: ./deploy-sepolia.sh vault"
+        exit 1
+    fi
+
+    echo "Using token: $TOKEN_ADDRESS"
+    echo "Using vault: $LOCK_VAULT_ADDRESS"
+
+    # Use Node.js dotrain package to compose the rainlang
+    echo "Composing rainlang with @rainlanguage/dotrain..."
+    RAINLANG=$(node compose-rainlang.mjs 2>&1)
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}dotrain compose failed:${NC}"
+        echo "$RAINLANG"
+        echo ""
+        echo "Make sure @rainlanguage/dotrain is installed: npm install @rainlanguage/dotrain"
+        exit 1
+    fi
+
+    echo "Composed Rainlang:"
+    echo "$RAINLANG"
+    echo ""
+
+    # Write rainlang to temp file (more reliable than env var for multi-line)
+    RAINLANG_FILE=$(mktemp)
+    echo "$RAINLANG" > "$RAINLANG_FILE"
+    echo "Written rainlang to: $RAINLANG_FILE"
+
+    # Run forge script with RAINLANG_FILE env var
+    echo "Running forge script..."
+    set +e  # Don't exit on error so we can capture output
+    OUTPUT=$(RAINLANG_FILE="$RAINLANG_FILE" forge script script/DeployClaimOrderViaVault.s.sol:DeployClaimOrderViaVault \
+        --rpc-url "$SEPOLIA_RPC_URL" \
+        --private-key "$PRIVATE_KEY" \
+        --broadcast \
+        -vvv 2>&1)
+    FORGE_EXIT_CODE=$?
+    set -e
+
+    # Clean up temp file
+    rm -f "$RAINLANG_FILE"
+
+    echo "$OUTPUT"
+
+    if [ $FORGE_EXIT_CODE -ne 0 ]; then
+        echo -e "${RED}Forge script failed with exit code $FORGE_EXIT_CODE${NC}"
+    fi
+
+    # Try to extract order hash from broadcast JSON
+    # The AddOrder event is emitted by the orderbook contract
+    # Order hash is at bytes 96-128 (4th 32-byte word) in the data field of the AddOrder event
+    BROADCAST_FILE="broadcast/DeployClaimOrderViaVault.s.sol/11155111/run-latest.json"
+
+    if [ -f "$BROADCAST_FILE" ]; then
+        # Find the AddOrder event from the orderbook (topic 0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf)
+        # Extract the order hash from byte offset 192-256 (after sender, deployer, offset)
+        # Data layout: 0x + sender(64) + deployer(64) + offset(64) + orderHash(64) = chars 195-258
+        ORDER_HASH_VAL=$(jq -r '.receipts[0].logs[] | select(.topics[0] == "0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf") | .data' "$BROADCAST_FILE" 2>/dev/null | cut -c195-258 | sed 's/^/0x/')
+    fi
+
+    if [ -n "$ORDER_HASH_VAL" ] && [ "$ORDER_HASH_VAL" != "0x" ]; then
+        echo -e "${GREEN}Order deployed via vault! Hash: $ORDER_HASH_VAL${NC}"
+        sed -i "s|^ORDER_HASH=.*|ORDER_HASH=$ORDER_HASH_VAL|" .env
+        # Set ORDER_OWNER to the vault address
+        sed -i "s|^ORDER_OWNER=.*|ORDER_OWNER=$LOCK_VAULT_ADDRESS|" .env
+        echo -e "${GREEN}Updated .env with ORDER_HASH and ORDER_OWNER (vault address)${NC}"
+
+        # Also update coupon-signer .env if it exists
+        if [ -f "coupon-signer/.env" ]; then
+            sed -i "s|^ORDER_HASH=.*|ORDER_HASH=$ORDER_HASH_VAL|" coupon-signer/.env
+            sed -i "s|^ORDER_OWNER=.*|ORDER_OWNER=$LOCK_VAULT_ADDRESS|" coupon-signer/.env
+            echo -e "${GREEN}Updated coupon-signer/.env as well${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Order deployed but could not extract hash from broadcast file${NC}"
+        echo "Check the transaction on Etherscan to get the order hash"
+        echo "Remember: ORDER_OWNER should be set to $LOCK_VAULT_ADDRESS"
     fi
 }
 
@@ -246,6 +344,9 @@ case "${1:-status}" in
     4|order)
         deploy_order
         ;;
+    5|order-via-vault)
+        deploy_order_via_vault
+        ;;
     all)
         deploy_token
         echo ""
@@ -256,7 +357,7 @@ case "${1:-status}" in
         mint_tokens
         echo ""
         source .env
-        deploy_order
+        deploy_order_via_vault
         ;;
     status)
         show_status
@@ -265,11 +366,12 @@ case "${1:-status}" in
         echo "Usage: $0 [step]"
         echo ""
         echo "Steps:"
-        echo "  1 or token   - Deploy MockHOT token"
-        echo "  2 or vault   - Deploy HoloLockVault"
-        echo "  3 or mint    - Mint test tokens"
-        echo "  4 or order   - Deploy claim order"
-        echo "  all          - Run all steps"
-        echo "  status       - Show deployment status"
+        echo "  1 or token          - Deploy MockHOT token"
+        echo "  2 or vault          - Deploy HoloLockVault"
+        echo "  3 or mint           - Mint test tokens"
+        echo "  4 or order          - Deploy claim order (direct, you as owner)"
+        echo "  5 or order-via-vault - Deploy claim order via vault (recommended)"
+        echo "  all                 - Run all steps (uses order-via-vault)"
+        echo "  status              - Show deployment status"
         ;;
 esac
