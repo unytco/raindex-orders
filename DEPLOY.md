@@ -1,6 +1,6 @@
 # Holo Bridge - Sepolia Deployment Guide
 
-This guide covers deploying and testing the complete HOT <> HoloFuel bridge infrastructure on Sepolia testnet.
+This guide covers deploying and testing the complete HOT <> bridged HOT bridge infrastructure on Sepolia testnet.
 
 ## Prerequisites
 
@@ -74,7 +74,7 @@ The `deploy-sepolia.sh` script handles all deployment steps:
 
 ## Testing the Complete Flow
 
-### Lock Flow (HOT -> HoloFuel)
+### Lock Flow (HOT -> Bridged HOT)
 
 1. **Start the lock watcher:**
 ```bash
@@ -94,12 +94,12 @@ npm run dev
 3. **Lock tokens:**
    - Open http://localhost:5173
    - Connect MetaMask to Sepolia
-   - Select "Lock HOT -> HoloFuel" tab
+   - Select "Lock HOT -> bridged HOT" tab
    - Enter amount and Holochain agent public key
    - Approve and lock tokens
    - Watch the lock-watcher detect the event
 
-### Claim Flow (HoloFuel -> HOT)
+### Claim Flow (Bridged HOT -> HOT)
 
 1. **Generate a claim coupon:**
 ```bash
@@ -131,7 +131,7 @@ cargo run -- \
 │                    SHARED LIQUIDITY POOL                         │
 │         (Raindex Orderbook Vault owned by HoloLockVault)        │
 │                                                                  │
-│   LOCK (HOT→HF)              HOT Tokens              CLAIM (HF→HOT)
+│   LOCK (HOT→bHOT)            HOT Tokens             CLAIM (bHOT→HOT)
 │   ─────────────────►    ┌───────────────┐    ◄─────────────────
 │   Deposits INTO         │   Balance: N   │         Withdraws FROM
 │                         └───────────────┘                        │
@@ -149,7 +149,7 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
 ### HoloLockVault Contract (`src/HoloLockVault.sol`)
 
 Functions:
-- `lock(amount, holochainAgent)` - Lock tokens, emit event for Holochain bridge
+- `lock(amount, holochainAgent)` - Lock tokens, emit event for bridged HOT crediting
 - `addOrder(config)` - Deploy claim order (admin only)
 - `removeOrder(order)` - Remove claim order (admin only)
 - `adminWithdraw(amount, to)` - Emergency withdrawal (admin only)
@@ -187,7 +187,7 @@ Features:
 
 SvelteKit web interface:
 - `/` - Home page with lock/claim selector
-- `/lock` - Lock HOT to receive HoloFuel
+- `/lock` - Lock HOT to receive bridged HOT
 - `/claim` - Claim HOT with coupon
 - `/claim?c=<coupon>` - Direct claim via URL parameter
 

@@ -1,20 +1,20 @@
-# HOT <> HoloFuel Bridge
+# HOT <> Bridged HOT Bridge
 
-A two-way bridge between HOT tokens on Ethereum and HoloFuel on Holochain.
+A two-way bridge between HOT tokens on Ethereum and bridged HOT on Holochain.
 
 ## Overview
 
-This repository contains the Ethereum-side infrastructure for the HOT <> HoloFuel swap:
+This repository contains the Ethereum-side infrastructure for the HOT <> bridged HOT swap:
 
-- **LOCK**: Users send HOT on Ethereum and receive HoloFuel on Holochain
-- **CLAIM**: Users burn HoloFuel on Holochain and receive HOT on Ethereum via signed coupons
+- **LOCK**: Users send HOT on Ethereum and receive bridged HOT on Holochain
+- **CLAIM**: Users burn bridged HOT on Holochain and receive HOT on Ethereum via signed coupons
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    SHARED LIQUIDITY POOL                         │
 │         (Raindex Orderbook Vault owned by HoloLockVault)        │
 │                                                                  │
-│   LOCK (HOT→HF)              HOT Tokens              CLAIM (HF→HOT)
+│   LOCK (HOT→bHOT)            HOT Tokens             CLAIM (bHOT→HOT)
 │   ─────────────────►    ┌───────────────┐    ◄─────────────────
 │   Deposits INTO         │               │         Withdraws FROM
 │                         └───────────────┘                        │
@@ -100,18 +100,18 @@ Paste the output into the claim page at http://localhost:5173/claim
 
 ## How It Works
 
-### Lock Flow (HOT -> HoloFuel)
+### Lock Flow (HOT -> Bridged HOT)
 
 1. User approves HoloLockVault to spend their HOT
 2. User calls `lock(amount, holochainAgentPubKey)`
 3. HoloLockVault deposits tokens to its Raindex vault
 4. `Lock` event emitted with amount and Holochain agent
 5. Lock watcher detects event
-6. (Future) Certificate submitted to Holochain to credit HoloFuel
+6. Holochain side credits bridged HOT to agent
 
-### Claim Flow (HoloFuel -> HOT)
+### Claim Flow (Bridged HOT -> HOT)
 
-1. User burns HoloFuel on Holochain
+1. User burns bridged HOT on Holochain
 2. Holo backend generates signed coupon via Fireblocks
 3. User receives coupon (URL or direct)
 4. User visits claim page and submits coupon

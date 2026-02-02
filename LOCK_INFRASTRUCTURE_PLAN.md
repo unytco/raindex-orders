@@ -1,11 +1,11 @@
-# HOT <> HoloFuel Bridge - Architecture Documentation
+# HOT <> Bridged HOT Bridge - Architecture Documentation
 
 ## Overview
 
-This document describes the architecture of the two-way bridge between HOT tokens on Ethereum and HoloFuel on Holochain:
+This document describes the architecture of the two-way bridge between HOT tokens on Ethereum and bridged HOT on Holochain:
 
-- **LOCK**: User sends HOT on Ethereum -> receives HoloFuel on Holochain
-- **CLAIM** (UNLOCK): User burns HoloFuel on Holochain -> receives HOT on Ethereum
+- **LOCK**: User sends HOT on Ethereum -> receives bridged HOT on Holochain
+- **CLAIM** (UNLOCK): User burns bridged HOT on Holochain -> receives HOT on Ethereum
 
 ## Implementation Status
 
@@ -29,7 +29,7 @@ This document describes the architecture of the two-way bridge between HOT token
 │           (Raindex Orderbook Vault owned by HoloLockVault)                  │
 │                                                                              │
 │                            ┌───────────────┐                                │
-│      LOCK (HOT→HF)         │   HOT Tokens  │         CLAIM (HF→HOT)         │
+│      LOCK (HOT→bHOT)       │   HOT Tokens  │        CLAIM (bHOT→HOT)        │
 │    ─────────────────►      │               │      ◄─────────────────        │
 │      Deposits INTO         │   Balance: N  │         Withdraws FROM         │
 │                            └───────────────┘                                │
@@ -54,7 +54,7 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
 
 ---
 
-## LOCK Flow: HOT -> HoloFuel
+## LOCK Flow: HOT -> Bridged HOT
 
 ```
     ETHEREUM                           │                      HOLOCHAIN
@@ -87,19 +87,16 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
 │ Vault balance:       │               │  │                     │
 │ +100 HOT             │               │  │ • Poll for events   │
 └──────────────────────┘               │  │ • Store in SQLite   │
-                                       │  │ • [Future] Sign     │
-                                       │  │   certificate       │
                                        │  └──────────┬──────────┘
                                        │             │
-                                       │             │ 5. [FUTURE] Submit
-                                       │             │    certificate
+                                       │             │ 5. Notify Holochain
+                                       │             │    (implementation TBD)
                                        │             ▼
                                        │  ┌─────────────────────┐
-                                       │  │   HoloFuel DNA      │
+                                       │  │   Bridged HOT DNA   │
                                        │  │                     │
-                                       │  │ • Verify signature  │
-                                       │  │ • Credit HoloFuel   │
-                                       │  │   to agent          │
+                                       │  │ • Credit bridged    │
+                                       │  │   HOT to agent      │
                                        │  └─────────────────────┘
 ```
 
@@ -111,12 +108,12 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
 | 2 | User calls `lock(amount, agent)` | HoloLockVault | Complete |
 | 3 | Contract deposits to orderbook | Raindex Orderbook | Complete |
 | 4 | Lock watcher detects event | lock-watcher-rs | Complete |
-| 5 | Certificate signed and submitted | Fireblocks + Holochain | **Pending** |
-| 6 | HoloFuel credited to agent | HoloFuel DNA | **Pending** |
+| 5 | Holochain notified of lock | TBD | **Pending** |
+| 6 | Bridged HOT credited to agent | Bridged HOT DNA | **Pending** |
 
 ---
 
-## CLAIM Flow: HoloFuel -> HOT
+## CLAIM Flow: Bridged HOT -> HOT
 
 ```
     HOLOCHAIN                          │                      ETHEREUM
@@ -124,16 +121,17 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
 ┌─────────────────────┐                │
 │  Holochain Agent    │                │
 │                     │                │
-│  Balance: 100 HF    │                │
+│  Balance: 100 bHOT  │                │
 └──────────┬──────────┘                │
            │                           │
            │ 1. [FUTURE] Request       │
-           │    redemption (burn HF)   │
+           │    redemption (burn bHOT) │
            ▼                           │
 ┌─────────────────────┐                │
-│   HoloFuel DNA      │                │
+│   Bridged HOT DNA   │                │
 │                     │                │
-│ • [FUTURE] Burn HF  │                │
+│ • [FUTURE] Burn     │                │
+│   bridged HOT       │                │
 │ • Notify backend    │────────────────┼─────────┐
 └─────────────────────┘                │         │
                                        │         │
@@ -195,7 +193,7 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
 
 | Step | Action | Component | Status |
 |------|--------|-----------|--------|
-| 1 | User burns HoloFuel | HoloFuel DNA | **Pending** |
+| 1 | User burns bridged HOT | Bridged HOT DNA | **Pending** |
 | 2 | Backend generates coupon | coupon-signer | Complete |
 | 3 | User receives coupon | Email/App/URL | Complete |
 | 4 | User visits claim page | ui/ | Complete |
@@ -231,6 +229,18 @@ contract HoloLockVault {
 - Deposits to Raindex orderbook vault owned by this contract
 - Can deploy/manage claim orders (making itself the order owner)
 - Admin controls for emergency withdrawal
+
+### Lock Watcher (`lock-watcher-rs/`)
+
+**Purpose**: Rust service that monitors Lock events on Ethereum.
+
+**Features**:
+- Polls Ethereum RPC for Lock events
+- Stores processed locks in SQLite database
+- Configurable polling interval
+- Ready for Holochain integration
+
+**Note**: The lock watcher currently stores events locally. The mechanism for notifying Holochain (direct API call, signed certificate, or other) is to be determined based on Holochain-side requirements.
 
 ### 2. Rainlang Claim Expression (`src/holo-claim.rain`)
 
@@ -300,7 +310,7 @@ cargo run -- \
 - Polls Ethereum RPC for Lock events
 - Stores processed locks in SQLite database
 - Configurable polling interval
-- Ready for Holochain integration (certificate generation)
+- Ready for Holochain integration
 
 **Configuration** (`.env`):
 ```env
@@ -317,7 +327,7 @@ DB_PATH=./data/locks.db
 
 **Routes**:
 - `/` - Home page with lock/claim selector
-- `/lock` - Lock HOT to receive HoloFuel
+- `/lock` - Lock HOT to receive bridged HOT
 - `/claim` - Claim HOT with coupon
 - `/claim?c=<coupon>` - Direct claim via URL parameter
 
@@ -359,10 +369,14 @@ PUBLIC_TOKEN_ADDRESS=0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749
 The lock-watcher-rs component is ready for Holochain integration:
 
 1. **Current State**: Detects Lock events and stores in SQLite
-2. **Next Step**: Generate signed reserve certificate
-3. **Final Step**: Submit certificate to HoloFuel DNA
+2. **Next Step**: Implement notification mechanism to Holochain
 
-**Reserve Certificate Structure** (proposed):
+**Integration Options** (to be determined based on Holochain requirements):
+- Direct Holochain conductor API call
+- Signed certificate submission (optional, if Holochain requires cryptographic proof)
+- WebSocket/webhook notification
+
+**Optional Certificate Structure** (if cryptographic proof is needed):
 ```rust
 pub struct ReserveCertificate {
     pub eth_tx_hash: [u8; 32],      // Ethereum tx hash
@@ -370,20 +384,7 @@ pub struct ReserveCertificate {
     pub lock_id: u64,                // Lock ID from contract
     pub recipient: AgentPubKey,      // Holochain agent
     pub expiry: Timestamp,           // Certificate expiry
-    pub signature: Signature,        // Fireblocks signature
-}
-```
-
-**HoloFuel DNA Integration** (proposed):
-```rust
-#[hdk_extern]
-pub fn claim_from_reserve(certificate: ReserveCertificate) -> ExternResult<()> {
-    verify_certificate_signature(&certificate)?;
-    ensure_not_expired(&certificate)?;
-    ensure_not_replayed(&certificate)?;
-    credit_holofuel(certificate.recipient, certificate.amount)?;
-    mark_processed(&certificate)?;
-    Ok(())
+    pub signature: Signature,        // Fireblocks signature (optional)
 }
 ```
 
@@ -393,11 +394,11 @@ The coupon-signer component is ready for Holochain integration:
 
 1. **Current State**: CLI generates coupons with test key
 2. **Next Step**: Integrate with Fireblocks MPC for production signing
-3. **Final Step**: Trigger from HoloFuel burn events
+3. **Final Step**: Trigger from bridged HOT burn events
 
 **Integration Flow**:
-1. User burns HoloFuel in HoloFuel DNA
-2. HoloFuel DNA notifies Holo backend
+1. User burns bridged HOT in Bridged HOT DNA
+2. Bridged HOT DNA notifies Holo backend
 3. Backend calls coupon-signer (or equivalent)
 4. Signed coupon delivered to user (email, app notification, etc.)
 5. User claims on Ethereum
