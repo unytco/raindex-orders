@@ -5,6 +5,7 @@
 	import { formatUnits, parseUnits, type Hex } from 'viem'
 	import { transactionStore } from '$lib/stores/transactionStore'
 	import { onMount } from 'svelte'
+	import { browser } from '$app/environment'
 	import TransactionModal from '$lib/components/TransactionModal.svelte'
 	import { PUBLIC_LOCK_VAULT_ADDRESS, PUBLIC_TOKEN_ADDRESS } from '$env/static/public'
 	import {
@@ -106,6 +107,41 @@
 		// Should be 0x followed by 64 hex characters (32 bytes)
 		return /^0x[a-fA-F0-9]{64}$/.test(agent)
 	}
+
+	// Get parameters from URL on mount
+	onMount(() => {
+		if (browser) {
+			try {
+				const urlParams = new URL(window.location.href).searchParams
+				const urlAmount = urlParams.get('amount')
+				const urlAgent = urlParams.get('agent')
+
+				// Validate and set amount if provided
+				if (urlAmount) {
+					// Validate that amount is a valid number
+					const parsedAmount = parseFloat(urlAmount)
+					if (!isNaN(parsedAmount) && parsedAmount > 0) {
+						amount = urlAmount
+					} else {
+						console.warn('Invalid amount parameter in URL:', urlAmount)
+					}
+				}
+
+				// Validate and set agent if provided
+				if (urlAgent) {
+					// Validate agent format before setting
+					if (isValidHolochainAgent(urlAgent)) {
+						holochainAgent = urlAgent
+					} else {
+						console.warn('Invalid agent parameter in URL:', urlAgent)
+					}
+				}
+			} catch (e) {
+				console.error('Error reading URL parameters:', e)
+				// Page continues to work normally even if URL parsing fails
+			}
+		}
+	})
 
 	// Handle approval
 	async function handleApprove() {
