@@ -71,6 +71,18 @@
 						</div>
 					</Card>
 				</a>
+
+				<a href="/faucet" class="block">
+					<Card class="hover:bg-gray-50 cursor-pointer transition-colors border-2 border-blue-200">
+						<div class="flex items-center justify-between">
+							<div>
+								<h3 class="text-lg font-semibold">MockHOT Faucet</h3>
+								<p class="text-sm text-gray-600">Get free testnet HOT tokens for testing</p>
+							</div>
+							<div class="text-2xl">💧</div>
+						</div>
+					</Card>
+				</a>
 			</div>
 		</div>
 	{/if}
