@@ -25,7 +25,7 @@
 		try {
 			// Validate inputs
 			if (!isAddress(recipient)) {
-				throw new Error('Invalid recipient address')
+				throw new Error('Invalid recipient address') 
 			}
 
 			const amount = parseFloat(hotAmount)
@@ -56,8 +56,14 @@
 			couponCode = data.couponCode
 			couponInfo = data.info
 
-			// Copy to clipboard
-			await navigator.clipboard.writeText(couponCode)
+			// Copy to clipboard (only in browser context)
+			if (typeof navigator !== 'undefined' && navigator.clipboard) {
+				try {
+					await navigator.clipboard.writeText(couponCode)
+				} catch (e) {
+					console.warn('Failed to copy to clipboard:', e)
+				}
+			}
 		} catch (e: any) {
 			error = e.message || 'Failed to generate coupon'
 			console.error('Coupon generation error:', e)
@@ -67,7 +73,15 @@
 	}
 
 	const copyToClipboard = async () => {
-		await navigator.clipboard.writeText(couponCode)
+		if (typeof navigator !== 'undefined' && navigator.clipboard) {
+			try {
+				await navigator.clipboard.writeText(couponCode)
+				alert('Copied to clipboard!')
+			} catch (e) {
+				console.error('Failed to copy to clipboard:', e)
+				alert('Failed to copy to clipboard')
+			}
+		}
 	}
 </script>
 
@@ -109,7 +123,6 @@
 	{#if couponCode}
 		<Card size="xl" class="mb-4">
 			<h3 class="mb-2 text-lg font-semibold text-green-600">✓ Coupon Generated Successfully</h3>
-			<p class="mb-4 text-sm text-gray-600">Copied to clipboard</p>
 
 			<div class="mb-4">
 				<label class="mb-2 block text-sm font-medium">Coupon Code:</label>
@@ -147,3 +160,4 @@
 		</div>
 	</Card>
 </div>
+ 
