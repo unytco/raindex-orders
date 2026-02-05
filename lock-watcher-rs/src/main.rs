@@ -1,5 +1,6 @@
 mod config;
 mod database;
+mod holochain_bridge;
 mod types;
 mod watcher;
 

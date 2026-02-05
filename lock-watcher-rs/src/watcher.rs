@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::database::LockDatabase;
+use crate::holochain_bridge;
 use crate::types::{LockRecord, LockStatus};
 use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
@@ -35,8 +36,7 @@ impl LockWatcher {
 
     /// Create an HTTP provider
     fn create_provider(&self) -> Result<RootProvider<Http<Client>>> {
-        let provider = ProviderBuilder::new()
-            .on_http(self.config.network_config.rpc_url.parse()?);
+        let provider = ProviderBuilder::new().on_http(self.config.network_config.rpc_url.parse()?);
         Ok(provider)
     }
 
@@ -48,8 +48,15 @@ impl LockWatcher {
     }
 
     /// Fetch historical Lock events from a range of blocks
-    pub async fn fetch_historical_locks(&self, from_block: u64, to_block: u64) -> Result<Vec<LockRecord>> {
-        info!("Fetching locks from block {} to {}...", from_block, to_block);
+    pub async fn fetch_historical_locks(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<LockRecord>> {
+        info!(
+            "Fetching locks from block {} to {}...",
+            from_block, to_block
+        );
 
         let provider = self.create_provider()?;
 
@@ -73,10 +80,8 @@ impl LockWatcher {
         }
 
         // Update last processed block
-        self.db.set_last_processed_block(
-            self.config.network_config.chain_id,
-            to_block,
-        )?;
+        self.db
+            .set_last_processed_block(self.config.network_config.chain_id, to_block)?;
 
         Ok(records)
     }
@@ -88,15 +93,21 @@ impl LockWatcher {
         log: Log,
     ) -> Result<Option<LockRecord>> {
         // Decode the log
-        let decoded = log.log_decode::<Lock>()
+        let decoded = log
+            .log_decode::<Lock>()
             .context("Failed to decode Lock event")?;
 
-        let Lock { sender, amount, holochainAgent, lockId } = decoded.inner.data;
+        let Lock {
+            sender,
+            amount,
+            holochainAgent,
+            lockId,
+        } = decoded.inner.data;
 
-        let tx_hash = log.transaction_hash
+        let tx_hash = log
+            .transaction_hash
             .context("Log missing transaction hash")?;
-        let block_number = log.block_number
-            .context("Log missing block number")?;
+        let block_number = log.block_number.context("Log missing block number")?;
 
         // Get block timestamp
         let block = provider
@@ -131,12 +142,15 @@ impl LockWatcher {
                     info!("========================================");
                     info!("  Lock ID:          {}", lock_record.lock_id);
                     info!("  Sender:           {}", lock_record.sender);
-                    info!("  Amount:           {} HOT", format_amount(&lock_record.amount));
+                    info!(
+                        "  Amount:           {} HOT",
+                        format_amount(&lock_record.amount)
+                    );
                     info!("  Holochain Agent:  {}", lock_record.holochain_agent);
                     info!("  TX Hash:          {}", lock_record.tx_hash);
                     info!("  Block:            {}", lock_record.block_number);
                     info!("========================================");
-                    info!("TODO: Call Holochain to credit HoloFuel");
+                    info!("Lock will be sent to Holochain after confirmations");
                     info!("========================================");
 
                     Ok(Some(lock_record))
@@ -167,7 +181,69 @@ impl LockWatcher {
                     "Lock {} confirmed ({} confirmations)",
                     lock.lock_id, confirmations
                 );
-                self.db.update_lock_status(&lock.lock_id, LockStatus::Confirmed, None)?;
+                self.db
+                    .update_lock_status(&lock.lock_id, LockStatus::Confirmed, None)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process confirmed locks: call Holochain create_parked_link, then mark Processed or Failed.
+    async fn process_confirmed_locks(&self) -> Result<()> {
+        let Some(ref hc) = self.config.holochain else {
+            return Ok(());
+        };
+
+        let confirmed = self.db.get_locks_by_status(LockStatus::Confirmed)?;
+        if confirmed.is_empty() {
+            return Ok(());
+        }
+
+        let contract_hex = format!("{:x}", self.config.network_config.lock_vault_address);
+
+        for lock in confirmed {
+            let payload = match holochain_bridge::build_create_parked_link_payload(
+                hc,
+                &lock,
+                &contract_hex,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    let msg = e.to_string();
+                    warn!(
+                        "Skipping zome call for lock {} (invalid payload): {}",
+                        lock.lock_id, msg
+                    );
+                    self.db.update_lock_status(
+                        &lock.lock_id,
+                        LockStatus::Failed,
+                        Some(msg.as_str()),
+                    )?;
+                    continue;
+                }
+            };
+            match holochain_bridge::call_create_parked_link(hc, &payload).await {
+                Ok(()) => {
+                    info!(
+                        "Holochain create_parked_link succeeded for lock {}",
+                        lock.lock_id
+                    );
+                    self.db
+                        .update_lock_status(&lock.lock_id, LockStatus::Processed, None)?;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    warn!(
+                        "Holochain create_parked_link failed for lock {}: {}",
+                        lock.lock_id, msg
+                    );
+                    self.db.update_lock_status(
+                        &lock.lock_id,
+                        LockStatus::Failed,
+                        Some(msg.as_str()),
+                    )?;
+                }
             }
         }
 
@@ -176,9 +252,9 @@ impl LockWatcher {
 
     /// Run a single processing cycle
     pub async fn run_cycle(&self) -> Result<()> {
-        let last_processed = self.db.get_last_processed_block(
-            self.config.network_config.chain_id
-        )?;
+        let last_processed = self
+            .db
+            .get_last_processed_block(self.config.network_config.chain_id)?;
         let current_block = self.get_current_block_number().await?;
 
         match last_processed {
@@ -187,10 +263,8 @@ impl LockWatcher {
             }
             None => {
                 // First run - start from current block
-                self.db.set_last_processed_block(
-                    self.config.network_config.chain_id,
-                    current_block,
-                )?;
+                self.db
+                    .set_last_processed_block(self.config.network_config.chain_id, current_block)?;
                 info!("Initialized - watching from block {}", current_block);
             }
             _ => {}
@@ -198,6 +272,9 @@ impl LockWatcher {
 
         // Check pending locks for confirmations
         self.check_confirmations().await?;
+
+        // Process confirmed locks: call Holochain create_parked_link, update status
+        self.process_confirmed_locks().await?;
 
         Ok(())
     }
@@ -208,8 +285,14 @@ impl LockWatcher {
         info!("Lock Watcher Started");
         info!("========================================");
         info!("Network:       {:?}", self.config.network);
-        info!("Lock Vault:    {:?}", self.config.network_config.lock_vault_address);
-        info!("Confirmations: {}", self.config.network_config.confirmations);
+        info!(
+            "Lock Vault:    {:?}",
+            self.config.network_config.lock_vault_address
+        );
+        info!(
+            "Confirmations: {}",
+            self.config.network_config.confirmations
+        );
         info!("Poll Interval: {}ms", self.config.poll_interval_ms);
         info!("========================================");
         info!("Watching for Lock events...");

@@ -1,5 +1,6 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
+use holo_hash::{ActionHashB64, AgentPubKeyB64, DnaHashB64};
 use std::env;
 use std::str::FromStr;
 
@@ -32,6 +33,21 @@ pub struct NetworkConfig {
     pub confirmations: u64,
 }
 
+/// Holochain conductor and transactor config (optional; used to call create_parked_link)
+#[derive(Debug, Clone)]
+pub struct HolochainConfig {
+    pub admin_url: String,
+    pub app_url: String,
+    pub app_id: String,
+    /// DNA hash (holochain base64, e.g. u...).
+    pub dna_hash: DnaHashB64,
+    /// Agent pubkey (holochain base64, e.g. u...).
+    pub agent_pubkey: AgentPubKeyB64,
+    pub bridging_agent_pubkey: AgentPubKeyB64,
+    pub credit_limit_ea_id: ActionHashB64,
+    pub unit_index: u32,
+}
+
 /// Application configuration
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -40,6 +56,7 @@ pub struct Config {
     pub signer_private_key: Option<String>,
     pub db_path: String,
     pub poll_interval_ms: u64,
+    pub holochain: Option<HolochainConfig>,
 }
 
 impl Config {
@@ -92,13 +109,89 @@ impl Config {
 
         let signer_private_key = env::var("SIGNER_PRIVATE_KEY").ok();
 
-        let db_path = env::var("DB_PATH")
-            .unwrap_or_else(|_| "./data/locks.db".to_string());
+        let db_path = env::var("DB_PATH").unwrap_or_else(|_| "./data/locks.db".to_string());
 
         let poll_interval_ms: u64 = env::var("POLL_INTERVAL_MS")
             .unwrap_or_else(|_| "5000".to_string())
             .parse()
             .context("Invalid POLL_INTERVAL_MS")?;
+
+        let holochain = {
+            let admin_url = env::var("HOLOCHAIN_ADMIN_URL")
+                .ok()
+                .unwrap_or("127.0.0.1:30000".to_string());
+            let app_url = env::var("HOLOCHAIN_APP_URL")
+                .ok()
+                .unwrap_or("127.0.0.1:30001".to_string());
+            let app_id = env::var("HOLOCHAIN_APP_ID")
+                .ok()
+                .unwrap_or("bridging-app".to_string());
+            let dna_hash = env::var("HOLOCHAIN_DNA_HASH").ok();
+            let agent_pubkey = env::var("HOLOCHAIN_AGENT_PUBKEY").ok();
+            let bridging_agent_pubkey = env::var("HOLOCHAIN_BRIDGING_AGENT_PUBKEY").ok();
+            let credit_limit_ea_id = env::var("HOLOCHAIN_CREDIT_LIMIT_EA_ID").ok();
+            let unit_index = env::var("HOLOCHAIN_UNIT_INDEX").ok();
+
+            let all_present = [
+                ("HOLOCHAIN_ADMIN_URL", !admin_url.is_empty()),
+                ("HOLOCHAIN_APP_URL", !app_url.is_empty()),
+                ("HOLOCHAIN_APP_ID", !app_id.is_empty()),
+                ("HOLOCHAIN_DNA_HASH", dna_hash.is_some()),
+                ("HOLOCHAIN_AGENT_PUBKEY", agent_pubkey.is_some()),
+                (
+                    "HOLOCHAIN_BRIDGING_AGENT_PUBKEY",
+                    bridging_agent_pubkey.is_some(),
+                ),
+                ("HOLOCHAIN_CREDIT_LIMIT_EA_ID", credit_limit_ea_id.is_some()),
+                ("HOLOCHAIN_UNIT_INDEX", unit_index.is_some()),
+            ];
+            let missing: Vec<_> = all_present
+                .iter()
+                .filter(|(_, present)| !*present)
+                .map(|(name, _)| *name)
+                .collect();
+            let any_present = all_present.iter().any(|(_, p)| *p);
+
+            if !missing.is_empty() {
+                if any_present {
+                    anyhow::bail!(
+                        "Holochain config incomplete: missing {} (set all or none)",
+                        missing.join(", ")
+                    );
+                }
+                None
+            } else {
+                let dna_hash_s = dna_hash.expect("checked");
+                let agent_pubkey_s = agent_pubkey.expect("checked");
+                let bridging_agent_pubkey_s = bridging_agent_pubkey.expect("checked");
+                let credit_limit_ea_id_s = credit_limit_ea_id.expect("checked");
+                let unit_index_s = unit_index.expect("checked");
+
+                // Convert to expected types before building config; bail if any value is not the right type
+                let dna_hash =
+                    DnaHashB64::from_str(&dna_hash_s).context("Invalid HOLOCHAIN_DNA_HASH")?;
+                let agent_pubkey = AgentPubKeyB64::from_str(&agent_pubkey_s)
+                    .context("Invalid HOLOCHAIN_AGENT_PUBKEY")?;
+                let bridging_agent_pubkey = AgentPubKeyB64::from_str(&bridging_agent_pubkey_s)
+                    .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
+                let credit_limit_ea_id = ActionHashB64::from_str(&credit_limit_ea_id_s)
+                    .context("Invalid HOLOCHAIN_CREDIT_LIMIT_EA_ID")?;
+                let unit_index = unit_index_s
+                    .parse()
+                    .context("Invalid HOLOCHAIN_UNIT_INDEX (must be u32)")?;
+
+                Some(HolochainConfig {
+                    admin_url,
+                    app_url,
+                    app_id,
+                    dna_hash,
+                    agent_pubkey,
+                    bridging_agent_pubkey,
+                    credit_limit_ea_id,
+                    unit_index,
+                })
+            }
+        };
 
         Ok(Config {
             network,
@@ -106,6 +199,7 @@ impl Config {
             signer_private_key,
             db_path,
             poll_interval_ms,
+            holochain,
         })
     }
 }
