@@ -3,7 +3,6 @@ import { parseEther, encodePacked, keccak256, type Hex, type Address } from 'vie
 import { privateKeyToAccount } from 'viem/accounts'
 import { createWalletClient, http } from 'viem'
 import { sepolia } from 'viem/chains'
-import { SEPOLIA_RPC_URL } from '$env/static/private'
 
 export type CouponConfig = {
 	recipient: Address
@@ -67,7 +66,7 @@ export const generateSignedContext = async ({
 
 	const client = createWalletClient({
 		chain: sepolia,
-		transport: http(SEPOLIA_RPC_URL)
+		transport: http()
 	})
 
 	const account = privateKeyToAccount(
