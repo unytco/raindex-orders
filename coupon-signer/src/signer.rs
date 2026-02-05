@@ -1,41 +1,50 @@
-use crate::Args;
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use anyhow::{Context, Result};
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Order/context used for signing. Built from CLI args (sign path, via `from_args`) or from env (withdrawer path, via `from_env`).
-#[derive(Debug, Clone)]
+/// Order/context used for signing. Single source of truth: flattened into sign CLI (main) or loaded from env (withdrawer).
+#[derive(Parser, Debug, Clone)]
 pub struct SignerContext {
+    /// Order hash (from the deployed Raindex order). Falls back to ORDER_HASH env var.
+    #[arg(long, env = "ORDER_HASH")]
     pub order_hash: String,
+
+    /// Order owner address. Falls back to ORDER_OWNER env var.
+    #[arg(long, env = "ORDER_OWNER")]
     pub order_owner: String,
+
+    /// Orderbook address. Falls back to ORDERBOOK_ADDRESS env var.
+    #[arg(long, env = "ORDERBOOK_ADDRESS")]
     pub orderbook: String,
+
+    /// Output token address (HOT or TROT). Falls back to TOKEN_ADDRESS env var.
+    #[arg(long, env = "TOKEN_ADDRESS")]
     pub token: String,
+
+    /// Output vault ID. Falls back to VAULT_ID env var.
+    #[arg(long, env = "VAULT_ID")]
     pub vault_id: String,
+
+    /// Expiry time in seconds from now (default: 1 week)
+    #[arg(long, env = "EXPIRY_SECONDS", default_value = "604800")]
     pub expiry_seconds: u64,
+
+    /// Nonce (unique per coupon, defaults to timestamp)
+    #[arg(long, env = "NONCE")]
     pub nonce: Option<u64>,
+
+    /// Output format: json, compact, hex, or ui (for the bridge UI)
+    #[arg(long, env = "OUTPUT", default_value = "ui")]
     pub output: String,
 }
 
 impl SignerContext {
-    /// Build from sign CLI args (used by main when running the sign command).
-    pub fn from_args(args: &Args) -> Self {
-        Self {
-            order_hash: args.order_hash.clone(),
-            order_owner: args.order_owner.clone(),
-            orderbook: args.orderbook.clone(),
-            token: args.token.clone(),
-            vault_id: args.vault_id.clone(),
-            expiry_seconds: args.expiry_seconds,
-            nonce: args.nonce,
-            output: args.output.clone(),
-        }
-    }
-
-    /// Load from environment (ORDER_HASH, ORDER_OWNER, etc.). Used by withdrawer so it doesn't parse sign CLI args.
+    /// Load from environment (ORDER_HASH, ORDER_OWNER, etc.). Used by withdrawer so it doesn't parse sign CLI.
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             order_hash: env::var("ORDER_HASH").context("ORDER_HASH not set")?,

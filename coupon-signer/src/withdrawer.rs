@@ -35,11 +35,11 @@ pub struct WithdrawerConfig {
 )]
 pub struct WithdrawerArgs {
     /// Holochain admin websocket URL (host:port)
-    #[arg(long, env = "HOLOCHAIN_ADMIN_URL", default_value = "127.0.0.1:30000")]
+    #[arg(long, env = "HOLOCHAIN_ADMIN_URL", default_value = "127.0.0.1:8800")]
     pub admin_url: String,
 
     /// Holochain app websocket URL (host:port)
-    #[arg(long, env = "HOLOCHAIN_APP_URL", default_value = "127.0.0.1:30001")]
+    #[arg(long, env = "HOLOCHAIN_APP_URL", default_value = "127.0.0.1:30000")]
     pub app_url: String,
 
     /// Installed app ID for auth token
@@ -142,13 +142,14 @@ impl WithdrawerSession {
 }
 
 /// Entry point for `coupon-signer withdrawer`. One session, then multiple zome calls (hardcoded names).
-pub fn run_withdrawer(args: WithdrawerArgs) -> Result<()> {
+pub fn run_withdrawer(withdrawer_args: WithdrawerArgs) -> Result<()> {
     let cfg = WithdrawerConfig {
-        admin_url: args.admin_url.clone(),
-        app_url: args.app_url.clone(),
-        app_id: args.app_id.clone(),
-        dna_hash: DnaHashB64::from_str(&args.dna_hash).context("Invalid HOLOCHAIN_DNA_HASH")?,
-        agent_pubkey: AgentPubKeyB64::from_str(&args.agent_pubkey)
+        admin_url: withdrawer_args.admin_url.clone(),
+        app_url: withdrawer_args.app_url.clone(),
+        app_id: withdrawer_args.app_id.clone(),
+        dna_hash: DnaHashB64::from_str(&withdrawer_args.dna_hash)
+            .context("Invalid HOLOCHAIN_DNA_HASH")?,
+        agent_pubkey: AgentPubKeyB64::from_str(&withdrawer_args.agent_pubkey)
             .context("Invalid HOLOCHAIN_AGENT_PUBKEY")?,
     };
 
@@ -157,7 +158,7 @@ pub fn run_withdrawer(args: WithdrawerArgs) -> Result<()> {
         let session = WithdrawerSession::connect(&cfg).await?;
         use rave_engine::types::Transaction;
         // Example zome call (hardcoded names). Add more session.call_zome(...) here as needed.
-        let bridging_agreement_id = args.bridging_agreement_id.clone();
+        let bridging_agreement_id = withdrawer_args.bridging_agreement_id.clone();
         let result: Vec<Transaction> = session
             .call_zome(
                 "transactor",
