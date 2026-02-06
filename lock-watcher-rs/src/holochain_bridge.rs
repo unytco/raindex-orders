@@ -102,7 +102,7 @@ pub fn build_create_parked_link_payload(
     let proof = serde_json::json!({
         "proof_of_deposit": {
             "method": "deposit",
-            "contract_address": "0xe3e064e3c2eef66cb93da8d8114f5084e92f48d6", // TODO contract_address_hex.to_lowercase(),
+            "contract_address": format!("0x{}", contract_address_hex.to_lowercase()),
             "amount": formatted_amount,
             "depositor_wallet_address": depositor_wallet_address_as_hc_pubkey,
         }
@@ -117,13 +117,17 @@ pub fn build_create_parked_link_payload(
     };
 
     info!(
-        "[build_payload] Payload built successfully for lock {} (ea_id: {}, executor: {})",
-        lock.lock_id, hc_config.credit_limit_ea_id, hc_config.bridging_agent_pubkey
+        "[build_payload] Payload built successfully for lock {}: {:?}",
+        lock.lock_id, parked_link_tag
     );
-
-    Ok(CreateParkedLinkInput {
+    let payload = CreateParkedLinkInput {
         ea_id: hc_config.credit_limit_ea_id.clone().into(),
         executor: Some(hc_config.bridging_agent_pubkey.clone().into()),
         tag: ParkedTag::ParkedLinkTag((parked_link_tag, true)),
-    })
+    };
+    info!(
+        "[build_payload] Payload built successfully for lock {}: {:?}",
+        lock.lock_id, payload
+    );
+    Ok(payload)
 }
