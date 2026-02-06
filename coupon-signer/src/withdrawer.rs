@@ -124,7 +124,7 @@ async fn process_transaction(
     );
     let ctx = SignerContext::from_env()
         .context("Load signer context (ORDER_HASH, ORDER_OWNER, etc.) for coupon")?;
-    let (coupon, _) = generate_coupon_with_context(&amount, &recipient, &ctx).await?;
+    let (_, coupon) = generate_coupon_with_context(&amount, &recipient, &ctx).await?;
     eprintln!("[process_transaction] Coupon generated successfully");
     eprintln!(
         "[process_transaction] Building RAVEExecuteInputs payload for EA: {}",
