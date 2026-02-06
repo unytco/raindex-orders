@@ -15,19 +15,43 @@ pub fn build_create_parked_link_payload(
     lock: &LockRecord,
     contract_address_hex: &str,
 ) -> Result<CreateParkedLinkInput, anyhow::Error> {
-    // 32 byte hex string that start with `0x......``
     // todo
     // Normalize holochain agent (strip 0x, validate as AgentPubKey). Warn and fail if conversion fails.
-    let depositor_wallet_address = match holo_hash::AgentPubKey::try_from(
+
+    // Convert 32-byte hex string (0x...) to AgentPubKey.
+    // The hex represents the core 32 bytes; from_raw_32 computes the DHT location bytes.
+    let depositor_wallet_address_as_hc_pubkey = match hex::decode(
         lock.holochain_agent.as_str().trim_start_matches("0x"),
     ) {
-        Ok(agent) => agent.to_string(),
+        Ok(bytes) => {
+            let core_bytes: [u8; 32] = match bytes.try_into() {
+                Ok(arr) => arr,
+                Err(v) => {
+                    let len = v.len();
+                    warn!(
+                        lock_id = %lock.lock_id,
+                        holochain_agent = %lock.holochain_agent,
+                        expected = 32,
+                        actual = len,
+                        "holochain agent hex has wrong byte length; zome call will not be attempted"
+                    );
+                    anyhow::bail!(
+                        "invalid holochain agent key for lock {}: expected 32 bytes, got {} (value: {})",
+                        lock.lock_id,
+                        len,
+                        lock.holochain_agent
+                    );
+                }
+            };
+            let agent_pubkey = holo_hash::AgentPubKey::from_raw_32(core_bytes.to_vec());
+            agent_pubkey.to_string()
+        }
         Err(e) => {
             warn!(
                 lock_id = %lock.lock_id,
                 holochain_agent = %lock.holochain_agent,
                 error = %e,
-                "holochain agent key could not be converted to AgentPubKey; zome call will not be attempted"
+                "holochain agent key could not be decoded from hex when converting to AgentPubKey; zome call will not be attempted"
             );
             anyhow::bail!(
                 "invalid holochain agent key for lock {}: {} (value: {})",
@@ -43,7 +67,7 @@ pub fn build_create_parked_link_payload(
             "method": "deposit",
             "contract_address": contract_address_hex.to_lowercase(),
             "amount": lock.amount,
-            "depositor_wallet_address": depositor_wallet_address,
+            "depositor_wallet_address": depositor_wallet_address_as_hc_pubkey,
         }
     });
     let parked_link_tag = ParkedLinkTag {
