@@ -2,8 +2,8 @@
 //!
 //! Payload types match the transactor zome API (ea_id, executor, tag with proof_of_deposit).
 
-use crate::config::HolochainConfig;
 use crate::types::LockRecord;
+use crate::{config::HolochainConfig, watcher::format_amount};
 use anyhow::{Context, Result};
 use rave_engine::types::{CreateParkedLinkInput, ParkedLinkTag, ParkedTag, UnitMap};
 use tracing::{debug, info, warn};

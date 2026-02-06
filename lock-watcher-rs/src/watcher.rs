@@ -346,7 +346,7 @@ impl LockWatcher {
 }
 
 /// Format amount with 18 decimals for display
-fn format_amount(amount: &str) -> String {
+pub fn format_amount(amount: &str) -> String {
     let amount: U256 = amount.parse().unwrap_or_default();
     let decimals = U256::from(10).pow(U256::from(18));
     let whole = amount / decimals;
