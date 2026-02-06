@@ -36,8 +36,8 @@ pub struct NetworkConfig {
 /// Holochain conductor and transactor config (optional; used to call create_parked_link)
 #[derive(Debug, Clone)]
 pub struct HolochainConfig {
-    pub admin_url: String,
-    pub app_url: String,
+    pub admin_port: u16,
+    pub app_port: u16,
     pub app_id: String,
     /// DNA hash (holochain base64, e.g. u...).
     pub dna_hash: DnaHashB64,
@@ -117,12 +117,12 @@ impl Config {
             .context("Invalid POLL_INTERVAL_MS")?;
 
         let holochain = {
-            let admin_url = env::var("HOLOCHAIN_ADMIN_URL")
+            let admin_port = env::var("HOLOCHAIN_ADMIN_PORT")
                 .ok()
-                .unwrap_or("127.0.0.1:30000".to_string());
-            let app_url = env::var("HOLOCHAIN_APP_URL")
+                .unwrap_or("30000".to_string());
+            let app_port = env::var("HOLOCHAIN_APP_PORT")
                 .ok()
-                .unwrap_or("127.0.0.1:30001".to_string());
+                .unwrap_or("30001".to_string());
             let app_id = env::var("HOLOCHAIN_APP_ID")
                 .ok()
                 .unwrap_or("bridging-app".to_string());
@@ -133,8 +133,8 @@ impl Config {
             let unit_index = env::var("HOLOCHAIN_UNIT_INDEX").ok();
 
             let all_present = [
-                ("HOLOCHAIN_ADMIN_URL", !admin_url.is_empty()),
-                ("HOLOCHAIN_APP_URL", !app_url.is_empty()),
+                ("HOLOCHAIN_ADMIN_PORT", !admin_port.is_empty()),
+                ("HOLOCHAIN_APP_PORT", !app_port.is_empty()),
                 ("HOLOCHAIN_APP_ID", !app_id.is_empty()),
                 ("HOLOCHAIN_DNA_HASH", dna_hash.is_some()),
                 ("HOLOCHAIN_AGENT_PUBKEY", agent_pubkey.is_some()),
@@ -180,9 +180,16 @@ impl Config {
                     .parse()
                     .context("Invalid HOLOCHAIN_UNIT_INDEX (must be u32)")?;
 
+                let admin_port: u16 = admin_port
+                    .parse()
+                    .context("Invalid HOLOCHAIN_ADMIN_PORT (must be u16)")?;
+                let app_port: u16 = app_port
+                    .parse()
+                    .context("Invalid HOLOCHAIN_APP_PORT (must be u16)")?;
+
                 Some(HolochainConfig {
-                    admin_url,
-                    app_url,
+                    admin_port,
+                    app_port,
                     app_id,
                     dna_hash,
                     agent_pubkey,

@@ -17,7 +17,9 @@ pub fn build_create_parked_link_payload(
 ) -> Result<CreateParkedLinkInput, anyhow::Error> {
     info!(
         "[build_payload] Building create_parked_link payload for lock {} (amount: {}, agent: {})",
-        lock.lock_id, lock.amount, lock.holochain_agent
+        lock.lock_id,
+        format_amount(&lock.amount),
+        lock.holochain_agent
     );
 
     // Normalize holochain agent (strip 0x, validate as AgentPubKey). Warn and fail if conversion fails.
@@ -133,47 +135,36 @@ pub async fn call_create_parked_link(
         AdminWebsocket, AppWebsocket, ClientAgentSigner, ExternIO, ZomeCallTarget,
     };
     use holochain_zome_types::prelude::{FunctionName, ZomeName};
-    use std::net::ToSocketAddrs;
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
 
+    let admin_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, hc_config.admin_port));
+    let app_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, hc_config.app_port));
+
     info!(
         "[call_zome] Initiating zome call: transactor/create_parked_link (admin: {}, app: {})",
-        hc_config.admin_url, hc_config.app_url
+        admin_addr, app_addr
     );
 
     let cell_id = cell_id_from_config(hc_config)?;
     debug!("[call_zome] CellId constructed from config");
 
-    let admin_addr = hc_config
-        .admin_url
-        .to_socket_addrs()
-        .context("Invalid HOLOCHAIN_ADMIN_URL")?
-        .next()
-        .context("HOLOCHAIN_ADMIN_URL resolved to no address")?;
-
-    let app_addr = hc_config
-        .app_url
-        .to_socket_addrs()
-        .context("Invalid HOLOCHAIN_APP_URL")?
-        .next()
-        .context("HOLOCHAIN_APP_URL resolved to no address")?;
-
-    debug!(
+    info!(
         "[call_zome] Connecting to admin websocket at {}",
         admin_addr
     );
     let admin_ws = AdminWebsocket::connect(admin_addr, None)
         .await
         .context("Failed to connect to Holochain admin")?;
-    debug!("[call_zome] Admin websocket connected");
+    info!("[call_zome] Admin websocket connected");
 
     let token_payload = holochain_client::IssueAppAuthenticationTokenPayload {
         installed_app_id: hc_config.app_id.clone().into(),
         expiry_seconds: 3600,
         single_use: false,
     };
-    debug!(
+    info!(
         "[call_zome] Issuing app auth token for app_id: {}",
         hc_config.app_id
     );
@@ -181,21 +172,21 @@ pub async fn call_create_parked_link(
         .issue_app_auth_token(token_payload)
         .await
         .context("Failed to issue app auth token")?;
-    debug!("[call_zome] App auth token issued successfully");
+    info!("[call_zome] App auth token issued successfully");
 
     let signer = ClientAgentSigner::default();
     let mut client_config = WebsocketConfig::CLIENT_DEFAULT;
     client_config.default_request_timeout = Duration::from_secs(30);
     let config = Arc::new(client_config);
 
-    debug!("[call_zome] Connecting to app websocket at {}", app_addr);
+    info!("[call_zome] Connecting to app websocket at {}", app_addr);
     let app_ws =
         AppWebsocket::connect_with_config(app_addr, config, issued.token, signer.into(), None)
             .await
             .context("Failed to connect to Holochain app")?;
-    debug!("[call_zome] App websocket connected");
+    info!("[call_zome] App websocket connected");
 
-    debug!("[call_zome] Encoding create_parked_link payload");
+    info!("[call_zome] Encoding create_parked_link payload");
     let payload_io = ExternIO::encode(payload).context("Encode create_parked_link payload")?;
 
     info!("[call_zome] Sending zome call: transactor/create_parked_link");
@@ -210,6 +201,6 @@ pub async fn call_create_parked_link(
         .map_err(|e| anyhow::anyhow!("Zome call create_parked_link failed: {}", e))?;
 
     info!("[call_zome] Zome call create_parked_link committed successfully");
-    debug!(?response, "[call_zome] create_parked_link response");
+    info!(?response, "[call_zome] create_parked_link response");
     Ok(())
 }
