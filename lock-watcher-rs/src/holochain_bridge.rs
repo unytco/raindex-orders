@@ -1,10 +1,11 @@
-//! Holochain bridge: call transactor zome `create_parked_link` with CreateParkedLinkInput.
+//! Holochain bridge: build `CreateParkedLinkInput` payloads for the transactor zome.
 //!
 //! Payload types match the transactor zome API (ea_id, executor, tag with proof_of_deposit).
+//! The actual zome call is handled by the Ham (Holochain Agent Manager) in `ham.rs`.
 
 use crate::types::LockRecord;
 use crate::{config::HolochainConfig, watcher::format_amount};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rave_engine::types::{CreateParkedLinkInput, ParkedLinkTag, ParkedTag, UnitMap};
 use tracing::{debug, info, warn};
 
@@ -114,93 +115,4 @@ pub fn build_create_parked_link_payload(
         executor: Some(hc_config.bridging_agent_pubkey.clone().into()),
         tag: ParkedTag::ParkedLinkTag((parked_link_tag, true)),
     })
-}
-
-/// Build CellId from HOLOCHAIN_DNA_HASH and HOLOCHAIN_AGENT_PUBKEY (holochain base64).
-fn cell_id_from_config(hc_config: &HolochainConfig) -> Result<holochain_client::CellId> {
-    let dna_hash: holo_hash::DnaHash = hc_config.dna_hash.clone().into();
-    let agent_pubkey: holo_hash::AgentPubKey = hc_config.agent_pubkey.clone().into();
-    Ok(holochain_client::CellId::new(dna_hash, agent_pubkey))
-}
-
-/// Call transactor zome `create_parked_link` on the local conductor.
-/// Connects via AdminWebsocket (token) then AppWebsocket, then sends the zome call.
-/// Uses HOLOCHAIN_DNA_HASH and HOLOCHAIN_AGENT_PUBKEY from config to target the correct cell.
-pub async fn call_create_parked_link(
-    hc_config: &HolochainConfig,
-    payload: &CreateParkedLinkInput,
-) -> Result<()> {
-    use holochain_client::WebsocketConfig;
-    use holochain_client::{
-        AdminWebsocket, AppWebsocket, ClientAgentSigner, ExternIO, ZomeCallTarget,
-    };
-    use holochain_zome_types::prelude::{FunctionName, ZomeName};
-    use std::net::{Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    let admin_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, hc_config.admin_port));
-    let app_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, hc_config.app_port));
-
-    info!(
-        "[call_zome] Initiating zome call: transactor/create_parked_link (admin: {}, app: {})",
-        admin_addr, app_addr
-    );
-
-    let cell_id = cell_id_from_config(hc_config)?;
-    debug!("[call_zome] CellId constructed from config");
-
-    info!(
-        "[call_zome] Connecting to admin websocket at {}",
-        admin_addr
-    );
-    let admin_ws = AdminWebsocket::connect(admin_addr, None)
-        .await
-        .context("Failed to connect to Holochain admin")?;
-    info!("[call_zome] Admin websocket connected");
-
-    let token_payload = holochain_client::IssueAppAuthenticationTokenPayload {
-        installed_app_id: hc_config.app_id.clone().into(),
-        expiry_seconds: 3600,
-        single_use: false,
-    };
-    info!(
-        "[call_zome] Issuing app auth token for app_id: {}",
-        hc_config.app_id
-    );
-    let issued = admin_ws
-        .issue_app_auth_token(token_payload)
-        .await
-        .context("Failed to issue app auth token")?;
-    info!("[call_zome] App auth token issued successfully");
-
-    let signer = ClientAgentSigner::default();
-    let mut client_config = WebsocketConfig::CLIENT_DEFAULT;
-    client_config.default_request_timeout = Duration::from_secs(30);
-    let config = Arc::new(client_config);
-
-    info!("[call_zome] Connecting to app websocket at {}", app_addr);
-    let app_ws =
-        AppWebsocket::connect_with_config(app_addr, config, issued.token, signer.into(), None)
-            .await
-            .context("Failed to connect to Holochain app")?;
-    info!("[call_zome] App websocket connected");
-
-    info!("[call_zome] Encoding create_parked_link payload");
-    let payload_io = ExternIO::encode(payload).context("Encode create_parked_link payload")?;
-
-    info!("[call_zome] Sending zome call: transactor/create_parked_link");
-    let response = app_ws
-        .call_zome(
-            ZomeCallTarget::CellId(cell_id),
-            ZomeName::from("transactor"),
-            FunctionName::from("create_parked_link"),
-            payload_io,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Zome call create_parked_link failed: {}", e))?;
-
-    info!("[call_zome] Zome call create_parked_link committed successfully");
-    info!(?response, "[call_zome] create_parked_link response");
-    Ok(())
 }

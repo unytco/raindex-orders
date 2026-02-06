@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
-use holo_hash::{ActionHashB64, AgentPubKeyB64, DnaHashB64};
+use holo_hash::{ActionHashB64, AgentPubKeyB64};
 use std::env;
 use std::str::FromStr;
 
@@ -39,10 +39,7 @@ pub struct HolochainConfig {
     pub admin_port: u16,
     pub app_port: u16,
     pub app_id: String,
-    /// DNA hash (holochain base64, e.g. u...).
-    pub dna_hash: DnaHashB64,
-    /// Agent pubkey (holochain base64, e.g. u...).
-    pub agent_pubkey: AgentPubKeyB64,
+    pub role_name: String,
     pub bridging_agent_pubkey: AgentPubKeyB64,
     pub credit_limit_ea_id: ActionHashB64,
     pub unit_index: u32,
@@ -126,8 +123,9 @@ impl Config {
             let app_id = env::var("HOLOCHAIN_APP_ID")
                 .ok()
                 .unwrap_or("bridging-app".to_string());
-            let dna_hash = env::var("HOLOCHAIN_DNA_HASH").ok();
-            let agent_pubkey = env::var("HOLOCHAIN_AGENT_PUBKEY").ok();
+            let role_name = env::var("HOLOCHAIN_ROLE_NAME")
+                .ok()
+                .unwrap_or("transactor".to_string());
             let bridging_agent_pubkey = env::var("HOLOCHAIN_BRIDGING_AGENT_PUBKEY").ok();
             let credit_limit_ea_id = env::var("HOLOCHAIN_CREDIT_LIMIT_EA_ID").ok();
             let unit_index = env::var("HOLOCHAIN_UNIT_INDEX").ok();
@@ -136,8 +134,7 @@ impl Config {
                 ("HOLOCHAIN_ADMIN_PORT", !admin_port.is_empty()),
                 ("HOLOCHAIN_APP_PORT", !app_port.is_empty()),
                 ("HOLOCHAIN_APP_ID", !app_id.is_empty()),
-                ("HOLOCHAIN_DNA_HASH", dna_hash.is_some()),
-                ("HOLOCHAIN_AGENT_PUBKEY", agent_pubkey.is_some()),
+                ("HOLOCHAIN_ROLE_NAME", !role_name.is_empty()),
                 (
                     "HOLOCHAIN_BRIDGING_AGENT_PUBKEY",
                     bridging_agent_pubkey.is_some(),
@@ -161,17 +158,10 @@ impl Config {
                 }
                 None
             } else {
-                let dna_hash_s = dna_hash.expect("checked");
-                let agent_pubkey_s = agent_pubkey.expect("checked");
                 let bridging_agent_pubkey_s = bridging_agent_pubkey.expect("checked");
                 let credit_limit_ea_id_s = credit_limit_ea_id.expect("checked");
                 let unit_index_s = unit_index.expect("checked");
 
-                // Convert to expected types before building config; bail if any value is not the right type
-                let dna_hash =
-                    DnaHashB64::from_str(&dna_hash_s).context("Invalid HOLOCHAIN_DNA_HASH")?;
-                let agent_pubkey = AgentPubKeyB64::from_str(&agent_pubkey_s)
-                    .context("Invalid HOLOCHAIN_AGENT_PUBKEY")?;
                 let bridging_agent_pubkey = AgentPubKeyB64::from_str(&bridging_agent_pubkey_s)
                     .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
                 let credit_limit_ea_id = ActionHashB64::from_str(&credit_limit_ea_id_s)
@@ -191,8 +181,7 @@ impl Config {
                     admin_port,
                     app_port,
                     app_id,
-                    dna_hash,
-                    agent_pubkey,
+                    role_name,
                     bridging_agent_pubkey,
                     credit_limit_ea_id,
                     unit_index,

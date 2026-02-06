@@ -1,3 +1,4 @@
+mod ham;
 mod signer;
 mod withdrawer;
 

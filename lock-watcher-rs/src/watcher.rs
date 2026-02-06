@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::database::LockDatabase;
+use crate::ham::Ham;
 use crate::holochain_bridge;
 use crate::types::{LockRecord, LockStatus};
 use alloy::primitives::U256;
@@ -189,10 +190,14 @@ impl LockWatcher {
         Ok(())
     }
 
-    /// Process confirmed locks: call Holochain create_parked_link, then mark Processed or Failed.
-    async fn process_confirmed_locks(&self) -> Result<()> {
+    /// Process confirmed locks: call Holochain create_parked_link via Ham, then mark Processed or Failed.
+    async fn process_confirmed_locks(&self, ham: Option<&Ham>) -> Result<()> {
         let Some(ref hc) = self.config.holochain else {
             debug!("[process_confirmed_locks] No Holochain config present, skipping");
+            return Ok(());
+        };
+        let Some(ham) = ham else {
+            debug!("[process_confirmed_locks] No Holochain connection available, skipping");
             return Ok(());
         };
 
@@ -256,7 +261,15 @@ impl LockWatcher {
                 lock.lock_id
             );
 
-            match holochain_bridge::call_create_parked_link(hc, &payload).await {
+            match ham
+                .zome_call::<_, ()>(
+                    &hc.role_name,
+                    "transactor",
+                    "create_parked_link",
+                    &payload,
+                )
+                .await
+            {
                 Ok(()) => {
                     info!(
                         "[process_confirmed_locks] Zome call committed successfully for lock {} — marking as Processed",
@@ -286,7 +299,7 @@ impl LockWatcher {
     }
 
     /// Run a single processing cycle
-    pub async fn run_cycle(&self) -> Result<()> {
+    pub async fn run_cycle(&self, ham: Option<&Ham>) -> Result<()> {
         let last_processed = self
             .db
             .get_last_processed_block(self.config.network_config.chain_id)?;
@@ -308,8 +321,8 @@ impl LockWatcher {
         // Check pending locks for confirmations
         self.check_confirmations().await?;
 
-        // Process confirmed locks: call Holochain create_parked_link, update status
-        self.process_confirmed_locks().await?;
+        // Process confirmed locks: call Holochain create_parked_link via Ham, update status
+        self.process_confirmed_locks(ham).await?;
 
         Ok(())
     }
@@ -330,13 +343,30 @@ impl LockWatcher {
         );
         info!("Poll Interval: {}ms", self.config.poll_interval_ms);
         info!("========================================");
+
+        // Connect to Holochain via Ham if config is present.
+        let ham = match &self.config.holochain {
+            Some(hc) => {
+                info!("[run] Connecting to Holochain (admin port: {})...", hc.admin_port);
+                Some(
+                    Ham::connect(hc.admin_port, hc.app_port, &hc.app_id)
+                        .await
+                        .context("Failed to connect Ham to Holochain")?,
+                )
+            }
+            None => {
+                info!("[run] No Holochain config — running without bridge");
+                None
+            }
+        };
+
         info!("Watching for Lock events...");
         info!("");
 
         let poll_interval = std::time::Duration::from_millis(self.config.poll_interval_ms);
 
         loop {
-            if let Err(e) = self.run_cycle().await {
+            if let Err(e) = self.run_cycle(ham.as_ref()).await {
                 error!("Error in processing cycle: {:?}", e);
             }
 
