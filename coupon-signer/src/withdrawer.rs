@@ -63,16 +63,15 @@ pub async fn run_withdrawer(withdrawer_args: WithdrawerArgs) -> Result<()> {
         .await?;
 
     eprintln!(
-        "Number of links found for ea: {} : {}",
+        "Number of links found for bridging agreement: {} : {}",
         bridging_agreement_id,
         result.len()
     );
 
     // Execute each link individually to manage the size of the inputs.
     for transaction in result {
-        let _ =
-            process_transaction(&ham, role_name, bridging_agreement_id.clone(), transaction)
-                .await?;
+        let _ = process_transaction(&ham, role_name, bridging_agreement_id.clone(), transaction)
+            .await?;
     }
     Ok(())
 }
@@ -84,7 +83,10 @@ async fn process_transaction(
     bridging_agreement_id: String,
     transaction: Transaction,
 ) -> Result<()> {
-    eprintln!("[process_transaction] Starting processing for transaction");
+    eprintln!(
+        "[process_transaction] Starting processing for transaction: {:?}",
+        transaction
+    );
     let amount = transaction
         .clone()
         .amount
@@ -99,13 +101,14 @@ async fn process_transaction(
         ..
     } = transaction.clone().details
     {
-        #[derive(Serialize, Deserialize)]
+        #[derive(Serialize, Deserialize, Debug)]
         struct SpenderPayload {
             withdraw_contract_address: String,
             withdraw_to_address: String,
         }
         let payload = serde_json::from_value::<SpenderPayload>(attached_payload.clone())
             .context("Failed to deserialize spender payload")?;
+        eprintln!("[process_transaction] Spender payload: {:?}", payload);
         (
             payload.withdraw_to_address,
             global_definition.clone(),
