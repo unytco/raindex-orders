@@ -1,14 +1,14 @@
 //! Withdrawer command: connect to Holochain via Ham and perform zome calls.
 //!
 //! Establishes a single Ham session and reuses it for multiple zome calls.
-//! Zome/function names are hardcoded; add more ham.zome_call(...) here as needed.
+//! Zome/function names are hardcoded; add more ham.call_zome(...) here as needed.
 
 use crate::ham::Ham;
 use crate::signer::{generate_coupon_with_context, SignerContext};
 use anyhow::{Context, Result};
 use clap::Parser;
-use holo_hash::ActionHashB64;
-use rave_engine::types::{RAVEExecuteInputs, Transaction, TransactionDetails};
+use holo_hash::{ActionHash, ActionHashB64};
+use rave_engine::types::{RAVEExecuteInputs, Transaction, TransactionDetails, RAVE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
@@ -32,7 +32,7 @@ pub struct WithdrawerArgs {
     pub app_id: String,
 
     /// Holochain role name for zome calls
-    #[arg(long, env = "HOLOCHAIN_ROLE_NAME", default_value = "transactor")]
+    #[arg(long, env = "HOLOCHAIN_ROLE_NAME", default_value = "alliance")]
     pub role_name: String,
 
     /// EA ID
@@ -56,7 +56,7 @@ pub fn run_withdrawer(withdrawer_args: WithdrawerArgs) -> Result<()> {
         let bridging_agreement_id = withdrawer_args.bridging_agreement_id.clone();
 
         let result: Vec<Transaction> = ham
-            .zome_call(
+            .call_zome(
                 role_name,
                 "transactor",
                 "get_parked_links_by_ea",
@@ -72,19 +72,15 @@ pub fn run_withdrawer(withdrawer_args: WithdrawerArgs) -> Result<()> {
 
         // Execute each link individually to manage the size of the inputs.
         for transaction in result {
-            let _ = process_transaction(
-                &ham,
-                role_name,
-                bridging_agreement_id.clone(),
-                transaction,
-            )
-            .await?;
+            let _ =
+                process_transaction(&ham, role_name, bridging_agreement_id.clone(), transaction)
+                    .await?;
         }
         Ok(())
     })
 }
 
-/// For each parked spend transaction: build coupon from signer context (env), then call execute_transaction.
+/// For each parked spend transaction: build coupon from signer context (env), then call execute_rave.
 async fn process_transaction(
     ham: &Ham,
     role_name: &str,
@@ -149,11 +145,13 @@ async fn process_transaction(
         lane_definitions: ld.iter().map(|ld| ld.clone().into()).collect(),
         strategy: holochain_zome_types::entry::GetStrategy::Network,
     };
-    eprintln!(
-        "[process_transaction] Payload built — calling zome: transactor/execute_transaction"
-    );
-    ham.zome_call::<_, ()>(role_name, "transactor", "execute_transaction", &payload)
+    eprintln!("[process_transaction] Payload built — calling zome: transactor/execute_rave");
+    let tx_hash = ham
+        .call_zome::<_, (RAVE, ActionHash)>(role_name, "transactor", "execute_rave", &payload)
         .await?;
-    eprintln!("[process_transaction] Zome call committed successfully");
+    eprintln!(
+        "[process_transaction] Zome call committed successfully: {}",
+        tx_hash.1.to_string()
+    );
     Ok(())
 }
