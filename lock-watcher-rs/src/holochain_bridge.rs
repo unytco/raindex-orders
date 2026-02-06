@@ -6,7 +6,7 @@ use crate::config::HolochainConfig;
 use crate::types::LockRecord;
 use anyhow::{Context, Result};
 use rave_engine::types::{CreateParkedLinkInput, ParkedLinkTag, ParkedTag, UnitMap};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 /// Build CreateParkedLinkInput from lock record and config.
 /// Fails with an error if the lock's holochain agent key cannot be converted to AgentPubKey (zome call will not be attempted).
@@ -15,11 +15,19 @@ pub fn build_create_parked_link_payload(
     lock: &LockRecord,
     contract_address_hex: &str,
 ) -> Result<CreateParkedLinkInput, anyhow::Error> {
-    // todo
+    info!(
+        "[build_payload] Building create_parked_link payload for lock {} (amount: {}, agent: {})",
+        lock.lock_id, lock.amount, lock.holochain_agent
+    );
+
     // Normalize holochain agent (strip 0x, validate as AgentPubKey). Warn and fail if conversion fails.
 
     // Convert 32-byte hex string (0x...) to AgentPubKey.
     // The hex represents the core 32 bytes; from_raw_32 computes the DHT location bytes.
+    debug!(
+        "[build_payload] Decoding holochain agent hex for lock {}",
+        lock.lock_id
+    );
     let depositor_wallet_address_as_hc_pubkey = match hex::decode(
         lock.holochain_agent.as_str().trim_start_matches("0x"),
     ) {
@@ -44,7 +52,12 @@ pub fn build_create_parked_link_payload(
                 }
             };
             let agent_pubkey = holo_hash::AgentPubKey::from_raw_32(core_bytes.to_vec());
-            agent_pubkey.to_string()
+            let pubkey_str = agent_pubkey.to_string();
+            debug!(
+                "[build_payload] Decoded holochain agent for lock {}: {}",
+                lock.lock_id, pubkey_str
+            );
+            pubkey_str
         }
         Err(e) => {
             warn!(
@@ -62,11 +75,21 @@ pub fn build_create_parked_link_payload(
         }
     };
 
+    debug!(
+        "[build_payload] Constructing proof_of_deposit JSON for lock {} (contract: {})",
+        lock.lock_id,
+        contract_address_hex.to_lowercase()
+    );
+    let formatted_amount = format_amount(&lock.amount);
+    debug!(
+        "[build_payload] Formatted amount for lock {}: {}",
+        lock.lock_id, formatted_amount
+    );
     let proof = serde_json::json!({
         "proof_of_deposit": {
             "method": "deposit",
             "contract_address": contract_address_hex.to_lowercase(),
-            "amount": lock.amount,
+            "amount": formatted_amount,
             "depositor_wallet_address": depositor_wallet_address_as_hc_pubkey,
         }
     });
@@ -74,10 +97,15 @@ pub fn build_create_parked_link_payload(
         ct_role_id: "oracle".to_string(),
         amount: Some(UnitMap::from(vec![(
             hc_config.unit_index,
-            lock.amount.as_str(),
+            formatted_amount,
         )])),
         payload: proof,
     };
+
+    info!(
+        "[build_payload] Payload built successfully for lock {} (ea_id: {}, executor: {})",
+        lock.lock_id, hc_config.credit_limit_ea_id, hc_config.bridging_agent_pubkey
+    );
 
     Ok(CreateParkedLinkInput {
         ea_id: hc_config.credit_limit_ea_id.clone().into(),
@@ -109,7 +137,13 @@ pub async fn call_create_parked_link(
     use std::sync::Arc;
     use std::time::Duration;
 
+    info!(
+        "[call_zome] Initiating zome call: transactor/create_parked_link (admin: {}, app: {})",
+        hc_config.admin_url, hc_config.app_url
+    );
+
     let cell_id = cell_id_from_config(hc_config)?;
+    debug!("[call_zome] CellId constructed from config");
 
     let admin_addr = hc_config
         .admin_url
@@ -125,32 +159,46 @@ pub async fn call_create_parked_link(
         .next()
         .context("HOLOCHAIN_APP_URL resolved to no address")?;
 
+    debug!(
+        "[call_zome] Connecting to admin websocket at {}",
+        admin_addr
+    );
     let admin_ws = AdminWebsocket::connect(admin_addr, None)
         .await
         .context("Failed to connect to Holochain admin")?;
+    debug!("[call_zome] Admin websocket connected");
 
     let token_payload = holochain_client::IssueAppAuthenticationTokenPayload {
         installed_app_id: hc_config.app_id.clone().into(),
         expiry_seconds: 3600,
         single_use: false,
     };
+    debug!(
+        "[call_zome] Issuing app auth token for app_id: {}",
+        hc_config.app_id
+    );
     let issued = admin_ws
         .issue_app_auth_token(token_payload)
         .await
         .context("Failed to issue app auth token")?;
+    debug!("[call_zome] App auth token issued successfully");
 
     let signer = ClientAgentSigner::default();
     let mut client_config = WebsocketConfig::CLIENT_DEFAULT;
     client_config.default_request_timeout = Duration::from_secs(30);
     let config = Arc::new(client_config);
 
+    debug!("[call_zome] Connecting to app websocket at {}", app_addr);
     let app_ws =
         AppWebsocket::connect_with_config(app_addr, config, issued.token, signer.into(), None)
             .await
             .context("Failed to connect to Holochain app")?;
+    debug!("[call_zome] App websocket connected");
 
+    debug!("[call_zome] Encoding create_parked_link payload");
     let payload_io = ExternIO::encode(payload).context("Encode create_parked_link payload")?;
 
+    info!("[call_zome] Sending zome call: transactor/create_parked_link");
     let response = app_ws
         .call_zome(
             ZomeCallTarget::CellId(cell_id),
@@ -161,6 +209,7 @@ pub async fn call_create_parked_link(
         .await
         .map_err(|e| anyhow::anyhow!("Zome call create_parked_link failed: {}", e))?;
 
-    tracing::debug!(?response, "create_parked_link response");
+    info!("[call_zome] Zome call create_parked_link committed successfully");
+    debug!(?response, "[call_zome] create_parked_link response");
     Ok(())
 }

@@ -192,27 +192,54 @@ impl LockWatcher {
     /// Process confirmed locks: call Holochain create_parked_link, then mark Processed or Failed.
     async fn process_confirmed_locks(&self) -> Result<()> {
         let Some(ref hc) = self.config.holochain else {
+            debug!("[process_confirmed_locks] No Holochain config present, skipping");
             return Ok(());
         };
 
         let confirmed = self.db.get_locks_by_status(LockStatus::Confirmed)?;
         if confirmed.is_empty() {
+            debug!("[process_confirmed_locks] No confirmed locks to process");
             return Ok(());
         }
 
+        info!(
+            "[process_confirmed_locks] Found {} confirmed lock(s) to process",
+            confirmed.len()
+        );
+
         let contract_hex = format!("{:x}", self.config.network_config.lock_vault_address);
 
-        for lock in confirmed {
+        for (i, lock) in confirmed.iter().enumerate() {
+            info!(
+                "[process_confirmed_locks] [{}/{}] Processing lock {} (sender: {}, amount: {} HOT)",
+                i + 1,
+                confirmed.len(),
+                lock.lock_id,
+                lock.sender,
+                format_amount(&lock.amount),
+            );
+
+            debug!(
+                "[process_confirmed_locks] Building create_parked_link payload for lock {} with contract {}",
+                lock.lock_id, contract_hex
+            );
+
             let payload = match holochain_bridge::build_create_parked_link_payload(
                 hc,
-                &lock,
+                lock,
                 &contract_hex,
             ) {
-                Ok(p) => p,
+                Ok(p) => {
+                    info!(
+                        "[process_confirmed_locks] Payload built successfully for lock {}",
+                        lock.lock_id
+                    );
+                    p
+                }
                 Err(e) => {
                     let msg = e.to_string();
                     warn!(
-                        "Skipping zome call for lock {} (invalid payload): {}",
+                        "[process_confirmed_locks] Skipping zome call for lock {} (invalid payload): {}",
                         lock.lock_id, msg
                     );
                     self.db.update_lock_status(
@@ -223,10 +250,16 @@ impl LockWatcher {
                     continue;
                 }
             };
+
+            info!(
+                "[process_confirmed_locks] Calling zome: transactor/create_parked_link for lock {}",
+                lock.lock_id
+            );
+
             match holochain_bridge::call_create_parked_link(hc, &payload).await {
                 Ok(()) => {
                     info!(
-                        "Holochain create_parked_link succeeded for lock {}",
+                        "[process_confirmed_locks] Zome call committed successfully for lock {} — marking as Processed",
                         lock.lock_id
                     );
                     self.db
@@ -235,7 +268,7 @@ impl LockWatcher {
                 Err(e) => {
                     let msg = e.to_string();
                     warn!(
-                        "Holochain create_parked_link failed for lock {}: {}",
+                        "[process_confirmed_locks] Zome call failed for lock {}: {} — marking as Failed",
                         lock.lock_id, msg
                     );
                     self.db.update_lock_status(
@@ -246,6 +279,8 @@ impl LockWatcher {
                 }
             }
         }
+
+        info!("[process_confirmed_locks] Finished processing all confirmed locks");
 
         Ok(())
     }

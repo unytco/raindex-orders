@@ -190,12 +190,14 @@ async fn process_transaction(
     transaction: Transaction,
 ) -> Result<()> {
     // Run the signer and get a coupon that will be used to execute the transaction.
+    eprintln!("[process_transaction] Starting processing for transaction");
     let amount = transaction
         .clone()
         .amount
         .get("1") // hard coded value
         .map(|amount| amount.to_string())
         .unwrap_or_default();
+    eprintln!("[process_transaction] Extracted amount: {}", amount);
     let (recipient, gd, ld) = if let TransactionDetails::ParkedSpend {
         attached_payload,
         global_definition,
@@ -219,9 +221,18 @@ async fn process_transaction(
         eprintln!("Transaction details are not a parked spend");
         return Ok(());
     };
+    eprintln!(
+        "[process_transaction] Recipient: {}, generating coupon...",
+        recipient
+    );
     let ctx = SignerContext::from_env()
         .context("Load signer context (ORDER_HASH, ORDER_OWNER, etc.) for coupon")?;
     let (coupon, _) = generate_coupon_with_context(&amount, &recipient, &ctx)?;
+    eprintln!("[process_transaction] Coupon generated successfully");
+    eprintln!(
+        "[process_transaction] Building RAVEExecuteInputs payload for EA: {}",
+        bridging_agreement_id
+    );
     let payload = RAVEExecuteInputs {
         ea_id: ActionHashB64::from_str(&bridging_agreement_id)
             .context("Invalid bridging agreement id")?
@@ -237,8 +248,12 @@ async fn process_transaction(
         lane_definitions: ld.iter().map(|ld| ld.clone().into()).collect(),
         strategy: GetStrategy::Network,
     };
+    eprintln!(
+        "[process_transaction] Payload built — calling zome: transactor/execute_transaction"
+    );
     session
         .call_zome::<_, ()>("transactor", "execute_transaction", &payload)
         .await?;
+    eprintln!("[process_transaction] Zome call committed successfully");
     Ok(())
 }
