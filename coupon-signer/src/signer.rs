@@ -88,7 +88,7 @@ pub struct ClaimCoupon {
 }
 
 /// Generate a coupon using explicit context. Called by main (with context from Args) or by withdrawer (with context from env).
-pub fn generate_coupon_with_context(
+pub async fn generate_coupon_with_context(
     amount: &str,
     recipient: &str,
     ctx: &SignerContext,
@@ -139,7 +139,8 @@ pub fn generate_coupon_with_context(
         &context,
         expiry,
         nonce,
-    )?;
+    )
+    .await?;
 
     let output = format_output(&coupon, &context, &signed_context, &ctx.output);
     Ok((coupon, output))
@@ -197,7 +198,7 @@ fn build_context(
 
 /// Hash context, apply Ethereum signed message prefix (toEthSignedMessageHash), sign, and build coupon.
 /// Same as SignContext.sol: keccak256(abi.encodePacked(context)) then "\x19Ethereum Signed Message:\n32" + hash.
-fn sign_and_build_coupon(
+async fn sign_and_build_coupon(
     signer: &PrivateKeySigner,
     signer_address: alloy::primitives::Address,
     amount: U256,
@@ -218,7 +219,7 @@ fn sign_and_build_coupon(
         .concat(),
     );
 
-    let signature = tokio::runtime::Runtime::new()?.block_on(signer.sign_hash(&prefixed))?;
+    let signature = signer.sign_hash(&prefixed).await?;
 
     // Encode signature as r || s || v (same as SignContext.sol). v is 27 or 28 for ecrecover.
     let sig_bytes = {

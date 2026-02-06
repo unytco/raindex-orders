@@ -31,7 +31,8 @@ struct SignArgs {
     context: signer::SignerContext,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Load .env file if present
     dotenvy::dotenv().ok();
 
@@ -42,12 +43,12 @@ fn main() -> Result<()> {
         let rest: Vec<String> = args_vec.into_iter().skip(2).collect();
         let withdrawer_args =
             withdrawer::WithdrawerArgs::parse_from(std::iter::once(prog).chain(rest));
-        return withdrawer::run_withdrawer(withdrawer_args);
+        return withdrawer::run_withdrawer(withdrawer_args).await;
     }
 
     let args = SignArgs::parse();
     let (coupon, _) =
-        signer::generate_coupon_with_context(&args.amount, &args.recipient, &args.context)?;
+        signer::generate_coupon_with_context(&args.amount, &args.recipient, &args.context).await?;
 
     // Print helpful info to stderr
     eprintln!();

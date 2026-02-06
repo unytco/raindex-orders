@@ -20,11 +20,11 @@ use std::str::FromStr;
 )]
 pub struct WithdrawerArgs {
     /// Holochain admin websocket port
-    #[arg(long, env = "HOLOCHAIN_ADMIN_PORT", default_value = "30000")]
+    #[arg(long, env = "HOLOCHAIN_ADMIN_PORT", default_value = "8800")]
     pub admin_port: u16,
 
     /// Holochain app websocket port (used when no existing app interface is found)
-    #[arg(long, env = "HOLOCHAIN_APP_PORT", default_value = "30001")]
+    #[arg(long, env = "HOLOCHAIN_APP_PORT", default_value = "30000")]
     pub app_port: u16,
 
     /// Installed app ID for auth token
@@ -41,43 +41,40 @@ pub struct WithdrawerArgs {
 }
 
 /// Entry point for `coupon-signer withdrawer`. One Ham session, then multiple zome calls.
-pub fn run_withdrawer(withdrawer_args: WithdrawerArgs) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new().context("Create tokio runtime")?;
-    rt.block_on(async {
-        let ham = Ham::connect(
-            withdrawer_args.admin_port,
-            withdrawer_args.app_port,
-            &withdrawer_args.app_id,
+pub async fn run_withdrawer(withdrawer_args: WithdrawerArgs) -> Result<()> {
+    let ham = Ham::connect(
+        withdrawer_args.admin_port,
+        withdrawer_args.app_port,
+        &withdrawer_args.app_id,
+    )
+    .await
+    .context("Failed to connect Ham to Holochain")?;
+
+    let role_name = &withdrawer_args.role_name;
+    let bridging_agreement_id = withdrawer_args.bridging_agreement_id.clone();
+
+    let result: Vec<Transaction> = ham
+        .call_zome(
+            role_name,
+            "transactor",
+            "get_parked_links_by_ea",
+            &bridging_agreement_id,
         )
-        .await
-        .context("Failed to connect Ham to Holochain")?;
+        .await?;
 
-        let role_name = &withdrawer_args.role_name;
-        let bridging_agreement_id = withdrawer_args.bridging_agreement_id.clone();
+    eprintln!(
+        "Number of links found for ea: {} : {}",
+        bridging_agreement_id,
+        result.len()
+    );
 
-        let result: Vec<Transaction> = ham
-            .call_zome(
-                role_name,
-                "transactor",
-                "get_parked_links_by_ea",
-                &bridging_agreement_id,
-            )
-            .await?;
-
-        eprintln!(
-            "Number of links found for ea: {} : {}",
-            bridging_agreement_id,
-            result.len()
-        );
-
-        // Execute each link individually to manage the size of the inputs.
-        for transaction in result {
-            let _ =
-                process_transaction(&ham, role_name, bridging_agreement_id.clone(), transaction)
-                    .await?;
-        }
-        Ok(())
-    })
+    // Execute each link individually to manage the size of the inputs.
+    for transaction in result {
+        let _ =
+            process_transaction(&ham, role_name, bridging_agreement_id.clone(), transaction)
+                .await?;
+    }
+    Ok(())
 }
 
 /// For each parked spend transaction: build coupon from signer context (env), then call execute_rave.
@@ -124,7 +121,7 @@ async fn process_transaction(
     );
     let ctx = SignerContext::from_env()
         .context("Load signer context (ORDER_HASH, ORDER_OWNER, etc.) for coupon")?;
-    let (coupon, _) = generate_coupon_with_context(&amount, &recipient, &ctx)?;
+    let (coupon, _) = generate_coupon_with_context(&amount, &recipient, &ctx).await?;
     eprintln!("[process_transaction] Coupon generated successfully");
     eprintln!(
         "[process_transaction] Building RAVEExecuteInputs payload for EA: {}",
