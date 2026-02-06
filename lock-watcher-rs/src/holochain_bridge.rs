@@ -6,8 +6,19 @@
 use crate::types::LockRecord;
 use crate::{config::HolochainConfig, watcher::format_amount};
 use anyhow::Result;
-use rave_engine::types::{CreateParkedLinkInput, ParkedLinkTag, ParkedTag, UnitMap};
+use rave_engine::types::{
+    BridgingAgentInitiateDepositInput, CreateParkedLinkInput, ParkedLinkTag, ParkedTag, UnitMap,
+};
 use tracing::{debug, info, warn};
+
+pub fn build_bridging_agent_initiate_deposit_payload(
+    hc_config: &HolochainConfig,
+) -> BridgingAgentInitiateDepositInput {
+    BridgingAgentInitiateDepositInput {
+        global_definition: hc_config.lane_definition.clone().into(), // this is just outdated and will be removed, currently not used
+        lane_definition: hc_config.lane_definition.clone().into(),
+    }
+}
 
 /// Build CreateParkedLinkInput from lock record and config.
 /// Fails with an error if the lock's holochain agent key cannot be converted to AgentPubKey (zome call will not be attempted).

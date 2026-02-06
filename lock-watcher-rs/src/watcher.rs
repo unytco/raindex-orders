@@ -10,6 +10,7 @@ use alloy::sol;
 use alloy::sol_types::SolEvent;
 use alloy::transports::http::{Client, Http};
 use anyhow::{Context, Result};
+use holo_hash::{ActionHash, ActionHashB64};
 use tracing::{debug, error, info, warn};
 
 // Define the Lock event using alloy's sol! macro
@@ -262,7 +263,7 @@ impl LockWatcher {
             );
 
             match ham
-                .zome_call::<_, ()>(
+                .call_zome::<_, ActionHashB64>(
                     &hc.role_name,
                     "transactor",
                     "create_parked_link",
@@ -270,13 +271,27 @@ impl LockWatcher {
                 )
                 .await
             {
-                Ok(()) => {
+                Ok(tx_hash) => {
                     info!(
-                        "[process_confirmed_locks] Zome call committed successfully for lock {} — marking as Processed",
-                        lock.lock_id
+                        "[process_confirmed_locks] Zome call committed successfully for lock {} — marking as Processed: {}",
+                        lock.lock_id, tx_hash.to_string()
                     );
                     self.db
                         .update_lock_status(&lock.lock_id, LockStatus::Processed, None)?;
+                    let payload =
+                        holochain_bridge::build_bridging_agent_initiate_deposit_payload(hc);
+                    if let Err(e) = ham
+                        .call_zome::<_, String>(
+                            &hc.role_name,
+                            "transactor",
+                            "blockchain_bridging_agent_initiate_deposit",
+                            &payload,
+                        )
+                        .await
+                    {
+                        warn!("bridging_agent_initiate failed {}", e);
+                    }
+                    info!("bridging_agent_initiate committed successfully");
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -347,7 +362,10 @@ impl LockWatcher {
         // Connect to Holochain via Ham if config is present.
         let ham = match &self.config.holochain {
             Some(hc) => {
-                info!("[run] Connecting to Holochain (admin port: {})...", hc.admin_port);
+                info!(
+                    "[run] Connecting to Holochain (admin port: {})...",
+                    hc.admin_port
+                );
                 Some(
                     Ham::connect(hc.admin_port, hc.app_port, &hc.app_id)
                         .await

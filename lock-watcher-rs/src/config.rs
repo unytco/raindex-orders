@@ -42,6 +42,7 @@ pub struct HolochainConfig {
     pub role_name: String,
     pub bridging_agent_pubkey: AgentPubKeyB64,
     pub credit_limit_ea_id: ActionHashB64,
+    pub lane_definition: ActionHashB64,
     pub unit_index: u32,
 }
 
@@ -128,6 +129,7 @@ impl Config {
                 .unwrap_or("transactor".to_string());
             let bridging_agent_pubkey = env::var("HOLOCHAIN_BRIDGING_AGENT_PUBKEY").ok();
             let credit_limit_ea_id = env::var("HOLOCHAIN_CREDIT_LIMIT_EA_ID").ok();
+            let lane_definition = env::var("HOLOCHAIN_LANE_DEFINITION").ok();
             let unit_index = env::var("HOLOCHAIN_UNIT_INDEX").ok();
 
             let all_present = [
@@ -140,6 +142,7 @@ impl Config {
                     bridging_agent_pubkey.is_some(),
                 ),
                 ("HOLOCHAIN_CREDIT_LIMIT_EA_ID", credit_limit_ea_id.is_some()),
+                ("HOLOCHAIN_LANE_DEFINITION", lane_definition.is_some()),
                 ("HOLOCHAIN_UNIT_INDEX", unit_index.is_some()),
             ];
             let missing: Vec<_> = all_present
@@ -161,11 +164,13 @@ impl Config {
                 let bridging_agent_pubkey_s = bridging_agent_pubkey.expect("checked");
                 let credit_limit_ea_id_s = credit_limit_ea_id.expect("checked");
                 let unit_index_s = unit_index.expect("checked");
-
+                let lane_definition_s = lane_definition.expect("checked");
                 let bridging_agent_pubkey = AgentPubKeyB64::from_str(&bridging_agent_pubkey_s)
                     .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
                 let credit_limit_ea_id = ActionHashB64::from_str(&credit_limit_ea_id_s)
                     .context("Invalid HOLOCHAIN_CREDIT_LIMIT_EA_ID")?;
+                let lane_definition = ActionHashB64::from_str(&lane_definition_s)
+                    .context("Invalid HOLOCHAIN_LANE_DEFINITION")?;
                 let unit_index = unit_index_s
                     .parse()
                     .context("Invalid HOLOCHAIN_UNIT_INDEX (must be u32)")?;
@@ -184,6 +189,7 @@ impl Config {
                     role_name,
                     bridging_agent_pubkey,
                     credit_limit_ea_id,
+                    lane_definition,
                     unit_index,
                 })
             }

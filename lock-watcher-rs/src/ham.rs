@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result};
 use holochain_client::{
-    AdminWebsocket, AppWebsocket, AuthorizeSigningCredentialsPayload, CellInfo,
-    ClientAgentSigner, ExternIO, ZomeCallTarget,
+    AdminWebsocket, AppWebsocket, AuthorizeSigningCredentialsPayload, CellInfo, ClientAgentSigner,
+    ExternIO, ZomeCallTarget,
 };
 use serde::de::DeserializeOwned;
 use std::net::Ipv4Addr;
@@ -21,10 +21,7 @@ pub struct Ham {
 impl Ham {
     /// Connect to a running Holochain conductor's admin interface.
     pub async fn connect(admin_port: u16, app_port: u16, app_id: &str) -> Result<Self> {
-        info!(
-            "[ham] Connecting to Holochain admin on port {}",
-            admin_port
-        );
+        info!("[ham] Connecting to Holochain admin on port {}", admin_port);
         let admin = AdminWebsocket::connect((Ipv4Addr::LOCALHOST, admin_port), None)
             .await
             .context("Failed to connect to admin interface")?;
@@ -48,12 +45,7 @@ impl Ham {
                 app_port
             );
             admin
-                .attach_app_interface(
-                    app_port,
-                    None,
-                    holochain_client::AllowedOrigins::Any,
-                    None,
-                )
+                .attach_app_interface(app_port, None, holochain_client::AllowedOrigins::Any, None)
                 .await
                 .context("Failed to attach app interface")?
         };
@@ -109,7 +101,7 @@ impl Ham {
     }
 
     /// Call a zome function through the app websocket.
-    pub async fn zome_call<I, R>(
+    pub async fn call_zome<I, R>(
         &self,
         role_name: &str,
         zome_name: &str,
