@@ -151,7 +151,7 @@ pub async fn call_create_parked_link(
 
     let payload_io = ExternIO::encode(payload).context("Encode create_parked_link payload")?;
 
-    app_ws
+    let response = app_ws
         .call_zome(
             ZomeCallTarget::CellId(cell_id),
             ZomeName::from("transactor"),
@@ -161,5 +161,6 @@ pub async fn call_create_parked_link(
         .await
         .map_err(|e| anyhow::anyhow!("Zome call create_parked_link failed: {}", e))?;
 
+    tracing::debug!(?response, "create_parked_link response");
     Ok(())
 }
