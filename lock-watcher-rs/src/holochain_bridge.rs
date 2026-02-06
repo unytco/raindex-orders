@@ -89,7 +89,7 @@ pub fn build_create_parked_link_payload(
         }
     };
 
-    debug!(
+    info!(
         "[build_payload] Constructing proof_of_deposit JSON for lock {} (contract: {})",
         lock.lock_id,
         contract_address_hex.to_lowercase()
@@ -102,7 +102,7 @@ pub fn build_create_parked_link_payload(
     let proof = serde_json::json!({
         "proof_of_deposit": {
             "method": "deposit",
-            "contract_address": contract_address_hex.to_lowercase(),
+            "contract_address": "0xe3e064e3c2eef66cb93da8d8114f5084e92f48d6", // TODO contract_address_hex.to_lowercase(),
             "amount": formatted_amount,
             "depositor_wallet_address": depositor_wallet_address_as_hc_pubkey,
         }
