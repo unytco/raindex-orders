@@ -10,7 +10,7 @@ use alloy::sol;
 use alloy::sol_types::SolEvent;
 use alloy::transports::http::{Client, Http};
 use anyhow::{Context, Result};
-use holo_hash::{ActionHash, ActionHashB64};
+use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use tracing::{debug, error, info, warn};
 
 // Define the Lock event using alloy's sol! macro
@@ -263,7 +263,7 @@ impl LockWatcher {
             );
 
             match ham
-                .call_zome::<_, ActionHashB64>(
+                .call_zome::<_, (ActionHashB64, AgentPubKey)>(
                     &hc.role_name,
                     "transactor",
                     "create_parked_link",
@@ -274,7 +274,7 @@ impl LockWatcher {
                 Ok(tx_hash) => {
                     info!(
                         "[process_confirmed_locks] Zome call committed successfully for lock {} — marking as Processed: {}",
-                        lock.lock_id, tx_hash.to_string()
+                        lock.lock_id, tx_hash.0.to_string()
                     );
                     self.db
                         .update_lock_status(&lock.lock_id, LockStatus::Processed, None)?;
