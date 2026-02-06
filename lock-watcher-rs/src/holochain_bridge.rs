@@ -97,7 +97,7 @@ pub fn build_create_parked_link_payload(
         ct_role_id: "oracle".to_string(),
         amount: Some(UnitMap::from(vec![(
             hc_config.unit_index,
-            formatted_amount,
+            formatted_amount.as_str(),
         )])),
         payload: proof,
     };
