@@ -280,7 +280,7 @@ impl LockWatcher {
                         .update_lock_status(&lock.lock_id, LockStatus::Processed, None)?;
                     let payload =
                         holochain_bridge::build_bridging_agent_initiate_deposit_payload(hc);
-                    if let Err(e) = ham
+                    match ham
                         .call_zome::<_, String>(
                             &hc.role_name,
                             "transactor",
@@ -289,9 +289,16 @@ impl LockWatcher {
                         )
                         .await
                     {
-                        warn!("bridging_agent_initiate failed {}", e);
+                        Ok(message) => {
+                            info!(
+                                "bridging_agent_initiate committed successfully: {}",
+                                message
+                            );
+                        }
+                        Err(e) => {
+                            warn!("bridging_agent_initiate failed: {}", e);
+                        }
                     }
-                    info!("bridging_agent_initiate committed successfully");
                 }
                 Err(e) => {
                     let msg = e.to_string();
