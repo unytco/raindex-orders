@@ -30,7 +30,7 @@
 			</Card>
 		</a>
 
-		<a href="/faucet" class="block">
+		<a href="/faucet" target="_blank" rel="noopener noreferrer" class="block">
 			<Card class="h-full transition-colors hover:bg-gray-50 dark:hover:bg-gray-800">
 				<h3 class="text-base font-semibold text-gray-900 dark:text-white">Get mock HOT</h3>
 				<p class="text-sm text-gray-600 dark:text-gray-400">
