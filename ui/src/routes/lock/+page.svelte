@@ -19,6 +19,8 @@
 	// Form state
 	let amount = ''
 	let holochainAgent = ''
+	let amountPrefilledFromUrl = false
+	let agentPrefilledFromUrl = false
 	let isLoading = false
 	let error = ''
 	let successLockId: bigint | null = null
@@ -122,6 +124,7 @@
 					const parsedAmount = parseFloat(urlAmount)
 					if (!isNaN(parsedAmount) && parsedAmount > 0) {
 						amount = urlAmount
+						amountPrefilledFromUrl = true
 					} else {
 						console.warn('Invalid amount parameter in URL:', urlAmount)
 					}
@@ -132,6 +135,7 @@
 					// Validate agent format before setting
 					if (isValidHolochainAgent(urlAgent)) {
 						holochainAgent = urlAgent
+						agentPrefilledFromUrl = true
 					} else {
 						console.warn('Invalid agent parameter in URL:', urlAgent)
 					}
@@ -282,7 +286,23 @@
 			<!-- Amount Input -->
 			<div>
 				<Label for="amount" class="mb-2">Amount to Lock</Label>
-				<Input id="amount" type="number" placeholder="0.0" bind:value={amount} disabled={isLoading} />
+				{#if amountPrefilledFromUrl}
+					<div
+						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default"
+						style="user-select: none; -webkit-user-select: none;"
+						aria-readonly="true"
+					>
+						{amount}
+					</div>
+				{:else}
+					<Input
+						id="amount"
+						type="number"
+						placeholder="0.0"
+						bind:value={amount}
+						disabled={isLoading}
+					/>
+				{/if}
 				<Helper class="mt-1">
 					Minimum: {formatUnits(minLockAmount, tokenDecimals)}
 					{tokenSymbol}
@@ -292,13 +312,23 @@
 			<!-- Holochain Agent Input -->
 			<div>
 				<Label for="agent" class="mb-2">Holochain Agent Public Key</Label>
-				<Input
-					id="agent"
-					type="text"
-					placeholder="0x..."
-					bind:value={holochainAgent}
-					disabled={isLoading}
-				/>
+				{#if agentPrefilledFromUrl}
+					<div
+						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default"
+						style="user-select: none; -webkit-user-select: none;"
+						aria-readonly="true"
+					>
+						{holochainAgent}
+					</div>
+				{:else}
+					<Input
+						id="agent"
+						type="text"
+						placeholder="0x..."
+						bind:value={holochainAgent}
+						disabled={isLoading}
+					/>
+				{/if}
 				<Helper class="mt-1">
 					32-byte hex string (0x + 64 characters). This is where your HoloFuel will be sent.
 				</Helper>

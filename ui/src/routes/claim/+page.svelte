@@ -22,6 +22,7 @@
 
 	// Coupon input (for manual entry)
 	let couponInput = ''
+	let couponPrefilledFromUrl = false
 	let signedContext: SignedContextV1Struct | undefined
 
 	// Order state (from RPC instead of subgraph)
@@ -36,6 +37,7 @@
 			const urlParam = new URL(window.location.href).searchParams.get('c')
 			if (urlParam) {
 				couponInput = urlParam
+				couponPrefilledFromUrl = true
 				parseCouponInput()
 			}
 		}
@@ -192,14 +194,24 @@
 			<!-- Coupon Input -->
 			<div>
 				<Label for="coupon" class="mb-2">Claim Coupon</Label>
-				<Input
-					id="coupon"
-					type="text"
-					placeholder="Paste your coupon code here..."
-					bind:value={couponInput}
-					on:input={parseCouponInput}
-					disabled={isLoading}
-				/>
+				{#if couponPrefilledFromUrl}
+					<div
+						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default"
+						style="user-select: none; -webkit-user-select: none;"
+						aria-readonly="true"
+					>
+						{couponInput}
+					</div>
+				{:else}
+					<Input
+						id="coupon"
+						type="text"
+						placeholder="Paste your coupon code here..."
+						bind:value={couponInput}
+						on:input={parseCouponInput}
+						disabled={isLoading}
+					/>
+				{/if}
 			</div>
 
 			{#if isCheckingOrder}
