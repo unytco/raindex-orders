@@ -3,7 +3,7 @@ import type { RequestHandler } from './$types'
 import { createWalletClient, createPublicClient, http, parseEther, formatEther } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { sepolia } from 'viem/chains'
-import { FAUCET_PRIVATE_KEY } from '$env/static/private'
+import { FAUCET_PRIVATE_KEY, SEPOLIA_RPC_URL } from '$env/static/private'
 import { PUBLIC_TOKEN_ADDRESS } from '$env/static/public'
 
 // ERC20 ABI for transfer function
@@ -40,7 +40,7 @@ export const GET: RequestHandler = async () => {
 		
 		const publicClient = createPublicClient({
 			chain: sepolia,
-			transport: http()
+			transport: http(SEPOLIA_RPC_URL)
 		})
 
 		const balance = await publicClient.readContract({
@@ -93,12 +93,12 @@ export const POST: RequestHandler = async ({ request }) => {
 		const walletClient = createWalletClient({
 			account,
 			chain: sepolia,
-			transport: http()
+			transport: http(SEPOLIA_RPC_URL)
 		})
 
 		const publicClient = createPublicClient({
 			chain: sepolia,
-			transport: http()
+			transport: http(SEPOLIA_RPC_URL)
 		})
 
 		// Check faucet balance

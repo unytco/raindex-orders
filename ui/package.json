@@ -41,6 +41,7 @@
 	"type": "module",
 	"dependencies": {
 		"@tanstack/svelte-query": "^5.90.2",
+		"moment": "^2.30.1",
 		"viem": "^2.45.0"
 	}
 }
