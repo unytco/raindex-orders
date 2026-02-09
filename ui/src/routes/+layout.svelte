@@ -20,8 +20,10 @@
 </script>
 
 <QueryClientProvider client={queryClient}>
-	<main class="m-12 flex flex-col items-center justify-center">
-		<slot />
+	<main class="m-12 flex flex-col lg:flex-row lg:items-start lg:justify-center gap-8">
+		<div class="flex flex-col items-center">
+			<slot />
+		</div>
 		<CommonFooter />
 	</main>
 </QueryClientProvider>

@@ -15,10 +15,12 @@
 		writeContract,
 		waitForTransaction
 	} from '$lib/ethereum'
+	import { isHolochainKey, holochainKeyTo32ByteHex } from '$lib/utils'
 
 	// Form state
 	let amount = ''
 	let holochainAgent = ''
+	let originalHolochainKey = ''
 	let amountPrefilledFromUrl = false
 	let agentPrefilledFromUrl = false
 	let isLoading = false
@@ -132,8 +134,18 @@
 
 				// Validate and set agent if provided
 				if (urlAgent) {
-					// Validate agent format before setting
-					if (isValidHolochainAgent(urlAgent)) {
+					if (isHolochainKey(urlAgent)) {
+						// Holochain format key (e.g. uhcA...) — convert to hex
+						try {
+							const convertedHex = holochainKeyTo32ByteHex(urlAgent)
+							originalHolochainKey = urlAgent
+							holochainAgent = convertedHex
+							agentPrefilledFromUrl = true
+						} catch (e) {
+							console.warn('Failed to convert Holochain agent key:', e)
+						}
+					} else if (isValidHolochainAgent(urlAgent)) {
+						// Already in hex format
 						holochainAgent = urlAgent
 						agentPrefilledFromUrl = true
 					} else {
@@ -258,9 +270,9 @@
 		<a href="/" class="text-blue-600 hover:underline">← Back</a>
 	</div>
 
-	<h1 class="text-2xl font-bold">Lock HOT for HoloFuel</h1>
+	<h1 class="text-2xl font-bold">Lock HOT for Mirrored-HOT</h1>
 	<p class="text-gray-600">
-		Lock your HOT tokens to receive HoloFuel on Holochain. Your HoloFuel will be credited to the
+		Lock your HOT tokens to receive Mirrored-HOT on Unyt. Your Mirrored-HOT will be credited to the
 		specified agent.
 	</p>
 
@@ -312,14 +324,21 @@
 			<!-- Holochain Agent Input -->
 			<div>
 				<Label for="agent" class="mb-2">Holochain Agent Public Key</Label>
-				{#if agentPrefilledFromUrl}
-					<div
-						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default"
-						style="user-select: none; -webkit-user-select: none;"
-						aria-readonly="true"
-					>
-						{holochainAgent}
+				{#if agentPrefilledFromUrl && originalHolochainKey}
+					<!-- Holochain key was passed via URL — show both original and converted -->
+					<div class="space-y-2">
+						<div>
+							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain Key (original)</p>
+							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{originalHolochainKey}</p>
+						</div>
+						<div>
+							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Converted Key (hex)</p>
+							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{holochainAgent}</p>
+						</div>
 					</div>
+				{:else if agentPrefilledFromUrl}
+					<!-- Hex key was passed via URL -->
+					<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{holochainAgent}</p>
 				{:else}
 					<Input
 						id="agent"
@@ -330,7 +349,7 @@
 					/>
 				{/if}
 				<Helper class="mt-1">
-					32-byte hex string (0x + 64 characters). This is where your HoloFuel will be sent.
+					32-byte hex string (0x + 64 characters). This is where your Mirrored-HOT will be sent.
 				</Helper>
 				{#if holochainAgent && !isValidHolochainAgent(holochainAgent)}
 					<Helper color="red" class="mt-1">
@@ -346,7 +365,7 @@
 
 			<!-- Success Display -->
 			{#if successLockId !== null}
-				<Alert color="green"> Lock successful! Your HoloFuel will be credited shortly. </Alert>
+				<Alert color="green"> Lock successful! Your Mirrored-HOT will be credited shortly. </Alert>
 			{/if}
 
 			<!-- Action Buttons -->
@@ -378,7 +397,7 @@
 			</div>
 
 			<!-- Vault Info -->
-			<div class="mt-4 pt-4 border-t">
+			<!-- <div class="mt-4 pt-4 border-t">
 				<p class="text-sm text-gray-500">
 					Vault Balance: {formatUnits(vaultBalance, tokenDecimals)}
 					{tokenSymbol}
@@ -390,7 +409,7 @@
 						class="hover:underline">{lockVaultAddress.slice(0, 10)}...{lockVaultAddress.slice(-8)}</a
 					>
 				</p>
-			</div>
+			</div> -->
 		</div>
 	{/if}
 </Card>

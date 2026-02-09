@@ -183,7 +183,7 @@
 
 	<h1 class="text-2xl font-bold">Claim HOT</h1>
 	<p class="text-gray-600">
-		Redeem your HoloFuel claim coupon to receive HOT tokens on Ethereum.
+		Redeem your Mirrored-HOT claim coupon to receive HOT tokens on Ethereum.
 	</p>
 
 	{#if !isConnected}
@@ -283,7 +283,7 @@
 				<Alert color="yellow">Order not found on-chain. The order may have been removed.</Alert>
 			{:else}
 				<Alert color="blue">
-					Enter your claim coupon above. You should have received this after burning HoloFuel.
+					Enter your claim coupon above. You should have received this after burning Mirrored-HOT.
 				</Alert>
 			{/if}
 		</div>

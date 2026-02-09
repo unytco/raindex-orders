@@ -5,15 +5,15 @@
 	import HotFaucetLink from './HotFaucetLink.svelte'
 </script>
 
-<footer class="mt-12 w-full max-w-4xl border-t border-gray-200 pt-8 dark:border-gray-700">
-	<h2 class="mb-4 text-center text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+<aside class="w-full lg:w-72">
+	<h2 class="mb-4 text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
 		Quick links
 	</h2>
-	<div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+	<div class="flex flex-col gap-4">
 		<Card class="flex flex-col">
 			<h3 class="text-base font-semibold text-gray-900 dark:text-white">Copy this page URL</h3>
 			<p class="mb-3 text-sm text-gray-600 dark:text-gray-400">
-				Share or bookmark the exact page you're on. Click copy to copy the URL.
+				Click copy to copy the URL to a different browser.
 			</p>
 			<div class="mt-auto">
 				<CopyableUrl />
@@ -40,4 +40,4 @@
 			</Card>
 		</a>
 	</div>
-</footer>
+</aside>

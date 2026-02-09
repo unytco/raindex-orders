@@ -17,7 +17,7 @@
 <Card size="xl" class="flex flex-col gap-6">
 	<div class="text-center">
 		<h1 class="text-3xl font-bold mb-2">HOT Bridge</h1>
-		<p class="text-gray-600">Bridge between HOT and HoloFuel</p>
+		<p class="text-gray-600">Bridge between HOT and Mirrored-HOT</p>
 	</div>
 
 	{#if !isConnected}
@@ -52,8 +52,8 @@
 					<Card class="hover:bg-gray-50 cursor-pointer transition-colors">
 						<div class="flex items-center justify-between">
 							<div>
-								<h3 class="text-lg font-semibold">HOT → HoloFuel</h3>
-								<p class="text-sm text-gray-600">Lock HOT tokens to receive HoloFuel on Holochain</p>
+								<h3 class="text-lg font-semibold">HOT → Mirrored-HOT</h3>
+								<p class="text-sm text-gray-600">Lock HOT tokens to receive Mirrored-HOT on Unyt</p>
 							</div>
 							<div class="text-2xl">→</div>
 						</div>
@@ -64,8 +64,8 @@
 					<Card class="hover:bg-gray-50 cursor-pointer transition-colors">
 						<div class="flex items-center justify-between">
 							<div>
-								<h3 class="text-lg font-semibold">HoloFuel → HOT</h3>
-								<p class="text-sm text-gray-600">Redeem HoloFuel to receive HOT tokens on Ethereum</p>
+								<h3 class="text-lg font-semibold">Mirrored-HOT → HOT</h3>
+								<p class="text-sm text-gray-600">Redeem Mirrored-HOT to receive HOT tokens on Ethereum</p>
 							</div>
 							<div class="text-2xl">→</div>
 						</div>

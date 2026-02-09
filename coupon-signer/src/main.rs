@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::env;
 
-/// CLI tool for signing HoloFuel claim coupons for Raindex
+/// CLI tool for signing Mirrored-HOT claim coupons for Raindex
 ///
 /// This generates SignedContext data that can be used with the holo-claim.rain order.
 ///
