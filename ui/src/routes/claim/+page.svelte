@@ -196,7 +196,7 @@
 				<Label for="coupon" class="mb-2">Claim Coupon</Label>
 				{#if couponPrefilledFromUrl}
 					<div
-						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default"
+						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default break-all"
 						style="user-select: none; -webkit-user-select: none;"
 						aria-readonly="true"
 					>
