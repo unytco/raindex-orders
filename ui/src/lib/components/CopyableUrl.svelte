@@ -2,7 +2,7 @@
 	import { page } from '$app/stores'
 	import { Button } from 'flowbite-svelte'
 
-	$: currentUrl = $page.url.href
+	$: currentUrl = $page?.url?.href ?? ''
 	let copied = false
 	let copyTimeout: ReturnType<typeof setTimeout>
 
