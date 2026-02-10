@@ -11,9 +11,9 @@
 	</h2>
 	<div class="flex flex-col gap-4">
 		<Card class="flex flex-col">
-			<h3 class="text-base font-semibold text-gray-900 dark:text-white">Copy this page URL</h3>
+			<h3 class="text-base font-semibold text-gray-900 dark:text-white">Copy URL</h3>
 			<p class="mb-3 text-sm text-gray-600 dark:text-gray-400">
-				Click copy to copy the URL to a different browser.
+				To access your wallet in a different browser, Copy URL.
 			</p>
 			<div class="mt-auto">
 				<CopyableUrl />

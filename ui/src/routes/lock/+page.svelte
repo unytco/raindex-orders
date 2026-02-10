@@ -200,7 +200,7 @@
 
 		// Validate holochain agent
 		if (!isValidHolochainAgent(holochainAgent)) {
-			error = 'Invalid Holochain agent public key. Must be 32 bytes (0x + 64 hex characters)'
+			error = 'Invalid Unyt agent public key. Must be 32 bytes (0x + 64 hex characters)'
 			return
 		}
 
@@ -323,16 +323,16 @@
 
 			<!-- Holochain Agent Input -->
 			<div>
-				<Label for="agent" class="mb-2">Holochain Agent Public Key</Label>
+				<Label for="agent" class="mb-2">Unyt Agent Public Key</Label>
 				{#if agentPrefilledFromUrl && originalHolochainKey}
 					<!-- Holochain key was passed via URL — show both original and converted -->
 					<div class="space-y-2">
 						<div>
-							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain Key (original)</p>
+							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain Format (original)</p>
 							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{originalHolochainKey}</p>
 						</div>
 						<div>
-							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Converted Key (hex)</p>
+							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Ethereum format (0x hex)</p>
 							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{holochainAgent}</p>
 						</div>
 					</div>
