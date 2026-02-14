@@ -177,9 +177,7 @@
 </script>
 
 <Card size="xl" class="flex flex-col gap-4">
-	<div class="flex items-center gap-2">
-		<a href="/" class="text-blue-600 hover:underline">← Back</a>
-	</div>
+
 
 	<h1 class="text-2xl font-bold">Claim HOT</h1>
 	<p class="text-gray-600">

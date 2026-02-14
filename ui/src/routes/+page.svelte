@@ -16,8 +16,8 @@
 
 <Card size="xl" class="flex flex-col gap-6">
 	<div class="text-center">
-		<h1 class="text-3xl font-bold mb-2">HOT Bridge</h1>
-		<p class="text-gray-600">Bridge between HOT and Mirrored-HOT</p>
+		<h1 class="text-3xl font-bold mb-2">Bridge Home</h1>
+		<p class="text-gray-600">Bridge between Blockchain and Mirrored-Units on Unyt</p>
 	</div>
 
 	{#if !isConnected}
@@ -44,16 +44,17 @@
 			</Button>
 		{/if}
 
+<!--	
 		<div class="border-t pt-6">
-			<h2 class="text-lg font-semibold mb-4 text-center">Select Bridge Direction</h2>
+			<h2 class="text-lg font-semibold mb-4 text-center">Select Bridge Direction</h2> 
 
 			<div class="flex flex-col gap-4">
 				<a href="/lock" class="block">
 					<Card class="hover:bg-gray-50 cursor-pointer transition-colors">
 						<div class="flex items-center justify-between">
 							<div>
-								<h3 class="text-lg font-semibold">HOT → Mirrored-HOT</h3>
-								<p class="text-sm text-gray-600">Lock HOT tokens to receive Mirrored-HOT on Unyt</p>
+								<h3 class="text-lg font-semibold">Transfer into Unyt</h3>
+								<p class="text-sm text-gray-600">Lock tokens to receive Mirrored-units on Unyt</p>
 							</div>
 							<div class="text-2xl">→</div>
 						</div>
@@ -64,8 +65,8 @@
 					<Card class="hover:bg-gray-50 cursor-pointer transition-colors">
 						<div class="flex items-center justify-between">
 							<div>
-								<h3 class="text-lg font-semibold">Mirrored-HOT → HOT</h3>
-								<p class="text-sm text-gray-600">Redeem Mirrored-HOT to receive HOT tokens on Ethereum</p>
+								<h3 class="text-lg font-semibold">Transfer Out of Unyt</h3>
+								<p class="text-sm text-gray-600">Claim Coupon for tokens on Ethereum</p>
 							</div>
 							<div class="text-2xl">→</div>
 						</div>
@@ -85,6 +86,7 @@
 				</a>
 			</div>
 		</div>
+-->
 	{/if}
 
 	{#if $ethereumStore.error}

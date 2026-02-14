@@ -89,9 +89,6 @@
 </script>
 
 <div class="container mx-auto max-w-2xl p-4">
-	<div class="mb-4">
-		<a href="/" class="text-blue-600 hover:underline">← Back to Home</a>
-	</div>
 
 	<h1 class="mb-6 text-3xl font-bold">MockHOT Faucet</h1>
 
