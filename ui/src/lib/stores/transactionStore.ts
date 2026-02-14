@@ -4,7 +4,7 @@ import type { Abi } from 'viem'
 export enum TransactionStatus {
 	IDLE = 'Idle',
 	IPFS_SUCCESS = 'IPFS upload successful!',
-	PENDING_WALLET = 'Waiting for wallet confirmation...',
+	PENDING_WALLET = 'Waiting for your manual confirmation in your blockchain wallet.',
 	PENDING_TX = 'Confirming transaction...',
 	SUCCESS = 'Success! Transaction confirmed',
 	ERROR = 'Something went wrong'

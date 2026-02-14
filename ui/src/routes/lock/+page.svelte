@@ -19,8 +19,7 @@
 
 	// Form state
 	let amount = ''
-	let holochainAgent = ''
-	let originalHolochainKey = ''
+	let agentInput = ''
 	let amountPrefilledFromUrl = false
 	let agentPrefilledFromUrl = false
 	let isLoading = false
@@ -105,12 +104,16 @@
 		fetchContractData()
 	}
 
-	// Validate holochain agent format (should be 32 bytes hex)
-	function isValidHolochainAgent(agent: string): boolean {
-		if (!agent) return false
-		// Should be 0x followed by 64 hex characters (32 bytes)
-		return /^0x[a-fA-F0-9]{64}$/.test(agent)
+	// Derive hex for contract from Holochain key (always convert in UI)
+	function getAgentHex(input: string): string {
+		if (!input || !isHolochainKey(input)) return ''
+		try {
+			return holochainKeyTo32ByteHex(input)
+		} catch {
+			return ''
+		}
 	}
+	$: agentHex = getAgentHex(agentInput)
 
 	// Get parameters from URL on mount
 	onMount(() => {
@@ -132,25 +135,12 @@
 					}
 				}
 
-				// Validate and set agent if provided
-				if (urlAgent) {
-					if (isHolochainKey(urlAgent)) {
-						// Holochain format key (e.g. uhcA...) — convert to hex
-						try {
-							const convertedHex = holochainKeyTo32ByteHex(urlAgent)
-							originalHolochainKey = urlAgent
-							holochainAgent = convertedHex
-							agentPrefilledFromUrl = true
-						} catch (e) {
-							console.warn('Failed to convert Holochain agent key:', e)
-						}
-					} else if (isValidHolochainAgent(urlAgent)) {
-						// Already in hex format
-						holochainAgent = urlAgent
-						agentPrefilledFromUrl = true
-					} else {
-						console.warn('Invalid agent parameter in URL:', urlAgent)
-					}
+				// Validate and set agent if provided (Holochain key only)
+				if (urlAgent && isHolochainKey(urlAgent)) {
+					agentInput = urlAgent
+					agentPrefilledFromUrl = true
+				} else if (urlAgent) {
+					console.warn('Invalid agent parameter in URL: expected Holochain key (uhCA...)', urlAgent)
 				}
 			} catch (e) {
 				console.error('Error reading URL parameters:', e)
@@ -196,11 +186,11 @@
 
 	// Handle lock
 	async function handleLock() {
-		if (!amount || !holochainAgent) return
+		if (!amount || !agentHex) return
 
-		// Validate holochain agent
-		if (!isValidHolochainAgent(holochainAgent)) {
-			error = 'Invalid Unyt agent public key. Must be 32 bytes (0x + 64 hex characters)'
+		// Validate we have a converted hex (from Holochain key)
+		if (!agentHex) {
+			error = 'Invalid Unyt agent public key. Provide a Holochain agent key (uhCA...).'
 			return
 		}
 
@@ -232,7 +222,7 @@
 				address: lockVaultAddress,
 				abi: holoLockVaultAbi,
 				functionName: 'lock',
-				args: [amountWei, holochainAgent as Hex]
+				args: [amountWei, agentHex as Hex]
 			})
 
 			transactionStore.awaitTxReceipt(hash)
@@ -248,7 +238,7 @@
 
 				// Reset form
 				amount = ''
-				holochainAgent = ''
+				agentInput = ''
 			}
 		} catch (e: any) {
 			const message = e?.message || 'Lock transaction failed'
@@ -263,12 +253,10 @@
 	// Calculate if we need approval
 	$: amountWei = amount ? parseUnits(amount, tokenDecimals) : 0n
 	$: needsApproval = amountWei > 0n && tokenAllowance < amountWei
+	$: hasValidAgent = !!agentHex
 </script>
 
 <Card size="xl" class="flex flex-col gap-4">
-	<div class="flex items-center gap-2">
-		<a href="/" class="text-blue-600 hover:underline">← Back</a>
-	</div>
 
 	<h1 class="text-2xl font-bold">Lock HOT for Mirrored-HOT</h1>
 	<p class="text-gray-600">
@@ -323,37 +311,45 @@
 
 			<!-- Holochain Agent Input -->
 			<div>
-				<Label for="agent" class="mb-2">Unyt Agent Public Key</Label>
-				{#if agentPrefilledFromUrl && originalHolochainKey}
-					<!-- Holochain key was passed via URL — show both original and converted -->
-					<div class="space-y-2">
-						<div>
-							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain Format (original)</p>
-							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{originalHolochainKey}</p>
-						</div>
-						<div>
-							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Ethereum format (0x hex)</p>
-							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{holochainAgent}</p>
-						</div>
+				<Label for="agent" class="mb-2">Unyt Agent Public Key (Holochain key)</Label>
+				{#if agentPrefilledFromUrl}
+					<div
+						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default break-all"
+						style="user-select: none; -webkit-user-select: none;"
+						aria-readonly="true"
+					>
+						{agentInput}
 					</div>
-				{:else if agentPrefilledFromUrl}
-					<!-- Hex key was passed via URL -->
-					<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{holochainAgent}</p>
 				{:else}
 					<Input
 						id="agent"
 						type="text"
-						placeholder="0x..."
-						bind:value={holochainAgent}
+						placeholder="uhCA..."
+						bind:value={agentInput}
 						disabled={isLoading}
 					/>
 				{/if}
 				<Helper class="mt-1">
-					32-byte hex string (0x + 64 characters). This is where your Mirrored-HOT will be sent.
+					{#if agentPrefilledFromUrl}
+						Agent key from URL (read-only). This is where your Mirrored-HOT will be sent.
+					{:else}
+						Paste your Holochain agent key (e.g. uhCA...). This is where your Mirrored-HOT will be sent. It is converted to hex for the contract below.
+					{/if}
 				</Helper>
-				{#if holochainAgent && !isValidHolochainAgent(holochainAgent)}
+				{#if agentInput && hasValidAgent}
+					<div class="mt-2 space-y-2 rounded-lg border border-gray-200 bg-gray-50 p-3 dark:border-gray-600 dark:bg-gray-700">
+						<div>
+							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain key</p>
+							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{agentInput}</p>
+						</div>
+						<div>
+							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Ethereum (hex, used for lock)</p>
+							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{agentHex}</p>
+						</div>
+					</div>
+				{:else if agentInput}
 					<Helper color="red" class="mt-1">
-						Invalid format. Must be 0x followed by 64 hex characters.
+						Invalid format. Provide a Holochain agent key (uhCA...).
 					</Helper>
 				{/if}
 			</div>
@@ -387,7 +383,7 @@
 				<Button
 					class="w-fit"
 					on:click={handleLock}
-					disabled={isLoading || !amount || !holochainAgent || needsApproval}
+					disabled={isLoading || !amount || !hasValidAgent || needsApproval}
 				>
 					{#if isLoading}
 						<Spinner size="4" class="mr-2" />

@@ -19,11 +19,21 @@
 		<div class="flex flex-col items-center justify-center gap-2">
 			{#if $transactionStore.status === TransactionStatus.PENDING_WALLET}
 				<Spinner size="10" color="blue" />
-				{$transactionStore.status}
+				<div class="text-center">
+					<p>{$transactionStore.status}</p>
+					<p class="mt-2 text-sm text-gray-600 dark:text-gray-400">
+						Check your wallet (e.g. MetaMask) and approve or sign the transaction if prompted.
+					</p>
+				</div>
 			{/if}
 			{#if $transactionStore.status === TransactionStatus.PENDING_TX}
 				<Spinner size="10" color="green" />
-				{$transactionStore.status}
+				<div class="text-center">
+					<p>{$transactionStore.status}</p>
+					<p class="mt-2 text-sm text-gray-600 dark:text-gray-400">
+						Check your wallet if needed. The transaction is being confirmed on-chain.
+					</p>
+				</div>
 				<a
 					class="font-blue-500 hover:underline"
 					href={`https://sepolia.etherscan.io/tx/${$transactionStore.hash}`}
