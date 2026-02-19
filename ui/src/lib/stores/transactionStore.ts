@@ -28,15 +28,16 @@ const initialState = {
 	error: { message: '' },
 	hash: '',
 	message: '',
-	data: null
+	data: null,
+	isLockTransaction: false
 }
 
 // TODO: Add a timeout on all transactions
 export const createTransactionStore = () => {
 	const { subscribe, set, update } = writable(initialState)
 	const reset = () => set(initialState)
-	const awaitWalletConfirmation = () =>
-		update(state => ({ ...state, status: TransactionStatus.PENDING_WALLET }))
+	const awaitWalletConfirmation = (isLockTransaction = false) =>
+		update(state => ({ ...state, status: TransactionStatus.PENDING_WALLET, isLockTransaction }))
 	const awaitTxReceipt = (txHash: string) =>
 		update(state => ({ ...state, status: TransactionStatus.PENDING_TX, hash: txHash }))
 	const transactionSuccess = (hash: string) =>

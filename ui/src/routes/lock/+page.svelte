@@ -24,7 +24,7 @@
 	let agentPrefilledFromUrl = false
 	let isLoading = false
 	let error = ''
-	let successLockId: bigint | null = null
+	let approvalJustCompleted = false
 
 	// Contract data
 	let tokenBalance: bigint = 0n
@@ -171,8 +171,9 @@
 			const receipt = await waitForTransaction(hash)
 
 			if (receipt) {
-				transactionStore.transactionSuccess(hash)
+				transactionStore.reset()
 				await fetchContractData()
+				approvalJustCompleted = true
 			}
 		} catch (e: any) {
 			const message = e?.message || 'Approval failed'
@@ -195,9 +196,9 @@
 		}
 
 		error = ''
-		successLockId = null
+		approvalJustCompleted = false
 		isLoading = true
-		transactionStore.awaitWalletConfirmation()
+		transactionStore.awaitWalletConfirmation(true)
 
 		try {
 			const amountWei = parseUnits(amount, tokenDecimals)
@@ -231,14 +232,6 @@
 			if (receipt) {
 				transactionStore.transactionSuccess(hash)
 				await fetchContractData()
-
-				// Parse the Lock event from the receipt to get the lockId
-				// For now, just show success
-				successLockId = 0n // Placeholder - would parse from logs
-
-				// Reset form
-				amount = ''
-				agentInput = ''
 			}
 		} catch (e: any) {
 			const message = e?.message || 'Lock transaction failed'
@@ -254,6 +247,7 @@
 	$: amountWei = amount ? parseUnits(amount, tokenDecimals) : 0n
 	$: needsApproval = amountWei > 0n && tokenAllowance < amountWei
 	$: hasValidAgent = !!agentHex
+	$: if (needsApproval) approvalJustCompleted = false
 </script>
 
 <Card size="xl" class="flex flex-col gap-4">
@@ -359,9 +353,10 @@
 				<Alert color="red">{error}</Alert>
 			{/if}
 
-			<!-- Success Display -->
-			{#if successLockId !== null}
-				<Alert color="green"> Lock successful! Your Mirrored-HOT will be credited shortly. </Alert>
+			{#if approvalJustCompleted && !needsApproval}
+				<Alert color="green">
+					Approval confirmed &mdash; now finalize by locking your {tokenSymbol}.
+				</Alert>
 			{/if}
 
 			<!-- Action Buttons -->
@@ -378,18 +373,18 @@
 						{/if}
 						Approve {tokenSymbol}
 					</Button>
+				{:else}
+					<Button
+						class="w-fit"
+						on:click={handleLock}
+						disabled={isLoading || !amount || !hasValidAgent}
+					>
+						{#if isLoading}
+							<Spinner size="4" class="mr-2" />
+						{/if}
+						Lock {tokenSymbol}
+					</Button>
 				{/if}
-
-				<Button
-					class="w-fit"
-					on:click={handleLock}
-					disabled={isLoading || !amount || !hasValidAgent || needsApproval}
-				>
-					{#if isLoading}
-						<Spinner size="4" class="mr-2" />
-					{/if}
-					Lock {tokenSymbol}
-				</Button>
 			</div>
 
 			<!-- Vault Info -->

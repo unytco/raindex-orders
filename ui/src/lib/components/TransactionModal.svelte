@@ -2,6 +2,9 @@
 	import { Button, Modal, Spinner } from 'flowbite-svelte'
 	import { transactionStore, TransactionStatus } from '$lib/stores/transactionStore'
 
+	$: isLockSuccess =
+		$transactionStore.status === TransactionStatus.SUCCESS && $transactionStore.isLockTransaction
+
 	function unescapeString(str) {
 		return str
 			.replace(/\\n/g, '\n')
@@ -9,11 +12,19 @@
 			.replace(/\\"/g, '"')
 			.replace(/\\\\/g, '\\')
 	}
+
+	function handleDone() {
+		transactionStore.reset()
+		window.location.href = window.location.pathname
+	}
 </script>
 
 <Modal
-	on:close={() => transactionStore.reset()}
+	on:close={() => {
+		if (!isLockSuccess) transactionStore.reset()
+	}}
 	open={$transactionStore.status !== TransactionStatus.IDLE}
+	dismissable={!isLockSuccess}
 >
 	<div class="p-4">
 		<div class="flex flex-col items-center justify-center gap-2">
@@ -47,13 +58,24 @@
 				>
 					<h1 class="text-2xl">✅</h1>
 				</div>
-				{$transactionStore.status}
+				{#if isLockSuccess}
+					<p class="text-lg font-semibold">Lock successful!</p>
+					<p class="text-sm text-gray-600 dark:text-gray-400">
+						Your Mirrored-HOT will be credited shortly.
+					</p>
+				{:else}
+					{$transactionStore.status}
+				{/if}
 				<a
 					class="font-blue-500 hover:underline"
 					href={`https://sepolia.etherscan.io/tx/${$transactionStore.hash}`}
 					target="_blank">View transaction on Etherscan</a
 				>
-				<Button on:click={() => transactionStore.reset()}>Close</Button>
+				{#if isLockSuccess}
+					<Button on:click={handleDone}>Done</Button>
+				{:else}
+					<Button on:click={() => transactionStore.reset()}>Close</Button>
+				{/if}
 			{/if}
 
 			{#if $transactionStore.status === TransactionStatus.ERROR}
