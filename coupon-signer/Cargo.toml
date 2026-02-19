@@ -19,4 +19,4 @@ rmp-serde = "1.1"
 holochain_client = "0.8.1-rc.0"
 holochain_zome_types = "0.6.1-rc.0"
 holo_hash = { version = "0.6.1-rc.0", features = ["encoding"] }
-rave_engine = "0.3.0"
+rave_engine = "0.3.1"

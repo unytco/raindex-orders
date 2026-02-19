@@ -7,7 +7,7 @@ use crate::types::LockRecord;
 use crate::{config::HolochainConfig, watcher::format_amount};
 use anyhow::Result;
 use rave_engine::types::{
-    BridgingAgentInitiateDepositInput, CreateParkedLinkInput, ParkedLinkTag, ParkedTag, UnitMap,
+    BridgingAgentInitiateDepositInput, CreateParkedLinkInput, ParkedData, ParkedLinkType, UnitMap,
 };
 use tracing::{debug, info, warn};
 
@@ -15,8 +15,8 @@ pub fn build_bridging_agent_initiate_deposit_payload(
     hc_config: &HolochainConfig,
 ) -> BridgingAgentInitiateDepositInput {
     BridgingAgentInitiateDepositInput {
-        global_definition: hc_config.lane_definition.clone().into(), // this is just outdated and will be removed, currently not used
         lane_definition: hc_config.lane_definition.clone().into(),
+        optimized_mode: false,
     }
 }
 
@@ -107,7 +107,7 @@ pub fn build_create_parked_link_payload(
             "depositor_wallet_address": depositor_wallet_address_as_hc_pubkey,
         }
     });
-    let parked_link_tag = ParkedLinkTag {
+    let parked_link_tag = ParkedData {
         ct_role_id: "oracle".to_string(),
         amount: Some(UnitMap::from(vec![(
             hc_config.unit_index,
@@ -123,7 +123,7 @@ pub fn build_create_parked_link_payload(
     let payload = CreateParkedLinkInput {
         ea_id: hc_config.credit_limit_ea_id.clone().into(),
         executor: Some(hc_config.bridging_agent_pubkey.clone().into()),
-        tag: ParkedTag::ParkedLinkTag((parked_link_tag, true)),
+        parked_link_type: ParkedLinkType::ParkedData((parked_link_tag, true)),
     };
     info!(
         "[build_payload] Payload built successfully for lock {}: {:?}",

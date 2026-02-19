@@ -35,7 +35,7 @@ dotenvy = "0.15"
 holochain_client = "0.8.1-rc.0"
 holochain_zome_types = "0.6.1-rc.0"
 holo_hash = { version = "0.6.1-rc.0", features = ["encoding"] }
-rave_engine = "0.3"
+rave_engine = "0.3.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
