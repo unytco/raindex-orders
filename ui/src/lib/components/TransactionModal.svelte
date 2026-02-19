@@ -13,10 +13,6 @@
 			.replace(/\\\\/g, '\\')
 	}
 
-	function handleDone() {
-		transactionStore.reset()
-		window.location.href = window.location.pathname
-	}
 </script>
 
 <Modal
@@ -71,9 +67,7 @@
 					href={`https://sepolia.etherscan.io/tx/${$transactionStore.hash}`}
 					target="_blank">View transaction on Etherscan</a
 				>
-				{#if isLockSuccess}
-					<Button on:click={handleDone}>Done</Button>
-				{:else}
+				{#if !isLockSuccess}
 					<Button on:click={() => transactionStore.reset()}>Close</Button>
 				{/if}
 			{/if}
