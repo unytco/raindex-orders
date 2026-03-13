@@ -15,7 +15,10 @@ pub fn build_bridging_agent_initiate_deposit_payload(
     hc_config: &HolochainConfig,
 ) -> BridgingAgentInitiateDepositInput {
     BridgingAgentInitiateDepositInput {
-        lane_definition: hc_config.lane_definition.clone().into(),
+        lane_definition: match &hc_config.lane_definition {
+            Some(ld) => Some(ld.clone().into()),
+            None => None,
+        },
         optimized_mode: false,
     }
 }

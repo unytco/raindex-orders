@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
-use holo_hash::{ActionHashB64, AgentPubKeyB64};
+use holo_hash::{ActionHash, ActionHashB64, AgentPubKeyB64};
 use std::env;
 use std::str::FromStr;
 
@@ -42,7 +42,7 @@ pub struct HolochainConfig {
     pub role_name: String,
     pub bridging_agent_pubkey: AgentPubKeyB64,
     pub credit_limit_ea_id: ActionHashB64,
-    pub lane_definition: ActionHashB64,
+    pub lane_definition: Option<ActionHashB64>,
     pub unit_index: u32,
 }
 
@@ -164,13 +164,15 @@ impl Config {
                 let bridging_agent_pubkey_s = bridging_agent_pubkey.expect("checked");
                 let credit_limit_ea_id_s = credit_limit_ea_id.expect("checked");
                 let unit_index_s = unit_index.expect("checked");
-                let lane_definition_s = lane_definition.expect("checked");
+                let lane_definition_s = lane_definition.unwrap_or_default();
                 let bridging_agent_pubkey = AgentPubKeyB64::from_str(&bridging_agent_pubkey_s)
                     .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
                 let credit_limit_ea_id = ActionHashB64::from_str(&credit_limit_ea_id_s)
                     .context("Invalid HOLOCHAIN_CREDIT_LIMIT_EA_ID")?;
-                let lane_definition = ActionHashB64::from_str(&lane_definition_s)
-                    .context("Invalid HOLOCHAIN_LANE_DEFINITION")?;
+                let lane_definition: Option<ActionHashB64> =
+                    ActionHashB64::from_str(&lane_definition_s)
+                        .context("Invalid HOLOCHAIN_LANE_DEFINITION")
+                        .ok();
                 let unit_index = unit_index_s
                     .parse()
                     .context("Invalid HOLOCHAIN_UNIT_INDEX (must be u32)")?;
