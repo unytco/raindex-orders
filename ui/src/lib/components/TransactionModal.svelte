@@ -42,7 +42,7 @@
 					</p>
 				</div>
 				<a
-					class="font-blue-500 hover:underline"
+					class="text-blue-500 hover:underline"
 					href={`https://sepolia.etherscan.io/tx/${$transactionStore.hash}`}
 					target="_blank">View pending transaction on Etherscan</a
 				>
@@ -56,14 +56,17 @@
 				</div>
 				{#if isLockSuccess}
 					<p class="text-lg font-semibold">Lock successful!</p>
-					<p class="text-sm text-gray-600 dark:text-gray-400">
-						Your Mirrored-HOT will be credited shortly.
-					</p>
+				<p class="text-sm text-gray-600 dark:text-gray-400">
+					Your Mirrored-HOT will be credited in your Unyt app shortly.
+				</p>
+				<p class="text-sm text-gray-600 dark:text-gray-400">
+					Please return to your Unyt app to finalize the bridge transfer.
+				</p>
 				{:else}
 					{$transactionStore.status}
 				{/if}
 				<a
-					class="font-blue-500 hover:underline"
+					class="text-blue-500 hover:underline"
 					href={`https://sepolia.etherscan.io/tx/${$transactionStore.hash}`}
 					target="_blank">View transaction on Etherscan</a
 				>
