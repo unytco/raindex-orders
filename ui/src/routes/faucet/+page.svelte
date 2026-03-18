@@ -111,7 +111,7 @@
 		<div class="mb-4 rounded-lg bg-yellow-50 p-4">
 			<h3 class="mb-2 font-semibold">Rate Limit</h3>
 			<p class="text-sm text-gray-700">
-				Each address can receive <strong>10 mockHOT</strong> every <strong>10 minutes</strong>.
+				Each address can receive <strong>1000 mockHOT</strong> every <strong>10 minutes</strong>.
 			</p>
 		</div>
 
@@ -125,7 +125,7 @@
 					<Spinner class="mr-2" size="4" />
 					Sending...
 				{:else}
-					Request 10 mockHOT
+					Request 1000 mockHOT
 				{/if}
 			</Button>
 		</div>
@@ -140,7 +140,7 @@
 	{#if success}
 		<Alert color="green" class="mb-4">
 			<div>
-				<p class="font-medium">✓ Successfully sent 10 mockHOT!</p>
+				<p class="font-medium">✓ Successfully sent 1000 mockHOT!</p>
 				<p class="mt-2 text-sm">Transaction Hash:</p>
 				<a
 					href="https://sepolia.etherscan.io/tx/{txHash}"
@@ -161,7 +161,7 @@
 				This faucet provides mockHOT tokens on Sepolia testnet for testing the HOT Bridge.
 			</p>
 			<ul class="list-inside list-disc space-y-1">
-				<li>Get 10 mockHOT per request</li>
+				<li>Get 1000 mockHOT per request</li>
 				<li>10 minute cooldown between requests per address</li>
 				<li>Free testnet tokens for development and testing</li>
 			</ul>

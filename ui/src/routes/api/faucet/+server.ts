@@ -31,7 +31,7 @@ const ERC20_ABI = [
 // In production, consider using Redis or a database
 const rateLimitStore = new Map<string, number>()
 const RATE_LIMIT_MS = 10 * 60 * 1000 // 10 minutes
-const FAUCET_AMOUNT = parseEther('10') // 10 HOT
+const FAUCET_AMOUNT = parseEther('1000') // 1000 HOT
 
 // Get faucet balance
 export const GET: RequestHandler = async () => {
