@@ -4,7 +4,7 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
 	plugins: [sveltekit()],
 	server: {
-		allowedHosts: ['*.unyt.dev', '*.unyt.co'],
+		allowedHosts: ['hot-bridge.unyt.dev', 'hot-bridge.unyt.co'],
 		host: true
 	},
 	test: {
