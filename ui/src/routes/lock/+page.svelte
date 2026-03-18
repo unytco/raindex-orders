@@ -2,7 +2,7 @@
 	import { Button, Card, Input, Label, Helper, Spinner, Alert } from 'flowbite-svelte'
 	import { erc20Abi } from '../../generated'
 	import { holoLockVaultAbi } from '$lib/lockVaultAbi'
-	import { formatUnits, parseUnits, type Hex } from 'viem'
+	import { formatUnits, parseUnits, maxUint256, type Hex } from 'viem'
 	import { transactionStore } from '$lib/stores/transactionStore'
 	import { onMount } from 'svelte'
 	import { browser } from '$app/environment'
@@ -24,7 +24,6 @@
 	let agentPrefilledFromUrl = false
 	let isLoading = false
 	let error = ''
-	let approvalJustCompleted = false
 
 	// Contract data
 	let tokenBalance: bigint = 0n
@@ -149,43 +148,7 @@
 		}
 	})
 
-	// Handle approval
-	async function handleApprove() {
-		if (!amount) return
-
-		error = ''
-		isLoading = true
-		transactionStore.awaitWalletConfirmation()
-
-		try {
-			const amountWei = parseUnits(amount, tokenDecimals)
-
-			const hash = await writeContract({
-				address: tokenAddress,
-				abi: erc20Abi,
-				functionName: 'approve',
-				args: [lockVaultAddress, amountWei]
-			})
-
-			transactionStore.awaitTxReceipt(hash)
-			const receipt = await waitForTransaction(hash)
-
-			if (receipt) {
-				transactionStore.reset()
-				await fetchContractData()
-				approvalJustCompleted = true
-			}
-		} catch (e: any) {
-			const message = e?.message || 'Approval failed'
-			error = message
-			transactionStore.transactionError({ message: error })
-			console.error(e)
-		} finally {
-			isLoading = false
-		}
-	}
-
-	// Handle lock
+	// Handle lock (runs approve first if needed, then lock — single action for the user)
 	async function handleLock() {
 		if (!amount || !agentHex) return
 
@@ -196,9 +159,7 @@
 		}
 
 		error = ''
-		approvalJustCompleted = false
 		isLoading = true
-		transactionStore.awaitWalletConfirmation(true)
 
 		try {
 			const amountWei = parseUnits(amount, tokenDecimals)
@@ -211,14 +172,28 @@
 				return
 			}
 
-			// Check allowance
+			// If allowance is insufficient, approve unlimited once (one confirmation), then lock (one confirmation).
+			// After first time, only lock is needed (single confirmation).
 			if (tokenAllowance < amountWei) {
-				error = 'Insufficient allowance. Please approve first.'
-				isLoading = false
+				transactionStore.awaitWalletConfirmation()
+				const approveHash = await writeContract({
+					address: tokenAddress,
+					abi: erc20Abi,
+					functionName: 'approve',
+					args: [lockVaultAddress, maxUint256]
+				})
+				transactionStore.awaitTxReceipt(approveHash)
+				const approveReceipt = await waitForTransaction(approveHash)
+				if (!approveReceipt) {
+					transactionStore.transactionError({ message: 'Approval failed' })
+					isLoading = false
+					return
+				}
 				transactionStore.reset()
-				return
+				await fetchContractData()
 			}
 
+			transactionStore.awaitWalletConfirmation(true)
 			const hash = await writeContract({
 				address: lockVaultAddress,
 				abi: holoLockVaultAbi,
@@ -234,7 +209,7 @@
 				await fetchContractData()
 			}
 		} catch (e: any) {
-			const message = e?.message || 'Lock transaction failed'
+			const message = e?.message || 'Transaction failed'
 			error = message
 			transactionStore.transactionError({ message: error })
 			console.error(e)
@@ -243,11 +218,8 @@
 		}
 	}
 
-	// Calculate if we need approval
 	$: amountWei = amount ? parseUnits(amount, tokenDecimals) : 0n
-	$: needsApproval = amountWei > 0n && tokenAllowance < amountWei
 	$: hasValidAgent = !!agentHex
-	$: if (needsApproval) approvalJustCompleted = false
 </script>
 
 <Card size="xl" class="flex flex-col gap-4">
@@ -353,38 +325,18 @@
 				<Alert color="red">{error}</Alert>
 			{/if}
 
-			{#if approvalJustCompleted && !needsApproval}
-				<Alert color="green">
-					Approval confirmed &mdash; now finalize by locking your {tokenSymbol}.
-				</Alert>
-			{/if}
-
-			<!-- Action Buttons -->
+			<!-- Single action: Lock (approve is done automatically first if needed) -->
 			<div class="flex flex-row gap-2">
-				{#if needsApproval}
-					<Button
-						class="w-fit"
-						color="alternative"
-						on:click={handleApprove}
-						disabled={isLoading || !amount}
-					>
-						{#if isLoading}
-							<Spinner size="4" class="mr-2" />
-						{/if}
-						Approve {tokenSymbol}
-					</Button>
-				{:else}
-					<Button
-						class="w-fit"
-						on:click={handleLock}
-						disabled={isLoading || !amount || !hasValidAgent}
-					>
-						{#if isLoading}
-							<Spinner size="4" class="mr-2" />
-						{/if}
-						Lock {tokenSymbol}
-					</Button>
-				{/if}
+				<Button
+					class="w-fit"
+					on:click={handleLock}
+					disabled={isLoading || !amount || !hasValidAgent}
+				>
+					{#if isLoading}
+						<Spinner size="4" class="mr-2" />
+					{/if}
+					Lock {tokenSymbol}
+				</Button>
 			</div>
 
 			<!-- Vault Info -->
