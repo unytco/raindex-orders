@@ -5,6 +5,10 @@
 	$: isLockSuccess =
 		$transactionStore.status === TransactionStatus.SUCCESS && $transactionStore.isLockTransaction
 
+	$: isPending =
+		$transactionStore.status === TransactionStatus.PENDING_WALLET ||
+		$transactionStore.status === TransactionStatus.PENDING_TX
+
 	function unescapeString(str) {
 		return str
 			.replace(/\\n/g, '\n')
@@ -17,10 +21,11 @@
 
 <Modal
 	on:close={() => {
-		if (!isLockSuccess) transactionStore.reset()
+		if (!isLockSuccess && !isPending) transactionStore.reset()
 	}}
 	open={$transactionStore.status !== TransactionStatus.IDLE}
-	dismissable={!isLockSuccess}
+	dismissable={!isLockSuccess && !isPending}
+	placement="center"
 >
 	<div class="p-4">
 		<div class="flex flex-col items-center justify-center gap-2">
@@ -57,10 +62,10 @@
 				{#if isLockSuccess}
 					<p class="text-lg font-semibold">Lock successful!</p>
 				<p class="text-sm text-gray-600 dark:text-gray-400">
-					Your Mirrored-HOT will be credited in your Unyt app shortly.
+					Your Wrapped-HOT will be credited in your Unyt app within a few minutes.
 				</p>
 				<p class="text-sm text-gray-600 dark:text-gray-400">
-					Please return to your Unyt app to finalize the bridge transfer.
+					You can now close this tab and return to your Unyt app to finalize the bridge transfer.
 				</p>
 				{:else}
 					{$transactionStore.status}

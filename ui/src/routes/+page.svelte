@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Button, Card, Alert } from 'flowbite-svelte'
 	import { ethereumStore, connectWallet, switchToSepolia } from '$lib/ethereum'
+	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 
 	const SEPOLIA_CHAIN_ID = 11155111
 
@@ -11,6 +12,13 @@
 
 	function truncateAddress(addr: string): string {
 		return `${addr.slice(0, 6)}...${addr.slice(-4)}`
+	}
+
+	let showConnectModal = false
+	async function handleConnect() {
+		showConnectModal = true
+		await connectWallet()
+		showConnectModal = false
 	}
 </script>
 
@@ -24,7 +32,7 @@
 		<Alert color="blue" class="text-center">
 			Connect your wallet to get started
 		</Alert>
-		<Button class="w-full" on:click={connectWallet}>
+		<Button class="w-full" on:click={handleConnect}>
 			Connect Wallet
 		</Button>
 	{:else}
@@ -93,3 +101,5 @@
 		<Alert color="red">{$ethereumStore.error}</Alert>
 	{/if}
 </Card>
+
+<ConnectWalletModal open={showConnectModal} />
