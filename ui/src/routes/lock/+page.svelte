@@ -7,6 +7,7 @@
 	import { onMount } from 'svelte'
 	import { browser } from '$app/environment'
 	import TransactionModal from '$lib/components/TransactionModal.svelte'
+	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 	import { PUBLIC_LOCK_VAULT_ADDRESS, PUBLIC_TOKEN_ADDRESS } from '$env/static/public'
 	import {
 		ethereumStore,
@@ -38,7 +39,8 @@
 	const tokenAddress = PUBLIC_TOKEN_ADDRESS
 
 	// Check if contracts are configured
-	const isZeroAddress = (addr: string) => !addr || addr === '0x0000000000000000000000000000000000000000'
+	const isZeroAddress = (addr: string) =>
+		!addr || addr === '0x0000000000000000000000000000000000000000'
 	const isConfigured = !isZeroAddress(lockVaultAddress) && !isZeroAddress(tokenAddress)
 
 	// Reactive account
@@ -236,10 +238,15 @@
 
 	$: amountWei = amount ? parseUnits(amount, tokenDecimals) : 0n
 	$: hasValidAgent = !!agentHex
+	let showConnectModal = false
+	async function handleConnect() {
+		showConnectModal = true
+		await connectWallet()
+		showConnectModal = false
+	}
 </script>
 
 <Card size="xl" class="flex flex-col gap-4">
-
 	<h1 class="text-2xl font-bold">Lock HOT for Mirrored-HOT</h1>
 	<p class="text-gray-600">
 		Lock your HOT tokens to receive Mirrored-HOT on Unyt. Your Mirrored-HOT will be credited to the
@@ -248,20 +255,22 @@
 
 	{#if !isConfigured}
 		<Alert color="yellow">
-			<span class="font-semibold">Contracts not configured.</span> The Lock Vault contract address needs to be set in the environment variables.
-			Please deploy the contracts and update <code>PUBLIC_LOCK_VAULT_ADDRESS</code> in your <code>.env</code> file.
+			<span class="font-semibold">Contracts not configured.</span> The Lock Vault contract address
+			needs to be set in the environment variables. Please deploy the contracts and update
+			<code>PUBLIC_LOCK_VAULT_ADDRESS</code>
+			in your <code>.env</code> file.
 		</Alert>
 	{:else if !isConnected}
-		<Alert color="blue"> Please connect your wallet to continue. </Alert>
-		<Button on:click={connectWallet}>Connect Wallet</Button>
+		<Alert color="blue">Please connect your wallet to continue.</Alert>
+		<Button on:click={handleConnect}>Connect Wallet</Button>
 	{:else}
 		<div class="space-y-4">
 			<!-- Balance Info -->
 			<div class="bg-gray-50 p-4 rounded-lg">
 				<p class="text-sm text-gray-600">Your {tokenSymbol} Balance</p>
 				<p class="text-xl font-semibold">
-				{formatToken(tokenBalance, tokenDecimals)}
-				{tokenSymbol}
+					{formatToken(tokenBalance, tokenDecimals)}
+					{tokenSymbol}
 				</p>
 			</div>
 
@@ -277,18 +286,18 @@
 						{amount}
 					</div>
 				{:else}
-				<Input
-					id="amount"
-					type="number"
-					step="0.000001"
-					placeholder="0.0"
-					bind:value={amount}
-					disabled={isLoading}
-				/>
+					<Input
+						id="amount"
+						type="number"
+						step="0.000001"
+						placeholder="0.0"
+						bind:value={amount}
+						disabled={isLoading}
+					/>
 				{/if}
 				<Helper class="mt-1">
-				Minimum: {formatToken(minLockAmount, tokenDecimals)}
-				{tokenSymbol}
+					Minimum: {formatToken(minLockAmount, tokenDecimals)}
+					{tokenSymbol}
 				</Helper>
 			</div>
 
@@ -316,18 +325,27 @@
 					{#if agentPrefilledFromUrl}
 						Agent key from URL (read-only). This is where your Mirrored-HOT will be sent.
 					{:else}
-						Paste your Holochain agent key (e.g. uhCA...). This is where your Mirrored-HOT will be sent. It is converted to hex for the contract below.
+						Paste your Holochain agent key (e.g. uhCA...). This is where your Mirrored-HOT will be
+						sent. It is converted to hex for the contract below.
 					{/if}
 				</Helper>
 				{#if agentInput && hasValidAgent}
-					<div class="mt-2 space-y-2 rounded-lg border border-gray-200 bg-gray-50 p-3 dark:border-gray-600 dark:bg-gray-700">
+					<div
+						class="mt-2 space-y-2 rounded-lg border border-gray-200 bg-gray-50 p-3 dark:border-gray-600 dark:bg-gray-700"
+					>
 						<div>
 							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain key</p>
-							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{agentInput}</p>
+							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
+								{agentInput}
+							</p>
 						</div>
 						<div>
-							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Ethereum (hex, used for lock)</p>
-							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">{agentHex}</p>
+							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">
+								Ethereum (hex, used for lock)
+							</p>
+							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
+								{agentHex}
+							</p>
 						</div>
 					</div>
 				{:else if agentInput}
@@ -375,3 +393,4 @@
 </Card>
 
 <TransactionModal />
+<ConnectWalletModal open={showConnectModal} />

@@ -4,6 +4,7 @@
 	import { formatUnits, type Hex, isAddress } from 'viem'
 	import { transactionStore } from '$lib/stores/transactionStore'
 	import TransactionModal from '$lib/components/TransactionModal.svelte'
+	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 	import { PUBLIC_ORDERBOOK_ADDRESS } from '$env/static/public'
 	import { deserializeSignedContext, parseCoupon, type SignedContextV1Struct } from '$lib/coupon'
 	import { getOrderConfig, buildOrderStruct, type OrderConfig } from '$lib/orderConfig'
@@ -116,6 +117,7 @@
 	let isLoading = false
 	let error = ''
 	let success = false
+	let successTxHash = ''
 
 	const handleClaim = async () => {
 		if (!signedContext) return
@@ -159,7 +161,7 @@
 			if (receipt) {
 				transactionStore.transactionSuccess(hash)
 				success = true
-				// Refresh vault balance
+				successTxHash = hash
 				await getVaultBalance()
 			}
 		} catch (e: any) {
@@ -174,54 +176,34 @@
 	function truncateAddress(addr: string): string {
 		return `${addr.slice(0, 10)}...${addr.slice(-8)}`
 	}
+
+	let showConnectModal = false
+	async function handleConnect() {
+		showConnectModal = true
+		await connectWallet()
+		showConnectModal = false
+	}
 </script>
 
 <Card size="xl" class="flex flex-col gap-4">
-
-
-	<h1 class="text-2xl font-bold">Claim HOT</h1>
-	<p class="text-gray-600">
-		Redeem your Mirrored-HOT claim coupon to receive HOT tokens on Ethereum.
-	</p>
-
-	{#if !isConnected}
-		<Alert color="blue"> Please connect your wallet to continue. </Alert>
-		<Button on:click={connectWallet}>Connect Wallet</Button>
-	{:else}
-		<div class="space-y-4">
-			<!-- Coupon Input -->
-			<div>
-				<Label for="coupon" class="mb-2">Claim Coupon</Label>
-				{#if couponPrefilledFromUrl}
-					<div
-						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default break-all"
-						style="user-select: none; -webkit-user-select: none;"
-						aria-readonly="true"
-					>
-						{couponInput}
-					</div>
-				{:else}
-					<Input
-						id="coupon"
-						type="text"
-						placeholder="Paste your coupon code here..."
-						bind:value={couponInput}
-						on:input={parseCouponInput}
-						disabled={isLoading}
-					/>
-				{/if}
+	{#if success}
+		<div class="flex flex-col items-center justify-center gap-4 py-8">
+			<div class="flex h-20 w-20 items-center justify-center rounded-full bg-green-100 dark:bg-green-900">
+				<span class="text-4xl">✅</span>
 			</div>
+			<h1 class="text-2xl font-bold">Claim Successful!</h1>
+			<p class="text-center text-gray-600">
+				Your HOT tokens have been transferred to your wallet.
+			</p>
 
-			{#if isCheckingOrder}
-				<div class="flex items-center justify-center py-8">
-					<Spinner size="16" />
-				</div>
-			{:else if coupon && orderConfig && orderExists}
-				<!-- Coupon Details -->
-				<div class="bg-gray-50 p-4 rounded-lg space-y-2">
-					<h3 class="font-semibold mb-2">Coupon Details</h3>
-
+			{#if coupon && orderConfig}
+				<div class="bg-gray-50 p-4 rounded-lg space-y-2 w-full max-w-md">
 					<div class="grid grid-cols-2 gap-2 text-sm">
+						<span class="text-gray-600">Amount:</span>
+						<span class="font-semibold">
+							{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} HOT
+						</span>
+
 						<span class="text-gray-600">Recipient:</span>
 						<a
 							class="font-mono hover:underline text-blue-600"
@@ -230,62 +212,118 @@
 						>
 							{truncateAddress(coupon.recipient)}
 						</a>
-
-						<span class="text-gray-600">Amount:</span>
-						<span class="font-semibold">
-							{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} HOT
-						</span>
-
-						<span class="text-gray-600">Expires:</span>
-						<span class={new Date(coupon.expiryTimestamp * 1000) < new Date() ? 'text-red-500' : ''}>
-							{new Date(coupon.expiryTimestamp * 1000).toLocaleString()}
-						</span>
 					</div>
 				</div>
+			{/if}
 
-				<!-- Vault Balance -->
-				{#if vaultBalance !== undefined}
-					<div class="text-sm text-gray-600">
-						Vault Balance: {formatUnits(vaultBalance, orderConfig.outputDecimals)} HOT
-					</div>
-				{/if}
-
-				<!-- Error Display -->
-				{#if error}
-					<Alert color="red">{error}</Alert>
-				{/if}
-
-				<!-- Success Display -->
-				{#if success}
-					<Alert color="green">
-						Claim successful! Your HOT tokens have been transferred to your wallet.
-					</Alert>
-				{/if}
-
-				<!-- Action Button -->
-				<Button
-					class="w-fit"
-					on:click={handleClaim}
-					disabled={isLoading || !signedContext || !orderConfig}
+			{#if successTxHash}
+				<a
+					class="text-blue-500 hover:underline"
+					href={`https://sepolia.etherscan.io/tx/${successTxHash}`}
+					target="_blank"
 				>
-					{#if isLoading}
-						<Spinner size="4" class="mr-2" />
-					{/if}
-					Claim HOT
-				</Button>
-			{:else if couponInput && !coupon}
-				<Alert color="red">Invalid coupon format. Please check and try again.</Alert>
-			{:else if coupon && !orderConfig}
-				<Alert color="yellow">Unknown order. This coupon is for an unrecognized order.</Alert>
-			{:else if coupon && orderConfig && !orderExists}
-				<Alert color="yellow">Order not found on-chain. The order may have been removed.</Alert>
-			{:else}
-				<Alert color="blue">
-					Enter your claim coupon above. You should have received this after burning Mirrored-HOT.
-				</Alert>
+					View transaction on Etherscan
+				</a>
 			{/if}
 		</div>
+	{:else}
+		<h1 class="text-2xl font-bold">Claim HOT</h1>
+		<p class="text-gray-600">
+			Redeem your Mirrored-HOT claim coupon to receive HOT tokens on Ethereum.
+		</p>
+
+		{#if !isConnected}
+			<Alert color="blue"> Please connect your wallet to continue. </Alert>
+			<Button on:click={handleConnect}>Connect Wallet</Button>
+		{:else}
+			<div class="space-y-4">
+				<div>
+					<Label for="coupon" class="mb-2">Claim Coupon</Label>
+					{#if couponPrefilledFromUrl}
+						<div
+							class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default break-all"
+							style="user-select: none; -webkit-user-select: none;"
+							aria-readonly="true"
+						>
+							{couponInput}
+						</div>
+					{:else}
+						<Input
+							id="coupon"
+							type="text"
+							placeholder="Paste your coupon code here..."
+							bind:value={couponInput}
+							on:input={parseCouponInput}
+							disabled={isLoading}
+						/>
+					{/if}
+				</div>
+
+				{#if isCheckingOrder}
+					<div class="flex items-center justify-center py-8">
+						<Spinner size="16" />
+					</div>
+				{:else if coupon && orderConfig && orderExists}
+					<div class="bg-gray-50 p-4 rounded-lg space-y-2">
+						<h3 class="font-semibold mb-2">Coupon Details</h3>
+
+						<div class="grid grid-cols-2 gap-2 text-sm">
+							<span class="text-gray-600">Recipient:</span>
+							<a
+								class="font-mono hover:underline text-blue-600"
+								href={`https://sepolia.etherscan.io/address/${coupon.recipient}`}
+								target="_blank"
+							>
+								{truncateAddress(coupon.recipient)}
+							</a>
+
+							<span class="text-gray-600">Amount:</span>
+							<span class="font-semibold">
+								{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} HOT
+							</span>
+
+							<span class="text-gray-600">Expires:</span>
+							<span class={new Date(coupon.expiryTimestamp * 1000) < new Date() ? 'text-red-500' : ''}>
+								{new Date(coupon.expiryTimestamp * 1000).toLocaleString()}
+							</span>
+						</div>
+					</div>
+
+					{#if vaultBalance !== undefined}
+						<div class="text-sm text-gray-600">
+							Vault Balance: {formatUnits(vaultBalance, orderConfig.outputDecimals)} HOT
+						</div>
+					{/if}
+
+					{#if error}
+						<Alert color="red">{error}</Alert>
+					{/if}
+
+					<Button
+						class="w-fit"
+						on:click={handleClaim}
+						disabled={isLoading || success || !signedContext || !orderConfig}
+					>
+						{#if isLoading}
+							<Spinner size="4" class="mr-2" />
+						{/if}
+						Claim HOT
+					</Button>
+				{:else if couponInput && !coupon}
+					<Alert color="red">Invalid coupon format. Please check and try again.</Alert>
+				{:else if coupon && !orderConfig}
+					<Alert color="yellow">Unknown order. This coupon is for an unrecognized order.</Alert>
+				{:else if coupon && orderConfig && !orderExists}
+					<Alert color="yellow">Order not found on-chain. The order may have been removed.</Alert>
+				{:else}
+					<Alert color="blue">
+						Enter your claim coupon above. You should have received this after burning Mirrored-HOT.
+					</Alert>
+				{/if}
+			</div>
+		{/if}
 	{/if}
 </Card>
 
 <TransactionModal />
+<ConnectWalletModal open={showConnectModal} />
