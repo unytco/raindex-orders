@@ -400,16 +400,16 @@ impl LockWatcher {
     }
 }
 
-/// Format amount with 18 decimals for display
+/// Format amount with 18 decimals for display (6 decimal places)
 pub fn format_amount(amount: &str) -> String {
     let amount: U256 = amount.parse().unwrap_or_default();
     let decimals = U256::from(10).pow(U256::from(18));
     let whole = amount / decimals;
-    let frac = (amount % decimals) / U256::from(10).pow(U256::from(14)); // 4 decimal places
+    let frac = (amount % decimals) / U256::from(10).pow(U256::from(12));
 
     if frac.is_zero() {
         whole.to_string()
     } else {
-        format!("{}.{:04}", whole, frac)
+        format!("{}.{:06}", whole, frac)
     }
 }

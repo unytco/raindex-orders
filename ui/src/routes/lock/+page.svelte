@@ -114,6 +114,14 @@
 	}
 	$: agentHex = getAgentHex(agentInput)
 
+	function formatToken(value: bigint, decimals: number): string {
+		const full = formatUnits(value, decimals)
+		const [whole, frac] = full.split('.')
+		if (!frac) return whole
+		const trimmed = frac.slice(0, MAX_DECIMAL_PLACES).replace(/0+$/, '')
+		return trimmed ? `${whole}.${trimmed}` : whole
+	}
+
 	// Get parameters from URL on mount
 	onMount(() => {
 		if (browser) {
@@ -148,6 +156,8 @@
 		}
 	})
 
+	const MAX_DECIMAL_PLACES = 6
+
 	// Handle lock (runs approve first if needed, then lock — single action for the user)
 	async function handleLock() {
 		if (!amount || !agentHex) return
@@ -155,6 +165,12 @@
 		// Validate we have a converted hex (from Holochain key)
 		if (!agentHex) {
 			error = 'Invalid Unyt agent public key. Provide a Holochain agent key (uhCA...).'
+			return
+		}
+
+		const parts = amount.split('.')
+		if (parts.length === 2 && parts[1].length > MAX_DECIMAL_PLACES) {
+			error = `Amount can have at most ${MAX_DECIMAL_PLACES} decimal places.`
 			return
 		}
 
@@ -166,7 +182,7 @@
 
 			// Check minimum amount
 			if (amountWei < minLockAmount) {
-				error = `Amount must be at least ${formatUnits(minLockAmount, tokenDecimals)} ${tokenSymbol}`
+				error = `Amount must be at least ${formatToken(minLockAmount, tokenDecimals)} ${tokenSymbol}`
 				isLoading = false
 				transactionStore.reset()
 				return
@@ -244,8 +260,8 @@
 			<div class="bg-gray-50 p-4 rounded-lg">
 				<p class="text-sm text-gray-600">Your {tokenSymbol} Balance</p>
 				<p class="text-xl font-semibold">
-					{formatUnits(tokenBalance, tokenDecimals)}
-					{tokenSymbol}
+				{formatToken(tokenBalance, tokenDecimals)}
+				{tokenSymbol}
 				</p>
 			</div>
 
@@ -261,17 +277,18 @@
 						{amount}
 					</div>
 				{:else}
-					<Input
-						id="amount"
-						type="number"
-						placeholder="0.0"
-						bind:value={amount}
-						disabled={isLoading}
-					/>
+				<Input
+					id="amount"
+					type="number"
+					step="0.000001"
+					placeholder="0.0"
+					bind:value={amount}
+					disabled={isLoading}
+				/>
 				{/if}
 				<Helper class="mt-1">
-					Minimum: {formatUnits(minLockAmount, tokenDecimals)}
-					{tokenSymbol}
+				Minimum: {formatToken(minLockAmount, tokenDecimals)}
+				{tokenSymbol}
 				</Helper>
 			</div>
 
