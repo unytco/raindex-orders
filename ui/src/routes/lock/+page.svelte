@@ -247,9 +247,9 @@
 </script>
 
 <Card size="xl" class="flex flex-col gap-4">
-	<h1 class="text-2xl font-bold">Lock HOT for Mirrored-HOT</h1>
+	<h1 class="text-2xl font-bold">Lock HOT for Wrapped-HOT</h1>
 	<p class="text-gray-600">
-		Lock your HOT tokens to receive Mirrored-HOT on Unyt. Your Mirrored-HOT will be credited to the
+		Lock your HOT tokens to receive Wrapped-HOT on Unyt. Your Wrapped-HOT will be credited to the
 		specified agent.
 	</p>
 
@@ -323,10 +323,10 @@
 				{/if}
 				<Helper class="mt-1">
 					{#if agentPrefilledFromUrl}
-						Agent key from URL (read-only). This is where your Mirrored-HOT will be sent.
-					{:else}
-						Paste your Holochain agent key (e.g. uhCA...). This is where your Mirrored-HOT will be
-						sent. It is converted to hex for the contract below.
+					Agent key from URL (read-only). This is where your Wrapped-HOT will be sent.
+				{:else}
+					Paste your Holochain agent key (e.g. uhCA...). This is where your Wrapped-HOT will be
+					sent. It is converted to hex for the contract below.
 					{/if}
 				</Helper>
 				{#if agentInput && hasValidAgent}
@@ -363,7 +363,7 @@
 			<!-- Single action: Lock (approve is done automatically first if needed) -->
 			<div class="flex flex-row gap-2">
 				<Button
-					class="w-fit"
+					class="w-fit disabled:!bg-primary-300 disabled:!opacity-100"
 					on:click={handleLock}
 					disabled={isLoading || !amount || !hasValidAgent}
 				>
