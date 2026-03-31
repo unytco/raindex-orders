@@ -90,7 +90,7 @@
 
 <div class="container mx-auto max-w-2xl p-4">
 
-	<h1 class="mb-6 text-3xl font-bold">MockHOT Faucet</h1>
+	<h1 class="mb-6 text-3xl font-bold">Mock HOT Faucet</h1>
 
 	<Card size="xl" class="mb-4">
 		<div class="mb-4 rounded-lg bg-blue-50 p-4">
@@ -102,7 +102,7 @@
 				</div>
 			{:else}
 				<div class="text-sm text-gray-700">
-					<p><strong>Available:</strong> {faucetBalance} mockHOT</p>
+					<p><strong>Available:</strong> {faucetBalance} mock HOT</p>
 					<p class="break-all text-xs text-gray-600"><strong>Address:</strong> {faucetAddress}</p>
 				</div>
 			{/if}
@@ -111,7 +111,7 @@
 		<div class="mb-4 rounded-lg bg-yellow-50 p-4">
 			<h3 class="mb-2 font-semibold">Rate Limit</h3>
 			<p class="text-sm text-gray-700">
-				Each address can receive <strong>1000 mockHOT</strong> every <strong>10 minutes</strong>.
+				Each address can receive <strong>1000 mock HOT</strong> every <strong>10 minutes</strong>.
 			</p>
 		</div>
 
@@ -125,7 +125,7 @@
 					<Spinner class="mr-2" size="4" />
 					Sending...
 				{:else}
-					Request 1000 mockHOT
+					Request 1000 mock HOT
 				{/if}
 			</Button>
 		</div>
@@ -140,7 +140,7 @@
 	{#if success}
 		<Alert color="green" class="mb-4">
 			<div>
-				<p class="font-medium">✓ Successfully sent 1000 mockHOT!</p>
+				<p class="font-medium">✓ Successfully sent 1000 mock HOT!</p>
 				<p class="mt-2 text-sm">Transaction Hash:</p>
 				<a
 					href="https://sepolia.etherscan.io/tx/{txHash}"
@@ -158,10 +158,10 @@
 		<h3 class="mb-2 text-lg font-semibold">About This Faucet</h3>
 		<div class="text-sm text-gray-600">
 			<p class="mb-2">
-				This faucet provides mockHOT tokens on Sepolia testnet for testing the HOT Bridge.
+				This faucet provides mock HOT tokens on Sepolia testnet for testing the HOT Bridge.
 			</p>
 			<ul class="list-inside list-disc space-y-1">
-				<li>Get 1000 mockHOT per request</li>
+				<li>Get 1000 mock HOT per request</li>
 				<li>10 minute cooldown between requests per address</li>
 				<li>Free testnet tokens for development and testing</li>
 			</ul>
