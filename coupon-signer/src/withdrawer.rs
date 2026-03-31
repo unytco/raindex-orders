@@ -62,17 +62,54 @@ pub async fn run_withdrawer(withdrawer_args: WithdrawerArgs) -> Result<()> {
         )
         .await?;
 
+    let total = result.len();
     eprintln!(
         "Number of links found for bridging agreement: {} : {}",
-        bridging_agreement_id,
-        result.len()
+        bridging_agreement_id, total
     );
+
+    let signer_ctx = SignerContext::from_env()
+        .context("Load signer context (ORDER_HASH, ORDER_OWNER, etc.) for coupon")?;
+
+    let mut success_count = 0usize;
+    let mut fail_count = 0usize;
 
     // Execute each link individually to manage the size of the inputs.
     for transaction in result {
-        let _ = process_transaction(&ham, role_name, bridging_agreement_id.clone(), transaction)
-            .await?;
+        match process_transaction(
+            &ham,
+            role_name,
+            bridging_agreement_id.clone(),
+            transaction.clone(),
+            &signer_ctx,
+        )
+        .await
+        {
+            Ok(_) => {
+                success_count += 1;
+                eprintln!(
+                    "[process_transaction] Transaction processed successfully: {:?}",
+                    transaction.id
+                );
+            }
+            Err(e) => {
+                fail_count += 1;
+                eprintln!(
+                    "[process_transaction] Error processing transaction: {}, ID: {:?}, Amount:{:?}",
+                    e, transaction.id, transaction.amount
+                );
+            }
+        }
     }
+
+    eprintln!(
+        "Summary: {}/{} succeeded, {} failed",
+        success_count, total, fail_count
+    );
+    if fail_count > 0 && success_count == 0 {
+        anyhow::bail!("All {} transactions failed", total);
+    }
+
     Ok(())
 }
 
@@ -82,6 +119,7 @@ async fn process_transaction(
     role_name: &str,
     bridging_agreement_id: String,
     transaction: Transaction,
+    ctx: &SignerContext,
 ) -> Result<()> {
     eprintln!(
         "[process_transaction] Starting processing for transaction: {:?}",
@@ -122,9 +160,7 @@ async fn process_transaction(
         "[process_transaction] Recipient: {}, generating coupon...",
         recipient
     );
-    let ctx = SignerContext::from_env()
-        .context("Load signer context (ORDER_HASH, ORDER_OWNER, etc.) for coupon")?;
-    let (_, coupon) = generate_coupon_with_context(&amount, &recipient, &ctx).await?;
+    let (_, coupon) = generate_coupon_with_context(&amount, &recipient, ctx).await?;
     eprintln!("[process_transaction] Coupon generated successfully");
     eprintln!(
         "[process_transaction] Building RAVEExecuteInputs payload for EA: {}",
