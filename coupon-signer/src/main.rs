@@ -19,7 +19,7 @@ use std::env;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct SignArgs {
-    /// Amount of HOT to claim (use decimal like "1.5" for 1.5 HOT, or wei amount)
+    /// Amount of HOT to claim (e.g. "1001" for 1001 HOT, or "1.5" for 1.5 HOT)
     #[arg(short, long)]
     amount: String,
 
