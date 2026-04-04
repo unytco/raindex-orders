@@ -317,18 +317,9 @@ fn parse_amount(amount_str: &str) -> Result<U256> {
 
         Ok(whole * scale + frac * frac_scale)
     } else {
-        // Assume it's already in wei if no decimal point
-        // But if it's a small number, assume it's in HOT
         let value: U256 = amount_str.parse().context("Invalid amount")?;
-
-        // If the number is less than 1000, assume it's HOT and convert to wei
-        if value < U256::from(1000) {
-            let scale = U256::from(10).pow(U256::from(18));
-            Ok(value * scale)
-        } else {
-            // Assume it's already in wei
-            Ok(value)
-        }
+        let scale = U256::from(10).pow(U256::from(18));
+        Ok(value * scale)
     }
 }
 
@@ -345,14 +336,19 @@ mod tests {
     #[test]
     fn test_parse_amount_whole() {
         let amount = parse_amount("10").unwrap();
-        // 10 < 1000, so treated as HOT
         assert_eq!(amount, U256::from(10_000_000_000_000_000_000u128));
     }
 
     #[test]
-    fn test_parse_amount_wei() {
-        let amount = parse_amount("1000000000000000000").unwrap();
-        // Large number, treated as wei
-        assert_eq!(amount, U256::from(1_000_000_000_000_000_000u64));
+    fn test_parse_amount_above_1000() {
+        let amount = parse_amount("1001").unwrap();
+        // 1001 HOT = 1001 * 10^18 wei
+        assert_eq!(amount, U256::from(1001u64) * U256::from(10).pow(U256::from(18)));
+    }
+
+    #[test]
+    fn test_parse_amount_large_whole() {
+        let amount = parse_amount("50000").unwrap();
+        assert_eq!(amount, U256::from(50000u64) * U256::from(10).pow(U256::from(18)));
     }
 }

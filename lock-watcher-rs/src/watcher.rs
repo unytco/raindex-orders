@@ -49,41 +49,65 @@ impl LockWatcher {
         Ok(block_number)
     }
 
-    /// Fetch historical Lock events from a range of blocks
+    /// Maximum block range per `eth_getLogs` request (Alchemy free-tier limit).
+    const MAX_BLOCK_RANGE: u64 = 10;
+
+    /// Fetch historical Lock events from a range of blocks, chunking into
+    /// batches of at most `MAX_BLOCK_RANGE` blocks to stay within RPC provider
+    /// free-tier limits.
     pub async fn fetch_historical_locks(
         &self,
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<LockRecord>> {
         info!(
-            "Fetching locks from block {} to {}...",
-            from_block, to_block
+            "Fetching locks from block {} to {} ({} blocks)...",
+            from_block,
+            to_block,
+            to_block.saturating_sub(from_block) + 1,
         );
 
         let provider = self.create_provider()?;
-
-        let filter = Filter::new()
-            .address(self.config.network_config.lock_vault_address)
-            .event_signature(Lock::SIGNATURE_HASH)
-            .from_block(from_block)
-            .to_block(to_block);
-
-        let logs = provider.get_logs(&filter).await?;
-
-        if !logs.is_empty() {
-            info!("Found {} Lock event(s)", logs.len());
-        }
-
         let mut records = Vec::new();
-        for log in logs {
-            if let Some(record) = self.process_lock_log(&provider, log).await? {
-                records.push(record);
-            }
-        }
+        let mut chunk_start = from_block;
 
-        // Update last processed block
-        self.db
-            .set_last_processed_block(self.config.network_config.chain_id, to_block)?;
+        while chunk_start <= to_block {
+            let chunk_end = (chunk_start + Self::MAX_BLOCK_RANGE - 1).min(to_block);
+
+            debug!(
+                "Querying logs for block range {} - {} ...",
+                chunk_start, chunk_end
+            );
+
+            let filter = Filter::new()
+                .address(self.config.network_config.lock_vault_address)
+                .event_signature(Lock::SIGNATURE_HASH)
+                .from_block(chunk_start)
+                .to_block(chunk_end);
+
+            let logs = provider.get_logs(&filter).await?;
+
+            if !logs.is_empty() {
+                info!(
+                    "Found {} Lock event(s) in blocks {} - {}",
+                    logs.len(),
+                    chunk_start,
+                    chunk_end
+                );
+            }
+
+            for log in logs {
+                if let Some(record) = self.process_lock_log(&provider, log).await? {
+                    records.push(record);
+                }
+            }
+
+            // Update last processed block after each chunk so progress is saved
+            self.db
+                .set_last_processed_block(self.config.network_config.chain_id, chunk_end)?;
+
+            chunk_start = chunk_end + 1;
+        }
 
         Ok(records)
     }
