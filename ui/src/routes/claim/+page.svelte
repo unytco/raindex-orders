@@ -188,12 +188,14 @@
 <Card size="xl" class="flex flex-col gap-4">
 	{#if success}
 		<div class="flex flex-col items-center justify-center gap-4 py-8">
-			<div class="flex h-20 w-20 items-center justify-center rounded-full bg-green-100 dark:bg-green-900">
+			<div
+				class="flex h-20 w-20 items-center justify-center rounded-full bg-green-100 dark:bg-green-900"
+			>
 				<span class="text-4xl">✅</span>
 			</div>
 			<h1 class="text-2xl font-bold">Claim Successful!</h1>
 			<p class="text-center text-gray-600">
-				Your HOT tokens have been transferred to your wallet.
+				Your mock HOT tokens have been transferred to your wallet.
 			</p>
 
 			{#if coupon && orderConfig}
@@ -201,7 +203,7 @@
 					<div class="grid grid-cols-2 gap-2 text-sm">
 						<span class="text-gray-600">Amount:</span>
 						<span class="font-semibold">
-							{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} HOT
+							{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} mock HOT
 						</span>
 
 						<span class="text-gray-600">Recipient:</span>
@@ -227,13 +229,13 @@
 			{/if}
 		</div>
 	{:else}
-		<h1 class="text-2xl font-bold">Claim HOT</h1>
+		<h1 class="text-2xl font-bold">Claim mock HOT</h1>
 		<p class="text-gray-600">
-			Redeem your Mirrored-HOT claim coupon to receive HOT tokens on Ethereum.
+			Redeem your mock HOT claim coupon to receive mock HOT tokens on Ethereum.
 		</p>
 
 		{#if !isConnected}
-			<Alert color="blue"> Please connect your wallet to continue. </Alert>
+			<Alert color="blue">Please connect your wallet to continue.</Alert>
 			<Button on:click={handleConnect}>Connect Wallet</Button>
 		{:else}
 			<div class="space-y-4">
@@ -279,11 +281,13 @@
 
 							<span class="text-gray-600">Amount:</span>
 							<span class="font-semibold">
-								{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} HOT
+								{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} mock HOT
 							</span>
 
 							<span class="text-gray-600">Expires:</span>
-							<span class={new Date(coupon.expiryTimestamp * 1000) < new Date() ? 'text-red-500' : ''}>
+							<span
+								class={new Date(coupon.expiryTimestamp * 1000) < new Date() ? 'text-red-500' : ''}
+							>
 								{new Date(coupon.expiryTimestamp * 1000).toLocaleString()}
 							</span>
 						</div>
@@ -291,7 +295,7 @@
 
 					{#if vaultBalance !== undefined}
 						<div class="text-sm text-gray-600">
-							Vault Balance: {formatUnits(vaultBalance, orderConfig.outputDecimals)} HOT
+							Vault Balance: {formatUnits(vaultBalance, orderConfig.outputDecimals)} mock HOT
 						</div>
 					{/if}
 
@@ -307,7 +311,7 @@
 						{#if isLoading}
 							<Spinner size="4" class="mr-2" />
 						{/if}
-						Claim HOT
+						Claim mock HOT
 					</Button>
 				{:else if couponInput && !coupon}
 					<Alert color="red">Invalid coupon format. Please check and try again.</Alert>
@@ -317,7 +321,7 @@
 					<Alert color="yellow">Order not found on-chain. The order may have been removed.</Alert>
 				{:else}
 					<Alert color="blue">
-						Enter your claim coupon above. You should have received this after burning Mirrored-HOT.
+						Enter your claim coupon above. You should have received this after burning mock HOT.
 					</Alert>
 				{/if}
 			</div>

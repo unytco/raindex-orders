@@ -29,12 +29,8 @@
 	</div>
 
 	{#if !isConnected}
-		<Alert color="blue" class="text-center">
-			Connect your wallet to get started
-		</Alert>
-		<Button class="w-full" on:click={handleConnect}>
-			Connect Wallet
-		</Button>
+		<Alert color="blue" class="text-center">Connect your wallet to get started</Alert>
+		<Button class="w-full" on:click={handleConnect}>Connect Wallet</Button>
 	{:else}
 		<div class="bg-gray-50 p-4 rounded-lg text-center">
 			<p class="text-sm text-gray-600">Connected</p>
@@ -47,12 +43,10 @@
 		</div>
 
 		{#if isWrongNetwork}
-			<Button class="w-full" color="red" on:click={switchToSepolia}>
-				Switch to Sepolia
-			</Button>
+			<Button class="w-full" color="red" on:click={switchToSepolia}>Switch to Sepolia</Button>
 		{/if}
 
-<!--	
+		<!--	
 		<div class="border-t pt-6">
 			<h2 class="text-lg font-semibold mb-4 text-center">Select Bridge Direction</h2> 
 
@@ -86,7 +80,7 @@
 						<div class="flex items-center justify-between">
 							<div>
 								<h3 class="text-lg font-semibold">Mock HOT Faucet</h3>
-								<p class="text-sm text-gray-600">Get free testnet HOT tokens for testing</p>
+								<p class="text-sm text-gray-600">Get free mock HOT tokens for testing</p>
 							</div>
 							<div class="text-2xl">💧</div>
 						</div>

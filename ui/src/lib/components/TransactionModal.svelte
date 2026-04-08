@@ -16,7 +16,6 @@
 			.replace(/\\"/g, '"')
 			.replace(/\\\\/g, '\\')
 	}
-
 </script>
 
 <Modal
@@ -61,12 +60,12 @@
 				</div>
 				{#if isLockSuccess}
 					<p class="text-lg font-semibold">Lock successful!</p>
-				<p class="text-sm text-gray-600 dark:text-gray-400">
-					Your Wrapped-HOT will be credited in your Unyt app within a few minutes.
-				</p>
-				<p class="text-sm text-gray-600 dark:text-gray-400">
-					You can now close this tab and return to your Unyt app to finalize the bridge transfer.
-				</p>
+					<p class="text-sm text-gray-600 dark:text-gray-400">
+						Your mock HOT will be credited in your Unyt app within a few minutes.
+					</p>
+					<p class="text-sm text-gray-600 dark:text-gray-400">
+						You can now close this tab and return to your Unyt app to finalize the bridge transfer.
+					</p>
 				{:else}
 					{$transactionStore.status}
 				{/if}
