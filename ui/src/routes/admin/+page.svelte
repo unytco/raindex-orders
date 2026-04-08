@@ -25,12 +25,12 @@
 		try {
 			// Validate inputs
 			if (!isAddress(recipient)) {
-				throw new Error('Invalid recipient address') 
+				throw new Error('Invalid recipient address')
 			}
 
 			const amount = parseFloat(hotAmount)
 			if (isNaN(amount) || amount <= 0) {
-				throw new Error('Invalid HOT amount')
+				throw new Error('Invalid mock HOT amount')
 			}
 
 			// Call the server API endpoint
@@ -89,7 +89,7 @@
 	<h1 class="mb-6 text-3xl font-bold">Admin - Generate Coupons</h1>
 
 	<Card size="xl" class="mb-4">
-		<h2 class="mb-4 text-xl font-semibold">Create HOT Claim Coupon</h2>
+		<h2 class="mb-4 text-xl font-semibold">Create mock HOT Claim Coupon</h2>
 
 		<div class="flex flex-col gap-4">
 			<FloatingLabelInput style="outlined" bind:value={password} type="password">
@@ -116,7 +116,8 @@
 
 	{#if error}
 		<Alert color="red" class="mb-4">
-			<span class="font-medium">Error:</span> {error}
+			<span class="font-medium">Error:</span>
+			{error}
 		</Alert>
 	{/if}
 
@@ -133,16 +134,15 @@
 						class="w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 font-mono text-sm"
 						value={couponCode}
 					/>
-					<Button size="xs" class="absolute right-2 top-2" on:click={copyToClipboard}>
-						Copy
-					</Button>
+					<Button size="xs" class="absolute right-2 top-2" on:click={copyToClipboard}>Copy</Button>
 				</div>
 			</div>
 
 			{#if couponInfo}
 				<div class="mb-4">
 					<label class="mb-2 block text-sm font-medium">Details:</label>
-					<pre class="whitespace-pre-wrap rounded-lg bg-gray-50 p-2.5 text-xs text-gray-700">{couponInfo}</pre>
+					<pre
+						class="whitespace-pre-wrap rounded-lg bg-gray-50 p-2.5 text-xs text-gray-700">{couponInfo}</pre>
 				</div>
 			{/if}
 		</Card>
@@ -152,12 +152,14 @@
 		<h3 class="mb-2 text-lg font-semibold">Notes</h3>
 		<div class="text-sm text-gray-600">
 			<p class="mb-2">
-				This page generates coupons using the <code class="rounded bg-gray-100 px-1">coupon-signer</code> binary.
+				This page generates coupons using the <code class="rounded bg-gray-100 px-1"
+					>coupon-signer</code
+				> binary.
 			</p>
 			<p>
-				Configuration is loaded from <code class="rounded bg-gray-100 px-1">coupon-signer/.env</code>
+				Configuration is loaded from <code class="rounded bg-gray-100 px-1">coupon-signer/.env</code
+				>
 			</p>
 		</div>
 	</Card>
 </div>
- 
