@@ -1,0 +1,25 @@
+[package]
+name = "bridge-orchestrator"
+version = "0.1.0"
+edition = "2021"
+description = "Single-writer bridge orchestrator for lock-watcher and coupon-signer flows"
+
+[dependencies]
+alloy = { version = "0.8", features = ["full", "signer-local"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+hex = "0.4"
+holo_hash = { version = "0.6.1-rc.0", features = ["encoding"] }
+holochain_client = "0.8.1-rc.0"
+holochain_zome_types = "0.6.1-rc.0"
+rave_engine = "0.3.3"
+rmp-serde = "1.1"
+rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
