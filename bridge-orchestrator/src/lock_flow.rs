@@ -108,7 +108,7 @@ impl LockFlow {
             &payload,
         )?;
         info!(
-            "lock detected id={} amount={} agent={} tx={} block={}",
+            "[lock-flow] lock detected id={} amount={} agent={} tx={} block={}",
             item_id,
             payload["amount_hot"].as_str().unwrap_or("0"),
             payload["holochain_agent"].as_str().unwrap_or("unknown"),
@@ -151,7 +151,7 @@ impl LockFlow {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
                     info!(
-                        "lock queued id={} confirmations={} amount={} agent={}",
+                        "[lock-flow] lock queued id={} confirmations={} amount={} agent={}",
                         item.item_id, confirmations, amount, agent
                     );
                 }

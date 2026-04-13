@@ -13,7 +13,7 @@ use rave_engine::types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct BridgeOrchestrator {
     cfg: Config,
@@ -41,7 +41,7 @@ impl BridgeOrchestrator {
 
         loop {
             if let Err(e) = lock_flow.run_cycle().await {
-                error!("lock cycle failed: {}", e);
+                error!("[lock-flow] cycle failed: {}", e);
             }
 
             if last_bridge_cycle.elapsed()
@@ -52,7 +52,12 @@ impl BridgeOrchestrator {
                         last_bridge_cycle = std::time::Instant::now();
                     }
                     Err(e) => {
-                        error!("bridge cycle failed: {}", e);
+                        error!("[bridge] cycle failed: {}", e);
+                        if let Err(reset_err) =
+                            self.db.reset_in_flight_to_queued("lock", &e.to_string())
+                        {
+                            error!("[bridge] failed to reset in_flight locks: {}", reset_err);
+                        }
                     }
                 }
             }
@@ -63,13 +68,13 @@ impl BridgeOrchestrator {
 
     /// Single unified bridge cycle that handles deposits and withdrawals together.
     ///
-    /// 1. ONE create_parked_link on credit limit EA (batched proof array)
-    /// 2. ONE credit limit RAVE (consumes the link via aggregate_execution)
-    /// 3. ONE create_parked_spend on bridging EA (aggregated proof list)
-    /// 4. Scan bridging EA for pending withdrawals, generate coupons
-    /// 5. ONE unified bridging RAVE with coupons map
+    /// 1. Size-capped extraction of deposit proofs from queued locks
+    /// 2. ONE create_parked_link on credit limit EA (batched proof array)
+    /// 3. ONE credit limit RAVE with explicit links
+    /// 4. ONE create_parked_spend on bridging EA (aggregated proof list)
+    /// 5. Scan bridging EA, size-capped withdrawal coupon generation
+    /// 6. ONE unified bridging RAVE with explicit links and coupons map
     async fn run_bridge_cycle(&self, ham: &Ham) -> Result<()> {
-        info!("bridge cycle started");
         let started = std::time::Instant::now();
 
         let global_definition: GlobalDefinitionExt = ham
@@ -84,30 +89,91 @@ impl BridgeOrchestrator {
 
         if context.bridging_agent != self.cfg.bridging_agent_pubkey {
             warn!(
-                "Skipping bridge cycle: configured bridging agent does not match lane/global"
+                "[bridge] skipping cycle: configured bridging agent does not match lane/global"
             );
             return Ok(());
         }
 
+        // --- Check for work before committing to a full cycle ---
+        let budget_bytes = self.cfg.deposit_batch_target_kb as usize * 1024;
         let queued_locks = self.db.list_work_items("lock", WorkState::Queued, 5000)?;
+
+        if queued_locks.is_empty() {
+            let bridging_ea_id: ActionHash = context.bridging_agreement.clone().into();
+            let bridging_links: Vec<Transaction> = ham
+                .call_zome(
+                    &self.cfg.role_name,
+                    "transactor",
+                    "get_parked_links_by_ea",
+                    &bridging_ea_id,
+                )
+                .await?;
+            if bridging_links.is_empty() {
+                let duration_ms = started.elapsed().as_millis() as u64;
+                debug!(
+                    "[bridge] cycle no-op (no pending deposits or withdrawals) duration={}ms",
+                    duration_ms
+                );
+                return Ok(());
+            }
+        }
+
+        // --- Size-capped deposit extraction ---
         let mut deposit_proofs: Vec<Value> = Vec::new();
         let mut deposit_amounts: Vec<UnitMap> = Vec::new();
         let mut processed_lock_ids: Vec<i64> = Vec::new();
+        let mut cumulative_bytes: usize = 0;
+
+        info!(
+            "[bridge] \u{2500}\u{2500} cycle started \u{2500}\u{2500} locks_queued={} budget_kb={}",
+            queued_locks.len(),
+            self.cfg.deposit_batch_target_kb
+        );
 
         for item in &queued_locks {
             match self.extract_lock_proof(item) {
                 Ok((proof, amount)) => {
+                    let proof_bytes = serde_json::to_vec(&proof)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    if cumulative_bytes + proof_bytes > budget_bytes
+                        && !deposit_proofs.is_empty()
+                    {
+                        info!(
+                            "[bridge/deposits] batch: selected={}/{} cumulative_bytes={} (cap reached, {} deferred)",
+                            deposit_proofs.len(),
+                            queued_locks.len(),
+                            cumulative_bytes,
+                            queued_locks.len() - deposit_proofs.len()
+                        );
+                        break;
+                    }
+                    cumulative_bytes += proof_bytes;
                     deposit_proofs.push(proof);
                     deposit_amounts.push(amount);
                     processed_lock_ids.push(item.id);
                 }
                 Err(e) => {
                     warn!(
-                        "proof extraction failed id={} error={}, skipping",
+                        "[bridge/deposits] proof extraction failed id={} error={}, skipping",
                         item.item_id, e
                     );
                 }
             }
+        }
+
+        if deposit_proofs.len() == queued_locks.len() || deposit_proofs.is_empty() {
+            info!(
+                "[bridge/deposits] batch: selected={}/{} cumulative_bytes={} (all fit within budget)",
+                deposit_proofs.len(),
+                queued_locks.len(),
+                cumulative_bytes
+            );
+        }
+
+        // --- Mark selected locks as in_flight ---
+        for lock_id in &processed_lock_ids {
+            self.db.mark_in_flight(*lock_id)?;
         }
 
         if !processed_lock_ids.is_empty() {
@@ -118,12 +184,6 @@ impl BridgeOrchestrator {
                 amount: Some(total_deposit_amount.clone()),
                 payload: json!({ "proof_of_deposit": deposit_proofs.clone() }),
             };
-
-            info!(
-                "create_parked_link start locks={} total_amount={:?}",
-                processed_lock_ids.len(),
-                total_deposit_amount
-            );
 
             let link_result: (ActionHashB64, AgentPubKey) = ham
                 .call_zome(
@@ -139,13 +199,28 @@ impl BridgeOrchestrator {
                 .await?;
 
             info!(
-                "batched create_parked_link success locks={} action_hash={}",
+                "[bridge/credit-limit] create_parked_link: {} proofs, action_hash={}",
                 processed_lock_ids.len(),
                 link_result.0
             );
 
+            // --- Explicit links for credit limit RAVE ---
             let credit_limit_ea_id: ActionHash =
                 context.credit_limit_adjustment.clone().into();
+            let cl_links: Vec<Transaction> = ham
+                .call_zome(
+                    &self.cfg.role_name,
+                    "transactor",
+                    "get_parked_links_by_ea",
+                    &credit_limit_ea_id,
+                )
+                .await?;
+
+            info!(
+                "[bridge/credit-limit] RAVE: consuming {} explicit links",
+                cl_links.len()
+            );
+
             let _: (RAVE, ActionHash) = ham
                 .call_zome(
                     &self.cfg.role_name,
@@ -154,14 +229,14 @@ impl BridgeOrchestrator {
                     &RAVEExecuteInputs {
                         ea_id: credit_limit_ea_id,
                         executor_inputs: Value::Null,
-                        links: vec![],
+                        links: cl_links,
                         global_definition: global_definition.id.clone().into(),
                         lane_definitions: context.lane_definitions.clone(),
                         strategy: GetStrategy::Local,
                     },
                 )
                 .await?;
-            info!("credit limit RAVE executed");
+            info!("[bridge/credit-limit] RAVE executed");
 
             if !total_deposit_amount.is_zero() {
                 let _: ActionHashB64 = ham
@@ -173,7 +248,7 @@ impl BridgeOrchestrator {
                             ea_id: context.bridging_agreement.clone().into(),
                             executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
                             ct_role_id: Some("bridging_agent".to_string()),
-                            amount: total_deposit_amount,
+                            amount: total_deposit_amount.clone(),
                             spender_payload: json!({
                                 "proof_of_deposit": deposit_proofs,
                             }),
@@ -181,15 +256,14 @@ impl BridgeOrchestrator {
                         },
                     )
                     .await?;
-                info!("parked spend created on bridging EA");
+                info!(
+                    "[bridge/bridging] create_parked_spend: total_amount={:?}",
+                    total_deposit_amount
+                );
             }
-
-            for lock_id in &processed_lock_ids {
-                self.db.mark_succeeded(*lock_id)?;
-            }
-            info!("marked {} locks as succeeded", processed_lock_ids.len());
         }
 
+        // --- Scan bridging EA and size-capped withdrawal selection ---
         let bridging_ea_id: ActionHash = context.bridging_agreement.clone().into();
         let bridging_links: Vec<Transaction> = ham
             .call_zome(
@@ -201,33 +275,93 @@ impl BridgeOrchestrator {
             .await?;
 
         let mut coupons_map = serde_json::Map::new();
+        let mut selected_withdrawal_links: Vec<Transaction> = Vec::new();
+        let mut deposit_rave_links: Vec<Transaction> = Vec::new();
+        let mut coupon_cumulative_bytes: usize = 0;
+        let mut total_withdrawals_found: usize = 0;
+        let mut withdrawal_capped = false;
+
         for tx in &bridging_links {
             if let TransactionDetails::ParkedSpend {
                 attached_payload, ..
             } = &tx.details
             {
+                if attached_payload.get("proof_of_deposit").is_some() {
+                    deposit_rave_links.push(tx.clone());
+                    continue;
+                }
+
                 if let Some(withdraw_to) = attached_payload
                     .get("withdraw_to_address")
                     .and_then(|v| v.as_str())
                 {
+                    total_withdrawals_found += 1;
+
+                    if withdrawal_capped {
+                        continue;
+                    }
+
                     let amount = tx
                         .amount
                         .get("1")
                         .map(|v| v.to_string())
                         .unwrap_or_default();
-                    info!(
-                        "generating coupon tx_id={:?} recipient={} amount={}",
-                        tx.id, withdraw_to, amount
-                    );
+
                     let signer_ctx = signer_context_from_env()?;
                     let coupon = generate_coupon(&amount, withdraw_to, &signer_ctx).await?;
-                    coupons_map.insert(tx.id.to_string(), Value::String(coupon));
+                    let key = tx.id.to_string();
+
+                    let entry_bytes = serde_json::to_vec(&json!({ &key: &coupon }))
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+
+                    if coupon_cumulative_bytes + entry_bytes > budget_bytes
+                        && !selected_withdrawal_links.is_empty()
+                    {
+                        withdrawal_capped = true;
+                        info!(
+                            "[bridge/withdrawals] batch: cap reached at {} coupons, coupon_bytes={}",
+                            selected_withdrawal_links.len(),
+                            coupon_cumulative_bytes
+                        );
+                        continue;
+                    }
+
+                    coupon_cumulative_bytes += entry_bytes;
+                    coupons_map.insert(key, Value::String(coupon));
+                    selected_withdrawal_links.push(tx.clone());
+
+                    info!(
+                        "[bridge/withdrawals] generating coupon tx_id={:?} recipient={} amount={}",
+                        tx.id, withdraw_to, amount
+                    );
                 }
             }
         }
-        let withdrawal_count = coupons_map.len();
 
-        if !bridging_links.is_empty() {
+        let withdrawal_count = selected_withdrawal_links.len();
+        let deferred_withdrawals = total_withdrawals_found - withdrawal_count;
+        info!(
+            "[bridge/withdrawals] scan: found={} selected={}/{} coupon_bytes={} deferred={}",
+            total_withdrawals_found,
+            withdrawal_count,
+            total_withdrawals_found,
+            coupon_cumulative_bytes,
+            deferred_withdrawals
+        );
+
+        // --- Explicit links for bridging RAVE ---
+        let mut rave_links: Vec<Transaction> = Vec::new();
+        rave_links.extend(deposit_rave_links.iter().cloned());
+        rave_links.extend(selected_withdrawal_links);
+
+        if !rave_links.is_empty() {
+            info!(
+                "[bridge/bridging] RAVE: {} deposit + {} withdrawal links",
+                deposit_rave_links.len(),
+                withdrawal_count
+            );
+
             let rave_result: (RAVE, ActionHash) = ham
                 .call_zome(
                     &self.cfg.role_name,
@@ -238,7 +372,7 @@ impl BridgeOrchestrator {
                         executor_inputs: json!({
                             "coupons": Value::Object(coupons_map)
                         }),
-                        links: vec![],
+                        links: rave_links,
                         global_definition: global_definition.id.clone().into(),
                         lane_definitions: context.lane_definitions,
                         strategy: GetStrategy::Local,
@@ -246,18 +380,24 @@ impl BridgeOrchestrator {
                 )
                 .await?;
             info!(
-                "unified bridging RAVE executed action_hash={} deposits={} withdrawals={}",
+                "[bridge/bridging] RAVE executed action_hash={}",
                 rave_result.1,
-                processed_lock_ids.len(),
-                withdrawal_count
             );
         } else if processed_lock_ids.is_empty() {
-            info!("bridge cycle no-op: no pending deposits or withdrawals");
+            debug!("[bridge] cycle no-op: no pending links on bridging EA");
+        }
+
+        // --- Mark processed locks as succeeded ---
+        for lock_id in &processed_lock_ids {
+            self.db.mark_succeeded(*lock_id)?;
+        }
+        if !processed_lock_ids.is_empty() {
+            info!("[bridge] marked {} locks as succeeded", processed_lock_ids.len());
         }
 
         let duration_ms = started.elapsed().as_millis() as u64;
         info!(
-            "bridge cycle completed duration={}ms locks={} withdrawals={}",
+            "[bridge] \u{2500}\u{2500} cycle completed \u{2500}\u{2500} duration={}ms locks={} withdrawals={}",
             duration_ms,
             processed_lock_ids.len(),
             withdrawal_count
@@ -281,7 +421,7 @@ impl BridgeOrchestrator {
         });
 
         info!(
-            "extracted proof id={} amount={} agent={}",
+            "[bridge/deposits] extracted proof id={} amount={} agent={}",
             payload.lock_id, amount, payload.holochain_agent
         );
 

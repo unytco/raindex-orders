@@ -603,6 +603,20 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn reset_in_flight_to_queued(&self, flow: &str, error: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            "UPDATE work_items
+             SET state='queued',
+                 error_class='transient',
+                 last_error=?2,
+                 updated_at=strftime('%s', 'now')
+             WHERE state='in_flight' AND flow=?1",
+            params![flow, error],
+        )?;
+        Ok(updated)
+    }
+
     pub fn queue_depth_by_flow(&self) -> Result<Vec<(String, i64)>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
