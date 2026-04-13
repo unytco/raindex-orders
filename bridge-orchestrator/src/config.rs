@@ -38,10 +38,8 @@ pub struct Config {
     pub admin_port: u16,
     pub app_port: u16,
     pub bridging_agent_pubkey: AgentPubKeyB64,
-    pub credit_limit_ea_id: ActionHashB64,
     pub lane_definition: Option<ActionHashB64>,
     pub unit_index: u32,
-    pub bridging_agreement_id: String,
 }
 
 impl Config {
@@ -103,11 +101,6 @@ impl Config {
                 .context("HOLOCHAIN_BRIDGING_AGENT_PUBKEY required")?,
         )
         .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
-        let credit_limit_ea_id = ActionHashB64::from_str(
-            &env::var("HOLOCHAIN_CREDIT_LIMIT_EA_ID")
-                .context("HOLOCHAIN_CREDIT_LIMIT_EA_ID required")?,
-        )
-        .context("Invalid HOLOCHAIN_CREDIT_LIMIT_EA_ID")?;
         let lane_definition = env::var("HOLOCHAIN_LANE_DEFINITION")
             .ok()
             .and_then(|v| ActionHashB64::from_str(&v).ok());
@@ -115,9 +108,6 @@ impl Config {
             .unwrap_or_else(|_| "1".into())
             .parse()
             .context("Invalid HOLOCHAIN_UNIT_INDEX")?;
-        let bridging_agreement_id =
-            env::var("BRIDGING_AGREEMENT_ID").context("BRIDGING_AGREEMENT_ID required")?;
-
         Ok(Self {
             network,
             rpc_url,
@@ -132,10 +122,8 @@ impl Config {
             admin_port,
             app_port,
             bridging_agent_pubkey,
-            credit_limit_ea_id,
             lane_definition,
             unit_index,
-            bridging_agreement_id,
         })
     }
 }

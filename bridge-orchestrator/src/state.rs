@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const SCHEMA_VERSION: i64 = 1;
+#[cfg(test)]
 const DEFAULT_MAX_ATTEMPTS: i64 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -294,132 +295,6 @@ impl StateStore {
         Ok(changed > 0)
     }
 
-    pub fn enqueue_queued(
-        &self,
-        flow: &str,
-        task_type: &str,
-        item_id: &str,
-        idempotency_key: &str,
-        payload_json: &Value,
-    ) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "INSERT OR IGNORE INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state, next_retry_at, max_attempts)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', NULL, ?6)",
-            params![
-                flow,
-                task_type,
-                item_id,
-                idempotency_key,
-                serde_json::to_string(payload_json)?,
-                DEFAULT_MAX_ATTEMPTS
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn enqueue_queued_or_requeue_transient_failed(
-        &self,
-        flow: &str,
-        task_type: &str,
-        item_id: &str,
-        idempotency_key: &str,
-        payload_json: &Value,
-    ) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let payload = serde_json::to_string(payload_json)?;
-        let changed = conn.execute(
-            "INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state, next_retry_at, max_attempts)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', NULL, ?6)
-             ON CONFLICT(idempotency_key) DO UPDATE SET
-               payload_json = excluded.payload_json,
-               state = CASE
-                 WHEN work_items.state = 'failed'
-                   AND coalesce(work_items.error_class, 'transient') = 'transient'
-                   AND work_items.attempts < work_items.max_attempts
-                 THEN 'queued'
-                 ELSE work_items.state
-               END,
-               next_retry_at = CASE
-                 WHEN work_items.state = 'failed'
-                   AND coalesce(work_items.error_class, 'transient') = 'transient'
-                   AND work_items.attempts < work_items.max_attempts
-                 THEN NULL
-                 ELSE work_items.next_retry_at
-               END,
-               updated_at = strftime('%s','now')",
-            params![
-                flow,
-                task_type,
-                item_id,
-                idempotency_key,
-                payload,
-                DEFAULT_MAX_ATTEMPTS
-            ],
-        )?;
-        Ok(changed > 0)
-    }
-
-    pub fn claim_next(&self, preferred_flow: Option<&str>) -> Result<Option<WorkItem>> {
-        let mut conn = self.conn.lock().expect("db mutex poisoned");
-        let tx = conn.transaction()?;
-
-        let next_id = if let Some(flow) = preferred_flow {
-            tx.query_row(
-                "SELECT id FROM work_items
-                 WHERE state='queued' AND flow = ?1
-                   AND (next_retry_at IS NULL OR next_retry_at <= strftime('%s', 'now'))
-                   AND attempts < max_attempts
-                 ORDER BY created_at ASC, id ASC LIMIT 1",
-                [flow],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        } else {
-            None
-        }
-        .or_else(|| {
-            tx.query_row(
-                "SELECT id FROM work_items
-                 WHERE state='queued'
-                   AND (next_retry_at IS NULL OR next_retry_at <= strftime('%s', 'now'))
-                   AND attempts < max_attempts
-                 ORDER BY created_at ASC, id ASC LIMIT 1",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
-        });
-
-        let Some(id) = next_id else {
-            tx.commit()?;
-            return Ok(None);
-        };
-
-        tx.execute(
-            "UPDATE work_items
-             SET state='claimed',
-                 attempts=attempts+1,
-                 last_attempt_at=strftime('%s', 'now'),
-                 updated_at=strftime('%s', 'now')
-             WHERE id = ?1 AND state='queued'",
-            [id],
-        )?;
-
-        let item = tx
-            .query_row(
-                "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at
-                 FROM work_items WHERE id = ?1",
-                [id],
-                row_to_work_item,
-            )
-            .optional()?;
-        tx.commit()?;
-        Ok(item)
-    }
-
     pub fn mark_in_flight(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
@@ -442,36 +317,6 @@ impl StateStore {
                  updated_at=strftime('%s', 'now')
              WHERE id=?1",
             [id],
-        )?;
-        Ok(())
-    }
-
-    pub fn schedule_retry(&self, id: i64, err: &str, next_retry_at: i64) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let updated = conn.execute(
-            "UPDATE work_items
-             SET state='queued',
-                 error_class='transient',
-                 last_error=?2,
-                 next_retry_at=?3,
-                 updated_at=strftime('%s', 'now')
-             WHERE id=?1 AND state='in_flight' AND attempts < max_attempts",
-            params![id, err, next_retry_at],
-        )?;
-        Ok(updated > 0)
-    }
-
-    pub fn mark_failed_terminal(&self, id: i64, err: &str, error_class: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "UPDATE work_items
-             SET state='failed',
-                 error_class=?3,
-                 last_error=?2,
-                 next_retry_at=NULL,
-                 updated_at=strftime('%s', 'now')
-             WHERE id=?1",
-            params![id, err, error_class],
         )?;
         Ok(())
     }
@@ -616,17 +461,6 @@ impl StateStore {
         )?;
         Ok(updated)
     }
-
-    pub fn queue_depth_by_flow(&self) -> Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT flow, COUNT(*) FROM work_items
-             WHERE state IN ('detected','queued','claimed','in_flight')
-             GROUP BY flow",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
 }
 
 fn json_value_to_string(value: Option<&Value>) -> Option<String> {
@@ -724,6 +558,108 @@ fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
     })
+}
+
+#[cfg(test)]
+impl StateStore {
+    pub fn enqueue_queued(
+        &self,
+        flow: &str,
+        task_type: &str,
+        item_id: &str,
+        idempotency_key: &str,
+        payload_json: &Value,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT OR IGNORE INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state, next_retry_at, max_attempts)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', NULL, ?6)",
+            params![
+                flow,
+                task_type,
+                item_id,
+                idempotency_key,
+                serde_json::to_string(payload_json)?,
+                DEFAULT_MAX_ATTEMPTS
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_next(&self, preferred_flow: Option<&str>) -> Result<Option<WorkItem>> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+
+        let next_id = if let Some(flow) = preferred_flow {
+            tx.query_row(
+                "SELECT id FROM work_items
+                 WHERE state='queued' AND flow = ?1
+                   AND (next_retry_at IS NULL OR next_retry_at <= strftime('%s', 'now'))
+                   AND attempts < max_attempts
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+                [flow],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        } else {
+            None
+        }
+        .or_else(|| {
+            tx.query_row(
+                "SELECT id FROM work_items
+                 WHERE state='queued'
+                   AND (next_retry_at IS NULL OR next_retry_at <= strftime('%s', 'now'))
+                   AND attempts < max_attempts
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+
+        let Some(id) = next_id else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        tx.execute(
+            "UPDATE work_items
+             SET state='claimed',
+                 attempts=attempts+1,
+                 last_attempt_at=strftime('%s', 'now'),
+                 updated_at=strftime('%s', 'now')
+             WHERE id = ?1 AND state='queued'",
+            [id],
+        )?;
+
+        let item = tx
+            .query_row(
+                "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at
+                 FROM work_items WHERE id = ?1",
+                [id],
+                row_to_work_item,
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(item)
+    }
+
+    pub fn schedule_retry(&self, id: i64, err: &str, next_retry_at: i64) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            "UPDATE work_items
+             SET state='queued',
+                 error_class='transient',
+                 last_error=?2,
+                 next_retry_at=?3,
+                 updated_at=strftime('%s', 'now')
+             WHERE id=?1 AND state='in_flight' AND attempts < max_attempts",
+            params![id, err, next_retry_at],
+        )?;
+        Ok(updated > 0)
+    }
 }
 
 #[cfg(test)]

@@ -191,7 +191,7 @@ impl BridgeOrchestrator {
                     "transactor",
                     "create_parked_link",
                     &CreateParkedLinkInput {
-                        ea_id: self.cfg.credit_limit_ea_id.clone().into(),
+                        ea_id: context.credit_limit_adjustment.clone().into(),
                         executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
                         parked_link_type: ParkedLinkType::ParkedData((parked_data, true)),
                     },
@@ -491,27 +491,22 @@ struct LockPayload {
 }
 
 struct NormalizedLockAmount {
-    amount_raw_wei: String,
     amount_hot: String,
 }
 
 impl LockPayload {
     fn normalized_amounts(&self) -> Result<NormalizedLockAmount> {
-        let amount_raw_wei = self
-            .amount_raw_wei
-            .clone()
-            .or_else(|| self.amount.clone())
-            .context("missing lock amount raw wei")?;
         let amount_hot = self
             .amount_hot
             .clone()
             .or_else(|| amount_from_legacy_field(self.amount.clone()))
-            .unwrap_or_else(|| format_amount(&amount_raw_wei));
+            .or_else(|| {
+                let raw = self.amount_raw_wei.as_ref().or(self.amount.as_ref())?;
+                Some(format_amount(raw))
+            })
+            .context("cannot determine amount_hot: no amount_hot, amount, or amount_raw_wei")?;
         validate_hot_amount(&amount_hot)?;
-        Ok(NormalizedLockAmount {
-            amount_raw_wei,
-            amount_hot,
-        })
+        Ok(NormalizedLockAmount { amount_hot })
     }
 }
 
