@@ -139,22 +139,6 @@ impl StateStore {
             );
         }
 
-        if flow == "coupon" && task_type == "execute_rave" {
-            return (
-                Some("transfer_out".to_string()),
-                Some("coupon_withdraw".to_string()),
-                extract_coupon_amount(payload),
-                payload
-                    .pointer("/details/ParkedSpend/attached_payload/withdraw_to_address")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                payload
-                    .pointer("/details/ParkedSpend/spender")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            );
-        }
-
         (None, None, None, None, None)
     }
 
@@ -640,21 +624,6 @@ fn json_value_to_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn extract_coupon_amount(payload: &Value) -> Option<String> {
-    let amount = payload.get("amount")?;
-    let amount_obj = amount.as_object()?;
-    if let Some(v) = amount_obj.get("1") {
-        return json_value_to_string(Some(v));
-    }
-    if let Some(v) = amount_obj.get("0") {
-        return json_value_to_string(Some(v));
-    }
-    amount_obj
-        .values()
-        .next()
-        .and_then(|v| json_value_to_string(Some(v)))
-}
-
 fn extract_lock_amount_hot(payload: &Value) -> Option<String> {
     if let Some(amount_hot) = payload.get("amount_hot").and_then(Value::as_str) {
         return Some(amount_hot.to_string());
@@ -800,71 +769,6 @@ mod tests {
             .clone()
             .unwrap_or_default()
             .contains("Recovered from stale in-progress state"));
-    }
-
-    #[test]
-    fn claims_preferred_flow_first() {
-        let path = test_db_path("rr");
-        let store = StateStore::open(&path).unwrap();
-        store
-            .enqueue_queued(
-                "lock",
-                "create_parked_link",
-                "lock:1",
-                "lock:1:create_parked_link",
-                &serde_json::json!({"lock_id":"1"}),
-            )
-            .unwrap();
-        store
-            .enqueue_queued(
-                "coupon",
-                "execute_rave",
-                "coupon:1",
-                "coupon:1:execute_rave",
-                &serde_json::json!({"id":"1"}),
-            )
-            .unwrap();
-
-        let first = store.claim_next(Some("coupon")).unwrap().unwrap();
-        assert_eq!(first.flow, "coupon");
-    }
-
-    #[test]
-    fn transient_failed_coupon_is_requeued_on_scan() {
-        let path = test_db_path("coupon-requeue");
-        let store = StateStore::open(&path).unwrap();
-
-        let idempotency_key = "coupon:1:execute_rave";
-        store
-            .enqueue_queued(
-                "coupon",
-                "execute_rave",
-                "coupon:1",
-                idempotency_key,
-                &serde_json::json!({"id":"1"}),
-            )
-            .unwrap();
-        let claimed = store.claim_next(Some("coupon")).unwrap().unwrap();
-        store.mark_in_flight(claimed.id).unwrap();
-        store
-            .mark_failed_terminal(claimed.id, "temporary websocket disconnect", "transient")
-            .unwrap();
-
-        store
-            .enqueue_queued_or_requeue_transient_failed(
-                "coupon",
-                "execute_rave",
-                "coupon:1",
-                idempotency_key,
-                &serde_json::json!({"id":"1"}),
-            )
-            .unwrap();
-
-        let rows = store
-            .list_work_items("coupon", WorkState::Queued, 10)
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].idempotency_key, idempotency_key);
     }
 
     #[test]
@@ -1042,86 +946,6 @@ mod tests {
         assert!(row.direction.is_none());
         assert!(row.transfer_type.is_none());
         assert!(row.amount_raw.is_none());
-    }
-
-    #[test]
-    fn status_enriches_coupon_transfer_fields() {
-        let path = test_db_path("status-coupon");
-        let store = StateStore::open(&path).unwrap();
-        store
-            .enqueue_queued(
-                "coupon",
-                "execute_rave",
-                "coupon:tx-1",
-                "coupon:tx-1:execute_rave",
-                &serde_json::json!({
-                    "amount": {
-                        "1": "999"
-                    },
-                    "details": {
-                        "ParkedSpend": {
-                            "spender": "uhCAkSpender",
-                            "attached_payload": {
-                                "withdraw_to_address": "0xWithdrawTo"
-                            }
-                        }
-                    }
-                }),
-            )
-            .unwrap();
-
-        let rows = store
-            .status(StateFilter {
-                flow: Some("coupon".to_string()),
-                state: None,
-                item_id: Some("coupon:tx-1".to_string()),
-                limit: 10,
-            })
-            .unwrap();
-
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-        assert_eq!(row.direction.as_deref(), Some("transfer_out"));
-        assert_eq!(row.transfer_type.as_deref(), Some("coupon_withdraw"));
-        assert_eq!(row.amount_raw.as_deref(), Some("999"));
-        assert_eq!(row.beneficiary.as_deref(), Some("0xWithdrawTo"));
-        assert_eq!(row.counterparty.as_deref(), Some("uhCAkSpender"));
-        assert_eq!(row.status, WorkState::Queued);
-    }
-
-    #[test]
-    fn status_keeps_coupon_row_when_payload_is_malformed() {
-        let path = test_db_path("status-malformed");
-        let store = StateStore::open(&path).unwrap();
-        store
-            .enqueue_queued(
-                "coupon",
-                "execute_rave",
-                "coupon:bad-payload",
-                "coupon:bad-payload:execute_rave",
-                &serde_json::json!({
-                    "amount": "unexpected-shape"
-                }),
-            )
-            .unwrap();
-
-        let rows = store
-            .status(StateFilter {
-                flow: Some("coupon".to_string()),
-                state: None,
-                item_id: Some("coupon:bad-payload".to_string()),
-                limit: 10,
-            })
-            .unwrap();
-
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-        assert_eq!(row.direction.as_deref(), Some("transfer_out"));
-        assert_eq!(row.transfer_type.as_deref(), Some("coupon_withdraw"));
-        assert!(row.amount_raw.is_none());
-        assert!(row.beneficiary.is_none());
-        assert!(row.counterparty.is_none());
-        assert_eq!(row.status, WorkState::Queued);
     }
 
     #[test]

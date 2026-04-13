@@ -1,9 +1,8 @@
 use crate::config::Config;
-use crate::coupon_flow::CouponFlow;
 use crate::ham::Ham;
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{generate_coupon, signer_context_from_env};
-use crate::state::{StateStore, WorkItem};
+use crate::state::{StateStore, WorkItem, WorkState};
 use anyhow::{Context, Result};
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use holochain_zome_types::entry::GetStrategy;
@@ -13,9 +12,7 @@ use rave_engine::types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::str::FromStr;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 pub struct BridgeOrchestrator {
@@ -31,152 +28,50 @@ impl BridgeOrchestrator {
 
     pub async fn run(&self) -> Result<()> {
         info!(
-            "bridge-orchestrator started network={:?} poll={}ms coupon_poll={}ms",
-            self.cfg.network, self.cfg.poll_interval_ms, self.cfg.coupon_poll_interval_ms
+            "bridge-orchestrator started network={:?} poll={}ms bridge_cycle={}ms",
+            self.cfg.network, self.cfg.poll_interval_ms, self.cfg.bridge_cycle_interval_ms
         );
         let ham = Ham::connect(self.cfg.admin_port, self.cfg.app_port, &self.cfg.app_id)
             .await
             .context("Failed to connect to Holochain")?;
         let lock_flow = LockFlow::new(self.cfg.clone(), self.db.clone());
-        let coupon_flow = CouponFlow::new(self.cfg.clone(), self.db.clone());
 
-        let mut last_flow = "coupon".to_string();
-        let mut last_coupon_scan = std::time::Instant::now() - Duration::from_millis(self.cfg.coupon_poll_interval_ms);
+        let mut last_bridge_cycle =
+            std::time::Instant::now() - Duration::from_millis(self.cfg.bridge_cycle_interval_ms);
+
         loop {
             if let Err(e) = lock_flow.run_cycle().await {
                 error!("lock cycle failed: {}", e);
             }
 
-            if last_coupon_scan.elapsed() >= Duration::from_millis(self.cfg.coupon_poll_interval_ms) {
-                if let Err(e) = coupon_flow.run_cycle(&ham).await {
-                    error!("coupon cycle failed: {}", e);
-                }
-                last_coupon_scan = std::time::Instant::now();
-            }
-
-            if let Some(item) = self.claim_round_robin(&last_flow)? {
-                last_flow = item.flow.clone();
-                self.db.mark_in_flight(item.id)?;
-                let started = std::time::Instant::now();
-                let started_event = if item.flow == "lock" {
-                    "lock"
-                } else {
-                    "coupon"
-                };
-                info!(
-                    "{} write started id={} task={} attempt={}/{}",
-                    started_event, item.item_id, item.task_type, item.attempts, item.max_attempts
-                );
-                let result = self.process_item(&ham, &item).await;
-                let duration_ms = started.elapsed().as_millis() as u64;
-                match result {
+            if last_bridge_cycle.elapsed()
+                >= Duration::from_millis(self.cfg.bridge_cycle_interval_ms)
+            {
+                match self.run_bridge_cycle(&ham).await {
                     Ok(()) => {
-                        let success_event = if item.flow == "lock" {
-                            "lock"
-                        } else {
-                            "coupon"
-                        };
-                        self.db.mark_succeeded(item.id)?;
-                        info!(
-                            "{} write succeeded id={} task={} duration={}ms",
-                            success_event, item.item_id, item.task_type, duration_ms
-                        );
+                        last_bridge_cycle = std::time::Instant::now();
                     }
                     Err(e) => {
-                        self.handle_failure(&item, e.to_string(), duration_ms)?;
+                        error!("bridge cycle failed: {}", e);
                     }
                 }
-            } else {
-                let queue_depth = self.db.queue_depth_by_flow()?;
-                let lock_depth = queue_depth
-                    .iter()
-                    .find(|(flow, _)| flow == "lock")
-                    .map(|(_, n)| *n)
-                    .unwrap_or(0);
-                let coupon_depth = queue_depth
-                    .iter()
-                    .find(|(flow, _)| flow == "coupon")
-                    .map(|(_, n)| *n)
-                    .unwrap_or(0);
-                info!("queue depth lock={} coupon={}", lock_depth, coupon_depth);
             }
 
             tokio::time::sleep(Duration::from_millis(self.cfg.poll_interval_ms)).await;
         }
     }
 
-    fn claim_round_robin(&self, last_flow: &str) -> Result<Option<WorkItem>> {
-        let preferred = if last_flow == "lock" { "coupon" } else { "lock" };
-        if let Some(item) = self.db.claim_next(Some(preferred))? {
-            return Ok(Some(item));
-        }
-        self.db.claim_next(None)
-    }
+    /// Single unified bridge cycle that handles deposits and withdrawals together.
+    ///
+    /// 1. ONE create_parked_link on credit limit EA (batched proof array)
+    /// 2. ONE credit limit RAVE (consumes the link via aggregate_execution)
+    /// 3. ONE create_parked_spend on bridging EA (aggregated proof list)
+    /// 4. Scan bridging EA for pending withdrawals, generate coupons
+    /// 5. ONE unified bridging RAVE with coupons map
+    async fn run_bridge_cycle(&self, ham: &Ham) -> Result<()> {
+        info!("bridge cycle started");
+        let started = std::time::Instant::now();
 
-    async fn process_item(&self, ham: &Ham, item: &WorkItem) -> Result<()> {
-        match item.task_type.as_str() {
-            "create_parked_link" => self.process_lock_create_parked_link(ham, item).await,
-            "execute_rave" => self.process_coupon_execute_rave(ham, item).await,
-            other => anyhow::bail!("Unknown task type: {}", other),
-        }
-    }
-
-    async fn process_lock_create_parked_link(&self, ham: &Ham, item: &WorkItem) -> Result<()> {
-        let payload = LockPayload::deserialize(item.payload_json.clone())?;
-        let contract_hex = format!("{:x}", self.cfg.lock_vault_address);
-
-        let depositor_wallet_address_as_hc_pubkey =
-            decode_holochain_agent_as_pubkey_string(&payload.holochain_agent)?;
-        let normalized = payload.normalized_amounts()?;
-        let amount = normalized.amount_hot.clone();
-
-        let proof = json!({
-            "proof_of_deposit": {
-                "method": "deposit",
-                "contract_address": format!("0x{}", contract_hex.to_lowercase()),
-                "amount": amount,
-                "depositor_wallet_address": depositor_wallet_address_as_hc_pubkey
-            }
-        });
-
-        let parked_link_tag = ParkedData {
-            ct_role_id: "oracle".to_string(),
-            amount: Some(UnitMap::from(vec![(self.cfg.unit_index, amount.as_str())])),
-            payload: proof,
-        };
-
-        let zome_payload = CreateParkedLinkInput {
-            ea_id: self.cfg.credit_limit_ea_id.clone().into(),
-            executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
-            parked_link_type: ParkedLinkType::ParkedData((parked_link_tag, true)),
-        };
-        info!(
-            "zome call start id={} zome=transactor.create_parked_link amount_hot={} amount_raw_wei={} agent={}",
-            payload.lock_id, amount, normalized.amount_raw_wei, payload.holochain_agent
-        );
-        let zome_result: (ActionHashB64, AgentPubKey) = ham
-            .call_zome(
-                &self.cfg.role_name,
-                "transactor",
-                "create_parked_link",
-                &zome_payload,
-            )
-            .await?;
-        info!(
-            "zome call success id={} zome=transactor.create_parked_link action_hash={} executor={}",
-            payload.lock_id,
-            zome_result.0,
-            zome_result.1
-        );
-
-        info!(
-            "create_parked_link succeeded for lock={}, continuing inline to initiate_deposit",
-            payload.lock_id
-        );
-        self.process_lock_initiate_deposit(ham).await
-    }
-
-    async fn process_lock_initiate_deposit(&self, ham: &Ham) -> Result<()> {
         let global_definition: GlobalDefinitionExt = ham
             .call_zome(
                 &self.cfg.role_name,
@@ -189,110 +84,111 @@ impl BridgeOrchestrator {
 
         if context.bridging_agent != self.cfg.bridging_agent_pubkey {
             warn!(
-                "Skipping initiate_deposit: configured bridging agent does not match lane/global bridging agent"
+                "Skipping bridge cycle: configured bridging agent does not match lane/global"
             );
             return Ok(());
         }
 
-        let credit_limit_ea_id: ActionHash = context.credit_limit_adjustment.clone().into();
-        let parked_links: Vec<Transaction> = ham
-            .call_zome(
-                &self.cfg.role_name,
-                "transactor",
-                "get_parked_links_by_ea",
-                &credit_limit_ea_id,
-            )
-            .await?;
-        if parked_links.is_empty() {
-            info!("initiate_deposit no-op: no parked links on credit limit agreement");
-            return Ok(());
-        }
+        let queued_locks = self.db.list_work_items("lock", WorkState::Queued, 5000)?;
+        let mut deposit_proofs: Vec<Value> = Vec::new();
+        let mut deposit_amounts: Vec<UnitMap> = Vec::new();
+        let mut processed_lock_ids: Vec<i64> = Vec::new();
 
-        let _: (RAVE, ActionHash) = ham
-            .call_zome(
-                &self.cfg.role_name,
-                "transactor",
-                "execute_rave",
-                &RAVEExecuteInputs {
-                    ea_id: context.credit_limit_adjustment.clone().into(),
-                    executor_inputs: Value::Null,
-                    links: vec![],
-                    global_definition: global_definition.id.clone().into(),
-                    lane_definitions: context.lane_definitions.clone(),
-                    strategy: GetStrategy::Local,
-                },
-            )
-            .await?;
-
-        let mut prepared_links = Vec::new();
-        for link in parked_links {
-            if let TransactionDetails::Parked {
-                attached_payload, ..
-            } = link.details.clone()
-            {
-                if let Some(proof_of_deposit) = attached_payload.get("proof_of_deposit") {
-                    let proof = proof_of_deposit.clone();
-                    let proof_size_bytes = serde_json::to_vec(&proof)
-                        .context("Failed to serialize proof_of_deposit for size estimate")?
-                        .len();
-                    prepared_links.push(PreparedDepositLink {
-                        transaction: link,
-                        proof_of_deposit: proof,
-                        proof_size_bytes,
-                    });
+        for item in &queued_locks {
+            match self.extract_lock_proof(item) {
+                Ok((proof, amount)) => {
+                    deposit_proofs.push(proof);
+                    deposit_amounts.push(amount);
+                    processed_lock_ids.push(item.id);
+                }
+                Err(e) => {
+                    warn!(
+                        "proof extraction failed id={} error={}, skipping",
+                        item.item_id, e
+                    );
                 }
             }
         }
-        if prepared_links.is_empty() {
-            info!("initiate_deposit no-op: parked links missing proof_of_deposit");
-            return Ok(());
+
+        if !processed_lock_ids.is_empty() {
+            let total_deposit_amount = accumulate_amounts(&deposit_amounts)?;
+
+            let parked_data = ParkedData {
+                ct_role_id: "oracle".to_string(),
+                amount: Some(total_deposit_amount.clone()),
+                payload: json!({ "proof_of_deposit": deposit_proofs.clone() }),
+            };
+
+            info!(
+                "create_parked_link start locks={} total_amount={:?}",
+                processed_lock_ids.len(),
+                total_deposit_amount
+            );
+
+            let link_result: (ActionHashB64, AgentPubKey) = ham
+                .call_zome(
+                    &self.cfg.role_name,
+                    "transactor",
+                    "create_parked_link",
+                    &CreateParkedLinkInput {
+                        ea_id: self.cfg.credit_limit_ea_id.clone().into(),
+                        executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
+                        parked_link_type: ParkedLinkType::ParkedData((parked_data, true)),
+                    },
+                )
+                .await?;
+
+            info!(
+                "batched create_parked_link success locks={} action_hash={}",
+                processed_lock_ids.len(),
+                link_result.0
+            );
+
+            let credit_limit_ea_id: ActionHash =
+                context.credit_limit_adjustment.clone().into();
+            let _: (RAVE, ActionHash) = ham
+                .call_zome(
+                    &self.cfg.role_name,
+                    "transactor",
+                    "execute_rave",
+                    &RAVEExecuteInputs {
+                        ea_id: credit_limit_ea_id,
+                        executor_inputs: Value::Null,
+                        links: vec![],
+                        global_definition: global_definition.id.clone().into(),
+                        lane_definitions: context.lane_definitions.clone(),
+                        strategy: GetStrategy::Local,
+                    },
+                )
+                .await?;
+            info!("credit limit RAVE executed");
+
+            if !total_deposit_amount.is_zero() {
+                let _: ActionHashB64 = ham
+                    .call_zome(
+                        &self.cfg.role_name,
+                        "transactor",
+                        "create_parked_spend",
+                        &CreateParkedSpendInput {
+                            ea_id: context.bridging_agreement.clone().into(),
+                            executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
+                            ct_role_id: Some("bridging_agent".to_string()),
+                            amount: total_deposit_amount,
+                            spender_payload: json!({
+                                "proof_of_deposit": deposit_proofs,
+                            }),
+                            lane_definitions: context.lane_definitions.clone(),
+                        },
+                    )
+                    .await?;
+                info!("parked spend created on bridging EA");
+            }
+
+            for lock_id in &processed_lock_ids {
+                self.db.mark_succeeded(*lock_id)?;
+            }
+            info!("marked {} locks as succeeded", processed_lock_ids.len());
         }
-
-        let target_bytes = kb_to_bytes(self.cfg.deposit_batch_target_kb);
-        let selected_index = select_single_link_index(prepared_links.len());
-        let Some(selected_index) = selected_index else {
-            info!("initiate_deposit no-op: no selectable links in single-link mode");
-            return Ok(());
-        };
-        let selected = prepared_links
-            .get(selected_index)
-            .context("invalid single-link index while selecting link")?;
-        let selected_links_count = 1usize;
-        let pod_inputs = vec![selected.proof_of_deposit.clone()];
-        let amounts = vec![selected.transaction.amount.clone()];
-        let estimated_bytes = selected.proof_size_bytes;
-        let invoiced_amount = accumulate_amounts(&amounts)?;
-        if invoiced_amount.is_zero() {
-            info!("initiate_deposit no-op: selected links aggregated to zero amount");
-            return Ok(());
-        }
-
-        info!(
-            "initiate_deposit single-link selected total_links={} selected_links={} estimated_bytes={} batch_target_bytes={} selection_mode=single_link",
-            prepared_links.len(),
-            selected_links_count,
-            estimated_bytes,
-            target_bytes
-        );
-
-        let create_payload = CreateParkedSpendInput {
-            ea_id: context.bridging_agreement.clone().into(),
-            executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
-            ct_role_id: Some("bridging_agent".to_string()),
-            amount: invoiced_amount.clone(),
-            spender_payload: json!({
-                "proof_of_deposit": pod_inputs,
-            }),
-            lane_definitions: context.lane_definitions.clone(),
-        };
-        let parked_spend_link_id: ActionHashB64 = ham
-            .call_zome(
-                &self.cfg.role_name,
-                "transactor",
-                "create_parked_spend",
-                &create_payload,
-            )
-            .await?;
 
         let bridging_ea_id: ActionHash = context.bridging_agreement.clone().into();
         let bridging_links: Vec<Transaction> = ham
@@ -303,36 +199,93 @@ impl BridgeOrchestrator {
                 &bridging_ea_id,
             )
             .await?;
-        let parked_spend_tx = bridging_links
-            .into_iter()
-            .find(|tx| tx.id == parked_spend_link_id)
-            .context("created parked spend link not found in bridging agreement links")?;
 
-        let rave_result: (RAVE, ActionHash) = ham
-            .call_zome(
-                &self.cfg.role_name,
-                "transactor",
-                "execute_rave",
-                &RAVEExecuteInputs {
-                    ea_id: context.bridging_agreement.into(),
-                    executor_inputs: json!({
-                        "call_method": "deposit",
-                        "coupon": "0",
-                    }),
-                    links: vec![parked_spend_tx],
-                    global_definition: global_definition.id.clone().into(),
-                    lane_definitions: context.lane_definitions,
-                    strategy: GetStrategy::Local,
-                },
-            )
-            .await?;
+        let mut coupons_map = serde_json::Map::new();
+        for tx in &bridging_links {
+            if let TransactionDetails::ParkedSpend {
+                attached_payload, ..
+            } = &tx.details
+            {
+                if let Some(withdraw_to) = attached_payload
+                    .get("withdraw_to_address")
+                    .and_then(|v| v.as_str())
+                {
+                    let amount = tx
+                        .amount
+                        .get("1")
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
+                    info!(
+                        "generating coupon tx_id={:?} recipient={} amount={}",
+                        tx.id, withdraw_to, amount
+                    );
+                    let signer_ctx = signer_context_from_env()?;
+                    let coupon = generate_coupon(&amount, withdraw_to, &signer_ctx).await?;
+                    coupons_map.insert(tx.id.to_string(), Value::String(coupon));
+                }
+            }
+        }
+        let withdrawal_count = coupons_map.len();
+
+        if !bridging_links.is_empty() {
+            let rave_result: (RAVE, ActionHash) = ham
+                .call_zome(
+                    &self.cfg.role_name,
+                    "transactor",
+                    "execute_rave",
+                    &RAVEExecuteInputs {
+                        ea_id: context.bridging_agreement.into(),
+                        executor_inputs: json!({
+                            "coupons": Value::Object(coupons_map)
+                        }),
+                        links: vec![],
+                        global_definition: global_definition.id.clone().into(),
+                        lane_definitions: context.lane_definitions,
+                        strategy: GetStrategy::Local,
+                    },
+                )
+                .await?;
+            info!(
+                "unified bridging RAVE executed action_hash={} deposits={} withdrawals={}",
+                rave_result.1,
+                processed_lock_ids.len(),
+                withdrawal_count
+            );
+        } else if processed_lock_ids.is_empty() {
+            info!("bridge cycle no-op: no pending deposits or withdrawals");
+        }
+
+        let duration_ms = started.elapsed().as_millis() as u64;
         info!(
-            "initiate_deposit success action_hash={} selected_links={} estimated_bytes={} selection_mode=single_link",
-            rave_result.1,
-            selected_links_count,
-            estimated_bytes
+            "bridge cycle completed duration={}ms locks={} withdrawals={}",
+            duration_ms,
+            processed_lock_ids.len(),
+            withdrawal_count
         );
+
         Ok(())
+    }
+
+    fn extract_lock_proof(&self, item: &WorkItem) -> Result<(Value, UnitMap)> {
+        let payload = LockPayload::deserialize(item.payload_json.clone())?;
+        let contract_hex = format!("{:x}", self.cfg.lock_vault_address);
+        let depositor = decode_holochain_agent_as_pubkey_string(&payload.holochain_agent)?;
+        let normalized = payload.normalized_amounts()?;
+        let amount = normalized.amount_hot.clone();
+
+        let proof = json!({
+            "method": "deposit",
+            "contract_address": format!("0x{}", contract_hex.to_lowercase()),
+            "amount": amount,
+            "depositor_wallet_address": depositor
+        });
+
+        info!(
+            "extracted proof id={} amount={} agent={}",
+            payload.lock_id, amount, payload.holochain_agent
+        );
+
+        Ok((proof, UnitMap::from(vec![(self.cfg.unit_index, amount.as_str())])))
     }
 
     async fn resolve_deposit_context(
@@ -377,115 +330,6 @@ impl BridgeOrchestrator {
             credit_limit_adjustment: global_lane.rave_agreements.credit_limit_adjustment,
             bridging_agreement,
         })
-    }
-
-    async fn process_coupon_execute_rave(&self, ham: &Ham, item: &WorkItem) -> Result<()> {
-        let tx: Transaction = serde_json::from_value(item.payload_json.clone())
-            .context("deserialize parked transaction")?;
-
-        let (recipient, global_definition, lane_definitions, amount) = if let TransactionDetails::ParkedSpend {
-            attached_payload,
-            global_definition,
-            lane_definitions,
-            ..
-        } = tx.clone().details
-        {
-            #[derive(Serialize, Deserialize)]
-            struct SpenderPayload {
-                withdraw_to_address: String,
-            }
-            let payload = serde_json::from_value::<SpenderPayload>(attached_payload)
-                .context("deserialize parked spender payload")?;
-            let amount = tx
-                .clone()
-                .amount
-                .get("1")
-                .map(|v| v.to_string())
-                .unwrap_or_default();
-            (
-                payload.withdraw_to_address,
-                global_definition,
-                lane_definitions,
-                amount,
-            )
-        } else {
-            return Ok(());
-        };
-
-        let signer_ctx = signer_context_from_env()?;
-        info!(
-            "coupon generation start tx_id={:?} recipient={} amount_raw={}",
-            item.item_id, recipient, amount
-        );
-        let coupon = generate_coupon(&amount, &recipient, &signer_ctx).await?;
-        info!(
-            "coupon generated tx_id={:?} recipient={} amount_raw={}",
-            item.item_id, recipient, amount
-        );
-
-        let payload = RAVEExecuteInputs {
-            ea_id: ActionHashB64::from_str(&self.cfg.bridging_agreement_id)
-                .context("Invalid BRIDGING_AGREEMENT_ID")?
-                .into(),
-            executor_inputs: json!({
-                "call_method": "withdraw",
-                "coupon": coupon
-            }),
-            links: vec![tx],
-            global_definition: global_definition.into(),
-            lane_definitions: lane_definitions.iter().map(|ld| ld.clone().into()).collect(),
-            strategy: holochain_zome_types::entry::GetStrategy::Network,
-        };
-        info!(
-            "zome call start tx_id={:?} zome=transactor.execute_rave recipient={} amount_raw={}",
-            item.item_id, recipient, amount
-        );
-        let zome_result: (RAVE, ActionHash) = ham
-            .call_zome(&self.cfg.role_name, "transactor", "execute_rave", &payload)
-            .await?;
-        info!(
-            "zome call success tx_id={:?} zome=transactor.execute_rave action_hash={}",
-            item.item_id, zome_result.1
-        );
-        Ok(())
-    }
-
-    fn handle_failure(&self, item: &WorkItem, err: String, duration_ms: u64) -> Result<()> {
-        let error_class = classify_error(&err);
-        if error_class == "transient" {
-            let now = now_unix_secs();
-            let delay_secs = compute_retry_delay_secs(item.attempts);
-            let next_retry_at = now + delay_secs;
-            if self.db.schedule_retry(item.id, &err, next_retry_at)? {
-                warn!(
-                    "retry scheduled flow={} id={} task={} attempt={}/{} class={} next_retry_at={} delay={}ms duration={}ms error={}",
-                    item.flow,
-                    item.item_id,
-                    item.task_type,
-                    item.attempts,
-                    item.max_attempts,
-                    error_class,
-                    next_retry_at,
-                    delay_secs * 1000,
-                    duration_ms,
-                    err
-                );
-                return Ok(());
-            }
-        }
-
-        self.db.mark_failed_terminal(item.id, &err, error_class)?;
-        warn!(
-            "{} write failed id={} task={} attempt={}/{} class={} duration={}ms error={}",
-            item.flow, item.item_id, item.task_type, item.attempts, item.max_attempts, error_class, duration_ms, err
-        );
-        if item.attempts >= item.max_attempts {
-            warn!(
-                "retry exhausted flow={} id={} task={} attempts={}",
-                item.flow, item.item_id, item.task_type, item.max_attempts
-            );
-        }
-        Ok(())
     }
 }
 
@@ -565,61 +409,11 @@ fn decode_holochain_agent_as_pubkey_string(agent_hex: &str) -> Result<String> {
     Ok(holo_hash::AgentPubKey::from_raw_32(core_bytes.to_vec()).to_string())
 }
 
-fn now_unix_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default()
-}
-
-fn classify_error(err: &str) -> &'static str {
-    let e = err.to_lowercase();
-    let permanent_signals = [
-        "invalid",
-        "deserialize",
-        "expected 32 byte agent key",
-        "unknown task type",
-        "invalid bridging_agreement_id",
-    ];
-    if permanent_signals.iter().any(|s| e.contains(s)) {
-        "permanent"
-    } else {
-        "transient"
-    }
-}
-
-fn compute_retry_delay_secs(attempts: i64) -> i64 {
-    let base = 5_i64;
-    let max_delay = 900_i64;
-    let pow = (attempts.saturating_sub(1)).clamp(0, 16) as u32;
-    let delay = base.saturating_mul(2_i64.saturating_pow(pow));
-    delay.clamp(base, max_delay)
-}
-
-#[derive(Clone)]
-struct PreparedDepositLink {
-    transaction: Transaction,
-    proof_of_deposit: Value,
-    proof_size_bytes: usize,
-}
-
 struct DepositContext {
     lane_definitions: Vec<ActionHash>,
     bridging_agent: holo_hash::AgentPubKeyB64,
     credit_limit_adjustment: ActionHashB64,
     bridging_agreement: ActionHashB64,
-}
-
-fn kb_to_bytes(kb: u64) -> usize {
-    kb.saturating_mul(1024).clamp(1, usize::MAX as u64) as usize
-}
-
-fn select_single_link_index(link_count: usize) -> Option<usize> {
-    if link_count > 0 {
-        Some(0)
-    } else {
-        None
-    }
 }
 
 fn accumulate_amounts(amounts: &[UnitMap]) -> Result<UnitMap> {
@@ -633,37 +427,6 @@ fn accumulate_amounts(amounts: &[UnitMap]) -> Result<UnitMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classifies_permanent_errors() {
-        assert_eq!(classify_error("Invalid BRIDGING_AGREEMENT_ID"), "permanent");
-        assert_eq!(classify_error("Failed to deserialize response"), "permanent");
-    }
-
-    #[test]
-    fn classifies_transient_errors() {
-        assert_eq!(classify_error("websocket disconnected"), "transient");
-        assert_eq!(classify_error("timeout while calling zome"), "transient");
-    }
-
-    #[test]
-    fn backoff_is_bounded() {
-        assert_eq!(compute_retry_delay_secs(1), 5);
-        assert_eq!(compute_retry_delay_secs(2), 10);
-        assert!(compute_retry_delay_secs(12) <= 900);
-    }
-
-    #[test]
-    fn selects_first_link_when_available() {
-        let index = select_single_link_index(3);
-        assert_eq!(index, Some(0));
-    }
-
-    #[test]
-    fn selects_none_when_no_links() {
-        let index = select_single_link_index(0);
-        assert_eq!(index, None);
-    }
 
     #[test]
     fn accumulates_unit_maps() {

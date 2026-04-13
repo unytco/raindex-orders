@@ -30,7 +30,7 @@ pub struct Config {
     pub lock_vault_address: Address,
     pub confirmations: u64,
     pub poll_interval_ms: u64,
-    pub coupon_poll_interval_ms: u64,
+    pub bridge_cycle_interval_ms: u64,
     pub deposit_batch_target_kb: u64,
     pub db_path: String,
     pub role_name: String,
@@ -76,10 +76,11 @@ impl Config {
             .unwrap_or_else(|_| "5000".into())
             .parse()
             .context("Invalid POLL_INTERVAL_MS")?;
-        let coupon_poll_interval_ms = env::var("COUPON_POLL_INTERVAL_MS")
+        let bridge_cycle_interval_ms = env::var("BRIDGE_CYCLE_INTERVAL_MS")
+            .or_else(|_| env::var("COUPON_POLL_INTERVAL_MS"))
             .unwrap_or_else(|_| "180000".into())
             .parse()
-            .context("Invalid COUPON_POLL_INTERVAL_MS")?;
+            .context("Invalid BRIDGE_CYCLE_INTERVAL_MS")?;
         let deposit_batch_target_kb = env::var("DEPOSIT_BATCH_TARGET_KB")
             .unwrap_or_else(|_| "512".into())
             .parse()
@@ -123,7 +124,7 @@ impl Config {
             lock_vault_address,
             confirmations,
             poll_interval_ms,
-            coupon_poll_interval_ms,
+            bridge_cycle_interval_ms,
             deposit_batch_target_kb,
             db_path,
             role_name,

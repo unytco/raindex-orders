@@ -1,5 +1,4 @@
 mod config;
-mod coupon_flow;
 mod ham;
 mod lock_flow;
 mod orchestrator;
@@ -23,7 +22,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run both lock and coupon flows with single-writer execution.
+    /// Run lock detection and periodic bridge cycle with single-writer execution.
     Run,
     /// Inspect orchestrator state from SQLite.
     Status {
