@@ -82,9 +82,48 @@ the env file must be sourced even for `status` and `clear`.
 | `HOLOCHAIN_BRIDGING_AGENT_PUBKEY` | **Yes** | -- |
 | `HOLOCHAIN_LANE_DEFINITION` | No | _(none)_ |
 | `HOLOCHAIN_UNIT_INDEX` | No | `1` |
+| `HAM_REQUEST_TIMEOUT_SECS` | No | `120` (per-request timeout applied to the Holochain app websocket; prevents a slow/hung zome call from blocking the orchestrator indefinitely) |
+| `HAM_RECONNECT_BACKOFF_INITIAL_MS` | No | `1000` (initial reconnect delay after a dropped Holochain websocket) |
+| `HAM_RECONNECT_BACKOFF_MAX_MS` | No | `30000` (cap on reconnect delay) |
+| `HAM_RECONNECT_ESCALATE_AFTER` | No | `5` (after this many consecutive failed reconnect attempts, logs escalate from `warn` to `error` so ops alerts can fire; the loop keeps retrying forever) |
 | `RUST_LOG` | No | `info` |
 
 Confirmations are not configurable: 15 (mainnet) / 5 (sepolia).
+
+### Holochain websocket resilience
+
+The orchestrator owns one persistent app websocket to the conductor. If that
+socket is dropped (idle timeout, conductor restart, network blip), the
+orchestrator will automatically:
+
+1. Detect the failure on the next pre-cycle health probe
+   (`app_info` round-trip) or on the next cycle-level error classified as
+   connection-like.
+2. Reconnect with exponential backoff capped at `HAM_RECONNECT_BACKOFF_MAX_MS`,
+   with small jitter and escalating log level per `HAM_RECONNECT_ESCALATE_AFTER`.
+3. Resume normal cycles on success.
+
+Cycle-level errors still reset affected locks from `in_flight` back to
+`queued` via the existing lifecycle (see below). The reconnect layer never
+retries an individual zome call; reconnects only happen between cycles so a
+dropped socket cannot cause a write to be replayed mid-cycle.
+
+**Known limitation: cycle-level idempotency.** A bridge cycle performs four
+writes on the conductor before marking locks `succeeded`. If a write lands
+on the conductor but the response is lost (ws drop or timeout), the affected
+locks are currently re-queued and will be re-processed on the next cycle.
+This risk exists independently of websocket drops and predates the
+reconnect layer. A reconciliation step (scan existing EA links / action
+hashes before re-committing) is a separate, larger change that is not part
+of the reconnect work.
+
+### Graceful shutdown
+
+`bridge-orchestrator run` installs handlers for `SIGINT` and `SIGTERM`. On
+signal, the currently running bridge cycle is allowed to finish
+(interrupting mid-write would leave state ambiguous), and the main loop
+then exits cleanly between iterations. systemd `Restart=` and rolling
+deploys are safe.
 
 ### Signer (run only, when generating withdrawal coupons)
 

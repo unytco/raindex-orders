@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::ham::Ham;
+use crate::ham::{self, Ham};
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{generate_coupon, signer_context_from_env};
 use crate::state::{StateStore, WorkItem, WorkState};
@@ -14,8 +14,13 @@ use rave_engine::types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use zfuel::fuel::ZFuel;
+
+/// Receiver side of the shutdown signal. Set to `true` when the process
+/// receives Ctrl+C or SIGTERM.
+type ShutdownRx = watch::Receiver<bool>;
 
 pub struct BridgeOrchestrator {
     cfg: Config,
@@ -33,38 +38,91 @@ impl BridgeOrchestrator {
             "bridge-orchestrator started network={:?} poll={}ms bridge_cycle={}ms",
             self.cfg.network, self.cfg.poll_interval_ms, self.cfg.bridge_cycle_interval_ms
         );
-        let ham = Ham::connect(self.cfg.admin_port, self.cfg.app_port, &self.cfg.app_id)
-            .await
-            .context("Failed to connect to Holochain")?;
+
+        let mut shutdown = install_shutdown_handler();
+
+        let mut ham = match connect_ham_with_backoff(&self.cfg, &mut shutdown).await {
+            Some(h) => h,
+            None => {
+                info!("[bridge] shutdown received before initial connect, exiting");
+                return Ok(());
+            }
+        };
         let lock_flow = LockFlow::new(self.cfg.clone(), self.db.clone());
 
         let mut last_bridge_cycle =
             std::time::Instant::now() - Duration::from_millis(self.cfg.bridge_cycle_interval_ms);
 
         loop {
+            if *shutdown.borrow() {
+                info!("[bridge] shutdown signal received, exiting cleanly");
+                return Ok(());
+            }
+
             if let Err(e) = lock_flow.run_cycle().await {
                 error!("[lock-flow] cycle failed: {}", e);
+            }
+
+            if *shutdown.borrow() {
+                info!("[bridge] shutdown signal received, exiting cleanly");
+                return Ok(());
             }
 
             if last_bridge_cycle.elapsed()
                 >= Duration::from_millis(self.cfg.bridge_cycle_interval_ms)
             {
-                match self.run_bridge_cycle(&ham).await {
-                    Ok(()) => {
-                        last_bridge_cycle = std::time::Instant::now();
-                    }
+                // Pre-cycle health probe: surfaces dead sockets before we
+                // start a multi-step write sequence. If the probe fails for
+                // connection-like reasons, reconnect and skip this iteration
+                // (the cycle will retry next pass).
+                match ham.ping().await {
+                    Ok(()) => match self.run_bridge_cycle(&ham).await {
+                        Ok(()) => {
+                            last_bridge_cycle = std::time::Instant::now();
+                        }
+                        Err(e) => {
+                            error!("[bridge] cycle failed: {}", e);
+                            if let Err(reset_err) =
+                                self.db.reset_in_flight_to_queued("lock", &e.to_string())
+                            {
+                                error!(
+                                    "[bridge] failed to reset in_flight locks: {}",
+                                    reset_err
+                                );
+                            }
+                            if ham::is_connection_error(&e) {
+                                warn!(event = "ham.disconnected", error = %e);
+                                match connect_ham_with_backoff(&self.cfg, &mut shutdown).await
+                                {
+                                    Some(new_ham) => ham = new_ham,
+                                    None => return Ok(()),
+                                }
+                            }
+                        }
+                    },
                     Err(e) => {
-                        error!("[bridge] cycle failed: {}", e);
-                        if let Err(reset_err) =
-                            self.db.reset_in_flight_to_queued("lock", &e.to_string())
-                        {
-                            error!("[bridge] failed to reset in_flight locks: {}", reset_err);
+                        if ham::is_connection_error(&e) {
+                            warn!(event = "ham.probe.failed", error = %e);
+                            match connect_ham_with_backoff(&self.cfg, &mut shutdown).await {
+                                Some(new_ham) => ham = new_ham,
+                                None => return Ok(()),
+                            }
+                        } else {
+                            warn!(
+                                "[bridge] probe failed with non-connection error: {}",
+                                e
+                            );
                         }
                     }
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(self.cfg.poll_interval_ms)).await;
+            // Interruptible poll-interval sleep so shutdown is observed
+            // promptly (never mid-write).
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(self.cfg.poll_interval_ms)) => {}
+                _ = shutdown.changed() => {}
+            }
         }
     }
 
@@ -608,6 +666,128 @@ fn accumulate_amounts(amounts: &[UnitMap]) -> Result<UnitMap> {
         total.add(amount.clone())?;
     }
     Ok(total)
+}
+
+/// Spawn a background task that flips the returned watch receiver to `true`
+/// once the process receives Ctrl+C or SIGTERM. The initial value is marked
+/// as seen so subsequent `.changed()` calls only complete on a real signal.
+fn install_shutdown_handler() -> ShutdownRx {
+    let (tx, mut rx) = watch::channel(false);
+    rx.mark_unchanged();
+
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("received SIGINT, initiating graceful shutdown");
+                        }
+                        _ = sigterm.recv() => {
+                            info!("received SIGTERM, initiating graceful shutdown");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to install SIGTERM handler, falling back to Ctrl+C only: {}", e);
+                    let _ = tokio::signal::ctrl_c().await;
+                    info!("received SIGINT, initiating graceful shutdown");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("received Ctrl+C, initiating graceful shutdown");
+        }
+        let _ = tx.send(true);
+    });
+
+    rx
+}
+
+/// Establish a fresh `Ham` connection. Thin wrapper that centralizes the
+/// connect call so both startup and reconnect flows share one path.
+async fn connect_ham(cfg: &Config) -> Result<Ham> {
+    Ham::connect(
+        cfg.admin_port,
+        cfg.app_port,
+        &cfg.app_id,
+        cfg.ham_request_timeout_secs,
+    )
+    .await
+    .context("Failed to connect to Holochain")
+}
+
+/// Loop forever (until shutdown) trying to establish a `Ham` connection.
+/// Uses exponential backoff capped at `ham_reconnect_backoff_max_ms` with
+/// small jitter. Logs each failed attempt at `warn!` and escalates to
+/// `error!` once the consecutive attempt count passes
+/// `ham_reconnect_escalate_after`, so operator alerts can fire while we
+/// keep trying.
+///
+/// Returns `None` if a shutdown signal arrives while we are waiting or
+/// retrying, allowing the caller to exit cleanly.
+async fn connect_ham_with_backoff(cfg: &Config, shutdown: &mut ShutdownRx) -> Option<Ham> {
+    let mut attempt: u32 = 0;
+    loop {
+        if *shutdown.borrow() {
+            return None;
+        }
+        match connect_ham(cfg).await {
+            Ok(ham) => {
+                if attempt > 0 {
+                    info!(event = "ham.reconnected", attempts = attempt);
+                }
+                return Some(ham);
+            }
+            Err(e) => {
+                let delay_ms = compute_backoff_ms(attempt, cfg);
+                if attempt >= cfg.ham_reconnect_escalate_after {
+                    error!(
+                        event = "ham.reconnect.attempt",
+                        attempt,
+                        delay_ms,
+                        error = %e,
+                        "reconnect failing persistently; operator attention needed"
+                    );
+                } else {
+                    warn!(
+                        event = "ham.reconnect.attempt",
+                        attempt,
+                        delay_ms,
+                        error = %e,
+                    );
+                }
+                attempt = attempt.saturating_add(1);
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                    _ = shutdown.changed() => { return None; }
+                }
+            }
+        }
+    }
+}
+
+/// Compute the next reconnect delay: exponential (1,2,4,... *initial) capped
+/// at `ham_reconnect_backoff_max_ms`, plus up to 10% jitter seeded from the
+/// system clock's sub-second nanos (no extra crate dependency required).
+fn compute_backoff_ms(attempt: u32, cfg: &Config) -> u64 {
+    let shift = attempt.min(20);
+    let factor = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let base = cfg
+        .ham_reconnect_backoff_initial_ms
+        .saturating_mul(factor);
+    let capped = base.min(cfg.ham_reconnect_backoff_max_ms);
+    let jitter_range = (capped / 10).max(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    capped.saturating_add(nanos % jitter_range)
 }
 
 /// Estimate the worst-case msgpack link-tag size this batch will produce.

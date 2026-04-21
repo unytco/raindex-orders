@@ -47,6 +47,16 @@ pub struct Config {
     pub bridging_agent_pubkey: AgentPubKeyB64,
     pub lane_definition: Option<ActionHashB64>,
     pub unit_index: u32,
+    /// Per-request timeout applied to the Holochain app websocket. Prevents a
+    /// slow or hung zome call from blocking the orchestrator indefinitely.
+    pub ham_request_timeout_secs: u64,
+    /// Initial backoff delay used by the reconnect loop (milliseconds).
+    pub ham_reconnect_backoff_initial_ms: u64,
+    /// Cap on the reconnect backoff delay (milliseconds).
+    pub ham_reconnect_backoff_max_ms: u64,
+    /// Number of consecutive failed reconnect attempts before the log level
+    /// escalates from `warn` to `error`. The loop keeps retrying forever.
+    pub ham_reconnect_escalate_after: u32,
 }
 
 impl Config {
@@ -125,6 +135,22 @@ impl Config {
             .unwrap_or_else(|_| "1".into())
             .parse()
             .context("Invalid HOLOCHAIN_UNIT_INDEX")?;
+        let ham_request_timeout_secs = env::var("HAM_REQUEST_TIMEOUT_SECS")
+            .unwrap_or_else(|_| "120".into())
+            .parse()
+            .context("Invalid HAM_REQUEST_TIMEOUT_SECS")?;
+        let ham_reconnect_backoff_initial_ms = env::var("HAM_RECONNECT_BACKOFF_INITIAL_MS")
+            .unwrap_or_else(|_| "1000".into())
+            .parse()
+            .context("Invalid HAM_RECONNECT_BACKOFF_INITIAL_MS")?;
+        let ham_reconnect_backoff_max_ms = env::var("HAM_RECONNECT_BACKOFF_MAX_MS")
+            .unwrap_or_else(|_| "30000".into())
+            .parse()
+            .context("Invalid HAM_RECONNECT_BACKOFF_MAX_MS")?;
+        let ham_reconnect_escalate_after = env::var("HAM_RECONNECT_ESCALATE_AFTER")
+            .unwrap_or_else(|_| "5".into())
+            .parse()
+            .context("Invalid HAM_RECONNECT_ESCALATE_AFTER")?;
         Ok(Self {
             network,
             rpc_url,
@@ -142,6 +168,10 @@ impl Config {
             bridging_agent_pubkey,
             lane_definition,
             unit_index,
+            ham_request_timeout_secs,
+            ham_reconnect_backoff_initial_ms,
+            ham_reconnect_backoff_max_ms,
+            ham_reconnect_escalate_after,
         })
     }
 }
