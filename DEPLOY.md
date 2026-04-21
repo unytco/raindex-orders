@@ -6,7 +6,7 @@ This guide covers deploying and testing the complete HOT <> bridged HOT bridge i
 
 1. MetaMask wallet with Sepolia ETH (get from [Sepolia Faucet](https://sepoliafaucet.com/))
 2. Foundry installed (`forge`, `cast` commands available)
-3. Rust toolchain (for lock-watcher and coupon-signer)
+3. Rust toolchain (for bridge-orchestrator)
 4. Node.js 20+ (for UI)
 
 ## Quick Start
@@ -76,11 +76,11 @@ The `deploy-sepolia.sh` script handles all deployment steps:
 
 ### Lock Flow (HOT -> Bridged HOT)
 
-1. **Start the lock watcher:**
+1. **Start the bridge orchestrator:**
 ```bash
-cd lock-watcher-rs
+cd bridge-orchestrator
 cp .env.example .env
-# Edit .env: set SEPOLIA_LOCK_VAULT_ADDRESS=0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6
+# Edit .env with your Sepolia + Holochain settings
 cargo run
 ```
 
@@ -97,22 +97,12 @@ npm run dev
    - Select "Lock HOT -> bridged HOT" tab
    - Enter amount and Holochain agent public key
    - Approve and lock tokens
-   - Watch the lock-watcher detect the event
+   - Watch the bridge-orchestrator detect the event and drive the Holochain bridge
 
 ### Claim Flow (Bridged HOT -> HOT)
 
-1. **Generate a claim coupon:**
-```bash
-cd coupon-signer
-cp .env.example .env
-# .env already configured with test values
-
-# Generate coupon for 10 tokens to a recipient
-cargo run -- \
-  --amount "10" \
-  --recipient "0xYourRecipientAddress" \
-  --format ui
-```
+1. **Coupon generation:**
+   Withdrawal coupons are produced by the bridge orchestrator as part of its bridging cycle whenever a burn/withdraw request is observed on the Holochain side. See `bridge-orchestrator/src/signer.rs` for the signing logic.
 
 2. **Claim via UI:**
    - Open http://localhost:5173/claim
@@ -121,7 +111,7 @@ cargo run -- \
    - Click "Claim HOT"
 
 3. **Claim via URL parameter:**
-   - The coupon-signer outputs a URL-safe format
+   - Coupons use a URL-safe format
    - Share: `http://localhost:5173/claim?c=<signer>,<signature>,<ctx0>,<ctx1>,...`
 
 ## Architecture Overview
@@ -155,33 +145,19 @@ Functions:
 - `adminWithdraw(amount, to)` - Emergency withdrawal (admin only)
 - `vaultBalance()` - Check vault balance
 
-### Coupon Signer (`coupon-signer/`)
+### Bridge Orchestrator (`bridge-orchestrator/`)
 
-Rust CLI that generates signed claim coupons:
+Rust service that replaces the legacy `lock-watcher-rs` and `coupon-signer`:
 ```bash
-cargo run -- \
-  --amount "10" \
-  --recipient "0x..." \
-  --format ui    # Output format: ui (default), json, or hex
-```
-
-Output formats:
-- `ui`: `signer,signature,ctx0,ctx1,...,ctx8` (decimal values, URL-safe)
-- `json`: Full JSON with all fields
-- `hex`: Raw hex-encoded signed context
-
-### Lock Watcher (`lock-watcher-rs/`)
-
-Rust service that monitors Lock events:
-```bash
+cd bridge-orchestrator
 cargo run
 ```
 
-Features:
-- Polls for new Lock events
-- SQLite database for tracking processed locks
-- Configurable polling interval
-- Ready for Holochain integration
+Responsibilities:
+- Polls the orderbook for new Lock events and drives the Holochain bridge
+- Processes withdrawal requests from Holochain and generates signed claim coupons (see `src/signer.rs::generate_coupon`)
+- Emits batched bridging RAVE transactions with explicit links and a coupons map
+- Produces the same URL-safe coupon format consumed by the UI: `signer,signature,ctx0,ctx1,...,ctx8`
 
 ### UI (`ui/`)
 
@@ -217,7 +193,7 @@ The UI reads order status directly from the blockchain via RPC. If you see this 
 ### Transaction fails with "Wrong signer"
 The coupon was signed with a different key than the one configured in the Rainlang order.
 - Check `valid-signer` in `src/holo-claim.rain`
-- Ensure `SIGNER_PRIVATE_KEY` in coupon-signer matches
+- Ensure `SIGNER_PRIVATE_KEY` in the bridge-orchestrator environment matches
 
 ### "Nonce already used"
 Each coupon can only be used once. Generate a new coupon with a fresh nonce.

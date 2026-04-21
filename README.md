@@ -27,8 +27,7 @@ This repository contains the Ethereum-side infrastructure for the HOT <> bridged
 |-----------|-------------|----------|
 | `src/HoloLockVault.sol` | Smart contract for locking HOT and managing claim orders | Solidity |
 | `src/holo-claim.rain` | Rainlang expression for validating claim coupons | Rainlang |
-| `coupon-signer/` | CLI tool for generating signed claim coupons | Rust |
-| `lock-watcher-rs/` | Service that monitors Lock events on Ethereum | Rust |
+| `bridge-orchestrator/` | Service that watches Lock events, drives the Holochain bridge, and generates withdrawal coupons | Rust |
 | `ui/` | Web interface for locking and claiming | SvelteKit |
 
 ## Quick Start
@@ -36,7 +35,7 @@ This repository contains the Ethereum-side infrastructure for the HOT <> bridged
 ### Prerequisites
 
 - [Foundry](https://book.getfoundry.sh/getting-started/installation) (forge, cast)
-- [Rust](https://rustup.rs/) (for coupon-signer and lock-watcher)
+- [Rust](https://rustup.rs/) (for bridge-orchestrator)
 - [Node.js 20+](https://nodejs.org/) (for UI)
 - MetaMask with Sepolia ETH
 
@@ -64,25 +63,16 @@ npm run dev
 # Open http://localhost:5173
 ```
 
-### 3. Test Locking
+### 3. Run the bridge orchestrator
 
 ```bash
-cd lock-watcher-rs
+cd bridge-orchestrator
 cp .env.example .env
-# Edit with SEPOLIA_LOCK_VAULT_ADDRESS
+# Edit with your Sepolia + Holochain settings
 cargo run
 ```
 
-Then use the UI to lock tokens. The watcher will detect the Lock event.
-
-### 4. Test Claiming
-
-```bash
-cd coupon-signer
-cargo run -- --amount "10" --recipient "0xYourAddress" --format ui
-```
-
-Paste the output into the claim page at http://localhost:5173/claim
+The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, and generates signed withdrawal coupons for claim flows.
 
 ## Sepolia Deployment
 
@@ -106,7 +96,7 @@ Paste the output into the claim page at http://localhost:5173/claim
 2. User calls `lock(amount, holochainAgentPubKey)`
 3. HoloLockVault deposits tokens to its Raindex vault
 4. `Lock` event emitted with amount and Holochain agent
-5. Lock watcher detects event
+5. Bridge orchestrator detects the event
 6. Holochain side credits bridged HOT to agent
 
 ### Claim Flow (Bridged HOT -> HOT)
@@ -127,11 +117,8 @@ forge build
 # Run tests
 forge test
 
-# Build coupon-signer
-cd coupon-signer && cargo build
-
-# Build lock-watcher
-cd lock-watcher-rs && cargo build
+# Build the bridge orchestrator
+cd bridge-orchestrator && cargo build
 ```
 
 ## Security

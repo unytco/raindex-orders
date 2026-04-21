@@ -14,8 +14,7 @@ This document describes the architecture of the two-way bridge between HOT token
 | HoloLockVault Contract | Complete | `src/HoloLockVault.sol` |
 | MockHOT Token | Complete | `src/MockHOT.sol` |
 | Rainlang Claim Expression | Complete | `src/holo-claim.rain` |
-| Coupon Signer (Rust) | Complete | `coupon-signer/` |
-| Lock Watcher (Rust) | Complete | `lock-watcher-rs/` |
+| Bridge Orchestrator (Rust) | Complete | `bridge-orchestrator/` |
 | Web UI | Complete | `ui/` |
 | Deployment Scripts | Complete | `deploy-sepolia.sh`, `script/` |
 | Foundry Tests | Complete | `test/` |
@@ -82,11 +81,11 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
        │ 3. Tokens deposited           │         │ 4. Lock event detected
        ▼                               │         ▼
 ┌──────────────────────┐               │  ┌─────────────────────┐
-│   Raindex Orderbook  │               │  │   Lock Watcher      │
-│                      │               │  │   (lock-watcher-rs) │
+│   Raindex Orderbook  │               │  │ Bridge Orchestrator │
+│                      │               │  │ (bridge-orchestrator)│
 │ Vault balance:       │               │  │                     │
 │ +100 HOT             │               │  │ • Poll for events   │
-└──────────────────────┘               │  │ • Store in SQLite   │
+└──────────────────────┘               │  │ • Drive Holochain   │
                                        │  └──────────┬──────────┘
                                        │             │
                                        │             │ 5. Notify Holochain
@@ -107,7 +106,7 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
 | 1 | User approves HoloLockVault | HOT ERC20 | Complete |
 | 2 | User calls `lock(amount, agent)` | HoloLockVault | Complete |
 | 3 | Contract deposits to orderbook | Raindex Orderbook | Complete |
-| 4 | Lock watcher detects event | lock-watcher-rs | Complete |
+| 4 | Bridge orchestrator detects event | bridge-orchestrator | Complete |
 | 5 | Holochain notified of lock | TBD | **Pending** |
 | 6 | Bridged HOT credited to agent | Bridged HOT DNA | **Pending** |
 
@@ -139,8 +138,8 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
                                        │         │    coupon
                                        │         ▼
                                        │  ┌─────────────────────┐
-                                       │  │   Coupon Signer     │
-                                       │  │   (coupon-signer/)  │
+                                       │  │ Bridge Orchestrator │
+                                       │  │ (bridge-orchestrator)│
                                        │  │                     │
                                        │  │ • Create coupon:    │
                                        │  │   - recipient       │
@@ -194,7 +193,7 @@ This ensures LOCK deposits and CLAIM withdrawals operate on the **same pool of t
 | Step | Action | Component | Status |
 |------|--------|-----------|--------|
 | 1 | User burns bridged HOT | Bridged HOT DNA | **Pending** |
-| 2 | Backend generates coupon | coupon-signer | Complete |
+| 2 | Backend generates coupon | bridge-orchestrator | Complete |
 | 3 | User receives coupon | Email/App/URL | Complete |
 | 4 | User visits claim page | ui/ | Complete |
 | 5 | User calls `takeOrders()` | Raindex Orderbook | Complete |
@@ -229,18 +228,6 @@ contract HoloLockVault {
 - Deposits to Raindex orderbook vault owned by this contract
 - Can deploy/manage claim orders (making itself the order owner)
 - Admin controls for emergency withdrawal
-
-### Lock Watcher (`lock-watcher-rs/`)
-
-**Purpose**: Rust service that monitors Lock events on Ethereum.
-
-**Features**:
-- Polls Ethereum RPC for Lock events
-- Stores processed locks in SQLite database
-- Configurable polling interval
-- Ready for Holochain integration
-
-**Note**: The lock watcher currently stores events locally. The mechanism for notifying Holochain (direct API call, signed certificate, or other) is to be determined based on Holochain-side requirements.
 
 ### 2. Rainlang Claim Expression (`src/holo-claim.rain`)
 
@@ -282,46 +269,27 @@ io-ratio: 0;
 | 7 | outputVaultId | Vault ID |
 | 8 | nonce | Unique nonce (prevents replay) |
 
-### 3. Coupon Signer (`coupon-signer/`)
+### 3. Bridge Orchestrator (`bridge-orchestrator/`)
 
-**Purpose**: Rust CLI that generates signed claim coupons.
+**Purpose**: Rust service that watches Lock events on Ethereum, drives the Holochain bridge, and generates signed withdrawal coupons. Replaces the legacy `lock-watcher-rs` and `coupon-signer` crates.
 
 ```bash
-cargo run -- \
-  --amount "10" \
-  --recipient "0x..." \
-  --format ui
+cd bridge-orchestrator
+cargo run
 ```
 
-**Output Formats**:
-- `ui`: Comma-separated decimal values for web UI
-- `json`: Full JSON with all fields
-- `hex`: Raw hex-encoded signed context
+**Responsibilities**:
+- Polls Ethereum RPC for Lock events and hands them off to the Holochain side
+- Scans bridging entries on Holochain and emits unified bridging RAVE transactions
+- Generates signed withdrawal coupons (`src/signer.rs::generate_coupon`) in the URL-safe `signer,signature,ctx0..ctx8` format consumed by the UI claim page
+- Tracks state required to batch coupons up to a configurable size cap
 
-**Configuration** (via `.env` or CLI):
+**Configuration** (via `.env`):
 - `SIGNER_PRIVATE_KEY`: Key that matches `valid-signer` in Rainlang
-- `ORDER_HASH`, `ORDER_OWNER`, `ORDERBOOK_ADDRESS`, etc.
+- `ORDER_HASH`, `ORDER_OWNER`, `ORDERBOOK_ADDRESS`, `TOKEN_ADDRESS`, `VAULT_ID`
+- Network/RPC settings, polling interval, coupon batch size cap (see `bridge-orchestrator/src/config.rs`)
 
-### 4. Lock Watcher (`lock-watcher-rs/`)
-
-**Purpose**: Rust service that monitors Lock events on Ethereum.
-
-**Features**:
-- Polls Ethereum RPC for Lock events
-- Stores processed locks in SQLite database
-- Configurable polling interval
-- Ready for Holochain integration
-
-**Configuration** (`.env`):
-```env
-NETWORK=sepolia
-SEPOLIA_RPC_URL=https://1rpc.io/sepolia
-SEPOLIA_LOCK_VAULT_ADDRESS=0x...
-POLL_INTERVAL_MS=5000
-DB_PATH=./data/locks.db
-```
-
-### 5. Web UI (`ui/`)
+### 4. Web UI (`ui/`)
 
 **Purpose**: SvelteKit web interface for locking and claiming.
 
@@ -366,10 +334,10 @@ PUBLIC_TOKEN_ADDRESS=0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749
 
 ### Lock Flow -> Holochain
 
-The lock-watcher-rs component is ready for Holochain integration:
+The bridge-orchestrator handles Lock-to-Holochain:
 
-1. **Current State**: Detects Lock events and stores in SQLite
-2. **Next Step**: Implement notification mechanism to Holochain
+1. **Current State**: Detects Lock events and forwards them into the Holochain bridge cycle
+2. **Next Step**: Refine the notification/reservation mechanism once Holochain-side requirements are finalised
 
 **Integration Options** (to be determined based on Holochain requirements):
 - Direct Holochain conductor API call
@@ -390,16 +358,16 @@ pub struct ReserveCertificate {
 
 ### Claim Flow <- Holochain
 
-The coupon-signer component is ready for Holochain integration:
+The bridge-orchestrator also handles coupon generation for claims:
 
-1. **Current State**: CLI generates coupons with test key
+1. **Current State**: Orchestrator generates signed coupons with the configured signer key
 2. **Next Step**: Integrate with Fireblocks MPC for production signing
 3. **Final Step**: Trigger from bridged HOT burn events
 
 **Integration Flow**:
 1. User burns bridged HOT in Bridged HOT DNA
 2. Bridged HOT DNA notifies Holo backend
-3. Backend calls coupon-signer (or equivalent)
+3. Bridge orchestrator generates a signed coupon
 4. Signed coupon delivered to user (email, app notification, etc.)
 5. User claims on Ethereum
 
@@ -419,7 +387,7 @@ The coupon-signer component is ready for Holochain integration:
 - **Parameter Binding**: Coupon bound to specific order, owner, token, vault
 
 ### Bridge Security
-- **Finality**: Lock watcher should wait for sufficient confirmations (15+)
+- **Finality**: Bridge orchestrator should wait for sufficient confirmations (15+)
 - **Replay Protection**: Track processed lock IDs on both sides
 - **Same Signer**: Use same trusted signer (Fireblocks) for both directions
 
@@ -444,11 +412,8 @@ raindex-orders/
 │   └── DeployClaimOrderViaVault.s.sol # Order deployment
 ├── test/
 │   └── HoloLockVault.t.sol     # Foundry tests
-├── coupon-signer/              # Rust coupon generator
-│   ├── src/main.rs
-│   └── .env.example
-├── lock-watcher-rs/            # Rust event watcher
-│   ├── src/main.rs
+├── bridge-orchestrator/        # Rust bridge orchestrator (lock watcher + coupon signer)
+│   ├── src/
 │   └── .env.example
 ├── ui/                         # SvelteKit web UI
 │   ├── src/routes/

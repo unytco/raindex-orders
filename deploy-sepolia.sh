@@ -295,13 +295,6 @@ deploy_order_via_vault() {
         # Set ORDER_OWNER to the vault address
         sed -i "s|^ORDER_OWNER=.*|ORDER_OWNER=$LOCK_VAULT_ADDRESS|" .env
         echo -e "${GREEN}Updated .env with ORDER_HASH and ORDER_OWNER (vault address)${NC}"
-
-        # Also update coupon-signer .env if it exists
-        if [ -f "coupon-signer/.env" ]; then
-            sed -i "s|^ORDER_HASH=.*|ORDER_HASH=$ORDER_HASH_VAL|" coupon-signer/.env
-            sed -i "s|^ORDER_OWNER=.*|ORDER_OWNER=$LOCK_VAULT_ADDRESS|" coupon-signer/.env
-            echo -e "${GREEN}Updated coupon-signer/.env as well${NC}"
-        fi
     else
         echo -e "${YELLOW}Order deployed but could not extract hash from broadcast file${NC}"
         echo "Check the transaction on Etherscan to get the order hash"
