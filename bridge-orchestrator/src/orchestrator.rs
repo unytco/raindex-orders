@@ -7,13 +7,15 @@ use anyhow::{Context, Result};
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use holochain_zome_types::entry::GetStrategy;
 use rave_engine::types::{
-    CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, LaneExt, ParkedData,
-    ParkedLinkType, RAVEExecuteInputs, Transaction, TransactionDetails, UnitMap, RAVE,
+    CarryForwardUnits, CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, LaneExt,
+    ParkedData, ParkedLinkType, ParkedSpendData, RAVEExecuteInputs, Transaction, TransactionDetails,
+    UnitMap, RAVE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+use zfuel::fuel::ZFuel;
 
 pub struct BridgeOrchestrator {
     cfg: Config,
@@ -95,7 +97,8 @@ impl BridgeOrchestrator {
         }
 
         // --- Check for work before committing to a full cycle ---
-        let budget_bytes = self.cfg.deposit_batch_target_kb as usize * 1024;
+        let tag_cap = self.cfg.max_link_tag_bytes;
+        let coupons_budget = self.cfg.coupons_target_bytes;
         let queued_locks = self.db.list_work_items("lock", WorkState::Queued, 5000)?;
 
         if queued_locks.is_empty() {
@@ -118,56 +121,104 @@ impl BridgeOrchestrator {
             }
         }
 
-        // --- Size-capped deposit extraction ---
+        // --- Tag-size-aware deposit extraction ---
+        //
+        // A single `create_parked_link` / `create_parked_spend` call packs ALL
+        // selected proofs into ONE link tag (msgpack-encoded ParkedData /
+        // ParkedSpendData). Holochain rejects any link tag larger than
+        // MAX_TAG_SIZE (1000 bytes). We measure the actual tentative tag size
+        // as we add each proof, and stop when either the ParkedData tag or the
+        // (larger) ParkedSpendData tag would exceed the configured cap.
         let mut deposit_proofs: Vec<Value> = Vec::new();
         let mut deposit_amounts: Vec<UnitMap> = Vec::new();
         let mut processed_lock_ids: Vec<i64> = Vec::new();
-        let mut cumulative_bytes: usize = 0;
+        let mut last_tag_bytes: usize = 0;
+        let mut batch_capped = false;
 
         info!(
-            "[bridge] \u{2500}\u{2500} cycle started \u{2500}\u{2500} locks_queued={} budget_kb={}",
+            "[bridge] \u{2500}\u{2500} cycle started \u{2500}\u{2500} locks_queued={} link_tag_cap={}",
             queued_locks.len(),
-            self.cfg.deposit_batch_target_kb
+            tag_cap
         );
 
+        let global_definition_hash: ActionHash = global_definition.id.clone().into();
+
         for item in &queued_locks {
-            match self.extract_lock_proof(item) {
-                Ok((proof, amount)) => {
-                    let proof_bytes = serde_json::to_vec(&proof)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    if cumulative_bytes + proof_bytes > budget_bytes
-                        && !deposit_proofs.is_empty()
-                    {
-                        info!(
-                            "[bridge/deposits] batch: selected={}/{} cumulative_bytes={} (cap reached, {} deferred)",
-                            deposit_proofs.len(),
-                            queued_locks.len(),
-                            cumulative_bytes,
-                            queued_locks.len() - deposit_proofs.len()
-                        );
-                        break;
-                    }
-                    cumulative_bytes += proof_bytes;
-                    deposit_proofs.push(proof);
-                    deposit_amounts.push(amount);
-                    processed_lock_ids.push(item.id);
-                }
+            let (proof, amount) = match self.extract_lock_proof(item) {
+                Ok(v) => v,
                 Err(e) => {
                     warn!(
                         "[bridge/deposits] proof extraction failed id={} error={}, skipping",
                         item.item_id, e
                     );
+                    continue;
                 }
+            };
+
+            let mut tentative_proofs = deposit_proofs.clone();
+            tentative_proofs.push(proof.clone());
+            let mut tentative_amounts = deposit_amounts.clone();
+            tentative_amounts.push(amount.clone());
+            let tentative_total = accumulate_amounts(&tentative_amounts)?;
+            let tentative_payload = json!({ "proof_of_deposit": &tentative_proofs });
+
+            let tag_bytes = match estimate_link_tag_bytes(
+                &tentative_total,
+                &tentative_payload,
+                &global_definition_hash,
+                &context.lane_definitions,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(
+                        "[bridge/deposits] failed to estimate tag size id={} error={}, skipping",
+                        item.item_id, e
+                    );
+                    continue;
+                }
+            };
+
+            if tag_bytes > tag_cap {
+                if deposit_proofs.is_empty() {
+                    // Single proof already exceeds cap: skip this lock rather than
+                    // block the head of the queue forever.
+                    warn!(
+                        "[bridge/deposits] single proof exceeds link tag cap (size={} > cap={}), skipping lock id={}",
+                        tag_bytes, tag_cap, item.item_id
+                    );
+                    continue;
+                }
+                info!(
+                    "[bridge/deposits] batch cap reached at {} proofs (next tag would be {} bytes > cap {})",
+                    deposit_proofs.len(),
+                    tag_bytes,
+                    tag_cap
+                );
+                batch_capped = true;
+                break;
             }
+
+            last_tag_bytes = tag_bytes;
+            deposit_proofs.push(proof);
+            deposit_amounts.push(amount);
+            processed_lock_ids.push(item.id);
         }
 
-        if deposit_proofs.len() == queued_locks.len() || deposit_proofs.is_empty() {
+        if !batch_capped {
             info!(
-                "[bridge/deposits] batch: selected={}/{} cumulative_bytes={} (all fit within budget)",
+                "[bridge/deposits] batch: selected={}/{} tag_bytes={} (all fit within cap {})",
                 deposit_proofs.len(),
                 queued_locks.len(),
-                cumulative_bytes
+                last_tag_bytes,
+                tag_cap
+            );
+        } else {
+            info!(
+                "[bridge/deposits] batch: selected={}/{} tag_bytes={} ({} deferred to next cycle)",
+                deposit_proofs.len(),
+                queued_locks.len(),
+                last_tag_bytes,
+                queued_locks.len() - deposit_proofs.len()
             );
         }
 
@@ -315,7 +366,7 @@ impl BridgeOrchestrator {
                         .map(|v| v.len())
                         .unwrap_or(0);
 
-                    if coupon_cumulative_bytes + entry_bytes > budget_bytes
+                    if coupon_cumulative_bytes + entry_bytes > coupons_budget
                         && !selected_withdrawal_links.is_empty()
                     {
                         withdrawal_capped = true;
@@ -557,6 +608,53 @@ fn accumulate_amounts(amounts: &[UnitMap]) -> Result<UnitMap> {
         total.add(amount.clone())?;
     }
     Ok(total)
+}
+
+/// Estimate the worst-case msgpack link-tag size this batch will produce.
+///
+/// The orchestrator creates two links from the same proofs-of-deposit payload:
+///   1. `ParkedData` on the credit-limit EA (via `create_parked_link`)
+///   2. `ParkedSpendData` on the bridging EA (via `create_parked_spend`)
+///
+/// `ParkedSpendData` carries extra fields (global_definition, new_balance,
+/// proposed_balance, carry_forward_units, fees_owed, lane_definitions) so its
+/// tag is strictly larger. We compute both and return the max. Unknown
+/// runtime-computed fields (new_balance, proposed_balance, etc.) are filled
+/// with worst-case-sized placeholders derived from `total_amount`.
+fn estimate_link_tag_bytes(
+    total_amount: &UnitMap,
+    payload: &Value,
+    global_definition: &ActionHash,
+    lane_definitions: &[ActionHash],
+) -> Result<usize> {
+    let parked_data = (
+        ParkedData {
+            ct_role_id: "oracle".to_string(),
+            amount: Some(total_amount.clone()),
+            payload: payload.clone(),
+        },
+        true,
+    );
+    let parked_data_tag = rmp_serde::to_vec(&parked_data)
+        .context("failed to msgpack-encode ParkedData for tag-size estimation")?
+        .len();
+
+    let parked_spend = ParkedSpendData {
+        ct_role_id: "bridging_agent".to_string(),
+        amount: total_amount.clone(),
+        payload: payload.clone(),
+        global_definition: global_definition.clone(),
+        lane_definitions: lane_definitions.to_vec(),
+        new_balance: total_amount.clone(),
+        carry_forward_units: CarryForwardUnits::new(),
+        fees_owed: ZFuel::zero(),
+        proposed_balance: total_amount.clone(),
+    };
+    let parked_spend_tag = rmp_serde::to_vec(&parked_spend)
+        .context("failed to msgpack-encode ParkedSpendData for tag-size estimation")?
+        .len();
+
+    Ok(parked_data_tag.max(parked_spend_tag))
 }
 
 #[cfg(test)]
