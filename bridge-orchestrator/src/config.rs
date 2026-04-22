@@ -57,6 +57,11 @@ pub struct Config {
     /// Number of consecutive failed reconnect attempts before the log level
     /// escalates from `warn` to `error`. The loop keeps retrying forever.
     pub ham_reconnect_escalate_after: u32,
+    /// Pause (milliseconds) applied after a cycle fails with a Holochain
+    /// source-chain-pressure error (e.g. `"deadline has elapsed"`). The
+    /// socket is healthy but the conductor is backpressured, so we back off
+    /// before the next cycle instead of hammering it.
+    pub ham_pressure_cooldown_ms: u64,
 }
 
 impl Config {
@@ -151,6 +156,10 @@ impl Config {
             .unwrap_or_else(|_| "5".into())
             .parse()
             .context("Invalid HAM_RECONNECT_ESCALATE_AFTER")?;
+        let ham_pressure_cooldown_ms = env::var("HAM_PRESSURE_COOLDOWN_MS")
+            .unwrap_or_else(|_| "30000".into())
+            .parse()
+            .context("Invalid HAM_PRESSURE_COOLDOWN_MS")?;
         Ok(Self {
             network,
             rpc_url,
@@ -172,6 +181,7 @@ impl Config {
             ham_reconnect_backoff_initial_ms,
             ham_reconnect_backoff_max_ms,
             ham_reconnect_escalate_after,
+            ham_pressure_cooldown_ms,
         })
     }
 }

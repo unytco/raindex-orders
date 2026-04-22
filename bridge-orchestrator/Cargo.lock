@@ -1170,6 +1170,7 @@ dependencies = [
  "chrono",
  "clap 4.6.0",
  "dotenvy",
+ "ham",
  "hex",
  "holo_hash",
  "holochain_client",
@@ -2306,6 +2307,18 @@ dependencies = [
  "ff",
  "rand_core 0.6.4",
  "subtle",
+]
+
+[[package]]
+name = "ham"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "holochain_client",
+ "rmp-serde",
+ "serde",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

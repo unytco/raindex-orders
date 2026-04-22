@@ -236,6 +236,17 @@ impl StateStore {
 
     fn recover_stale_items(&self) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
+        // Bump attempts for every row we recover so a subsequent cycle can
+        // detect the retry and run the source-chain dedup. Must happen before
+        // the max_attempts check so rows that just crossed the threshold this
+        // recovery are correctly promoted to 'failed'.
+        conn.execute(
+            "UPDATE work_items
+             SET attempts = attempts + 1,
+                 updated_at = strftime('%s', 'now')
+             WHERE state IN ('claimed', 'in_flight')",
+            [],
+        )?;
         conn.execute(
             "UPDATE work_items
              SET state = 'queued',
@@ -448,13 +459,57 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn reset_in_flight_to_queued(&self, flow: &str, error: &str) -> Result<usize> {
+    /// Terminally fail a single row with `error_class='permanent'`. Used
+    /// by the cycle for per-lock failure modes that cannot possibly succeed
+    /// on retry (malformed payload, tag-size estimation bug, or a single
+    /// proof that is structurally larger than the link tag cap).
+    pub fn mark_failed_permanent(&self, id: i64, error: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE work_items
+             SET state='failed',
+                 error_class='permanent',
+                 last_error=?2,
+                 next_retry_at=NULL,
+                 updated_at=strftime('%s', 'now')
+             WHERE id=?1",
+            params![id, error],
+        )?;
+        Ok(())
+    }
+
+    /// Promote any `queued` rows that have already exhausted their retry
+    /// budget to `failed` with `error_class='permanent'`. Intended to be
+    /// called at the top of each cycle so a broken lock cannot loop
+    /// forever in a long-running session (the `recover_stale_items`
+    /// equivalent only runs on startup).
+    pub fn fail_exhausted_queued(&self, flow: &str) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let updated = conn.execute(
             "UPDATE work_items
+             SET state='failed',
+                 error_class='permanent',
+                 last_error = coalesce(last_error || '; ', '') || 'Exceeded max attempts in-cycle',
+                 next_retry_at=NULL,
+                 updated_at=strftime('%s', 'now')
+             WHERE flow=?1 AND state='queued' AND attempts >= max_attempts",
+            params![flow],
+        )?;
+        Ok(updated)
+    }
+
+    pub fn reset_in_flight_to_queued(&self, flow: &str, error: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        // Bump attempts so the next cycle knows this lock has been tried at
+        // least once; the bridge orchestrator uses attempts > 0 as the gate
+        // for the expensive RAVE-history dedup scan.
+        let updated = conn.execute(
+            "UPDATE work_items
              SET state='queued',
+                 attempts=attempts+1,
                  error_class='transient',
                  last_error=?2,
+                 last_attempt_at=strftime('%s', 'now'),
                  updated_at=strftime('%s', 'now')
              WHERE state='in_flight' AND flow=?1",
             params![flow, error],
@@ -692,6 +747,31 @@ mod tests {
         .unwrap();
     }
 
+    fn insert_work_item_with_attempts(
+        path: &str,
+        item_id: &str,
+        state: WorkState,
+        attempts: i64,
+        max_attempts: i64,
+    ) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%s', 'now'), strftime('%s', 'now'))",
+            rusqlite::params![
+                "lock",
+                "create_parked_link",
+                item_id,
+                format!("{}:key", item_id),
+                serde_json::json!({"lock_id": item_id}).to_string(),
+                state.to_string(),
+                attempts,
+                max_attempts,
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn recovers_stale_in_progress_items_on_startup() {
         let path = test_db_path("recover");
@@ -719,6 +799,201 @@ mod tests {
             .clone()
             .unwrap_or_default()
             .contains("Recovered from stale in-progress state"));
+    }
+
+    #[test]
+    fn recover_stale_items_bumps_attempts() {
+        // Guards the invariant that `attempts > 0` reliably means "this lock
+        // has been tried before", which is the gate the bridge orchestrator
+        // uses to decide whether to run the expensive RAVE-history dedup
+        // scan. Historically the prod binary never incremented `attempts`
+        // because the only caller lived inside `#[cfg(test)] claim_next`,
+        // so every row read 0 forever.
+        let path = test_db_path("recover-bumps-attempts");
+        let item_id = {
+            let store = StateStore::open(&path).unwrap();
+            store
+                .enqueue_queued(
+                    "lock",
+                    "create_parked_link",
+                    "lock:1",
+                    "lock:1:create_parked_link",
+                    &serde_json::json!({"lock_id":"1"}),
+                )
+                .unwrap();
+            let item = store.claim_next(Some("lock")).unwrap().unwrap();
+            assert_eq!(item.attempts, 1, "claim_next should bump attempts to 1");
+            store.mark_in_flight(item.id).unwrap();
+            item.id
+        };
+
+        let store = StateStore::open(&path).unwrap();
+        let items = store
+            .list_work_items("lock", WorkState::Queued, 10)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].id, item_id,
+            "recovered item should be the same row we stashed"
+        );
+        assert_eq!(
+            items[0].attempts, 2,
+            "recover_stale_items must bump attempts so retry gate can fire"
+        );
+    }
+
+    #[test]
+    fn reset_in_flight_to_queued_bumps_attempts() {
+        // Per-cycle error path (as opposed to startup crash-recovery). The
+        // bridge orchestrator calls `reset_in_flight_to_queued` when a cycle
+        // fails mid-write; the next cycle uses `attempts > 0` to decide it
+        // needs to scan applied RAVE history before issuing any
+        // `create_parked_*` call, so the bump *must* happen here.
+        let path = test_db_path("reset-bumps-attempts");
+        let store = StateStore::open(&path).unwrap();
+        store
+            .enqueue_queued(
+                "lock",
+                "create_parked_link",
+                "lock:1",
+                "lock:1:create_parked_link",
+                &serde_json::json!({"lock_id":"1"}),
+            )
+            .unwrap();
+        let item = store.claim_next(Some("lock")).unwrap().unwrap();
+        assert_eq!(item.attempts, 1);
+        store.mark_in_flight(item.id).unwrap();
+
+        let affected = store
+            .reset_in_flight_to_queued("lock", "simulated cycle error")
+            .unwrap();
+        assert_eq!(affected, 1, "one in_flight row should have been reset");
+
+        let items = store
+            .list_work_items("lock", WorkState::Queued, 10)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].attempts, 2,
+            "reset_in_flight_to_queued must bump attempts so retry gate can fire"
+        );
+        assert_eq!(
+            items[0].last_error.as_deref(),
+            Some("simulated cycle error"),
+            "last_error should carry the cycle error context"
+        );
+    }
+
+    #[test]
+    fn mark_failed_permanent_sets_permanent_error_class() {
+        // Per-lock terminal failure helper used by the cycle whenever a
+        // single lock cannot be processed on any retry (malformed payload,
+        // tag-size encoder bug, oversize proof, etc).
+        let path = test_db_path("mark-failed-permanent");
+        let store = StateStore::open(&path).unwrap();
+        store
+            .enqueue_queued(
+                "lock",
+                "create_parked_link",
+                "lock:1",
+                "lock:1:create_parked_link",
+                &serde_json::json!({"lock_id": "1"}),
+            )
+            .unwrap();
+
+        let item = store.claim_next(Some("lock")).unwrap().unwrap();
+        store
+            .mark_failed_permanent(item.id, "proof extraction failed: bogus payload")
+            .unwrap();
+
+        let failed = store
+            .list_work_items("lock", WorkState::Failed, 10)
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, item.id);
+        assert_eq!(failed[0].error_class.as_deref(), Some("permanent"));
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some("proof extraction failed: bogus payload")
+        );
+        assert_eq!(failed[0].next_retry_at, None);
+
+        let queued = store
+            .list_work_items("lock", WorkState::Queued, 10)
+            .unwrap();
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn fail_exhausted_queued_promotes_rows_over_cap() {
+        // Per-cycle safety valve: queued rows whose `attempts` have already
+        // reached `max_attempts` must be promoted to `failed` so they don't
+        // keep re-entering the deep dedup scan every cycle.
+        let path = test_db_path("fail-exhausted-over-cap");
+        let store = StateStore::open(&path).unwrap();
+
+        insert_work_item_with_attempts(&path, "lock:over", WorkState::Queued, 8, 8);
+        insert_work_item_with_attempts(&path, "lock:equal-over", WorkState::Queued, 9, 8);
+        insert_work_item_with_attempts(&path, "lock:under", WorkState::Queued, 3, 8);
+
+        let promoted = store.fail_exhausted_queued("lock").unwrap();
+        assert_eq!(promoted, 2, "both at-cap and over-cap rows should promote");
+
+        let failed = store
+            .list_work_items("lock", WorkState::Failed, 10)
+            .unwrap();
+        assert_eq!(failed.len(), 2);
+        for row in &failed {
+            assert_eq!(row.error_class.as_deref(), Some("permanent"));
+            assert!(row
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Exceeded max attempts in-cycle"));
+        }
+
+        // The within-budget row stays queued and keeps its attempts intact.
+        let queued = store
+            .list_work_items("lock", WorkState::Queued, 10)
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].item_id, "lock:under");
+        assert_eq!(queued[0].attempts, 3);
+    }
+
+    #[test]
+    fn fail_exhausted_queued_leaves_other_states_alone() {
+        // Only queued rows can be promoted — in_flight / claimed must wait
+        // for `recover_stale_items` / `reset_in_flight_to_queued`, and
+        // terminal states are untouched.
+        let path = test_db_path("fail-exhausted-state-scope");
+        let store = StateStore::open(&path).unwrap();
+
+        insert_work_item_with_attempts(&path, "lock:in-flight", WorkState::InFlight, 8, 8);
+        insert_work_item_with_attempts(&path, "lock:claimed", WorkState::Claimed, 8, 8);
+        insert_work_item_with_attempts(&path, "lock:succeeded", WorkState::Succeeded, 8, 8);
+        insert_work_item_with_attempts(&path, "lock:failed", WorkState::Failed, 8, 8);
+
+        let promoted = store.fail_exhausted_queued("lock").unwrap();
+        assert_eq!(
+            promoted, 0,
+            "only queued rows are in scope; other states must not be touched"
+        );
+
+        for (state, expected) in [
+            (WorkState::InFlight, 1),
+            (WorkState::Claimed, 1),
+            (WorkState::Succeeded, 1),
+            (WorkState::Failed, 1),
+        ] {
+            let rows = store.list_work_items("lock", state.clone(), 10).unwrap();
+            assert_eq!(
+                rows.len(),
+                expected,
+                "state {:?} should be unchanged",
+                state
+            );
+        }
     }
 
     #[test]

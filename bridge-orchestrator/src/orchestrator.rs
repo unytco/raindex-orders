@@ -1,9 +1,12 @@
 use crate::config::Config;
-use crate::ham::{self, Ham};
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{generate_coupon, signer_context_from_env};
 use crate::state::{StateStore, WorkItem, WorkState};
 use anyhow::{Context, Result};
+use ham::{
+    connect_with_backoff, install_shutdown_handler, is_connection_error, is_source_chain_pressure,
+    BackoffConfig, Ham, HamConfig,
+};
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use holochain_zome_types::entry::GetStrategy;
 use rave_engine::types::{
@@ -14,13 +17,8 @@ use rave_engine::types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
-use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use zfuel::fuel::ZFuel;
-
-/// Receiver side of the shutdown signal. Set to `true` when the process
-/// receives Ctrl+C or SIGTERM.
-type ShutdownRx = watch::Receiver<bool>;
 
 pub struct BridgeOrchestrator {
     cfg: Config,
@@ -40,8 +38,15 @@ impl BridgeOrchestrator {
         );
 
         let mut shutdown = install_shutdown_handler();
+        let backoff = backoff_config(&self.cfg);
 
-        let mut ham = match connect_ham_with_backoff(&self.cfg, &mut shutdown).await {
+        let mut ham = match connect_with_backoff(
+            || connect_ham(&self.cfg),
+            &backoff,
+            &mut shutdown,
+        )
+        .await
+        {
             Some(h) => h,
             None => {
                 info!("[bridge] shutdown received before initial connect, exiting");
@@ -90,20 +95,53 @@ impl BridgeOrchestrator {
                                     reset_err
                                 );
                             }
-                            if ham::is_connection_error(&e) {
+                            if is_connection_error(&e) {
                                 warn!(event = "ham.disconnected", error = %e);
-                                match connect_ham_with_backoff(&self.cfg, &mut shutdown).await
+                                match connect_with_backoff(
+                                    || connect_ham(&self.cfg),
+                                    &backoff,
+                                    &mut shutdown,
+                                )
+                                .await
                                 {
                                     Some(new_ham) => ham = new_ham,
                                     None => return Ok(()),
+                                }
+                            } else if is_source_chain_pressure(&e) {
+                                // Server-side workflow timeout / source-chain
+                                // backpressure. Socket is healthy, so we keep
+                                // it open and simply pause before the next
+                                // cycle instead of retrying at full tempo.
+                                // The lock itself is already queued for retry
+                                // by `reset_in_flight_to_queued` above, and
+                                // the idempotent pre-scans in
+                                // `run_bridge_cycle` prevent a duplicate
+                                // parked entry if the prior write actually
+                                // committed despite the elapsed deadline.
+                                warn!(
+                                    event = "ham.source_chain_pressure",
+                                    cooldown_ms = self.cfg.ham_pressure_cooldown_ms,
+                                    error = %e
+                                );
+                                let cooldown =
+                                    Duration::from_millis(self.cfg.ham_pressure_cooldown_ms);
+                                tokio::select! {
+                                    _ = tokio::time::sleep(cooldown) => {}
+                                    _ = shutdown.changed() => {}
                                 }
                             }
                         }
                     },
                     Err(e) => {
-                        if ham::is_connection_error(&e) {
+                        if is_connection_error(&e) {
                             warn!(event = "ham.probe.failed", error = %e);
-                            match connect_ham_with_backoff(&self.cfg, &mut shutdown).await {
+                            match connect_with_backoff(
+                                || connect_ham(&self.cfg),
+                                &backoff,
+                                &mut shutdown,
+                            )
+                            .await
+                            {
                                 Some(new_ham) => ham = new_ham,
                                 None => return Ok(()),
                             }
@@ -128,12 +166,24 @@ impl BridgeOrchestrator {
 
     /// Single unified bridge cycle that handles deposits and withdrawals together.
     ///
-    /// 1. Size-capped extraction of deposit proofs from queued locks
-    /// 2. ONE create_parked_link on credit limit EA (batched proof array)
-    /// 3. ONE credit limit RAVE with explicit links
-    /// 4. ONE create_parked_spend on bridging EA (aggregated proof list)
-    /// 5. Scan bridging EA, size-capped withdrawal coupon generation
-    /// 6. ONE unified bridging RAVE with explicit links and coupons map
+    /// The sequence is idempotent against the Holochain source chain. Before
+    /// issuing any `create_parked_*` write we pre-scan both EAs and build a
+    /// [`DedupIndex`] keyed by the EVM `tx_hash` embedded in every
+    /// `proof_of_deposit`; any lock whose work has already been committed is
+    /// either skipped at the appropriate step or marked succeeded locally.
+    ///
+    /// The "applied RAVE history" half of the scan is gated on
+    /// `attempts > 0` so the steady-state cycle pays exactly the same zome
+    /// calls it always did.
+    ///
+    /// 1. Resolve context + always-on live parked pre-scan (both EAs)
+    /// 2. Conditional applied-RAVE scan (only if any lock is a retry)
+    /// 3. Per-lock decision table → two size-capped proof batches
+    /// 4. ONE create_parked_link (if any lock still needs the CL link)
+    /// 5. ONE credit limit RAVE over a freshly re-fetched live link set
+    /// 6. ONE create_parked_spend (if any lock still needs the bridging spend)
+    /// 7. Scan bridging EA, size-capped withdrawal coupon generation
+    /// 8. ONE unified bridging RAVE with explicit links and coupons map
     async fn run_bridge_cycle(&self, ham: &Ham) -> Result<()> {
         let started = std::time::Instant::now();
 
@@ -154,101 +204,290 @@ impl BridgeOrchestrator {
             return Ok(());
         }
 
-        // --- Check for work before committing to a full cycle ---
         let tag_cap = self.cfg.max_link_tag_bytes;
         let coupons_budget = self.cfg.coupons_target_bytes;
-        let queued_locks = self.db.list_work_items("lock", WorkState::Queued, 5000)?;
 
-        if queued_locks.is_empty() {
-            let bridging_ea_id: ActionHash = context.bridging_agreement.clone().into();
-            let bridging_links: Vec<Transaction> = ham
+        // Per-cycle safety valve: promote any queued lock that has already
+        // exhausted its retry budget to `failed` before we fetch the work
+        // list. Without this a permanently broken lock would keep retrying
+        // forever in a long-running session (the `recover_stale_items`
+        // equivalent only runs at startup).
+        let promoted = self.db.fail_exhausted_queued("lock")?;
+        if promoted > 0 {
+            warn!(
+                "[bridge] promoted {} queued lock(s) to failed (attempts >= max_attempts)",
+                promoted
+            );
+        }
+
+        let queued_locks = self.db.list_work_items("lock", WorkState::Queued, 5000)?;
+        let credit_limit_ea_id: ActionHash = context.credit_limit_adjustment.clone().into();
+        let bridging_ea_id: ActionHash = context.bridging_agreement.clone().into();
+        let global_definition_hash: ActionHash = global_definition.id.clone().into();
+
+        // --- Always-on pre-scan: live parked entries on both EAs ---
+        //
+        // These two calls are required anyway (we previously invoked
+        // `get_parked_links_by_ea` right before each RAVE); hoisting them to
+        // the top of the cycle lets us use their results for dedup AND for
+        // the subsequent RAVE, so steady-state cost is unchanged.
+        let cl_parked: Vec<Transaction> = ham
+            .call_zome(
+                &self.cfg.role_name,
+                "transactor",
+                "get_parked_links_by_ea",
+                &credit_limit_ea_id,
+            )
+            .await?;
+        let br_parked: Vec<Transaction> = ham
+            .call_zome(
+                &self.cfg.role_name,
+                "transactor",
+                "get_parked_links_by_ea",
+                &bridging_ea_id,
+            )
+            .await?;
+
+        // --- Early exit: nothing anywhere to work on ---
+        if queued_locks.is_empty() && cl_parked.is_empty() && br_parked.is_empty() {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            debug!(
+                "[bridge] cycle no-op (no pending deposits or withdrawals) duration={}ms",
+                duration_ms
+            );
+            return Ok(());
+        }
+
+        // --- Conditional deep scan: applied RAVE history ---
+        //
+        // Expensive (bounded by EA history, grows over time). Only run when
+        // at least one queued lock has been tried before — by construction a
+        // never-retried lock cannot have committed on-chain state under a
+        // consumed parked link, so there is nothing for the RAVE-history
+        // scan to find.
+        let retry_lock_count = queued_locks.iter().filter(|l| l.attempts > 0).count();
+        let needs_deep_dedup = queued_locks_need_deep_dedup(&queued_locks);
+        let (cl_raves, br_raves) = if needs_deep_dedup {
+            let cl_raves: Vec<Transaction> = ham
                 .call_zome(
                     &self.cfg.role_name,
                     "transactor",
-                    "get_parked_links_by_ea",
+                    "get_raves_for_smart_agreement",
+                    &credit_limit_ea_id,
+                )
+                .await?;
+            let br_raves: Vec<Transaction> = ham
+                .call_zome(
+                    &self.cfg.role_name,
+                    "transactor",
+                    "get_raves_for_smart_agreement",
                     &bridging_ea_id,
                 )
                 .await?;
-            if bridging_links.is_empty() {
-                let duration_ms = started.elapsed().as_millis() as u64;
-                debug!(
-                    "[bridge] cycle no-op (no pending deposits or withdrawals) duration={}ms",
-                    duration_ms
-                );
-                return Ok(());
-            }
-        }
+            info!(
+                "[bridge] deep dedup scan engaged: retry_locks={} cl_raves={} br_raves={}",
+                retry_lock_count,
+                cl_raves.len(),
+                br_raves.len()
+            );
+            (cl_raves, br_raves)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
-        // --- Tag-size-aware deposit extraction ---
-        //
-        // A single `create_parked_link` / `create_parked_spend` call packs ALL
-        // selected proofs into ONE link tag (msgpack-encoded ParkedData /
-        // ParkedSpendData). Holochain rejects any link tag larger than
-        // MAX_TAG_SIZE (1000 bytes). We measure the actual tentative tag size
-        // as we add each proof, and stop when either the ParkedData tag or the
-        // (larger) ParkedSpendData tag would exceed the configured cap.
-        let mut deposit_proofs: Vec<Value> = Vec::new();
-        let mut deposit_amounts: Vec<UnitMap> = Vec::new();
-        let mut processed_lock_ids: Vec<i64> = Vec::new();
-        let mut last_tag_bytes: usize = 0;
-        let mut batch_capped = false;
+        let dedup = DedupIndex::from_scans(&cl_parked, &cl_raves, &br_parked, &br_raves);
 
         info!(
-            "[bridge] \u{2500}\u{2500} cycle started \u{2500}\u{2500} locks_queued={} link_tag_cap={}",
+            "[bridge] \u{2500}\u{2500} cycle started \u{2500}\u{2500} locks_queued={} link_tag_cap={} cl_parked_live={} br_parked_live={} deep_dedup={}",
             queued_locks.len(),
-            tag_cap
+            tag_cap,
+            cl_parked.len(),
+            br_parked.len(),
+            needs_deep_dedup
         );
 
-        let global_definition_hash: ActionHash = global_definition.id.clone().into();
+        // --- Per-lock decision + tag-size-aware batch extraction ---
+        //
+        // Each queued lock independently populates up to two proof batches:
+        //   * `cl_proofs`    — to be packed into a single `create_parked_link`
+        //   * `spend_proofs` — to be packed into a single `create_parked_spend`
+        //
+        // Either batch can be empty (e.g. after a partial-failure retry where
+        // the CL link has already been consumed by its RAVE, so only the
+        // spend still needs creating). `in_flight_lock_ids` is the union of
+        // locks we'll mark in_flight; `fully_done_ids` is the disjoint set
+        // we mark succeeded without any on-chain write.
+        let mut cl_proofs: Vec<Value> = Vec::new();
+        let mut cl_amounts: Vec<UnitMap> = Vec::new();
+        let mut spend_proofs: Vec<Value> = Vec::new();
+        let mut spend_amounts: Vec<UnitMap> = Vec::new();
+        let mut in_flight_lock_ids: Vec<i64> = Vec::new();
+        let mut fully_done_ids: Vec<i64> = Vec::new();
+        let mut last_cl_tag_bytes: usize = 0;
+        let mut last_spend_tag_bytes: usize = 0;
+        let mut batch_capped = false;
 
         for item in &queued_locks {
             let (proof, amount) = match self.extract_lock_proof(item) {
                 Ok(v) => v,
                 Err(e) => {
+                    // Extraction failures are permanent for this payload
+                    // shape — retrying won't help. Promote to failed so the
+                    // lock stops forever-lurking in the queue.
                     warn!(
-                        "[bridge/deposits] proof extraction failed id={} error={}, skipping",
+                        "[bridge/deposits] proof extraction failed id={} error={}, marking failed",
                         item.item_id, e
                     );
+                    if let Err(db_err) = self.db.mark_failed_permanent(
+                        item.id,
+                        &format!("proof extraction failed: {e}"),
+                    ) {
+                        error!(
+                            "[bridge] failed to mark lock {} failed: {}",
+                            item.id, db_err
+                        );
+                    }
                     continue;
                 }
             };
 
-            let mut tentative_proofs = deposit_proofs.clone();
-            tentative_proofs.push(proof.clone());
-            let mut tentative_amounts = deposit_amounts.clone();
-            tentative_amounts.push(amount.clone());
-            let tentative_total = accumulate_amounts(&tentative_amounts)?;
-            let tentative_payload = json!({ "proof_of_deposit": &tentative_proofs });
+            let tx_hash = proof
+                .get("tx_hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let flags = dedup.lookup(&tx_hash);
+            let decision = decide(&flags);
 
-            let tag_bytes = match estimate_link_tag_bytes(
-                &tentative_total,
-                &tentative_payload,
-                &global_definition_hash,
-                &context.lane_definitions,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(
-                        "[bridge/deposits] failed to estimate tag size id={} error={}, skipping",
-                        item.item_id, e
-                    );
-                    continue;
+            if matches!(decision, LockDecision::FullyDone) {
+                info!(
+                    "[bridge] idempotent_complete lock={} tx_hash={} reason=rave_history_match attempts={}",
+                    item.item_id, tx_hash, item.attempts
+                );
+                fully_done_ids.push(item.id);
+                continue;
+            }
+
+            let needs_cl = matches!(decision, LockDecision::Fresh);
+            let needs_spend = matches!(decision, LockDecision::Fresh | LockDecision::SkipClOnly);
+
+            // Build tentative batches so we can tag-size the incremental add.
+            let tentative_cl_proofs = if needs_cl {
+                let mut p = cl_proofs.clone();
+                p.push(proof.clone());
+                p
+            } else {
+                cl_proofs.clone()
+            };
+            let tentative_cl_amounts = if needs_cl {
+                let mut a = cl_amounts.clone();
+                a.push(amount.clone());
+                a
+            } else {
+                cl_amounts.clone()
+            };
+            let tentative_spend_proofs = if needs_spend {
+                let mut p = spend_proofs.clone();
+                p.push(proof.clone());
+                p
+            } else {
+                spend_proofs.clone()
+            };
+            let tentative_spend_amounts = if needs_spend {
+                let mut a = spend_amounts.clone();
+                a.push(amount.clone());
+                a
+            } else {
+                spend_amounts.clone()
+            };
+
+            let cl_tag_bytes = if tentative_cl_proofs.is_empty() {
+                0
+            } else {
+                let total = accumulate_amounts(&tentative_cl_amounts)?;
+                let payload = json!({ "proof_of_deposit": &tentative_cl_proofs });
+                match estimate_parked_data_tag_bytes(&total, &payload) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        // Encoder shouldn't fail on well-formed data; if it
+                        // does the payload is unprocessable on retry too.
+                        warn!(
+                            "[bridge/deposits] failed to estimate cl tag size id={} error={}, marking failed",
+                            item.item_id, e
+                        );
+                        if let Err(db_err) = self.db.mark_failed_permanent(
+                            item.id,
+                            &format!("cl tag size estimation failed: {e}"),
+                        ) {
+                            error!(
+                                "[bridge] failed to mark lock {} failed: {}",
+                                item.id, db_err
+                            );
+                        }
+                        continue;
+                    }
+                }
+            };
+            let spend_tag_bytes = if tentative_spend_proofs.is_empty() {
+                0
+            } else {
+                let total = accumulate_amounts(&tentative_spend_amounts)?;
+                let payload = json!({ "proof_of_deposit": &tentative_spend_proofs });
+                match estimate_parked_spend_tag_bytes(
+                    &total,
+                    &payload,
+                    &global_definition_hash,
+                    &context.lane_definitions,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!(
+                            "[bridge/deposits] failed to estimate spend tag size id={} error={}, marking failed",
+                            item.item_id, e
+                        );
+                        if let Err(db_err) = self.db.mark_failed_permanent(
+                            item.id,
+                            &format!("spend tag size estimation failed: {e}"),
+                        ) {
+                            error!(
+                                "[bridge] failed to mark lock {} failed: {}",
+                                item.id, db_err
+                            );
+                        }
+                        continue;
+                    }
                 }
             };
 
+            let tag_bytes = cl_tag_bytes.max(spend_tag_bytes);
             if tag_bytes > tag_cap {
-                if deposit_proofs.is_empty() {
-                    // Single proof already exceeds cap: skip this lock rather than
-                    // block the head of the queue forever.
+                let batches_empty = cl_proofs.is_empty() && spend_proofs.is_empty();
+                if batches_empty {
+                    // A single proof that on its own exceeds the tag cap
+                    // cannot ever be processed (Holochain enforces the
+                    // limit at write time). Promote to failed instead of
+                    // silently re-skipping every cycle forever.
                     warn!(
-                        "[bridge/deposits] single proof exceeds link tag cap (size={} > cap={}), skipping lock id={}",
+                        "[bridge/deposits] single proof exceeds link tag cap (size={} > cap={}), marking lock id={} failed",
                         tag_bytes, tag_cap, item.item_id
                     );
+                    if let Err(db_err) = self.db.mark_failed_permanent(
+                        item.id,
+                        &format!(
+                            "proof exceeds max_link_tag_bytes (size={tag_bytes}, cap={tag_cap})"
+                        ),
+                    ) {
+                        error!(
+                            "[bridge] failed to mark lock {} failed: {}",
+                            item.id, db_err
+                        );
+                    }
                     continue;
                 }
                 info!(
-                    "[bridge/deposits] batch cap reached at {} proofs (next tag would be {} bytes > cap {})",
-                    deposit_proofs.len(),
+                    "[bridge/deposits] batch cap reached cl={} spend={} next_tag={} cap={}",
+                    cl_proofs.len(),
+                    spend_proofs.len(),
                     tag_bytes,
                     tag_cap
                 );
@@ -256,87 +495,128 @@ impl BridgeOrchestrator {
                 break;
             }
 
-            last_tag_bytes = tag_bytes;
-            deposit_proofs.push(proof);
-            deposit_amounts.push(amount);
-            processed_lock_ids.push(item.id);
+            if flags.cl_parked_live || flags.cl_rave_applied {
+                info!(
+                    "[bridge/deposits] idempotent_skip step=create_parked_link lock={} tx_hash={} reason={} attempts={}",
+                    item.item_id,
+                    tx_hash,
+                    if flags.cl_rave_applied { "rave_history" } else { "live_parked" },
+                    item.attempts
+                );
+            }
+            if flags.br_parked_live {
+                info!(
+                    "[bridge/deposits] idempotent_skip step=create_parked_spend lock={} tx_hash={} reason=live_parked attempts={}",
+                    item.item_id, tx_hash, item.attempts
+                );
+            }
+
+            if needs_cl {
+                cl_proofs = tentative_cl_proofs;
+                cl_amounts = tentative_cl_amounts;
+                last_cl_tag_bytes = cl_tag_bytes;
+            }
+            if needs_spend {
+                spend_proofs = tentative_spend_proofs;
+                spend_amounts = tentative_spend_amounts;
+                last_spend_tag_bytes = spend_tag_bytes;
+            }
+            in_flight_lock_ids.push(item.id);
+        }
+
+        if !fully_done_ids.is_empty() {
+            info!(
+                "[bridge/deposits] {} lock(s) detected as already-consumed by bridging RAVE in history; marking succeeded without any new on-chain write",
+                fully_done_ids.len()
+            );
+            for lock_id in &fully_done_ids {
+                self.db.mark_succeeded(*lock_id)?;
+            }
         }
 
         if !batch_capped {
             info!(
-                "[bridge/deposits] batch: selected={}/{} tag_bytes={} (all fit within cap {})",
-                deposit_proofs.len(),
-                queued_locks.len(),
-                last_tag_bytes,
+                "[bridge/deposits] batch: in_flight={} cl_create={} spend_create={} already_done={} cl_tag={} spend_tag={} (fit within cap {})",
+                in_flight_lock_ids.len(),
+                cl_proofs.len(),
+                spend_proofs.len(),
+                fully_done_ids.len(),
+                last_cl_tag_bytes,
+                last_spend_tag_bytes,
                 tag_cap
             );
         } else {
             info!(
-                "[bridge/deposits] batch: selected={}/{} tag_bytes={} ({} deferred to next cycle)",
-                deposit_proofs.len(),
+                "[bridge/deposits] batch: in_flight={}/{} cl_create={} spend_create={} already_done={} cl_tag={} spend_tag={} (remainder deferred to next cycle)",
+                in_flight_lock_ids.len(),
                 queued_locks.len(),
-                last_tag_bytes,
-                queued_locks.len() - deposit_proofs.len()
+                cl_proofs.len(),
+                spend_proofs.len(),
+                fully_done_ids.len(),
+                last_cl_tag_bytes,
+                last_spend_tag_bytes
             );
         }
 
         // --- Mark selected locks as in_flight ---
-        for lock_id in &processed_lock_ids {
+        for lock_id in &in_flight_lock_ids {
             self.db.mark_in_flight(*lock_id)?;
         }
 
-        if !processed_lock_ids.is_empty() {
-            let total_deposit_amount = accumulate_amounts(&deposit_amounts)?;
-
+        // --- create_parked_link (credit limit EA) ---
+        if !cl_proofs.is_empty() {
+            let total_cl = accumulate_amounts(&cl_amounts)?;
             let parked_data = ParkedData {
                 ct_role_id: "oracle".to_string(),
-                amount: Some(total_deposit_amount.clone()),
-                payload: json!({ "proof_of_deposit": deposit_proofs.clone() }),
+                amount: Some(total_cl.clone()),
+                payload: json!({ "proof_of_deposit": cl_proofs.clone() }),
             };
-
             let link_result: (ActionHashB64, AgentPubKey) = ham
                 .call_zome(
                     &self.cfg.role_name,
                     "transactor",
                     "create_parked_link",
                     &CreateParkedLinkInput {
-                        ea_id: context.credit_limit_adjustment.clone().into(),
+                        ea_id: credit_limit_ea_id.clone().into(),
                         executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
                         parked_link_type: ParkedLinkType::ParkedData((parked_data, true)),
                     },
                 )
                 .await?;
-
             info!(
                 "[bridge/credit-limit] create_parked_link: {} proofs, action_hash={}",
-                processed_lock_ids.len(),
+                cl_proofs.len(),
                 link_result.0
             );
+        }
 
-            // --- Explicit links for credit limit RAVE ---
-            let credit_limit_ea_id: ActionHash =
-                context.credit_limit_adjustment.clone().into();
-            let cl_links: Vec<Transaction> = ham
-                .call_zome(
-                    &self.cfg.role_name,
-                    "transactor",
-                    "get_parked_links_by_ea",
-                    &credit_limit_ea_id,
-                )
-                .await?;
-
+        // --- Credit-limit RAVE with a freshly re-fetched live-link set ---
+        //
+        // We re-fetch even if we just wrote a new link, so the RAVE call
+        // sees exactly the set of links it will try to consume. Runs
+        // whenever there's ANY live link on the CL EA — not just when we
+        // created one this cycle — so orphaned links from a previous cycle
+        // get swept up instead of sitting forever.
+        let cl_links: Vec<Transaction> = ham
+            .call_zome(
+                &self.cfg.role_name,
+                "transactor",
+                "get_parked_links_by_ea",
+                &credit_limit_ea_id,
+            )
+            .await?;
+        if !cl_links.is_empty() {
             info!(
                 "[bridge/credit-limit] RAVE: consuming {} explicit links",
                 cl_links.len()
             );
-
             let _: (RAVE, ActionHash) = ham
                 .call_zome(
                     &self.cfg.role_name,
                     "transactor",
                     "execute_rave",
                     &RAVEExecuteInputs {
-                        ea_id: credit_limit_ea_id,
+                        ea_id: credit_limit_ea_id.clone(),
                         executor_inputs: Value::Null,
                         links: cl_links,
                         global_definition: global_definition.id.clone().into(),
@@ -346,20 +626,24 @@ impl BridgeOrchestrator {
                 )
                 .await?;
             info!("[bridge/credit-limit] RAVE executed");
+        }
 
-            if !total_deposit_amount.is_zero() {
+        // --- create_parked_spend (bridging EA) ---
+        if !spend_proofs.is_empty() {
+            let total_spend = accumulate_amounts(&spend_amounts)?;
+            if !total_spend.is_zero() {
                 let _: ActionHashB64 = ham
                     .call_zome(
                         &self.cfg.role_name,
                         "transactor",
                         "create_parked_spend",
                         &CreateParkedSpendInput {
-                            ea_id: context.bridging_agreement.clone().into(),
+                            ea_id: bridging_ea_id.clone().into(),
                             executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
                             ct_role_id: Some("bridging_agent".to_string()),
-                            amount: total_deposit_amount.clone(),
+                            amount: total_spend.clone(),
                             spender_payload: json!({
-                                "proof_of_deposit": deposit_proofs,
+                                "proof_of_deposit": spend_proofs,
                             }),
                             lane_definitions: context.lane_definitions.clone(),
                         },
@@ -367,13 +651,12 @@ impl BridgeOrchestrator {
                     .await?;
                 info!(
                     "[bridge/bridging] create_parked_spend: total_amount={:?}",
-                    total_deposit_amount
+                    total_spend
                 );
             }
         }
 
-        // --- Scan bridging EA and size-capped withdrawal selection ---
-        let bridging_ea_id: ActionHash = context.bridging_agreement.clone().into();
+        // --- Scan bridging EA (freshly re-fetched) + withdrawal selection ---
         let bridging_links: Vec<Transaction> = ham
             .call_zome(
                 &self.cfg.role_name,
@@ -477,7 +760,7 @@ impl BridgeOrchestrator {
                     "transactor",
                     "execute_rave",
                     &RAVEExecuteInputs {
-                        ea_id: context.bridging_agreement.into(),
+                        ea_id: bridging_ea_id.into(),
                         executor_inputs: json!({
                             "coupons": Value::Object(coupons_map)
                         }),
@@ -492,23 +775,27 @@ impl BridgeOrchestrator {
                 "[bridge/bridging] RAVE executed action_hash={}",
                 rave_result.1,
             );
-        } else if processed_lock_ids.is_empty() {
+        } else if in_flight_lock_ids.is_empty() {
             debug!("[bridge] cycle no-op: no pending links on bridging EA");
         }
 
         // --- Mark processed locks as succeeded ---
-        for lock_id in &processed_lock_ids {
+        for lock_id in &in_flight_lock_ids {
             self.db.mark_succeeded(*lock_id)?;
         }
-        if !processed_lock_ids.is_empty() {
-            info!("[bridge] marked {} locks as succeeded", processed_lock_ids.len());
+        if !in_flight_lock_ids.is_empty() {
+            info!(
+                "[bridge] marked {} locks as succeeded",
+                in_flight_lock_ids.len()
+            );
         }
 
         let duration_ms = started.elapsed().as_millis() as u64;
         info!(
-            "[bridge] \u{2500}\u{2500} cycle completed \u{2500}\u{2500} duration={}ms locks={} withdrawals={}",
+            "[bridge] \u{2500}\u{2500} cycle completed \u{2500}\u{2500} duration={}ms locks={} already_done={} withdrawals={}",
             duration_ms,
-            processed_lock_ids.len(),
+            in_flight_lock_ids.len(),
+            fully_done_ids.len(),
             withdrawal_count
         );
 
@@ -522,16 +809,21 @@ impl BridgeOrchestrator {
         let normalized = payload.normalized_amounts()?;
         let amount = normalized.amount_hot.clone();
 
+        // Normalize tx_hash to lowercase at the proof boundary so the
+        // DedupIndex's string-keyed lookup is robust to any upstream caller
+        // or migrated row that ever stored it mixed-case.
         let proof = json!({
             "method": "deposit",
             "contract_address": format!("0x{}", contract_hex.to_lowercase()),
             "amount": amount,
-            "depositor_wallet_address": depositor
+            "depositor_wallet_address": depositor,
+            "lock_id": payload.lock_id,
+            "tx_hash": payload.tx_hash.to_ascii_lowercase(),
         });
 
         info!(
-            "[bridge/deposits] extracted proof id={} amount={} agent={}",
-            payload.lock_id, amount, payload.holochain_agent
+            "[bridge/deposits] extracted proof id={} amount={} agent={} tx_hash={}",
+            payload.lock_id, amount, payload.holochain_agent, payload.tx_hash
         );
 
         Ok((proof, UnitMap::from(vec![(self.cfg.unit_index, amount.as_str())])))
@@ -668,145 +960,30 @@ fn accumulate_amounts(amounts: &[UnitMap]) -> Result<UnitMap> {
     Ok(total)
 }
 
-/// Spawn a background task that flips the returned watch receiver to `true`
-/// once the process receives Ctrl+C or SIGTERM. The initial value is marked
-/// as seen so subsequent `.changed()` calls only complete on a real signal.
-fn install_shutdown_handler() -> ShutdownRx {
-    let (tx, mut rx) = watch::channel(false);
-    rx.mark_unchanged();
-
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            match signal(SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("received SIGINT, initiating graceful shutdown");
-                        }
-                        _ = sigterm.recv() => {
-                            info!("received SIGTERM, initiating graceful shutdown");
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("failed to install SIGTERM handler, falling back to Ctrl+C only: {}", e);
-                    let _ = tokio::signal::ctrl_c().await;
-                    info!("received SIGINT, initiating graceful shutdown");
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("received Ctrl+C, initiating graceful shutdown");
-        }
-        let _ = tx.send(true);
-    });
-
-    rx
-}
-
 /// Establish a fresh `Ham` connection. Thin wrapper that centralizes the
 /// connect call so both startup and reconnect flows share one path.
 async fn connect_ham(cfg: &Config) -> Result<Ham> {
     Ham::connect(
-        cfg.admin_port,
-        cfg.app_port,
-        &cfg.app_id,
-        cfg.ham_request_timeout_secs,
+        HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
+            .with_request_timeout_secs(cfg.ham_request_timeout_secs),
     )
     .await
     .context("Failed to connect to Holochain")
 }
 
-/// Loop forever (until shutdown) trying to establish a `Ham` connection.
-/// Uses exponential backoff capped at `ham_reconnect_backoff_max_ms` with
-/// small jitter. Logs each failed attempt at `warn!` and escalates to
-/// `error!` once the consecutive attempt count passes
-/// `ham_reconnect_escalate_after`, so operator alerts can fire while we
-/// keep trying.
-///
-/// Returns `None` if a shutdown signal arrives while we are waiting or
-/// retrying, allowing the caller to exit cleanly.
-async fn connect_ham_with_backoff(cfg: &Config, shutdown: &mut ShutdownRx) -> Option<Ham> {
-    let mut attempt: u32 = 0;
-    loop {
-        if *shutdown.borrow() {
-            return None;
-        }
-        match connect_ham(cfg).await {
-            Ok(ham) => {
-                if attempt > 0 {
-                    info!(event = "ham.reconnected", attempts = attempt);
-                }
-                return Some(ham);
-            }
-            Err(e) => {
-                let delay_ms = compute_backoff_ms(attempt, cfg);
-                if attempt >= cfg.ham_reconnect_escalate_after {
-                    error!(
-                        event = "ham.reconnect.attempt",
-                        attempt,
-                        delay_ms,
-                        error = %e,
-                        "reconnect failing persistently; operator attention needed"
-                    );
-                } else {
-                    warn!(
-                        event = "ham.reconnect.attempt",
-                        attempt,
-                        delay_ms,
-                        error = %e,
-                    );
-                }
-                attempt = attempt.saturating_add(1);
-
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
-                    _ = shutdown.changed() => { return None; }
-                }
-            }
-        }
+/// Project orchestrator config into the shared [`BackoffConfig`].
+fn backoff_config(cfg: &Config) -> BackoffConfig {
+    BackoffConfig {
+        initial_ms: cfg.ham_reconnect_backoff_initial_ms,
+        max_ms: cfg.ham_reconnect_backoff_max_ms,
+        escalate_after: cfg.ham_reconnect_escalate_after,
     }
 }
 
-/// Compute the next reconnect delay: exponential (1,2,4,... *initial) capped
-/// at `ham_reconnect_backoff_max_ms`, plus up to 10% jitter seeded from the
-/// system clock's sub-second nanos (no extra crate dependency required).
-fn compute_backoff_ms(attempt: u32, cfg: &Config) -> u64 {
-    let shift = attempt.min(20);
-    let factor = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let base = cfg
-        .ham_reconnect_backoff_initial_ms
-        .saturating_mul(factor);
-    let capped = base.min(cfg.ham_reconnect_backoff_max_ms);
-    let jitter_range = (capped / 10).max(1);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
-    capped.saturating_add(nanos % jitter_range)
-}
-
-/// Estimate the worst-case msgpack link-tag size this batch will produce.
-///
-/// The orchestrator creates two links from the same proofs-of-deposit payload:
-///   1. `ParkedData` on the credit-limit EA (via `create_parked_link`)
-///   2. `ParkedSpendData` on the bridging EA (via `create_parked_spend`)
-///
-/// `ParkedSpendData` carries extra fields (global_definition, new_balance,
-/// proposed_balance, carry_forward_units, fees_owed, lane_definitions) so its
-/// tag is strictly larger. We compute both and return the max. Unknown
-/// runtime-computed fields (new_balance, proposed_balance, etc.) are filled
-/// with worst-case-sized placeholders derived from `total_amount`.
-fn estimate_link_tag_bytes(
-    total_amount: &UnitMap,
-    payload: &Value,
-    global_definition: &ActionHash,
-    lane_definitions: &[ActionHash],
-) -> Result<usize> {
+/// Estimate the msgpack link-tag size a `ParkedData` write with the given
+/// aggregate proofs payload would produce. Used to cap the
+/// `create_parked_link` batch against Holochain's link tag size limit.
+fn estimate_parked_data_tag_bytes(total_amount: &UnitMap, payload: &Value) -> Result<usize> {
     let parked_data = (
         ParkedData {
             ct_role_id: "oracle".to_string(),
@@ -815,10 +992,22 @@ fn estimate_link_tag_bytes(
         },
         true,
     );
-    let parked_data_tag = rmp_serde::to_vec(&parked_data)
+    let bytes = rmp_serde::to_vec(&parked_data)
         .context("failed to msgpack-encode ParkedData for tag-size estimation")?
         .len();
+    Ok(bytes)
+}
 
+/// Estimate the msgpack link-tag size a `ParkedSpendData` write with the
+/// given aggregate proofs payload would produce. Runtime-computed numeric
+/// fields (new_balance / proposed_balance) are filled with worst-case-sized
+/// placeholders derived from `total_amount`.
+fn estimate_parked_spend_tag_bytes(
+    total_amount: &UnitMap,
+    payload: &Value,
+    global_definition: &ActionHash,
+    lane_definitions: &[ActionHash],
+) -> Result<usize> {
     let parked_spend = ParkedSpendData {
         ct_role_id: "bridging_agent".to_string(),
         amount: total_amount.clone(),
@@ -830,11 +1019,204 @@ fn estimate_link_tag_bytes(
         fees_owed: ZFuel::zero(),
         proposed_balance: total_amount.clone(),
     };
-    let parked_spend_tag = rmp_serde::to_vec(&parked_spend)
+    let bytes = rmp_serde::to_vec(&parked_spend)
         .context("failed to msgpack-encode ParkedSpendData for tag-size estimation")?
         .len();
+    Ok(bytes)
+}
 
-    Ok(parked_data_tag.max(parked_spend_tag))
+// ---------------------------------------------------------------------------
+// Source-chain-truth dedup index
+// ---------------------------------------------------------------------------
+//
+// For every queued lock we want to know four things, keyed by the lock's
+// EVM tx_hash (which we now embed in every `proof_of_deposit` payload):
+//
+//   * cl_parked_live    — an unconsumed ParkedData exists on the credit-limit
+//                         EA that already carries this tx_hash. A CL RAVE
+//                         hasn't consumed it yet.
+//   * cl_rave_applied   — a past credit-limit RAVE *has* consumed a parked
+//                         link that carried this tx_hash. Proof survives
+//                         even after the parked link itself is gone.
+//   * br_parked_live    — an unconsumed ParkedSpend exists on the bridging
+//                         EA that carries this tx_hash.
+//   * br_rave_applied   — a past bridging RAVE has consumed this tx_hash.
+//                         The lock is fully done; nothing to do.
+//
+// Having both the live-entry flag AND the applied-RAVE flag per side lets us
+// safely no-op every single sub-step of a previously-interrupted cycle,
+// including the nasty fail-after-CL-RAVE / fail-before-create_parked_spend
+// window that blew up the 3499 lock.
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DedupFlags {
+    cl_parked_live: bool,
+    cl_rave_applied: bool,
+    br_parked_live: bool,
+    br_rave_applied: bool,
+}
+
+/// Per-lock decision derived from [`DedupFlags`]. Encodes the five rows of
+/// the decision table documented on [`BridgeOrchestrator::run_bridge_cycle`]
+/// into four concrete outcomes (rows 2 and 3 both collapse to
+/// [`LockDecision::SkipClOnly`] because they produce the same action).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LockDecision {
+    /// No on-chain evidence for this lock. Stage the proof for both the CL
+    /// `create_parked_link` and the bridging `create_parked_spend` batches.
+    Fresh,
+    /// Credit-limit step already handled (either still live or already
+    /// consumed by a past RAVE). Skip the CL create; stage the bridging
+    /// spend.
+    SkipClOnly,
+    /// Bridging spend already exists on-chain (either live or a previous
+    /// cycle already ran the CL RAVE over it). No new creates; this cycle's
+    /// bridging RAVE will consume the existing parked spend.
+    SkipBothCreates,
+    /// The bridging RAVE has already consumed a parked spend carrying this
+    /// lock's tx_hash. Nothing left to do; mark the lock succeeded locally
+    /// without touching the chain.
+    FullyDone,
+}
+
+/// Apply the source-chain-truth decision table to a set of [`DedupFlags`].
+/// Pure / total / side-effect-free so the full table is trivially testable.
+fn decide(flags: &DedupFlags) -> LockDecision {
+    if flags.br_rave_applied {
+        return LockDecision::FullyDone;
+    }
+    if flags.br_parked_live {
+        return LockDecision::SkipBothCreates;
+    }
+    if flags.cl_parked_live || flags.cl_rave_applied {
+        return LockDecision::SkipClOnly;
+    }
+    LockDecision::Fresh
+}
+
+/// Retry-gate predicate that decides whether this cycle needs to engage
+/// the expensive RAVE-history scan. A never-retried lock cannot have
+/// committed anything on-chain by construction, so a batch of pure-fresh
+/// locks can safely skip the deep scan.
+///
+/// Locks with `attempts >= max_attempts` are also excluded: they're about
+/// to be promoted to `failed` by `fail_exhausted_queued`, so paying the
+/// unbounded `get_raves_for_smart_agreement` cost on their behalf would
+/// be pointless — and without this guard a single permanently broken
+/// lock would force a full history scan every cycle forever.
+fn queued_locks_need_deep_dedup(locks: &[WorkItem]) -> bool {
+    locks
+        .iter()
+        .any(|l| l.attempts > 0 && l.attempts < l.max_attempts)
+}
+
+#[derive(Debug, Default)]
+struct DedupIndex {
+    flags: std::collections::HashMap<String, DedupFlags>,
+}
+
+impl DedupIndex {
+    fn from_scans(
+        cl_parked: &[Transaction],
+        cl_raves: &[Transaction],
+        br_parked: &[Transaction],
+        br_raves: &[Transaction],
+    ) -> Self {
+        let mut flags: std::collections::HashMap<String, DedupFlags> =
+            std::collections::HashMap::new();
+        for tx in cl_parked {
+            for h in extract_parked_tx_hashes(tx) {
+                flags.entry(h).or_default().cl_parked_live = true;
+            }
+        }
+        for tx in br_parked {
+            for h in extract_parked_tx_hashes(tx) {
+                flags.entry(h).or_default().br_parked_live = true;
+            }
+        }
+        for tx in cl_raves {
+            for h in extract_rave_tx_hashes(tx) {
+                flags.entry(h).or_default().cl_rave_applied = true;
+            }
+        }
+        for tx in br_raves {
+            for h in extract_rave_tx_hashes(tx) {
+                flags.entry(h).or_default().br_rave_applied = true;
+            }
+        }
+        Self { flags }
+    }
+
+    fn lookup(&self, tx_hash: &str) -> DedupFlags {
+        self.flags.get(tx_hash).cloned().unwrap_or_default()
+    }
+}
+
+/// Pull `proof_of_deposit[*].tx_hash` values out of a live
+/// `Parked` / `ParkedSpend` transaction's `attached_payload`.
+fn extract_parked_tx_hashes(tx: &Transaction) -> Vec<String> {
+    let payload = match &tx.details {
+        TransactionDetails::Parked {
+            attached_payload, ..
+        }
+        | TransactionDetails::ParkedSpend {
+            attached_payload, ..
+        } => attached_payload,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    collect_tx_hashes(payload, &mut out);
+    out
+}
+
+/// Pull `proof_of_deposit[*].tx_hash` values out of a historical `RAVE`
+/// transaction's `required_inputs` blob. Parked-link payloads the RAVE
+/// consumed live inside `required_inputs.consumed_inputs` keyed by role,
+/// wrapped in `RAVEInputStdPayloadInner { data, link_hash }`, so we need a
+/// recursive walk rather than a fixed JSON path.
+fn extract_rave_tx_hashes(tx: &Transaction) -> Vec<String> {
+    let required_inputs = match &tx.details {
+        TransactionDetails::RAVE { required_inputs, .. } => required_inputs,
+        _ => return Vec::new(),
+    };
+    // RAVEInput's internal shape is `{ consumed_inputs, inputs }`; both
+    // branches may carry proofs we care about (we only commit them into
+    // `consumed_inputs`, but a defensive walk of both is free).
+    let value = match serde_json::to_value(required_inputs) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    collect_tx_hashes(&value, &mut out);
+    out
+}
+
+/// Recursively walk a `serde_json::Value` looking for any object that has a
+/// `proof_of_deposit` array, and collect the `tx_hash` of each proof entry.
+fn collect_tx_hashes(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(Value::Array(arr)) = map.get("proof_of_deposit") {
+                for proof in arr {
+                    if let Some(h) = proof.get("tx_hash").and_then(|x| x.as_str()) {
+                        // Lowercase on ingress so the DedupIndex key space
+                        // is case-insensitive regardless of what a past
+                        // writer stored in the parked payload.
+                        out.push(h.to_ascii_lowercase());
+                    }
+                }
+            }
+            for (_, child) in map {
+                collect_tx_hashes(child, out);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr {
+                collect_tx_hashes(child, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -868,5 +1250,306 @@ mod tests {
             amount_from_legacy_field(Some("2.500000".to_string())),
             Some("2.500000".to_string())
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Source-chain-truth idempotency tests
+    // ---------------------------------------------------------------------
+
+    use crate::state::{WorkItem, WorkState};
+    use rave_engine::types::{
+        RAVEInput, RAVEInputHandler, RAVEInputStdPayload, RAVEInputStdPayloadInner,
+    };
+
+    // ----- decide() decision table ---------------------------------------
+
+    fn flags(
+        cl_parked_live: bool,
+        cl_rave_applied: bool,
+        br_parked_live: bool,
+        br_rave_applied: bool,
+    ) -> DedupFlags {
+        DedupFlags {
+            cl_parked_live,
+            cl_rave_applied,
+            br_parked_live,
+            br_rave_applied,
+        }
+    }
+
+    #[test]
+    fn decide_fresh_lock_is_scheduled_for_both_steps() {
+        assert_eq!(
+            decide(&flags(false, false, false, false)),
+            LockDecision::Fresh
+        );
+    }
+
+    #[test]
+    fn decide_live_cl_parked_skips_cl_create_only() {
+        assert_eq!(
+            decide(&flags(true, false, false, false)),
+            LockDecision::SkipClOnly
+        );
+    }
+
+    #[test]
+    fn decide_applied_cl_rave_skips_cl_create_only() {
+        // This is the fail-after-CL-RAVE / fail-before-create_parked_spend
+        // scenario that motivated extending dedup beyond live parked entries.
+        // Without this row the orchestrator would re-issue a CL RAVE and
+        // double-count the credit limit adjustment.
+        assert_eq!(
+            decide(&flags(false, true, false, false)),
+            LockDecision::SkipClOnly
+        );
+    }
+
+    #[test]
+    fn decide_live_br_parked_skips_both_creates() {
+        // Bridging parked_spend already exists on-chain: no new creates.
+        // The CL side must have been done in a previous cycle to get here,
+        // so we don't need a new CL link either.
+        assert_eq!(
+            decide(&flags(false, false, true, false)),
+            LockDecision::SkipBothCreates
+        );
+        // Even if CL flags also happen to be set, SkipBothCreates still
+        // dominates over SkipClOnly because the bridging spend is staged.
+        assert_eq!(
+            decide(&flags(true, true, true, false)),
+            LockDecision::SkipBothCreates
+        );
+    }
+
+    #[test]
+    fn decide_applied_br_rave_marks_lock_fully_done() {
+        // Once the bridging RAVE has consumed a parked spend carrying this
+        // lock's tx_hash, the lock is terminally resolved on-chain. We
+        // mark it succeeded locally with no further writes, regardless of
+        // whatever ghost state exists on the other flags.
+        assert_eq!(
+            decide(&flags(false, false, false, true)),
+            LockDecision::FullyDone
+        );
+        assert_eq!(
+            decide(&flags(true, true, true, true)),
+            LockDecision::FullyDone
+        );
+    }
+
+    // ----- collect_tx_hashes JSON walker ---------------------------------
+
+    #[test]
+    fn collect_tx_hashes_empty_value_yields_nothing() {
+        let mut out = Vec::new();
+        collect_tx_hashes(&json!({}), &mut out);
+        assert!(out.is_empty());
+        collect_tx_hashes(&json!(null), &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_tx_hashes_finds_all_proofs_in_parked_payload() {
+        // Shape of `ParkedData.payload` / `ParkedSpendData.payload` after
+        // this change: `{"proof_of_deposit": [{"tx_hash": "0x.."}, ...]}`.
+        let v = json!({
+            "proof_of_deposit": [
+                {"tx_hash": "0xaaa", "amount": "1", "lock_id": "1"},
+                {"tx_hash": "0xbbb", "amount": "2", "lock_id": "2"},
+            ]
+        });
+        let mut out = Vec::new();
+        collect_tx_hashes(&v, &mut out);
+        assert_eq!(out, vec!["0xaaa".to_string(), "0xbbb".to_string()]);
+    }
+
+    #[test]
+    fn collect_tx_hashes_walks_rave_input_shape() {
+        // This mirrors how a past RAVE transaction stores the proofs it
+        // consumed: nested under `required_inputs.consumed_inputs.<role>.data`.
+        let v = json!({
+            "consumed_inputs": {
+                "oracle": {
+                    "data": {"proof_of_deposit": [{"tx_hash": "0xccc"}]},
+                    "link_hash": "uhCkkSomeHashHere"
+                },
+                "some_other_role": {
+                    "data": {"proof_of_deposit": [{"tx_hash": "0xddd"}]},
+                    "link_hash": null
+                }
+            },
+            "inputs": {}
+        });
+        let mut out = Vec::new();
+        collect_tx_hashes(&v, &mut out);
+        out.sort();
+        assert_eq!(out, vec!["0xccc".to_string(), "0xddd".to_string()]);
+    }
+
+    #[test]
+    fn collect_tx_hashes_normalizes_case_so_mixed_case_matches_lowercase_proof() {
+        // Belt-and-suspenders: if a past writer (migration, manual re-enqueue,
+        // a different EVM source) ever stored an uppercase `0xABC...` tx_hash
+        // in a parked payload, dedup must still match a queued lock whose
+        // proof carries the same hash lowercased. Otherwise we'd silently
+        // re-issue the create_parked_* write and double-spend.
+        let parked_payload = json!({
+            "proof_of_deposit": [
+                {"tx_hash": "0xABCDEF0123456789"}
+            ]
+        });
+        let mut out = Vec::new();
+        collect_tx_hashes(&parked_payload, &mut out);
+        assert_eq!(out, vec!["0xabcdef0123456789".to_string()]);
+
+        // And the symmetric check: a DedupIndex built from that payload
+        // answers `Fresh` for the uppercase lookup but `SkipClOnly` /
+        // whatever-is-set for the lowercase lookup — because downstream
+        // callers must themselves lowercase the lookup key. That's the
+        // invariant `extract_lock_proof` + the call site both enforce.
+        let mut idx = DedupIndex::default();
+        for h in &out {
+            idx.flags.entry(h.clone()).or_default().cl_parked_live = true;
+        }
+        assert_eq!(
+            decide(&idx.lookup("0xabcdef0123456789")),
+            LockDecision::SkipClOnly,
+            "lowercased lookup must match the lowercased-on-ingress key"
+        );
+    }
+
+    #[test]
+    fn collect_tx_hashes_ignores_proofs_without_tx_hash_field() {
+        let v = json!({
+            "proof_of_deposit": [
+                {"amount": "1"},
+                {"tx_hash": "0xaaa"}
+            ]
+        });
+        let mut out = Vec::new();
+        collect_tx_hashes(&v, &mut out);
+        assert_eq!(out, vec!["0xaaa".to_string()]);
+    }
+
+    // ----- extract_rave_tx_hashes via synthetic RAVEInput ----------------
+
+    fn rave_input_with_proofs(tx_hashes: &[&str]) -> RAVEInput {
+        let mut consumed = RAVEInputHandler::new();
+        let proofs: Vec<Value> = tx_hashes
+            .iter()
+            .map(|h| json!({"tx_hash": *h}))
+            .collect();
+        consumed.insert(
+            "oracle".to_string(),
+            RAVEInputStdPayload::Single(RAVEInputStdPayloadInner {
+                data: Box::new(json!({"proof_of_deposit": proofs})),
+                link_hash: None,
+            }),
+        );
+        RAVEInput::new(consumed, RAVEInputHandler::new())
+    }
+
+    #[test]
+    fn collect_tx_hashes_finds_proofs_inside_live_rave_input_struct() {
+        // Exercises the same serialize-then-walk path that
+        // `extract_rave_tx_hashes` uses on a `TransactionDetails::RAVE`.
+        let input = rave_input_with_proofs(&["0xfeed", "0xbead"]);
+        let v = serde_json::to_value(&input).expect("RAVEInput should serialize");
+        let mut out = Vec::new();
+        collect_tx_hashes(&v, &mut out);
+        out.sort();
+        assert_eq!(out, vec!["0xbead".to_string(), "0xfeed".to_string()]);
+    }
+
+    // ----- DedupIndex end-to-end sanity check ---------------------------
+    //
+    // Construction of a full `Transaction` fixture is intentionally avoided
+    // here — the tricky paths (Parked `attached_payload` and RAVE
+    // `required_inputs`) are already covered by the `collect_tx_hashes`
+    // tests above and by `extract_*` walking the same walker. What we
+    // additionally want to verify is that `DedupIndex::from_scans` keys by
+    // tx_hash and tracks the four source flags independently. We do that
+    // by poking the `flags` map directly after hand-simulating the per-side
+    // for-loops the real `from_scans` runs.
+
+    #[test]
+    fn dedup_uses_tx_hash_not_amount() {
+        // Negative control: two locks with identical amounts but distinct
+        // tx_hashes must be tracked as independent entries in the index.
+        let mut idx = DedupIndex::default();
+        idx.flags
+            .entry("0xlockA".to_string())
+            .or_default()
+            .cl_parked_live = true;
+        idx.flags
+            .entry("0xlockB".to_string())
+            .or_default()
+            .br_parked_live = true;
+
+        assert_eq!(decide(&idx.lookup("0xlockA")), LockDecision::SkipClOnly);
+        assert_eq!(decide(&idx.lookup("0xlockB")), LockDecision::SkipBothCreates);
+        // Unknown tx_hash gets a zeroed DedupFlags => Fresh.
+        assert_eq!(decide(&idx.lookup("0xlockC")), LockDecision::Fresh);
+    }
+
+    // ----- retry-gate predicate -----------------------------------------
+
+    fn work_item(id: i64, attempts: i64) -> WorkItem {
+        WorkItem {
+            id,
+            flow: "lock".to_string(),
+            task_type: "create_parked_link".to_string(),
+            item_id: format!("lock:{}", id),
+            idempotency_key: format!("lock:{}:key", id),
+            payload_json: json!({}),
+            state: WorkState::Queued,
+            attempts,
+            max_attempts: 8,
+            next_retry_at: None,
+            last_attempt_at: None,
+            error_class: None,
+            last_error: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn fresh_batch_does_not_need_deep_dedup() {
+        // When every queued lock has `attempts == 0` the cycle can safely
+        // skip the RAVE-history scan — no retry means no chance of a
+        // stranded commit.
+        let locks = vec![work_item(1, 0), work_item(2, 0), work_item(3, 0)];
+        assert!(!queued_locks_need_deep_dedup(&locks));
+    }
+
+    #[test]
+    fn retry_batch_triggers_deep_dedup() {
+        let locks = vec![work_item(1, 0), work_item(2, 3), work_item(3, 0)];
+        assert!(queued_locks_need_deep_dedup(&locks));
+    }
+
+    #[test]
+    fn empty_batch_does_not_need_deep_dedup() {
+        assert!(!queued_locks_need_deep_dedup(&[]));
+    }
+
+    #[test]
+    fn exhausted_retry_lock_does_not_trigger_deep_dedup() {
+        // A single permanently-stuck lock whose attempts have reached
+        // max_attempts would otherwise force a full get_raves_for_smart_agreement
+        // scan every cycle. The gate must ignore it; it will be promoted to
+        // 'failed' at the top of the next cycle by fail_exhausted_queued.
+        let mut lock = work_item(1, 8);
+        lock.max_attempts = 8;
+        assert!(!queued_locks_need_deep_dedup(&[lock]));
+
+        // Mix of one still-within-budget retry and one exhausted lock: the
+        // within-budget one alone is enough to engage the deep scan.
+        let retrying = work_item(2, 3);
+        let mut exhausted = work_item(3, 8);
+        exhausted.max_attempts = 8;
+        assert!(queued_locks_need_deep_dedup(&[retrying, exhausted]));
     }
 }

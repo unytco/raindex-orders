@@ -1,5 +1,4 @@
 mod config;
-mod ham;
 mod lock_flow;
 mod orchestrator;
 mod signer;

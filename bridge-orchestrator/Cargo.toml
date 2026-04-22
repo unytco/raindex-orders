@@ -10,10 +10,12 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
+# TODO(ham-migration): switch to `ham = { git = "https://github.com/unytco/ham.git", rev = "<sha>" }` once the ham repo is pushed to GitHub.
+ham = { path = "../../ham" }
 hex = "0.4"
-holo_hash = { version = "0.6.1-rc.0", features = ["encoding"] }
-holochain_client = "0.8.1-rc.0"
-holochain_zome_types = "0.6.1-rc.0"
+holo_hash = { version = "0.6.1-rc.5", features = ["encoding"] }
+holochain_client = "0.8.1-rc.7"
+holochain_zome_types = "0.6.1-rc.5"
 rave_engine = "0.3.3"
 rmp-serde = "1.1"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
