@@ -60,8 +60,21 @@ pub struct Config {
     /// Pause (milliseconds) applied after a cycle fails with a Holochain
     /// source-chain-pressure error (e.g. `"deadline has elapsed"`). The
     /// socket is healthy but the conductor is backpressured, so we back off
-    /// before the next cycle instead of hammering it.
+    /// before the next cycle instead of hammering it. This is the *base*
+    /// value; consecutive pressure errors double the wait up to
+    /// [`Config::ham_pressure_cooldown_max_ms`].
     pub ham_pressure_cooldown_ms: u64,
+    /// Upper bound (milliseconds) on the escalating source-chain-pressure
+    /// cooldown. Once hit, further consecutive pressure errors keep sleeping
+    /// at this cap and log severity escalates from `warn!` to `error!` so
+    /// operators can alert. The first fully-clean cycle resets the counter.
+    pub ham_pressure_cooldown_max_ms: u64,
+    /// If a write-bearing zome call inside `run_bridge_cycle` takes longer
+    /// than this many milliseconds, the orchestrator ejects the rest of the
+    /// cycle instead of stacking more pressure on a slow conductor. The
+    /// reconciler advances the skipped stages next cycle. Set to `0` to
+    /// disable stage-ejection entirely.
+    pub slow_call_threshold_ms: u128,
 }
 
 impl Config {
@@ -160,6 +173,14 @@ impl Config {
             .unwrap_or_else(|_| "30000".into())
             .parse()
             .context("Invalid HAM_PRESSURE_COOLDOWN_MS")?;
+        let ham_pressure_cooldown_max_ms = env::var("HAM_PRESSURE_COOLDOWN_MAX_MS")
+            .unwrap_or_else(|_| "90000".into())
+            .parse()
+            .context("Invalid HAM_PRESSURE_COOLDOWN_MAX_MS")?;
+        let slow_call_threshold_ms = env::var("SLOW_CALL_THRESHOLD_MS")
+            .unwrap_or_else(|_| "35000".into())
+            .parse()
+            .context("Invalid SLOW_CALL_THRESHOLD_MS")?;
         Ok(Self {
             network,
             rpc_url,
@@ -182,6 +203,8 @@ impl Config {
             ham_reconnect_backoff_max_ms,
             ham_reconnect_escalate_after,
             ham_pressure_cooldown_ms,
+            ham_pressure_cooldown_max_ms,
+            slow_call_threshold_ms,
         })
     }
 }

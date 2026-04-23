@@ -52,6 +52,61 @@ impl std::str::FromStr for WorkState {
     }
 }
 
+/// Pipeline progress for a lock row. Independent of `WorkState` (which tracks
+/// orchestrator ownership); `step` tracks which zome calls in the four-stage
+/// bridge pipeline have been proven to have landed on-chain.
+///
+/// Advancement is always driven by chain truth — a row is only moved to a
+/// later step once we either observed the returned `ActionHash` from the
+/// relevant zome call, or the reconciler at the top of a cycle confirmed the
+/// expected side-effect against a fresh `get_parked_links_by_ea` probe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStep {
+    /// No on-chain work observed yet; eligible for S1 (`create_parked_link`).
+    New,
+    /// S1 landed; `cl_link_hash` references the live parked link on the
+    /// credit-limit EA.
+    ClLinkCreated,
+    /// S2 landed; the CL `execute_rave` has consumed the parked link.
+    ClRaveExecuted,
+    /// S3 landed; `br_spend_hash` references the live parked spend on the
+    /// bridging EA.
+    BrSpendCreated,
+    /// S4 landed; the bridging `execute_rave` has consumed the parked spend.
+    /// Terminal for the pipeline — the row is simultaneously marked
+    /// `state='succeeded'`.
+    BrRaveExecuted,
+}
+
+impl std::fmt::Display for WorkStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = match self {
+            WorkStep::New => "new",
+            WorkStep::ClLinkCreated => "cl_link_created",
+            WorkStep::ClRaveExecuted => "cl_rave_executed",
+            WorkStep::BrSpendCreated => "br_spend_created",
+            WorkStep::BrRaveExecuted => "br_rave_executed",
+        };
+        write!(f, "{}", v)
+    }
+}
+
+impl std::str::FromStr for WorkStep {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "new" => Ok(Self::New),
+            "cl_link_created" => Ok(Self::ClLinkCreated),
+            "cl_rave_executed" => Ok(Self::ClRaveExecuted),
+            "br_spend_created" => Ok(Self::BrSpendCreated),
+            "br_rave_executed" => Ok(Self::BrRaveExecuted),
+            _ => Err(format!("Unknown step: {}", s)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: i64,
@@ -69,6 +124,11 @@ pub struct WorkItem {
     pub last_error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub step: WorkStep,
+    pub cl_link_hash: Option<String>,
+    pub cl_rave_hash: Option<String>,
+    pub br_spend_hash: Option<String>,
+    pub br_rave_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,35 +172,39 @@ impl Clone for StateStore {
     }
 }
 
+/// Status-row transfer fields derived from a work-item payload.
+/// Returned as a named struct (instead of a 5-tuple) so the status
+/// endpoint's builder can use field access and clippy's
+/// `type_complexity` lint stays green. All fields are `Option<String>`
+/// because they are absent for non-lock/non-create_parked_link rows.
+#[derive(Default)]
+struct TransferFields {
+    direction: Option<String>,
+    transfer_type: Option<String>,
+    amount_raw: Option<String>,
+    beneficiary: Option<String>,
+    counterparty: Option<String>,
+}
+
 impl StateStore {
-    fn extract_transfer_fields(
-        flow: &str,
-        task_type: &str,
-        payload: &Value,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) {
+    fn extract_transfer_fields(flow: &str, task_type: &str, payload: &Value) -> TransferFields {
         if flow == "lock" && task_type == "create_parked_link" {
-            return (
-                Some("transfer_in".to_string()),
-                Some("lock".to_string()),
-                extract_lock_amount_hot(payload),
-                payload
+            return TransferFields {
+                direction: Some("transfer_in".to_string()),
+                transfer_type: Some("lock".to_string()),
+                amount_raw: extract_lock_amount_hot(payload),
+                beneficiary: payload
                     .get("holochain_agent")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-                payload
+                counterparty: payload
                     .get("sender")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-            );
+            };
         }
 
-        (None, None, None, None, None)
+        TransferFields::default()
     }
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -317,21 +381,6 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn mark_succeeded(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "UPDATE work_items
-             SET state='succeeded',
-                 error_class=NULL,
-                 last_error=NULL,
-                 next_retry_at=NULL,
-                 updated_at=strftime('%s', 'now')
-             WHERE id=?1",
-            [id],
-        )?;
-        Ok(())
-    }
-
     pub fn get_checkpoint_u64(&self, key: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let v: Option<String> = conn
@@ -392,22 +441,21 @@ impl StateStore {
             let payload_str: String = row.get(4)?;
             let payload = serde_json::from_str::<Value>(&payload_str).unwrap_or(Value::Null);
             let state_str: String = row.get(5)?;
-            let (direction, transfer_type, amount_raw, beneficiary, counterparty) =
-                Self::extract_transfer_fields(
-                    row.get::<_, String>(1)?.as_str(),
-                    row.get::<_, String>(2)?.as_str(),
-                    &payload,
-                );
+            let fields = Self::extract_transfer_fields(
+                row.get::<_, String>(1)?.as_str(),
+                row.get::<_, String>(2)?.as_str(),
+                &payload,
+            );
             Ok(StatusRow {
                 id: row.get(0)?,
                 flow: row.get(1)?,
                 task_type: row.get(2)?,
                 item_id: row.get(3)?,
-                direction,
-                transfer_type,
-                amount_raw,
-                beneficiary,
-                counterparty,
+                direction: fields.direction,
+                transfer_type: fields.transfer_type,
+                amount_raw: fields.amount_raw,
+                beneficiary: fields.beneficiary,
+                counterparty: fields.counterparty,
                 status: state_str.parse().unwrap_or(WorkState::Failed),
                 attempts: row.get(6)?,
                 max_attempts: row.get(7)?,
@@ -446,7 +494,7 @@ impl StateStore {
     ) -> Result<Vec<WorkItem>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at
+            "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash
              FROM work_items
              WHERE flow = ?1 AND state = ?2
              ORDER BY created_at ASC, id ASC
@@ -457,6 +505,116 @@ impl StateStore {
             row_to_work_item,
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// List all non-terminal rows (state IN `queued` or `in_flight`) for the
+    /// given flow at the given pipeline step, ordered oldest-first. This is
+    /// the core query used by the step-driven bridge cycle: each stage
+    /// (S1..S4) selects its input by `step` value rather than by a
+    /// dedup-derived decision.
+    pub fn list_pending_by_step(
+        &self,
+        flow: &str,
+        step: WorkStep,
+        limit: usize,
+    ) -> Result<Vec<WorkItem>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash
+             FROM work_items
+             WHERE flow = ?1 AND step = ?2 AND state IN ('queued', 'in_flight')
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![flow, step.to_string(), limit as i64],
+            row_to_work_item,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Advance a row to `step='cl_link_created'`, recording the ActionHash
+    /// returned by `create_parked_link`. `state` is reset to `queued` so the
+    /// row is eligible for the next stage.
+    pub fn advance_to_cl_link_created(&self, id: i64, cl_link_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE work_items
+             SET step='cl_link_created',
+                 cl_link_hash=?2,
+                 state='queued',
+                 attempts=0,
+                 error_class=NULL,
+                 last_error=NULL,
+                 next_retry_at=NULL,
+                 updated_at=strftime('%s', 'now')
+             WHERE id=?1",
+            params![id, cl_link_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Advance a row to `step='cl_rave_executed'`. `cl_rave_hash` is optional
+    /// — we record it when we observed the RAVE's returned ActionHash
+    /// directly, and leave it NULL when the reconciler inferred the advance
+    /// from the parked link no longer being live.
+    pub fn advance_to_cl_rave_executed(&self, id: i64, cl_rave_hash: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE work_items
+             SET step='cl_rave_executed',
+                 cl_rave_hash=?2,
+                 state='queued',
+                 attempts=0,
+                 error_class=NULL,
+                 last_error=NULL,
+                 next_retry_at=NULL,
+                 updated_at=strftime('%s', 'now')
+             WHERE id=?1",
+            params![id, cl_rave_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Advance a row to `step='br_spend_created'`, recording the ActionHash
+    /// returned by `create_parked_spend`.
+    pub fn advance_to_br_spend_created(&self, id: i64, br_spend_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE work_items
+             SET step='br_spend_created',
+                 br_spend_hash=?2,
+                 state='queued',
+                 attempts=0,
+                 error_class=NULL,
+                 last_error=NULL,
+                 next_retry_at=NULL,
+                 updated_at=strftime('%s', 'now')
+             WHERE id=?1",
+            params![id, br_spend_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Advance a row to `step='br_rave_executed'` and simultaneously mark it
+    /// `state='succeeded'` — the bridging RAVE is the terminal stage of the
+    /// lock pipeline.
+    pub fn advance_to_br_rave_executed(&self, id: i64, br_rave_hash: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE work_items
+             SET step='br_rave_executed',
+                 br_rave_hash=?2,
+                 state='succeeded',
+                 attempts=0,
+                 error_class=NULL,
+                 last_error=NULL,
+                 next_retry_at=NULL,
+                 updated_at=strftime('%s', 'now')
+             WHERE id=?1",
+            params![id, br_rave_hash],
+        )?;
+        Ok(())
     }
 
     /// Terminally fail a single row with `error_class='permanent'`. Used
@@ -589,6 +747,24 @@ impl StateStore {
         if !cols.iter().any(|c| c == "error_class") {
             conn.execute("ALTER TABLE work_items ADD COLUMN error_class TEXT", [])?;
         }
+        if !cols.iter().any(|c| c == "step") {
+            conn.execute(
+                "ALTER TABLE work_items ADD COLUMN step TEXT NOT NULL DEFAULT 'new'",
+                [],
+            )?;
+        }
+        if !cols.iter().any(|c| c == "cl_link_hash") {
+            conn.execute("ALTER TABLE work_items ADD COLUMN cl_link_hash TEXT", [])?;
+        }
+        if !cols.iter().any(|c| c == "cl_rave_hash") {
+            conn.execute("ALTER TABLE work_items ADD COLUMN cl_rave_hash TEXT", [])?;
+        }
+        if !cols.iter().any(|c| c == "br_spend_hash") {
+            conn.execute("ALTER TABLE work_items ADD COLUMN br_spend_hash TEXT", [])?;
+        }
+        if !cols.iter().any(|c| c == "br_rave_hash") {
+            conn.execute("ALTER TABLE work_items ADD COLUMN br_rave_hash TEXT", [])?;
+        }
         Ok(())
     }
 }
@@ -596,6 +772,7 @@ impl StateStore {
 fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
     let payload: String = row.get(5)?;
     let state_str: String = row.get(6)?;
+    let step_str: String = row.get(15)?;
     Ok(WorkItem {
         id: row.get(0)?,
         flow: row.get(1)?,
@@ -612,6 +789,11 @@ fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
         last_error: row.get(12)?,
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
+        step: step_str.parse().unwrap_or(WorkStep::New),
+        cl_link_hash: row.get(16)?,
+        cl_rave_hash: row.get(17)?,
+        br_spend_hash: row.get(18)?,
+        br_rave_hash: row.get(19)?,
     })
 }
 
@@ -691,7 +873,7 @@ impl StateStore {
 
         let item = tx
             .query_row(
-                "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at
+                "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash
                  FROM work_items WHERE id = ?1",
                 [id],
                 row_to_work_item,
@@ -1225,5 +1407,355 @@ mod tests {
             })
             .unwrap();
         assert!(rows.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Per-step pipeline tracking (plan: "per-step lock tracking")
+    // -----------------------------------------------------------------
+
+    /// Helper: queue a fresh lock row and return its DB id.
+    fn enqueue_one(store: &StateStore, item_id: &str) -> i64 {
+        store
+            .enqueue_queued(
+                "lock",
+                "create_parked_link",
+                item_id,
+                &format!("{}:key", item_id),
+                &serde_json::json!({"lock_id": item_id}),
+            )
+            .unwrap();
+        store
+            .list_work_items("lock", WorkState::Queued, 10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.item_id == item_id)
+            .expect("just-inserted row must be listable")
+            .id
+    }
+
+    #[test]
+    fn new_row_defaults_to_step_new_with_no_hashes() {
+        // Schema migration invariant: every freshly-enqueued row lands at
+        // `step='new'` with all pipeline hashes NULL. This is the state
+        // the S1 batch builder expects for every lock it processes.
+        let path = test_db_path("step-default");
+        let store = StateStore::open(&path).unwrap();
+        let id = enqueue_one(&store, "lock:step-default:1");
+        let items = store
+            .list_work_items("lock", WorkState::Queued, 10)
+            .unwrap();
+        let row = items.into_iter().find(|w| w.id == id).unwrap();
+        assert_eq!(row.step, WorkStep::New);
+        assert!(row.cl_link_hash.is_none());
+        assert!(row.cl_rave_hash.is_none());
+        assert!(row.br_spend_hash.is_none());
+        assert!(row.br_rave_hash.is_none());
+    }
+
+    #[test]
+    fn list_pending_by_step_filters_on_step_and_nonterminal_state() {
+        // The S1..S3 batch builders each call `list_pending_by_step` with
+        // the step they expect as input. Confirm it (a) matches exact
+        // step, (b) ignores terminal (`succeeded`/`failed`) rows, and
+        // (c) returns both `queued` and `in_flight` rows — because a
+        // freshly-marked in_flight row from earlier in the same cycle is
+        // still valid input until the cycle's outer error handler resets
+        // it.
+        let path = test_db_path("list-pending-by-step");
+        let store = StateStore::open(&path).unwrap();
+        let id_new1 = enqueue_one(&store, "lock:s:new:1");
+        let id_new2 = enqueue_one(&store, "lock:s:new:2");
+        let id_cl = enqueue_one(&store, "lock:s:cl");
+        let id_done = enqueue_one(&store, "lock:s:done");
+
+        store.advance_to_cl_link_created(id_cl, "uhCkkCL").unwrap();
+        store
+            .advance_to_cl_link_created(id_done, "uhCkkDONE")
+            .unwrap();
+        store
+            .advance_to_cl_rave_executed(id_done, Some("uhCkkRAVE1"))
+            .unwrap();
+        store
+            .advance_to_br_spend_created(id_done, "uhCkkSPEND")
+            .unwrap();
+        store
+            .advance_to_br_rave_executed(id_done, Some("uhCkkRAVE2"))
+            .unwrap();
+
+        // Mark one of the 'new' rows in_flight to prove it's still
+        // returned (the cycle still owns the batch until it either
+        // advances or errors out).
+        store.mark_in_flight(id_new2).unwrap();
+
+        let new_rows = store
+            .list_pending_by_step("lock", WorkStep::New, 100)
+            .unwrap();
+        let new_ids: Vec<i64> = new_rows.iter().map(|r| r.id).collect();
+        assert_eq!(new_ids.len(), 2);
+        assert!(new_ids.contains(&id_new1));
+        assert!(new_ids.contains(&id_new2));
+
+        let cl_rows = store
+            .list_pending_by_step("lock", WorkStep::ClLinkCreated, 100)
+            .unwrap();
+        assert_eq!(cl_rows.len(), 1);
+        assert_eq!(cl_rows[0].id, id_cl);
+        assert_eq!(cl_rows[0].cl_link_hash.as_deref(), Some("uhCkkCL"));
+
+        // The fully-advanced row is `state='succeeded'`; it must not
+        // appear at any step lookup, even though its `step` column is
+        // `br_rave_executed`.
+        let done_rows = store
+            .list_pending_by_step("lock", WorkStep::BrRaveExecuted, 100)
+            .unwrap();
+        assert!(done_rows.is_empty());
+    }
+
+    #[test]
+    fn advance_to_cl_link_created_records_hash_and_clears_error() {
+        // Invariant: every step advance clears the row's last error and
+        // resets state to `queued` so the next stage can pick it up.
+        // Without this the in_flight row stuck halfway through a cycle
+        // would keep its stale error text forever.
+        let path = test_db_path("advance-cl-link");
+        let store = StateStore::open(&path).unwrap();
+        let id = enqueue_one(&store, "lock:cl-link:1");
+        store.mark_in_flight(id).unwrap();
+        store.schedule_retry(id, "boom", 0).unwrap();
+
+        store.advance_to_cl_link_created(id, "uhCkkABC123").unwrap();
+
+        let row = store
+            .list_pending_by_step("lock", WorkStep::ClLinkCreated, 10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.id == id)
+            .unwrap();
+        assert_eq!(row.step, WorkStep::ClLinkCreated);
+        assert_eq!(row.state, WorkState::Queued);
+        assert_eq!(row.cl_link_hash.as_deref(), Some("uhCkkABC123"));
+        assert!(
+            row.last_error.is_none(),
+            "error text must be cleared on advance"
+        );
+        assert!(row.next_retry_at.is_none());
+    }
+
+    #[test]
+    fn advance_helpers_reset_attempts_so_each_step_gets_fresh_retry_budget() {
+        // Each zome call in the four-stage pipeline is independently
+        // retryable. If attempts carried over from S1 into S2..S4, a
+        // row that makes forward progress could still exhaust its
+        // `max_attempts` budget and get permanently failed while
+        // actually being healthy. Every `advance_to_*` helper must
+        // therefore reset `attempts` to zero.
+        let path = test_db_path("advance-resets-attempts");
+        let store = StateStore::open(&path).unwrap();
+
+        // S1 → cl_link_created: burn two attempts first.
+        let id_s1 = enqueue_one(&store, "lock:attempts:s1");
+        let _ = store.claim_next(Some("lock")).unwrap().unwrap();
+        let _ = store.claim_next(Some("lock")).unwrap();
+        store.advance_to_cl_link_created(id_s1, "uhCkkS1").unwrap();
+        let row = store
+            .list_pending_by_step("lock", WorkStep::ClLinkCreated, 10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.id == id_s1)
+            .unwrap();
+        assert_eq!(
+            row.attempts, 0,
+            "cl_link_created advance must reset attempts"
+        );
+
+        // S2 → cl_rave_executed: seed attempts via mark_in_flight + schedule_retry.
+        let id_s2 = enqueue_one(&store, "lock:attempts:s2");
+        store.advance_to_cl_link_created(id_s2, "uhCkkS2A").unwrap();
+        store.mark_in_flight(id_s2).unwrap();
+        store.schedule_retry(id_s2, "boom s2", 0).unwrap();
+        store.advance_to_cl_rave_executed(id_s2, None).unwrap();
+        let row = store
+            .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.id == id_s2)
+            .unwrap();
+        assert_eq!(
+            row.attempts, 0,
+            "cl_rave_executed advance must reset attempts"
+        );
+
+        // S3 → br_spend_created.
+        let id_s3 = enqueue_one(&store, "lock:attempts:s3");
+        store.advance_to_cl_link_created(id_s3, "uhCkkS3A").unwrap();
+        store.advance_to_cl_rave_executed(id_s3, None).unwrap();
+        store.mark_in_flight(id_s3).unwrap();
+        store.schedule_retry(id_s3, "boom s3", 0).unwrap();
+        store
+            .advance_to_br_spend_created(id_s3, "uhCkkS3B")
+            .unwrap();
+        let row = store
+            .list_pending_by_step("lock", WorkStep::BrSpendCreated, 10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.id == id_s3)
+            .unwrap();
+        assert_eq!(
+            row.attempts, 0,
+            "br_spend_created advance must reset attempts"
+        );
+
+        // S4 → br_rave_executed (terminal).
+        let id_s4 = enqueue_one(&store, "lock:attempts:s4");
+        store.advance_to_cl_link_created(id_s4, "uhCkkS4A").unwrap();
+        store.advance_to_cl_rave_executed(id_s4, None).unwrap();
+        store
+            .advance_to_br_spend_created(id_s4, "uhCkkS4B")
+            .unwrap();
+        store.mark_in_flight(id_s4).unwrap();
+        store.schedule_retry(id_s4, "boom s4", 0).unwrap();
+        store.advance_to_br_rave_executed(id_s4, None).unwrap();
+        let row = store
+            .list_work_items("lock", WorkState::Succeeded, 10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.id == id_s4)
+            .unwrap();
+        assert_eq!(
+            row.attempts, 0,
+            "br_rave_executed advance must reset attempts"
+        );
+    }
+
+    #[test]
+    fn advance_to_cl_rave_executed_accepts_optional_hash() {
+        // The reconciler advances rows whose link is no longer live
+        // WITHOUT knowing the triggering RAVE's ActionHash, so the
+        // advance helper must accept `None` and leave `cl_rave_hash`
+        // NULL in that case. When the orchestrator advances after its
+        // own successful RAVE, it passes `Some(hash)` and the column
+        // gets populated for audit.
+        let path = test_db_path("advance-cl-rave");
+        let store = StateStore::open(&path).unwrap();
+        let id_inferred = enqueue_one(&store, "lock:cl-rave:inferred");
+        let id_observed = enqueue_one(&store, "lock:cl-rave:observed");
+
+        for id in [id_inferred, id_observed] {
+            store.advance_to_cl_link_created(id, "uhCkkLINK").unwrap();
+        }
+        store
+            .advance_to_cl_rave_executed(id_inferred, None)
+            .unwrap();
+        store
+            .advance_to_cl_rave_executed(id_observed, Some("uhCkkRAVE"))
+            .unwrap();
+
+        let rows = store
+            .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 10)
+            .unwrap();
+        let inferred = rows.iter().find(|w| w.id == id_inferred).unwrap();
+        let observed = rows.iter().find(|w| w.id == id_observed).unwrap();
+        assert!(inferred.cl_rave_hash.is_none());
+        assert_eq!(observed.cl_rave_hash.as_deref(), Some("uhCkkRAVE"));
+    }
+
+    #[test]
+    fn advance_to_br_rave_executed_marks_row_succeeded() {
+        // Terminal stage: `br_rave_executed` and `state='succeeded'`
+        // must be set atomically in the same UPDATE. Otherwise a crash
+        // between advancing step and setting state would leave the row
+        // eligible for S4 again and cause a duplicate RAVE on recovery.
+        let path = test_db_path("advance-br-rave");
+        let store = StateStore::open(&path).unwrap();
+        let id = enqueue_one(&store, "lock:br-rave:1");
+        store.advance_to_cl_link_created(id, "uhCkkA").unwrap();
+        store
+            .advance_to_cl_rave_executed(id, Some("uhCkkB"))
+            .unwrap();
+        store.advance_to_br_spend_created(id, "uhCkkC").unwrap();
+        store
+            .advance_to_br_rave_executed(id, Some("uhCkkD"))
+            .unwrap();
+
+        let succeeded = store
+            .list_work_items("lock", WorkState::Succeeded, 10)
+            .unwrap();
+        let row = succeeded.into_iter().find(|w| w.id == id).unwrap();
+        assert_eq!(row.step, WorkStep::BrRaveExecuted);
+        assert_eq!(row.br_rave_hash.as_deref(), Some("uhCkkD"));
+        assert_eq!(row.br_spend_hash.as_deref(), Some("uhCkkC"));
+    }
+
+    #[test]
+    fn pipeline_row_survives_reopen_with_hashes_intact() {
+        // Schema-migration + round-trip guard. A row that walked halfway
+        // through the pipeline in one process must deserialise back to
+        // the same `step`/hash tuple when the binary restarts, so the
+        // reconciler can pick up exactly where the previous run left
+        // off. This is the property that prevents the "we restarted and
+        // re-ran the CL RAVE" duplicate-transaction symptom.
+        let path = test_db_path("reopen-roundtrip");
+        let id = {
+            let store = StateStore::open(&path).unwrap();
+            let id = enqueue_one(&store, "lock:reopen:1");
+            store.advance_to_cl_link_created(id, "uhCkkLINK").unwrap();
+            store
+                .advance_to_cl_rave_executed(id, Some("uhCkkRAVE"))
+                .unwrap();
+            id
+        };
+        let store = StateStore::open(&path).unwrap();
+        let rows = store
+            .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 10)
+            .unwrap();
+        let row = rows.into_iter().find(|w| w.id == id).unwrap();
+        assert_eq!(row.step, WorkStep::ClRaveExecuted);
+        assert_eq!(row.cl_link_hash.as_deref(), Some("uhCkkLINK"));
+        assert_eq!(row.cl_rave_hash.as_deref(), Some("uhCkkRAVE"));
+    }
+
+    #[test]
+    fn ensure_work_item_columns_adds_step_and_hash_columns_to_legacy_schema() {
+        // Simulate upgrading a pre-plan database: drop the new columns
+        // from the schema after they've been created, then re-run
+        // `StateStore::open` which invokes `ensure_work_item_columns`.
+        // Every pre-existing row must end up at `step='new'` (the
+        // column default) and with NULL hashes, without any data loss.
+        let path = test_db_path("migration");
+        let store = StateStore::open(&path).unwrap();
+        let _id = enqueue_one(&store, "lock:migrate:1");
+        drop(store);
+
+        // Simulate an older binary that never had these columns by
+        // rebuilding the table without them.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE work_items_legacy AS
+                SELECT id, flow, task_type, item_id, idempotency_key, payload_json,
+                       state, attempts, max_attempts, next_retry_at, last_attempt_at,
+                       error_class, last_error, created_at, updated_at
+                FROM work_items;
+                DROP TABLE work_items;
+                ALTER TABLE work_items_legacy RENAME TO work_items;
+                "#,
+            )
+            .unwrap();
+        }
+
+        // Re-open: `ensure_work_item_columns` should re-add every
+        // pipeline column without failing on the missing columns.
+        let store = StateStore::open(&path).unwrap();
+        let rows = store
+            .list_work_items("lock", WorkState::Queued, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.step, WorkStep::New);
+        assert!(row.cl_link_hash.is_none());
+        assert!(row.cl_rave_hash.is_none());
+        assert!(row.br_spend_hash.is_none());
+        assert!(row.br_rave_hash.is_none());
     }
 }

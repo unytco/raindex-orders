@@ -86,6 +86,9 @@ the env file must be sourced even for `status` and `clear`.
 | `HAM_RECONNECT_BACKOFF_INITIAL_MS` | No | `1000` (initial reconnect delay after a dropped Holochain websocket) |
 | `HAM_RECONNECT_BACKOFF_MAX_MS` | No | `30000` (cap on reconnect delay) |
 | `HAM_RECONNECT_ESCALATE_AFTER` | No | `5` (after this many consecutive failed reconnect attempts, logs escalate from `warn` to `error` so ops alerts can fire; the loop keeps retrying forever) |
+| `HAM_PRESSURE_COOLDOWN_MS` | No | `30000` (base pause after a Holochain source-chain-pressure error such as `"deadline has elapsed"`; doubles on each consecutive occurrence up to `HAM_PRESSURE_COOLDOWN_MAX_MS`) |
+| `HAM_PRESSURE_COOLDOWN_MAX_MS` | No | `90000` (cap on the escalating pressure cooldown; once reached, consecutive pressure errors log at `error` level with `event="ham.source_chain_pressure_stuck"` so alerts can fire) |
+| `SLOW_CALL_THRESHOLD_MS` | No | `35000` (if a write-bearing zome call inside a bridge cycle exceeds this, the orchestrator ejects the rest of the cycle instead of stacking more pressure; the reconciler advances the skipped stages next cycle; set to `0` to disable. Tune above your conductor's healthy per-call baseline so only clearly-slow calls eject the rest of the cycle; 35s sits just above the typical successful latency observed in production (~20–32s) while still protecting against pathological calls piling up) |
 | `RUST_LOG` | No | `info` |
 
 Confirmations are not configurable: 15 (mainnet) / 5 (sepolia).
