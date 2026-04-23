@@ -4,7 +4,7 @@ use clap::ValueEnum;
 use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const SCHEMA_VERSION: i64 = 1;
@@ -160,14 +160,149 @@ pub struct StateFilter {
     pub limit: usize,
 }
 
+/// Lightweight aggregate over `work_items` computed in a single SQL
+/// pass. Consumed by the watchtower reporter; computing this must stay
+/// O(rows) small and must never hold the mutex longer than a handful of
+/// milliseconds.
+#[derive(Debug, Clone, Default)]
+pub struct BridgeAggregateStats {
+    pub detected: i64,
+    pub queued: i64,
+    pub claimed: i64,
+    pub in_flight: i64,
+    pub succeeded_total: i64,
+    pub failed_total: i64,
+    /// Terminal rows in the last 24h. Useful for "did anything happen
+    /// today?" indicators without scanning the whole table.
+    pub succeeded_24h: i64,
+    pub failed_24h: i64,
+    pub succeeded_1h: i64,
+    pub failed_1h: i64,
+    /// Age (seconds) of the oldest row currently in `queued`. `None`
+    /// when the queue is empty. A large number means items are not
+    /// moving through the pipeline.
+    pub oldest_queued_age_s: Option<i64>,
+    /// Average end-to-end time (seconds) across rows that reached
+    /// `succeeded` in the last 24h. `None` when no rows terminated.
+    pub avg_time_to_succeed_s_24h: Option<f64>,
+}
+
+/// Summary of a single [`StateStore::prune_terminal_older_than`]
+/// invocation. Broken out per state so the retention task (and the
+/// CLI) can log the split without peeking at the SQL.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    pub succeeded_deleted: usize,
+    pub failed_deleted: usize,
+}
+
+impl PruneStats {
+    pub fn total(&self) -> usize {
+        self.succeeded_deleted + self.failed_deleted
+    }
+}
+
+/// Compute the aggregate snapshot against an arbitrary sqlite
+/// connection. Pulled out of `StateStore` so the watchtower reporter
+/// can run this against a dedicated read-only connection without
+/// touching the writer mutex. Callers that want the "use the shared
+/// writer" ergonomics should prefer [`StateStore::aggregate_stats`].
+pub fn compute_aggregate_stats(conn: &Connection) -> Result<BridgeAggregateStats> {
+    let mut stats = BridgeAggregateStats::default();
+
+    // Per-state counts (cheap thanks to idx_work_items_state_created).
+    {
+        let mut stmt = conn.prepare("SELECT state, COUNT(*) FROM work_items GROUP BY state")?;
+        let rows = stmt.query_map([], |row| {
+            let state: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((state, count))
+        })?;
+        for row in rows {
+            let (state, count) = row?;
+            match state.as_str() {
+                "detected" => stats.detected = count,
+                "queued" => stats.queued = count,
+                "claimed" => stats.claimed = count,
+                "in_flight" => stats.in_flight = count,
+                "succeeded" => stats.succeeded_total = count,
+                "failed" => stats.failed_total = count,
+                _ => {}
+            }
+        }
+    }
+
+    // Rolling-window terminal counts. `updated_at` is set whenever
+    // the row moves to a new state, so this is a reasonable proxy
+    // for "terminated during the window".
+    let day_ago: i64 = conn.query_row("SELECT strftime('%s','now') - 86400", [], |r| {
+        r.get::<_, i64>(0)
+    })?;
+    let hour_ago: i64 = conn.query_row("SELECT strftime('%s','now') - 3600", [], |r| {
+        r.get::<_, i64>(0)
+    })?;
+
+    stats.succeeded_24h = conn.query_row(
+        "SELECT COUNT(*) FROM work_items WHERE state='succeeded' AND updated_at >= ?1",
+        [day_ago],
+        |r| r.get::<_, i64>(0),
+    )?;
+    stats.failed_24h = conn.query_row(
+        "SELECT COUNT(*) FROM work_items WHERE state='failed' AND updated_at >= ?1",
+        [day_ago],
+        |r| r.get::<_, i64>(0),
+    )?;
+    stats.succeeded_1h = conn.query_row(
+        "SELECT COUNT(*) FROM work_items WHERE state='succeeded' AND updated_at >= ?1",
+        [hour_ago],
+        |r| r.get::<_, i64>(0),
+    )?;
+    stats.failed_1h = conn.query_row(
+        "SELECT COUNT(*) FROM work_items WHERE state='failed' AND updated_at >= ?1",
+        [hour_ago],
+        |r| r.get::<_, i64>(0),
+    )?;
+
+    // Oldest queued row's age. `None` when the queue is empty.
+    let oldest: Option<i64> = conn
+        .query_row(
+            "SELECT CAST(strftime('%s','now') AS INTEGER) - MIN(created_at)
+             FROM work_items WHERE state = 'queued'",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    stats.oldest_queued_age_s = oldest;
+
+    // Average end-to-end time for rows terminated in the last 24h.
+    let avg: Option<f64> = conn
+        .query_row(
+            "SELECT AVG(updated_at - created_at) FROM work_items
+             WHERE state='succeeded' AND updated_at >= ?1",
+            [day_ago],
+            |r| r.get::<_, Option<f64>>(0),
+        )
+        .optional()?
+        .flatten();
+    stats.avg_time_to_succeed_s_24h = avg;
+
+    Ok(stats)
+}
+
 pub struct StateStore {
     conn: Arc<Mutex<Connection>>,
+    /// Path the database was opened from. Used so read-only consumers
+    /// (e.g. the watchtower reporter) can open their own detached
+    /// connection without contending for the writer mutex.
+    path: PathBuf,
 }
 
 impl Clone for StateStore {
     fn clone(&self) -> Self {
         Self {
             conn: Arc::clone(&self.conn),
+            path: self.path.clone(),
         }
     }
 }
@@ -211,13 +346,30 @@ impl StateStore {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent).context("Failed to create db directory")?;
         }
-        let conn = Connection::open(path).context("Failed to open sqlite database")?;
+        let path_buf = path.as_ref().to_path_buf();
+        let conn = Connection::open(&path_buf).context("Failed to open sqlite database")?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            path: path_buf,
         };
         store.init_schema()?;
         store.recover_stale_items()?;
         Ok(store)
+    }
+
+    /// Open a fresh read-only sqlite connection to the same database
+    /// file. Intended for callers that need to read aggregates without
+    /// blocking the writer mutex — primarily the watchtower reporter.
+    /// The caller owns the returned `Connection` and must drop it when
+    /// done; connections are cheap to create against an existing file
+    /// so opening one per probe is acceptable.
+    pub fn open_read_only_connection(&self) -> Result<Connection> {
+        use rusqlite::OpenFlags;
+        Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .context("open read-only sqlite connection")
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -484,6 +636,54 @@ impl StateStore {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let deleted = conn.execute("DELETE FROM work_items", [])?;
         Ok(deleted)
+    }
+
+    /// Delete terminal (`succeeded` / `failed`) `work_items` rows
+    /// whose `updated_at` is older than the supplied per-state age
+    /// windows. Called both by the background retention task and by
+    /// the CLI `Clear --older-than-s` path, so the SQL + mutex-hold
+    /// behavior lives exactly once.
+    ///
+    /// Uses two independent DELETEs — one per state — so a caller
+    /// can set very different windows for succeeded vs failed rows
+    /// without the SQL having to understand the policy.
+    pub fn prune_terminal_older_than(
+        &self,
+        succeeded_max_age_s: u64,
+        failed_max_age_s: u64,
+    ) -> Result<PruneStats> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let succeeded_deleted = conn.execute(
+            "DELETE FROM work_items
+             WHERE state = 'succeeded'
+               AND updated_at < CAST(strftime('%s','now') AS INTEGER) - ?1",
+            params![succeeded_max_age_s as i64],
+        )?;
+        let failed_deleted = conn.execute(
+            "DELETE FROM work_items
+             WHERE state = 'failed'
+               AND updated_at < CAST(strftime('%s','now') AS INTEGER) - ?1",
+            params![failed_max_age_s as i64],
+        )?;
+        Ok(PruneStats {
+            succeeded_deleted,
+            failed_deleted,
+        })
+    }
+
+    /// Read-only aggregate snapshot over `work_items`. Thin wrapper
+    /// around [`compute_aggregate_stats`] that uses the writer mutex —
+    /// useful for local probes and tests. The watchtower reporter
+    /// should call [`compute_aggregate_stats`] directly against its
+    /// own dedicated read-only connection (see
+    /// [`StateStore::open_read_only_connection`]) so reporting never
+    /// contends with the bridge cycle. `allow(dead_code)` because
+    /// the prod binary only takes the RO path; tests still exercise
+    /// this wrapper to pin the semantic equivalence.
+    #[allow(dead_code)]
+    pub fn aggregate_stats(&self) -> Result<BridgeAggregateStats> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        compute_aggregate_stats(&conn)
     }
 
     pub fn list_work_items(
@@ -1409,6 +1609,75 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    #[test]
+    fn prune_terminal_older_than_respects_per_state_windows_and_leaves_non_terminals_alone() {
+        // Covers the three invariants the retention task relies on:
+        //   1. `queued`/`in_flight` rows are never touched, regardless of age.
+        //   2. Young terminal rows survive (within the configured window).
+        //   3. Stale terminal rows get deleted, and the per-state counts
+        //      returned in `PruneStats` match the actual deletes.
+        let path = test_db_path("prune-terminal");
+        let store = StateStore::open(&path).unwrap();
+
+        insert_work_item_with_state(&path, "prune:queued", WorkState::Queued);
+        insert_work_item_with_state(&path, "prune:inflight", WorkState::InFlight);
+        insert_work_item_with_state(&path, "prune:succ-young", WorkState::Succeeded);
+        insert_work_item_with_state(&path, "prune:succ-old", WorkState::Succeeded);
+        insert_work_item_with_state(&path, "prune:fail-young", WorkState::Failed);
+        insert_work_item_with_state(&path, "prune:fail-old", WorkState::Failed);
+
+        // Backdate the "old" rows by rewriting `updated_at`. 1M seconds
+        // (~11.6 days) puts them well beyond both 7d (succeeded) and
+        // the 30d failed window used in the test call below.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE work_items SET updated_at = CAST(strftime('%s','now') AS INTEGER) - 1000000
+             WHERE item_id IN ('prune:succ-old', 'prune:fail-old')",
+            [],
+        )
+        .unwrap();
+        // Intentionally backdate `prune:fail-old` *less* than the
+        // failed window (30d = 2_592_000s). 1_000_000s is well under
+        // that, so the failed-old row should survive the first call
+        // and only get deleted when we tighten the failed window.
+        drop(conn);
+
+        let first = store
+            .prune_terminal_older_than(7 * 24 * 60 * 60, 30 * 24 * 60 * 60)
+            .unwrap();
+        assert_eq!(first.succeeded_deleted, 1);
+        assert_eq!(first.failed_deleted, 0);
+        assert_eq!(first.total(), 1);
+
+        // Tighten the failed window to half a day; now the backdated
+        // failed row (~11.6d old) is eligible and should drop.
+        let second = store
+            .prune_terminal_older_than(7 * 24 * 60 * 60, 43_200)
+            .unwrap();
+        assert_eq!(second.succeeded_deleted, 0);
+        assert_eq!(second.failed_deleted, 1);
+
+        let rows = store
+            .status(StateFilter {
+                flow: Some("lock".to_string()),
+                state: None,
+                item_id: None,
+                limit: 20,
+            })
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            4,
+            "only the two stale terminal rows should be gone"
+        );
+        let surviving: std::collections::HashSet<String> =
+            rows.into_iter().map(|r| r.item_id).collect();
+        assert!(surviving.contains("prune:queued"));
+        assert!(surviving.contains("prune:inflight"));
+        assert!(surviving.contains("prune:succ-young"));
+        assert!(surviving.contains("prune:fail-young"));
+    }
+
     // -----------------------------------------------------------------
     // Per-step pipeline tracking (plan: "per-step lock tracking")
     // -----------------------------------------------------------------
@@ -1757,5 +2026,66 @@ mod tests {
         assert!(row.cl_rave_hash.is_none());
         assert!(row.br_spend_hash.is_none());
         assert!(row.br_rave_hash.is_none());
+    }
+
+    #[test]
+    fn compute_aggregate_stats_matches_on_read_only_connection() {
+        // The watchtower reporter runs its aggregate against a
+        // dedicated read-only sqlite connection so it never contends
+        // with the writer mutex. That only works if the extracted
+        // `compute_aggregate_stats` helper is purely connection-driven
+        // and returns the same numbers as the mutex-backed wrapper.
+        let path = test_db_path("agg-ro-conn");
+        let store = StateStore::open(&path).unwrap();
+
+        // Seed a mix of states through the normal writer path so we
+        // exercise per-state counts, rolling windows, and the empty
+        // oldest-queued branch simultaneously.
+        insert_work_item_with_state(&path, "ro:queued-1", WorkState::Queued);
+        insert_work_item_with_state(&path, "ro:queued-2", WorkState::Queued);
+        insert_work_item_with_state(&path, "ro:in-flight-1", WorkState::InFlight);
+        insert_work_item_with_state(&path, "ro:succeeded-1", WorkState::Succeeded);
+        insert_work_item_with_state(&path, "ro:failed-1", WorkState::Failed);
+
+        let via_mutex = store.aggregate_stats().unwrap();
+
+        let ro = store.open_read_only_connection().unwrap();
+        let via_ro = compute_aggregate_stats(&ro).unwrap();
+
+        assert_eq!(via_mutex.detected, via_ro.detected);
+        assert_eq!(via_mutex.queued, via_ro.queued);
+        assert_eq!(via_mutex.claimed, via_ro.claimed);
+        assert_eq!(via_mutex.in_flight, via_ro.in_flight);
+        assert_eq!(via_mutex.succeeded_total, via_ro.succeeded_total);
+        assert_eq!(via_mutex.failed_total, via_ro.failed_total);
+        assert_eq!(via_mutex.succeeded_24h, via_ro.succeeded_24h);
+        assert_eq!(via_mutex.failed_24h, via_ro.failed_24h);
+        assert_eq!(via_mutex.succeeded_1h, via_ro.succeeded_1h);
+        assert_eq!(via_mutex.failed_1h, via_ro.failed_1h);
+        assert_eq!(via_mutex.oldest_queued_age_s, via_ro.oldest_queued_age_s);
+        assert_eq!(
+            via_mutex.avg_time_to_succeed_s_24h,
+            via_ro.avg_time_to_succeed_s_24h,
+        );
+
+        // Sanity-check the seeded distribution so future refactors
+        // don't silently null everything out.
+        assert_eq!(via_ro.queued, 2);
+        assert_eq!(via_ro.in_flight, 1);
+        assert_eq!(via_ro.succeeded_total, 1);
+        assert_eq!(via_ro.failed_total, 1);
+
+        // The read-only connection must actually reject writes —
+        // otherwise the whole isolation story is a fiction.
+        let write_err = ro.execute(
+            "INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, created_at, updated_at)
+             VALUES ('lock','create_parked_link','ro:bad','ro:bad:key','{}','queued',0,8,strftime('%s','now'),strftime('%s','now'))",
+            [],
+        );
+        assert!(
+            write_err.is_err(),
+            "read-only connection should refuse writes, got {:?}",
+            write_err
+        );
     }
 }

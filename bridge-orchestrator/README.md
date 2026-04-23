@@ -41,11 +41,12 @@ bridge-orchestrator status [OPTIONS]
 
 ### `bridge-orchestrator clear`
 
-Delete work items from the SQLite database. Exactly one of the two flags is
-required; they are mutually exclusive.
+Delete work items from the SQLite database. Exactly one of the two mode flags
+is required; they are mutually exclusive.
 
 ```
 bridge-orchestrator clear --non-in-progress
+bridge-orchestrator clear --non-in-progress --older-than-s 604800
 bridge-orchestrator clear --all
 ```
 
@@ -53,8 +54,13 @@ bridge-orchestrator clear --all
 |------|-------------|
 | `--non-in-progress` | Delete only terminal rows (`succeeded`, `failed`) |
 | `--all` | Delete every row in `work_items` |
+| `--older-than-s N` | Only with `--non-in-progress`: restrict deletion to terminal rows whose `updated_at` is older than N seconds. Applied to both `succeeded` and `failed`. Use the in-process retention task (below) for per-state windows. |
 
-Outputs a JSON object: `{"mode":"non_in_progress","deleted_count":N}`
+Outputs a JSON object. Plain `--non-in-progress` returns
+`{"mode":"non_in_progress","deleted_count":N}`; with `--older-than-s` the
+output also includes `succeeded_deleted` and `failed_deleted`. Steady-state ops
+should rely on the in-process retention task and reserve this CLI for one-off
+hygiene.
 
 ## Environment variables
 
@@ -92,6 +98,95 @@ the env file must be sourced even for `status` and `clear`.
 | `RUST_LOG` | No | `info` |
 
 Confirmations are not configurable: 15 (mainnet) / 5 (sepolia).
+
+### Watchtower reporter (optional)
+
+The orchestrator can post small, DNA-scoped health and throughput
+snapshots to the `unyt-watchtower` Worker. The reporter runs in a
+detached tokio task with a 10s per-request HTTP timeout and
+log-and-forget error handling, so it can never affect the bridge
+cycle. Configuration is fully optional: if any required variable is
+unset the reporter is disabled and the orchestrator runs exactly as
+before.
+
+| Variable | Required | Default |
+|----------|----------|---------|
+| `WATCHTOWER_INGEST_URL` | Yes (to enable) | -- (e.g. `https://watchtower.unyt.dev/ingest/bridge`) |
+| `WATCHTOWER_OBSERVER_ID` | Yes (to enable) | -- (e.g. `bridge-hot-2-mhot`) |
+| `WATCHTOWER_HMAC_SECRET_HEX` | Yes (to enable) | -- (64-char hex; register in the Worker's D1 `observer_secrets` table) |
+| `WATCHTOWER_DNA_B64` | Yes (to enable) | -- (the alliance DNA hash this bridge is bound to) |
+| `WATCHTOWER_REPORT_INTERVAL_MS` | No | `60000` |
+
+Registration:
+
+```bash
+# From this repo's root, inside the dev shell if you have one.
+./automation/scripts/register-bridge-reporter.sh \
+    --observer-id bridge-hot-2-mhot \
+    --dna-b64 uhCkk... \
+    --ingest-url https://watchtower.unyt.dev/ingest/bridge
+```
+
+The script generates an HMAC secret, upserts it into the Worker's
+`observer_secrets` table via `wrangler d1 execute`, and prints the env
+lines to add to `bridge-orchestrator.env`. Reload the systemd unit after
+updating the env file.
+
+The reported panel shows up on the watchtower DNA Overview page for
+the configured DNA; no new tabs or tables are added to the UI.
+
+### Retention (automatic cleanup)
+
+The orchestrator runs an in-process retention task that periodically
+prunes old terminal rows (`succeeded`, `failed`) from `work_items`.
+It runs as a detached tokio task — same failure-isolation contract
+as the watchtower reporter — so any error is logged and swallowed
+without touching the bridge cycle. No separate systemd timer or cron
+is required.
+
+Defaults are deliberately compact: succeeded rows are kept for 7 days
+(routine history window), failed rows for 30 days (longer because
+failures are operationally forensic). All values are tunable via
+environment variables; set `BRIDGE_RETENTION_DISABLED=true` to skip
+spawning the task entirely.
+
+| Variable | Required | Default |
+|----------|----------|---------|
+| `BRIDGE_RETENTION_DISABLED` | No | `false` (set to `true` to disable the retention task) |
+| `BRIDGE_RETENTION_TICK_MS` | No | `3600000` (1 hour) |
+| `BRIDGE_RETENTION_SUCCEEDED_MAX_AGE_S` | No | `604800` (7 days) |
+| `BRIDGE_RETENTION_FAILED_MAX_AGE_S` | No | `2592000` (30 days) |
+
+When a tick deletes rows, a single `tracing::info!` line is emitted
+with `event="bridge_orchestrator.retention.pruned"` and the per-state
+counts. Idle ticks log at `trace` level so steady-state runs stay
+quiet.
+
+Application-log rotation is intentionally **not** handled by the
+binary. The orchestrator writes via `tracing` to stdout/stderr and
+delegates rotation to the process supervisor (systemd/journald,
+docker, or your equivalent). This keeps deployment conventional and
+avoids duplicating log-lifecycle logic inside the service.
+
+### Deployment via automation
+
+For the `hot-2-mhot` bridge server the orchestrator is fully provisioned
+by the `automation/` repo. From its root, one command builds the binary,
+auto-derives the DNA hash from the latest Holochain deploy result,
+reuses/creates a local HMAC secret for the watchtower reporter,
+registers it with the worker, writes `bridge-orchestrator.env` (including
+`WATCHTOWER_*` and any `BRIDGE_RETENTION_*` overrides from
+`config/hot-2-mhot-bridge/services.json`), SCPs the binary, and restarts
+systemd:
+
+```bash
+cd automation && make hot-2-mhot-bridge-services
+```
+
+Manual editing of `bridge-orchestrator.env` is only needed for local/dev
+setups or ad-hoc secret rotation. See `automation/scripts/setup-blockchain-bridge-services.sh`
+and the `watchtower_reporter` / `retention` blocks in `services.json`
+for the knobs available to operators.
 
 ### Holochain websocket resilience
 

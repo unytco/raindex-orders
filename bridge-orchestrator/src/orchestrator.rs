@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{generate_coupon, signer_context_from_env};
 use crate::state::{StateStore, WorkItem, WorkStep};
+use crate::watchtower_reporter::{self, ReporterState};
 use anyhow::{Context, Result};
 use ham::{
     connect_with_backoff, install_shutdown_handler, is_connection_error, is_source_chain_pressure,
@@ -24,6 +25,7 @@ use zfuel::fuel::ZFuel;
 pub struct BridgeOrchestrator {
     cfg: Config,
     db: StateStore,
+    reporter: ReporterState,
 }
 
 /// Severity bucket for a source-chain-pressure event. Mapped to a
@@ -38,7 +40,21 @@ enum PressureSeverity {
 impl BridgeOrchestrator {
     pub fn new(cfg: Config) -> Result<Self> {
         let db = StateStore::open(&cfg.db_path)?;
-        Ok(Self { cfg, db })
+        let reporter = ReporterState::new();
+        Ok(Self { cfg, db, reporter })
+    }
+
+    /// Timestamp in milliseconds. Wrapped so we can keep every
+    /// orchestrator hook that updates reporter state a single line.
+    fn now_ms() -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    /// Derive the "stuck" threshold the reporter should use: a bridge
+    /// is considered stuck when it hasn't completed a cycle within
+    /// three configured cycle intervals.
+    fn stuck_threshold_ms(&self) -> u64 {
+        self.cfg.bridge_cycle_interval_ms.saturating_mul(3)
     }
 
     /// Returns `true` when the last write-bearing zome call was slow
@@ -60,6 +76,9 @@ impl BridgeOrchestrator {
             threshold_ms = self.cfg.slow_call_threshold_ms as u64,
             "[bridge/cycle] stage ejected — skipping remaining stages; reconciler will advance next cycle"
         );
+        self.reporter.update(|h| {
+            h.stage_ejections_total = h.stage_ejections_total.saturating_add(1);
+        });
     }
 
     /// Compute the next source-chain-pressure cooldown given the
@@ -98,6 +117,35 @@ impl BridgeOrchestrator {
             "bridge-orchestrator started network={:?} poll={}ms bridge_cycle={}ms",
             self.cfg.network, self.cfg.poll_interval_ms, self.cfg.bridge_cycle_interval_ms
         );
+
+        // Spawn the watchtower reporter, if configured. The handle is
+        // intentionally dropped: the task runs detached, and any
+        // failure inside it is logged and swallowed.
+        if let Some(wt_cfg) = self.cfg.watchtower.clone() {
+            // The returned JoinHandle is intentionally dropped: the
+            // reporter runs detached, and any failure inside it is
+            // logged and swallowed by the task itself.
+            drop(watchtower_reporter::spawn(
+                wt_cfg,
+                self.reporter.clone(),
+                self.db.clone(),
+                self.stuck_threshold_ms(),
+            ));
+        } else {
+            tracing::info!(
+                event = "watchtower_reporter.disabled",
+                "watchtower reporter not configured; skipping"
+            );
+        }
+
+        // Spawn the retention task. Like the reporter, it runs
+        // detached and swallows its own errors — the bridge cycle is
+        // never affected. Disabled via `BRIDGE_RETENTION_DISABLED=true`
+        // in which case the task exits immediately.
+        drop(crate::retention::spawn(
+            self.cfg.retention.clone(),
+            self.db.clone(),
+        ));
 
         let mut shutdown = install_shutdown_handler();
         let backoff = backoff_config(&self.cfg);
@@ -150,9 +198,24 @@ impl BridgeOrchestrator {
                 // connection-like reasons, reconnect and skip this iteration
                 // (the cycle will retry next pass).
                 match ham.ping().await {
-                    Ok(()) => match self.run_bridge_cycle(&ham).await {
+                    Ok(()) => {
+                        let cycle_started_at_ms = Self::now_ms();
+                        let cycle_started_instant = std::time::Instant::now();
+                        self.reporter.update(|h| {
+                            h.last_cycle_started_at_ms = Some(cycle_started_at_ms);
+                        });
+                        match self.run_bridge_cycle(&ham).await {
                         Ok(()) => {
                             last_bridge_cycle = std::time::Instant::now();
+                            let duration_ms =
+                                cycle_started_instant.elapsed().as_millis() as u64;
+                            self.reporter.update(|h| {
+                                h.last_cycle_finished_at_ms = Some(Self::now_ms());
+                                h.last_cycle_duration_ms = Some(duration_ms);
+                                h.consecutive_failed_cycles = 0;
+                                h.pressure_active = false;
+                                h.pressure_consecutive = 0;
+                            });
                             // A fully-clean cycle (no error) resets the
                             // escalating-cooldown counter. Any non-zero
                             // previous state means we just recovered
@@ -169,6 +232,14 @@ impl BridgeOrchestrator {
                         }
                         Err(e) => {
                             error!("[bridge] cycle failed: {}", e);
+                            let err_str = e.to_string();
+                            self.reporter.update(|h| {
+                                h.last_cycle_finished_at_ms = Some(Self::now_ms());
+                                h.consecutive_failed_cycles =
+                                    h.consecutive_failed_cycles.saturating_add(1);
+                                h.last_error = Some(err_str.clone());
+                                h.last_error_at_ms = Some(Self::now_ms());
+                            });
                             if let Err(reset_err) =
                                 self.db.reset_in_flight_to_queued("lock", &e.to_string())
                             {
@@ -179,6 +250,10 @@ impl BridgeOrchestrator {
                             }
                             if is_connection_error(&e) {
                                 warn!(event = "ham.disconnected", error = %e);
+                                self.reporter.update(|h| {
+                                    h.reconnect_failures_total =
+                                        h.reconnect_failures_total.saturating_add(1);
+                                });
                                 match connect_with_backoff(
                                     || connect_ham(&self.cfg),
                                     &backoff,
@@ -186,7 +261,13 @@ impl BridgeOrchestrator {
                                 )
                                 .await
                                 {
-                                    Some(new_ham) => ham = new_ham,
+                                    Some(new_ham) => {
+                                        ham = new_ham;
+                                        self.reporter.update(|h| {
+                                            h.reconnects_ok_total =
+                                                h.reconnects_ok_total.saturating_add(1);
+                                        });
+                                    }
                                     None => return Ok(()),
                                 }
                             } else if is_source_chain_pressure(&e) {
@@ -226,16 +307,25 @@ impl BridgeOrchestrator {
                                     ),
                                 }
                                 let cooldown = Duration::from_millis(cooldown_ms);
+                                self.reporter.update(|h| {
+                                    h.pressure_active = true;
+                                    h.pressure_consecutive = pressure_consecutive;
+                                });
                                 tokio::select! {
                                     _ = tokio::time::sleep(cooldown) => {}
                                     _ = shutdown.changed() => {}
                                 }
                             }
                         }
+                        }
                     },
                     Err(e) => {
                         if is_connection_error(&e) {
                             warn!(event = "ham.probe.failed", error = %e);
+                            self.reporter.update(|h| {
+                                h.reconnect_failures_total =
+                                    h.reconnect_failures_total.saturating_add(1);
+                            });
                             match connect_with_backoff(
                                 || connect_ham(&self.cfg),
                                 &backoff,
@@ -1437,7 +1527,7 @@ mod tests {
     // the transition is step-gated) negative test.
     // -----------------------------------------------------------------
 
-    use crate::config::Network;
+    use crate::config::{Network, RetentionConfig};
     use alloy::primitives::Address;
     use holo_hash::{ActionHash, AgentPubKey, AgentPubKeyB64};
     use holochain_zome_types::timestamp::Timestamp;
@@ -1479,6 +1569,13 @@ mod tests {
             ham_pressure_cooldown_ms: 30000,
             ham_pressure_cooldown_max_ms: 90000,
             slow_call_threshold_ms: 35000,
+            watchtower: None,
+            retention: RetentionConfig {
+                enabled: false,
+                tick_interval_ms: 3_600_000,
+                succeeded_max_age_s: 7 * 24 * 60 * 60,
+                failed_max_age_s: 30 * 24 * 60 * 60,
+            },
         }
     }
 
@@ -1488,6 +1585,7 @@ mod tests {
         BridgeOrchestrator {
             cfg: test_config(path),
             db,
+            reporter: ReporterState::new(),
         }
     }
 
