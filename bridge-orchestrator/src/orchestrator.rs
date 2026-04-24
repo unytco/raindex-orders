@@ -5,8 +5,8 @@ use crate::state::{StateStore, WorkItem, WorkStep};
 use crate::watchtower_reporter::{self, ReporterState};
 use anyhow::{Context, Result};
 use ham::{
-    connect_with_backoff, install_shutdown_handler, is_connection_error, is_source_chain_pressure,
-    BackoffConfig, Ham, HamConfig,
+    connect_with_backoff, install_shutdown_handler, is_connection_error, is_request_timeout,
+    is_source_chain_pressure, BackoffConfig, Ham, HamConfig,
 };
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use holochain_zome_types::entry::GetStrategy;
@@ -270,16 +270,34 @@ impl BridgeOrchestrator {
                                     }
                                     None => return Ok(()),
                                 }
-                            } else if is_source_chain_pressure(&e) {
-                                // Server-side workflow timeout / source-chain
-                                // backpressure. Socket is healthy, so we keep
-                                // it open and simply pause before the next
-                                // cycle instead of retrying at full tempo.
-                                // The lock itself is already queued for retry
-                                // by `reset_in_flight_to_queued` above; on
-                                // the next cycle the reconcile prelude will
+                            } else if is_source_chain_pressure(&e) || is_request_timeout(&e) {
+                                // Two distinct but similarly-shaped slow-call
+                                // failures that share one cooldown policy:
+                                //   * `is_source_chain_pressure` — server-side
+                                //     workflow timeout / source-chain
+                                //     backpressure (socket is healthy).
+                                //   * `is_request_timeout` — client-side
+                                //     per-request timeout fired while the
+                                //     zome call was still running (socket is
+                                //     also healthy).
+                                // In both cases reconnecting is counter-
+                                // productive, so we keep the socket open and
+                                // pause before the next cycle instead of
+                                // retrying at full tempo. The lock is already
+                                // queued for retry by the
+                                // `reset_in_flight_to_queued` call above; the
+                                // next cycle's reconcile prelude will
                                 // observe whether the write landed silently
                                 // and advance the row's `step` accordingly.
+                                //
+                                // The two classes share cooldown shape and
+                                // severity thresholds so operators get a
+                                // single consistent backoff curve, but they
+                                // emit distinct event keys
+                                // (`ham.source_chain_pressure*` vs
+                                // `ham.request_timeout*`) so dashboards and
+                                // alerts can tell them apart.
+                                let request_timeout = is_request_timeout(&e);
                                 pressure_consecutive =
                                     pressure_consecutive.saturating_add(1);
                                 let cooldown_ms = Self::pressure_cooldown_ms(
@@ -287,19 +305,33 @@ impl BridgeOrchestrator {
                                     self.cfg.ham_pressure_cooldown_max_ms,
                                     pressure_consecutive,
                                 );
-                                match Self::pressure_severity(
+                                let severity = Self::pressure_severity(
                                     pressure_consecutive,
                                     cooldown_ms,
                                     self.cfg.ham_pressure_cooldown_max_ms,
-                                ) {
-                                    PressureSeverity::Stuck => error!(
+                                );
+                                match (request_timeout, severity) {
+                                    (true, PressureSeverity::Stuck) => error!(
+                                        event = "ham.request_timeout_stuck",
+                                        attempt = pressure_consecutive,
+                                        cooldown_ms,
+                                        error = %e,
+                                        "[bridge] ham per-request timeout persists; root cause is upstream of the orchestrator"
+                                    ),
+                                    (true, PressureSeverity::Warn) => warn!(
+                                        event = "ham.request_timeout",
+                                        attempt = pressure_consecutive,
+                                        cooldown_ms,
+                                        error = %e,
+                                    ),
+                                    (false, PressureSeverity::Stuck) => error!(
                                         event = "ham.source_chain_pressure_stuck",
                                         attempt = pressure_consecutive,
                                         cooldown_ms,
                                         error = %e,
                                         "[bridge] conductor source-chain pressure persists; check Holochain conductor health"
                                     ),
-                                    PressureSeverity::Warn => warn!(
+                                    (false, PressureSeverity::Warn) => warn!(
                                         event = "ham.source_chain_pressure",
                                         attempt = pressure_consecutive,
                                         cooldown_ms,

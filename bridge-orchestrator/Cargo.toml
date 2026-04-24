@@ -29,3 +29,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 zfuel = "0.6.2"
+
+# Local-only override so verification picks up the in-tree ham changes.
+# Remove (or move behind a workspace-level Cargo config) once the matching
+# ham release is pushed to https://github.com/unytco/ham.git on main.
+[patch."https://github.com/unytco/ham.git"]
+ham = { path = "../../ham" }
