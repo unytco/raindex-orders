@@ -574,7 +574,7 @@ impl BridgeOrchestrator {
         // `step='cl_link_created'` is then driven by hash membership in
         // this consumed set: if `cl_link_hash ∈ cl_links`, the RAVE
         // consumed it.
-        let cl_links: Vec<Transaction> = ham
+        let cl_links_fetched: Vec<Transaction> = ham
             .call_zome(
                 &self.cfg.role_name,
                 "transactor",
@@ -582,10 +582,32 @@ impl BridgeOrchestrator {
                 &credit_limit_ea_id,
             )
             .await?;
+        // Apply the optional per-cycle RAVE link cap. Deferred links stay
+        // live server-side and are picked up by the next cycle via the
+        // reconcile prelude (rows at `cl_link_created` whose hash is no
+        // longer live get swept into `cl_rave_executed`).
+        let cl_fetched_count = cl_links_fetched.len();
+        let (cl_links, deferred_cl_links) =
+            apply_rave_link_cap(cl_links_fetched, self.cfg.rave_max_links);
+        // Consumed-set MUST be derived from the capped slice so we never
+        // advance a DB row whose `cl_link_hash` wasn't actually sent to
+        // `execute_rave` this cycle.
         let consumed_cl_ids: HashSet<String> =
             cl_links.iter().map(|t| t.id.to_string()).collect();
         let mut cl_rave_advanced = 0usize;
         if !cl_links.is_empty() {
+            if deferred_cl_links > 0 {
+                info!(
+                    event = "bridge.s2.rave_capped",
+                    cap = self.cfg.rave_max_links.unwrap_or(0),
+                    fetched = cl_fetched_count,
+                    consuming = cl_links.len(),
+                    deferred = deferred_cl_links,
+                    "[bridge/s2] RAVE: capping CL link batch to {} (deferring {} to next cycle)",
+                    cl_links.len(),
+                    deferred_cl_links
+                );
+            }
             info!(
                 "[bridge/s2] RAVE: consuming {} explicit links",
                 cl_links.len()
@@ -783,8 +805,66 @@ impl BridgeOrchestrator {
             }
         }
 
-        let withdrawal_count = selected_withdrawal_links.len();
+        // Build the pooled RAVE link Vec (deposits first, then selected
+        // withdrawals) before applying the optional per-cycle cap. The
+        // deposits-first ordering makes `apply_rave_link_cap` preferentially
+        // defer withdrawals, which is operationally preferable: deposits
+        // already have their HOT-side settled in S3, so finishing their
+        // CL→BR flow unlocks user-facing progress faster than re-batching
+        // withdrawals.
+        let pre_cap_deposit_count = deposit_rave_links.len();
+        let pre_cap_withdrawal_count = selected_withdrawal_links.len();
+        let deposit_rave_ids: HashSet<String> = deposit_rave_links
+            .iter()
+            .map(|t| t.id.to_string())
+            .collect();
+
+        let mut rave_links: Vec<Transaction> = Vec::new();
+        rave_links.extend(deposit_rave_links.iter().cloned());
+        rave_links.extend(selected_withdrawal_links);
+
+        let (rave_links, deferred_br_rave) =
+            apply_rave_link_cap(rave_links, self.cfg.rave_max_links);
+
+        // Derive the post-cap retained subsets. Every bookkeeping step
+        // below must key off these, not the pre-cap Vecs, or we'd advance
+        // DB rows / forward coupons for links that never made it into
+        // `execute_rave`.
+        let retained_deposit_ids: HashSet<String> = rave_links
+            .iter()
+            .filter(|t| deposit_rave_ids.contains(&t.id.to_string()))
+            .map(|t| t.id.to_string())
+            .collect();
+        let retained_withdrawal_ids: HashSet<String> = rave_links
+            .iter()
+            .filter(|t| !deposit_rave_ids.contains(&t.id.to_string()))
+            .map(|t| t.id.to_string())
+            .collect();
+
+        // Strip coupons whose withdrawal link was deferred by the cap so
+        // `execute_rave` only receives coupons for links it's actually
+        // going to process.
+        coupons_map.retain(|k, _| retained_withdrawal_ids.contains(k));
+
+        let retained_deposit_count = retained_deposit_ids.len();
+        let withdrawal_count = retained_withdrawal_ids.len();
         let deferred_withdrawals = total_withdrawals_found - withdrawal_count;
+        let deferred_deposits_by_rave_cap = pre_cap_deposit_count - retained_deposit_count;
+        let deferred_withdrawals_by_rave_cap = pre_cap_withdrawal_count - withdrawal_count;
+
+        if deferred_br_rave > 0 {
+            info!(
+                event = "bridge.s4.rave_capped",
+                cap = self.cfg.rave_max_links.unwrap_or(0),
+                deferred = deferred_br_rave,
+                deferred_deposits = deferred_deposits_by_rave_cap,
+                deferred_withdrawals_by_cap = deferred_withdrawals_by_rave_cap,
+                "[bridge/s4] RAVE: capping combined link batch to {} (deferring {} to next cycle)",
+                rave_links.len(),
+                deferred_br_rave
+            );
+        }
+
         info!(
             "[bridge/withdrawals] scan: found={} selected={}/{} coupon_bytes={} deferred={}",
             total_withdrawals_found,
@@ -794,20 +874,13 @@ impl BridgeOrchestrator {
             deferred_withdrawals
         );
 
-        let consumed_deposit_spend_ids: HashSet<String> = deposit_rave_links
-            .iter()
-            .map(|t| t.id.to_string())
-            .collect();
-
-        let mut rave_links: Vec<Transaction> = Vec::new();
-        rave_links.extend(deposit_rave_links.iter().cloned());
-        rave_links.extend(selected_withdrawal_links);
+        let consumed_deposit_spend_ids: HashSet<String> = retained_deposit_ids;
 
         let mut succeeded_locks = 0usize;
         if !rave_links.is_empty() {
             info!(
                 "[bridge/s4] RAVE: {} deposit + {} withdrawal links",
-                deposit_rave_links.len(),
+                retained_deposit_count,
                 withdrawal_count
             );
 
@@ -861,7 +934,7 @@ impl BridgeOrchestrator {
 
         let duration_ms = started.elapsed().as_millis() as u64;
         info!(
-            "[bridge/cycle] completed duration={}ms reconcile=(s1={} s2={} s3={} s4={}) s1_written={} s2_advanced={} s3_written={} s4_succeeded={} withdrawals={} capped_cl={} capped_spend={}",
+            "[bridge/cycle] completed duration={}ms reconcile=(s1={} s2={} s3={} s4={}) s1_written={} s2_advanced={} s3_written={} s4_succeeded={} withdrawals={} capped_cl={} capped_spend={} deferred_cl={} deferred_br_rave={}",
             duration_ms,
             reconcile.s1_advanced,
             reconcile.s2_advanced,
@@ -874,6 +947,8 @@ impl BridgeOrchestrator {
             withdrawal_count,
             s1_batch.capped,
             s3_batch.capped,
+            deferred_cl_links,
+            deferred_br_rave,
         );
 
         Ok(())
@@ -1403,6 +1478,29 @@ fn accumulate_amounts(amounts: &[UnitMap]) -> Result<UnitMap> {
     Ok(total)
 }
 
+/// Truncate `links` to at most `cap` entries. Returns the (possibly
+/// truncated) Vec and the count of deferred entries.
+///
+/// `cap == None` or `cap == Some(0)` is treated as "no cap" and returns
+/// the input unchanged with `deferred = 0`. The helper is intentionally
+/// order-preserving (`Vec::truncate`) so callers that rely on the input
+/// ordering — e.g. S4 keeping deposits ahead of withdrawals so the cap
+/// preferentially defers withdrawals — get deterministic behavior
+/// without an explicit sort step.
+fn apply_rave_link_cap(
+    mut links: Vec<Transaction>,
+    cap: Option<usize>,
+) -> (Vec<Transaction>, usize) {
+    match cap {
+        Some(n) if n > 0 && links.len() > n => {
+            let deferred = links.len() - n;
+            links.truncate(n);
+            (links, deferred)
+        }
+        _ => (links, 0),
+    }
+}
+
 /// Establish a fresh `Ham` connection. Thin wrapper that centralizes the
 /// connect call so both startup and reconnect flows share one path.
 async fn connect_ham(cfg: &Config) -> Result<Ham> {
@@ -1601,6 +1699,7 @@ mod tests {
             ham_pressure_cooldown_ms: 30000,
             ham_pressure_cooldown_max_ms: 90000,
             slow_call_threshold_ms: 35000,
+            rave_max_links: None,
             watchtower: None,
             retention: RetentionConfig {
                 enabled: false,
@@ -1733,6 +1832,80 @@ mod tests {
         ];
         let total = accumulate_amounts(&amounts).expect("amount accumulation should succeed");
         assert_eq!(total.get("1").map(|v| v.to_string()), Some("25".to_string()));
+    }
+
+    #[test]
+    fn apply_rave_link_cap_no_cap_returns_input_unchanged() {
+        let links = vec![parked_tx(1, "0x01"), parked_tx(2, "0x02")];
+        let original_ids: Vec<String> = links.iter().map(|t| t.id.to_string()).collect();
+
+        let (unchanged, deferred) = apply_rave_link_cap(links.clone(), None);
+        assert_eq!(deferred, 0);
+        assert_eq!(
+            unchanged.iter().map(|t| t.id.to_string()).collect::<Vec<_>>(),
+            original_ids
+        );
+
+        // `Some(0)` normalises to "no cap" (the config layer already warns
+        // at startup when `RAVE_MAX_LINKS=0` is seen; this asserts the
+        // helper does the sane thing if a zero slips through anyway).
+        let (unchanged2, deferred2) = apply_rave_link_cap(links, Some(0));
+        assert_eq!(deferred2, 0);
+        assert_eq!(
+            unchanged2.iter().map(|t| t.id.to_string()).collect::<Vec<_>>(),
+            original_ids
+        );
+    }
+
+    #[test]
+    fn apply_rave_link_cap_cap_ge_len_returns_input_unchanged() {
+        let links = vec![parked_tx(1, "0x01"), parked_tx(2, "0x02")];
+        let original_len = links.len();
+
+        let (out, deferred) = apply_rave_link_cap(links.clone(), Some(original_len));
+        assert_eq!(out.len(), original_len);
+        assert_eq!(deferred, 0);
+
+        let (out, deferred) = apply_rave_link_cap(links, Some(original_len + 5));
+        assert_eq!(out.len(), original_len);
+        assert_eq!(deferred, 0);
+    }
+
+    #[test]
+    fn apply_rave_link_cap_cap_lt_len_truncates_and_reports_deferred() {
+        let links = vec![
+            parked_tx(1, "0x01"),
+            parked_tx(2, "0x02"),
+            parked_tx(3, "0x03"),
+            parked_tx(4, "0x04"),
+            parked_tx(5, "0x05"),
+        ];
+
+        let (out, deferred) = apply_rave_link_cap(links, Some(2));
+        assert_eq!(out.len(), 2);
+        assert_eq!(deferred, 3);
+    }
+
+    #[test]
+    fn apply_rave_link_cap_preserves_head_order() {
+        // Mirrors the S4 ordering contract: deposits are pushed first,
+        // withdrawals second. A cap below total should keep deposits and
+        // drop withdrawals, not re-order anything.
+        let deposits = vec![parked_spend_tx(10, "0x0A"), parked_spend_tx(11, "0x0B")];
+        let withdrawals = vec![parked_spend_tx(20, "0x14"), parked_spend_tx(21, "0x15")];
+        let deposit_ids: Vec<String> = deposits.iter().map(|t| t.id.to_string()).collect();
+
+        let mut pooled = deposits.clone();
+        pooled.extend(withdrawals.clone());
+
+        let (out, deferred) = apply_rave_link_cap(pooled, Some(2));
+        assert_eq!(deferred, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.iter().map(|t| t.id.to_string()).collect::<Vec<_>>(),
+            deposit_ids,
+            "cap at 2 over a deposits-first pool must keep the two deposits and drop both withdrawals"
+        );
     }
 
     #[test]

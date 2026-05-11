@@ -75,6 +75,16 @@ pub struct Config {
     /// reconciler advances the skipped stages next cycle. Set to `0` to
     /// disable stage-ejection entirely.
     pub slow_call_threshold_ms: u128,
+    /// Optional per-cycle cap on the number of parked links fed into an
+    /// `execute_rave` call. Applied independently to the S2 credit-limit
+    /// RAVE (`cl_links`) and the S4 bridging RAVE (pooled
+    /// deposits + selected withdrawals). `None` means no cap (current
+    /// behavior). `Some(n)` truncates each RAVE's input Vec to at most
+    /// `n` entries; deferred links stay live server-side and are picked
+    /// up by the next cycle. Intended as a mitigation when `execute_rave`
+    /// hangs correlate with large batch sizes; the existing withdrawal
+    /// `coupons_target_bytes` cap remains in force on top.
+    pub rave_max_links: Option<usize>,
     /// Optional watchtower reporter configuration. When `None`, the
     /// reporter task is not spawned and the orchestrator runs exactly as
     /// before. All fields must be supplied together for reporting to be
@@ -246,6 +256,30 @@ impl Config {
             .parse()
             .context("Invalid SLOW_CALL_THRESHOLD_MS")?;
 
+        // `RAVE_MAX_LINKS`: unset → no cap; explicit `0` is normalized to
+        // `None` with a one-time startup warn so operators don't have to
+        // remove the env entirely to disable the feature. Any positive
+        // integer becomes `Some(n)` and truncates each `execute_rave`
+        // input Vec. Bad input fails fast at startup.
+        let rave_max_links = match env::var("RAVE_MAX_LINKS") {
+            Ok(raw) => {
+                let n: usize = raw
+                    .trim()
+                    .parse()
+                    .context("Invalid RAVE_MAX_LINKS (expected a non-negative integer)")?;
+                if n == 0 {
+                    tracing::warn!(
+                        event = "config.rave_max_links_disabled",
+                        "RAVE_MAX_LINKS=0 treated as disabled (no cap)"
+                    );
+                    None
+                } else {
+                    Some(n)
+                }
+            }
+            Err(_) => None,
+        };
+
         let watchtower = WatchtowerReporterConfig::from_env();
         let retention = RetentionConfig::from_env()?;
 
@@ -273,6 +307,7 @@ impl Config {
             ham_pressure_cooldown_ms,
             ham_pressure_cooldown_max_ms,
             slow_call_threshold_ms,
+            rave_max_links,
             watchtower,
             retention,
         })
