@@ -9,4 +9,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- upgrade bridge-orchestrator Holochain deps to 0.6.1
+- upgrade bridge-orchestrator Holochain deps to support holochain v0.6.1
