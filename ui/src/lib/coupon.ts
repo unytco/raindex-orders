@@ -1,8 +1,8 @@
-// getCoupon.ts
-import { parseEther, encodePacked, keccak256, type Hex, type Address } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
-import { createWalletClient, http } from 'viem'
-import { sepolia } from 'viem/chains'
+// coupon.ts — client-safe coupon helpers.
+// Coupon SIGNING is done server-side only (the bridge orchestrator, see
+// bridge-orchestrator/src/signer.rs). No signing key lives in this module or any
+// client-bundled code (issue #14).
+import { type Hex, type Address } from 'viem'
 
 export type CouponConfig = {
 	recipient: Address
@@ -20,71 +20,6 @@ export type SignedContextV1Struct = {
 	signer: Hex
 	signature: Hex
 	context: bigint[]
-}
-	
-
-export const generateSignedContext = async ({
-	recipient,
-	withdrawAmount,
-	orderHash,
-	orderbookAddress,
-	claimTokenAddress,
-	outputVaultId,
-	orderOwner,
-	nonce,
-	expiryTimestamp
-}: CouponConfig): Promise<SignedContextV1Struct> => {
-
-	const coupon: [bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint, bigint] = [
-		BigInt(recipient),
-		withdrawAmount,
-		BigInt(expiryTimestamp),
-		BigInt(orderHash),
-		BigInt(orderOwner),
-		BigInt(orderbookAddress),
-		BigInt(claimTokenAddress),
-		BigInt(outputVaultId),
-		BigInt(nonce)
-	]
-
-	const message = keccak256(
-		encodePacked(
-			[
-				'uint256',
-				'uint256',
-				'uint256',
-				'uint256',
-				'uint256',
-				'uint256',
-				'uint256',
-				'uint256',
-				'uint256',
-			],
-			coupon
-		)
-	)
-
-	const client = createWalletClient({
-		chain: sepolia,
-		transport: http()
-	})
-
-	const account = privateKeyToAccount(
-		'0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd'
-	)
-
-	const signature = await client.signMessage({
-		account,
-		message: { raw: message }
-	})
-
-	const signedContext = {
-		signer: account.address,
-		signature,
-		context: coupon
-	}
-
-	return signedContext
 }
 
 export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig => {

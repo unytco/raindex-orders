@@ -3,7 +3,9 @@ import type { RequestHandler } from './$types'
 import { createWalletClient, createPublicClient, http, parseEther, formatEther } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { sepolia } from 'viem/chains'
-import { FAUCET_PRIVATE_KEY, SEPOLIA_RPC_URL } from '$env/static/private'
+// $env/dynamic/private reads from the runtime env (Cloudflare Pages secret bindings),
+// so the key is NOT inlined into the built bundle — unlike $env/static/private (issue #14).
+import { env } from '$env/dynamic/private'
 import { PUBLIC_TOKEN_ADDRESS } from '$env/static/public'
 
 // ERC20 ABI for transfer function
@@ -36,11 +38,11 @@ const FAUCET_AMOUNT = parseEther('1000') // 1000 HOT
 // Get faucet balance
 export const GET: RequestHandler = async () => {
 	try {
-		const account = privateKeyToAccount(FAUCET_PRIVATE_KEY as `0x${string}`)
+		const account = privateKeyToAccount(env.FAUCET_PRIVATE_KEY as `0x${string}`)
 		
 		const publicClient = createPublicClient({
 			chain: sepolia,
-			transport: http(SEPOLIA_RPC_URL)
+			transport: http(env.SEPOLIA_RPC_URL)
 		})
 
 		const balance = await publicClient.readContract({
@@ -89,16 +91,16 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 
 		// Create wallet client
-		const account = privateKeyToAccount(FAUCET_PRIVATE_KEY as `0x${string}`)
+		const account = privateKeyToAccount(env.FAUCET_PRIVATE_KEY as `0x${string}`)
 		const walletClient = createWalletClient({
 			account,
 			chain: sepolia,
-			transport: http(SEPOLIA_RPC_URL)
+			transport: http(env.SEPOLIA_RPC_URL)
 		})
 
 		const publicClient = createPublicClient({
 			chain: sepolia,
-			transport: http(SEPOLIA_RPC_URL)
+			transport: http(env.SEPOLIA_RPC_URL)
 		})
 
 		// Check faucet balance
