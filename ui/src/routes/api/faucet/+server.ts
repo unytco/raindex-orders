@@ -35,14 +35,31 @@ const rateLimitStore = new Map<string, number>()
 const RATE_LIMIT_MS = 10 * 60 * 1000 // 10 minutes
 const FAUCET_AMOUNT = parseEther('1000') // 1000 HOT
 
+// Fail fast with a clear, named error if a required runtime secret binding is
+// missing. Without this, a missing FAUCET_PRIVATE_KEY surfaces as an opaque viem
+// error and a missing SEPOLIA_RPC_URL silently falls back to the public RPC.
+function requireFaucetEnv(): { privateKey: `0x${string}`; rpcUrl: string } {
+	const privateKey = env.FAUCET_PRIVATE_KEY
+	const rpcUrl = env.SEPOLIA_RPC_URL
+	const missing = [
+		!privateKey && 'FAUCET_PRIVATE_KEY',
+		!rpcUrl && 'SEPOLIA_RPC_URL'
+	].filter(Boolean)
+	if (missing.length > 0) {
+		throw new Error(`Missing ${missing.join(', ')}`)
+	}
+	return { privateKey: privateKey as `0x${string}`, rpcUrl: rpcUrl as string }
+}
+
 // Get faucet balance
 export const GET: RequestHandler = async () => {
 	try {
-		const account = privateKeyToAccount(env.FAUCET_PRIVATE_KEY as `0x${string}`)
-		
+		const { privateKey, rpcUrl } = requireFaucetEnv()
+		const account = privateKeyToAccount(privateKey)
+
 		const publicClient = createPublicClient({
 			chain: sepolia,
-			transport: http(env.SEPOLIA_RPC_URL)
+			transport: http(rpcUrl)
 		})
 
 		const balance = await publicClient.readContract({
@@ -91,16 +108,17 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 
 		// Create wallet client
-		const account = privateKeyToAccount(env.FAUCET_PRIVATE_KEY as `0x${string}`)
+		const { privateKey, rpcUrl } = requireFaucetEnv()
+		const account = privateKeyToAccount(privateKey)
 		const walletClient = createWalletClient({
 			account,
 			chain: sepolia,
-			transport: http(env.SEPOLIA_RPC_URL)
+			transport: http(rpcUrl)
 		})
 
 		const publicClient = createPublicClient({
 			chain: sepolia,
-			transport: http(env.SEPOLIA_RPC_URL)
+			transport: http(rpcUrl)
 		})
 
 		// Check faucet balance
