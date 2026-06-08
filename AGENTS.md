@@ -1,17 +1,16 @@
 # raindex-orders — Agent Instructions
 
+> **This repo follows the workshop root's patterns — it does not define its own.** Development workflow, process, changelog conventions, and spec/feature-doc discipline live in the workshop: [`CLAUDE.md`](../CLAUDE.md), [`AGENTS.md`](../AGENTS.md), [`documentation/DEVELOPMENT_WORKFLOW.md`](../documentation/DEVELOPMENT_WORKFLOW.md). Below is only what's specific to THIS repo.
+
 ## Purpose
 
-The HOT ↔ bridged-HOT (bHOT) bridge: a Solidity vault contract
-(`HoloLockVault`) that locks/unlocks token pairs against a Holochain
-ledger, plus a Rainlang claim coupon, a **bridge orchestrator**
-daemon (Rust) that watches both sides and reconciles, and a UI
-(SvelteKit / Vite) for end users to initiate swaps.
-
-## Classification
-
-`service` — the bridge orchestrator and UI deploy via `automation/`;
-the contracts deploy via the included Foundry scripts.
+`service` — the HOT ↔ bridged-HOT (bHOT) bridge: a Solidity vault
+contract (`HoloLockVault`) that locks/unlocks token pairs against a
+Holochain ledger, plus a Rainlang claim coupon, a **bridge
+orchestrator** daemon (Rust) that watches both sides and reconciles,
+and a UI (SvelteKit / Vite) for end users to initiate swaps. The
+bridge orchestrator and UI deploy via `automation/`; the contracts
+deploy via the included Foundry scripts.
 
 ## Stack
 
@@ -78,31 +77,13 @@ proven there.
   or similar — see workshop
   [Deployment hub](../AGENTS.md#deployment-hub-automation)).
 
-## Related repos in workshop
-
-- Bridge orchestrator uses [`ham`](../ham/) for its Holochain
-  `AppWebsocket` connection.
-- Deployed by [`automation/`](../automation/).
-- Coordinates with the Unyt DNA in
-  [`unyt-sandbox/unyt`](../unyt-sandbox/unyt/) (the Holochain side
-  the bridge reconciles against).
-
-## Changelog
-
-File: [`./CHANGELOG.md`](./CHANGELOG.md). Format: [Keep a Changelog
-1.1.0](https://keepachangelog.com/en/1.1.0/) with `## [Unreleased]`
-at the top and standard subsections. One bullet per agent change,
-≤120 chars, present-tense imperative. Branch-type → section mapping
-per workshop
-[`branch-and-pr-workflow.mdc`](../.cursor/rules/branch-and-pr-workflow.mdc).
-
-Contract changes are user-money-impacting — always note ABI changes,
-storage-layout changes, and constructor-arg changes under
-`### Changed` (or `### Removed` / `### Added`). Bridge-protocol
-changes MUST appear; UI-only tweaks are usually `### Changed`.
-
 ## Repo-specific rules
 
+- **Contract changes are user-money-impacting.** Always note ABI
+  changes, storage-layout changes, and constructor-arg changes in
+  `CHANGELOG.md` under `### Changed` (or `### Removed` / `### Added`);
+  bridge-protocol changes MUST appear, UI-only tweaks are usually
+  `### Changed`.
 - **Contract storage layout is sacred.** Adding a field is fine;
   reordering or removing existing storage breaks deployed state.
   Use append-only, document under `### Changed`.
@@ -111,9 +92,3 @@ changes MUST appear; UI-only tweaks are usually `### Changed`.
   composed output by hand.
 - **Bridge orchestrator must idempotently retry.** Network
   partitions are routine; the daemon must not double-claim.
-
-## Lessons learned
-
-_Append entries here whenever an agent (or human) loses time to
-something a guardrail would have prevented. Keep each entry: date,
-short symptom, concrete fix._
