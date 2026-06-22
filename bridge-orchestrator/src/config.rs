@@ -44,6 +44,12 @@ pub struct Config {
     pub app_id: String,
     pub admin_port: u16,
     pub app_port: u16,
+    /// Conductor config path — its `keystore.connection_url` is read to sign
+    /// zome calls via lair (no cap grant). Defaults to the fleet path.
+    pub conductor_config: String,
+    /// Lair passphrase file, read to unlock the keystore. Defaults to the
+    /// fleet path.
+    pub lair_passphrase_file: String,
     pub bridging_agent_pubkey: AgentPubKeyB64,
     pub lane_definition: Option<ActionHashB64>,
     pub unit_index: u32,
@@ -215,6 +221,10 @@ impl Config {
             .context("Invalid HOLOCHAIN_APP_PORT")?;
         let app_id = env::var("HOLOCHAIN_APP_ID").unwrap_or_else(|_| "bridging-app".into());
         let role_name = env::var("HOLOCHAIN_ROLE_NAME").unwrap_or_else(|_| "alliance".into());
+        let conductor_config = env::var("CONDUCTOR_CONFIG")
+            .unwrap_or_else(|_| "/etc/holochain/conductor-config.yaml".into());
+        let lair_passphrase_file = env::var("LAIR_PASSPHRASE_FILE")
+            .unwrap_or_else(|_| "/var/lib/holochain/lair-passphrase".into());
         let bridging_agent_pubkey = AgentPubKeyB64::from_str(
             &env::var("HOLOCHAIN_BRIDGING_AGENT_PUBKEY")
                 .context("HOLOCHAIN_BRIDGING_AGENT_PUBKEY required")?,
@@ -297,6 +307,8 @@ impl Config {
             app_id,
             admin_port,
             app_port,
+            conductor_config,
+            lair_passphrase_file,
             bridging_agent_pubkey,
             lane_definition,
             unit_index,
