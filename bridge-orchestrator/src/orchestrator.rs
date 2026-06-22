@@ -1506,7 +1506,11 @@ fn apply_rave_link_cap(
 async fn connect_ham(cfg: &Config) -> Result<Ham> {
     Ham::connect(
         HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
-            .with_request_timeout_secs(cfg.ham_request_timeout_secs),
+            .with_request_timeout_secs(cfg.ham_request_timeout_secs)
+            .try_lair_signing_from_node(
+                std::path::Path::new(&cfg.conductor_config),
+                std::path::Path::new(&cfg.lair_passphrase_file),
+            ),
     )
     .await
     .context("Failed to connect to Holochain")

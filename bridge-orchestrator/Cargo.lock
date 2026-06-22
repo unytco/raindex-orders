@@ -2327,6 +2327,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "holochain_client",
+ "lair_keystore_api",
  "rmp-serde",
  "serde",
  "tokio",
