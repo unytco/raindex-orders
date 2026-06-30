@@ -13,10 +13,10 @@ dotenvy = "0.15"
 ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
 hex = "0.4"
 hmac = "0.12"
-holo_hash = { version = "0.6.1", features = ["encoding"] }
-holochain_client = "0.8.1"
-holochain_zome_types = "0.6.1"
-rave_engine = "0.3.3"
+holo_hash = { version = "0.6.2-rc.0", features = ["encoding"] }
+holochain_client = "0.8.2-rc.0"
+holochain_zome_types = "0.6.2-rc.0"
+rave_engine = "0.6.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmp-serde = "1.1"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }

@@ -1693,6 +1693,8 @@ mod tests {
             app_id: "bridging-app".to_string(),
             admin_port: 0,
             app_port: 0,
+            conductor_config: "/etc/holochain/conductor-config.yaml".to_string(),
+            lair_passphrase_file: "/var/lib/holochain/lair-passphrase".to_string(),
             bridging_agent_pubkey: agent_pubkey,
             lane_definition: None,
             unit_index: 1,
