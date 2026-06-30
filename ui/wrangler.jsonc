@@ -5,7 +5,7 @@
 	//
 	// `name` must match the existing Cloudflare Worker for this project, or
 	// `wrangler deploy` will publish to a different Worker.
-	"name": "hf-bridge",
+	"name": "hot-bridge-ui",
 	"compatibility_date": "2026-05-30",
 	// SvelteKit server code + viem rely on Node built-ins (Buffer, crypto, etc.).
 	"compatibility_flags": ["nodejs_compat"],
