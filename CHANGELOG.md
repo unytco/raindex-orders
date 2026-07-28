@@ -14,7 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - upgrade bridge-orchestrator Holochain deps to 0.6.2-rc.0 (rave_engine 0.6.0; holo_hash / holochain_client / holochain_zome_types)
+- bridge-orchestrator's outbound HTTPS clients (Ethereum RPC, watchtower ingest) validate against bundled webpki roots instead of the host trust store, following the switch to rustls.
 
 ### Fixed
 
+- bridge-orchestrator builds with pure-Rust TLS (`alloy` on `reqwest-rustls-tls`), dropping `openssl-sys` from its dependency tree and unblocking the host build.
 - `test_config` test helper now initialises the `conductor_config` / `lair_passphrase_file` fields added by the lair-signing change above. The bridge-orchestrator unit tests compile only under `cargo test` (CI runs the Solidity suite), so the stale helper had gone unnoticed.
