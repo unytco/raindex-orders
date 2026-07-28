@@ -5,7 +5,20 @@ edition = "2021"
 description = "Single-writer bridge orchestrator for lock-watcher and coupon-signer flows"
 
 [dependencies]
-alloy = { version = "0.8", features = ["full", "signer-local"] }
+# Defaults off so `openssl-sys` stays out of the tree: alloy's default `reqwest`
+# feature selects reqwest's default-tls (-> native-tls -> openssl-sys), and Cargo
+# features cannot be subtracted. This binary is built on an operator's host and
+# scp'd to a droplet, so `reqwest-rustls-tls` keeps TLS pure-Rust and self-contained,
+# trusting bundled webpki roots rather than the host store. `std` and `map` are the
+# rest of `default` apart from its `map-foldhash`, which has no alloy feature — so
+# alloy's maps use std's SipHash builder.
+alloy = { version = "0.8", default-features = false, features = [
+    "std",
+    "map",
+    "full",
+    "reqwest-rustls-tls",
+    "signer-local",
+] }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
