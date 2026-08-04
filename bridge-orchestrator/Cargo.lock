@@ -2305,6 +2305,7 @@ dependencies = [
 [[package]]
 name = "ham"
 version = "0.1.0"
+source = "git+https://github.com/unytco/ham.git?branch=main-0.7#eade1d9ed51c5ab749900c762b38175b2328fbb3"
 dependencies = [
  "anyhow",
  "holochain_client",
