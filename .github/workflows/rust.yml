@@ -12,7 +12,7 @@ on:
 # One run per branch under test: `head_ref` is the PR's source branch, `ref` the
 # pushed branch. Superseded runs are cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
