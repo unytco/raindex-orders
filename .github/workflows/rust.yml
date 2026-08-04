@@ -1,0 +1,47 @@
+name: Rust CI
+
+# Deliberately separate from `test.yml`: that workflow's Solidity job is disabled
+# on a bit-rotted nixpkgs pin, and folding this job in with it would let that
+# failure mask the Rust results.
+on:
+  push:
+    branches: [main, main-0.7]
+  pull_request:
+    branches: [main, main-0.7]
+
+# One run per branch under test: `head_ref` is the PR's source branch, `ref` the
+# pushed branch. Superseded runs are cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  orchestrator:
+    name: bridge-orchestrator (Rust)
+    runs-on: ubuntu-latest
+    # `ham` (git dep) and `rave_engine` / `zfuel` (crates.io) are all public —
+    # cargo fetches them anonymously, no token or git-auth config needed.
+    defaults:
+      run:
+        working-directory: bridge-orchestrator
+    steps:
+      # No `submodules:` — the crate needs only crates.io and the `ham` git dep;
+      # `lib/` is the Solidity side's, and rain.orderbook is the broken pin.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Installs the *active* toolchain, which in this directory is whatever
+      # bridge-orchestrator/rust-toolchain.toml pins (1.93.1 + rustfmt, clippy).
+      # Not dtolnay/rust-toolchain: that action takes an explicit version input,
+      # which would restate the pin here and leave it free to drift.
+      - name: toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bridge-orchestrator
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
