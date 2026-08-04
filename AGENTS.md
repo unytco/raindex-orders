@@ -23,16 +23,13 @@ deploy via the included Foundry scripts.
   `format` / `lint` / `test` npm scripts wired.
 - Root `package.json` is a tools shell (no scripts) — `npx`
   invocations use it for transitive deps.
-- **Requires `nix develop -c …`** — see
-  [`flake.nix`](flake.nix). The workshop's
-  [Nix discipline section](../AGENTS.md#nix-discipline) lists this
-  repo.
+- **Requires `nix develop -c …`** — see [`flake.nix`](flake.nix). The workshop's [Nix discipline section](../AGENTS.md#nix-discipline) lists this repo. **Exception: `bridge-orchestrator/` builds on the host toolchain**, not in the dev shell — Holochain 0.7 needs Rust ≥ 1.91 and rainix supplies 1.89, so the crate pins its own [`rust-toolchain.toml`](bridge-orchestrator/rust-toolchain.toml). This matches how `automation` releases it (`host_cargo_build`, kept off nix so the droplet binary has no `/nix/store` loader).
 
 ## Build
 
 ```bash
 nix develop -c forge build                          # contracts
-nix develop -c bash -c '( cd bridge-orchestrator && cargo build --release )'
+( cd bridge-orchestrator && cargo build --release )  # host toolchain (see Stack)
 nix develop -c bash -c '( cd ui && npm install && npm run build )'
 node compose-rainlang.mjs                           # rebuild composed Rainlang
 ```
@@ -46,9 +43,9 @@ Apply, then verify, per stack:
 nix develop -c forge fmt
 nix develop -c forge fmt --check
 
-# Rust (orchestrator)
-( cd bridge-orchestrator && nix develop -c cargo fmt )
-( cd bridge-orchestrator && nix develop -c cargo fmt --check )
+# Rust (orchestrator) — host toolchain, not the dev shell
+( cd bridge-orchestrator && cargo fmt )
+( cd bridge-orchestrator && cargo fmt --check )
 
 # UI (scripts already wired)
 ( cd ui && npm run format )
@@ -60,7 +57,7 @@ nix develop -c forge fmt --check
 
 ```bash
 nix develop -c forge test                                   # contracts
-( cd bridge-orchestrator && nix develop -c cargo test )     # orchestrator
+( cd bridge-orchestrator && cargo test )                    # orchestrator (host toolchain)
 ( cd ui && npm run test )                                   # UI
 ```
 

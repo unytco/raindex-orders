@@ -5,13 +5,16 @@ edition = "2021"
 description = "Single-writer bridge orchestrator for lock-watcher and coupon-signer flows"
 
 [dependencies]
-# Defaults off so `openssl-sys` stays out of the tree: alloy's default `reqwest`
-# feature selects reqwest's default-tls (-> native-tls -> openssl-sys), and Cargo
-# features cannot be subtracted. This binary is built on an operator's host and
-# scp'd to a droplet, so `reqwest-rustls-tls` keeps TLS pure-Rust and self-contained,
-# trusting bundled webpki roots rather than the host store. `std` and `map` are the
-# rest of `default` apart from its `map-foldhash`, which has no alloy feature — so
-# alloy's maps use std's SipHash builder.
+# Defaults off to keep TLS pure-Rust: alloy's default `reqwest` feature selects
+# reqwest's default-tls (-> native-tls -> the host's openssl), and Cargo features
+# cannot be subtracted. This binary is built on an operator's host and scp'd to a
+# droplet, so `reqwest-rustls-tls` keeps TLS self-contained, trusting bundled webpki
+# roots rather than the host store. It no longer keeps `openssl-sys` out of the tree
+# altogether — since 0.7, holochain_keystore forces lair_keystore's
+# `rusqlite-bundled-sqlcipher-vendored-openssl` — but that copy is vendored and built
+# from source for sqlcipher, off this TLS path. `std` and `map` are the rest of
+# `default` apart from its `map-foldhash`, which has no alloy feature — so alloy's
+# maps use std's SipHash builder.
 alloy = { version = "0.8", default-features = false, features = [
     "std",
     "map",
@@ -26,10 +29,10 @@ dotenvy = "0.15"
 ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
 hex = "0.4"
 hmac = "0.12"
-holo_hash = { version = "0.6.2-rc.0", features = ["encoding"] }
-holochain_client = "0.8.2-rc.0"
-holochain_zome_types = "0.6.2-rc.0"
-rave_engine = "0.6.0"
+holo_hash = { version = "0.7.0", features = ["encoding"] }
+holochain_client = "0.9.0"
+holochain_zome_types = "0.7.0"
+rave_engine = "0.9.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmp-serde = "1.1"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
@@ -41,7 +44,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
-zfuel = "0.6.2"
+zfuel = "0.9.0"
 
 # Local-only override so verification picks up the in-tree ham changes.
 # Remove (or move behind a workspace-level Cargo config) once the matching

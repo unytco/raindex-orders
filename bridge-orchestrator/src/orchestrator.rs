@@ -9,7 +9,7 @@ use ham::{
     is_source_chain_pressure, BackoffConfig, Ham, HamConfig,
 };
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
-use holochain_zome_types::entry::GetStrategy;
+use holochain_zome_types::prelude::GetStrategy;
 use rave_engine::types::{
     CarryForwardUnits, CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, LaneExt,
     ParkedData, ParkedLinkType, ParkedSpendData, RAVEExecuteInputs, Transaction,
