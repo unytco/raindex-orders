@@ -71,7 +71,9 @@ impl LockFlow {
         provider: &RootProvider<Http<Client>>,
         log: Log,
     ) -> Result<()> {
-        let decoded = log.log_decode::<Lock>().context("Failed to decode Lock event")?;
+        let decoded = log
+            .log_decode::<Lock>()
+            .context("Failed to decode Lock event")?;
         let tx_hash = log
             .transaction_hash
             .context("Lock log missing transaction hash")?;
@@ -119,9 +121,9 @@ impl LockFlow {
     }
 
     fn promote_confirmed(&self, current_block: u64) -> Result<()> {
-        let candidates = self
-            .db
-            .list_work_items("lock", crate::state::WorkState::Detected, 5000)?;
+        let candidates =
+            self.db
+                .list_work_items("lock", crate::state::WorkState::Detected, 5000)?;
         for item in candidates {
             let payload = item.payload_json;
             let block_number = payload
@@ -132,7 +134,10 @@ impl LockFlow {
             if confirmations >= self.cfg.confirmations {
                 let idempotency_key = format!(
                     "lock:{}:create_parked_link",
-                    payload.get("lock_id").and_then(|v| v.as_str()).unwrap_or("unknown")
+                    payload
+                        .get("lock_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
                 );
                 if self.db.move_detected_to_queued(&idempotency_key)? {
                     let amount = payload

@@ -38,8 +38,8 @@ pub fn signer_context_from_env() -> Result<SignerContext> {
 }
 
 pub async fn generate_coupon(amount: &str, recipient: &str, ctx: &SignerContext) -> Result<String> {
-    let private_key =
-        env::var("SIGNER_PRIVATE_KEY").context("SIGNER_PRIVATE_KEY environment variable not set")?;
+    let private_key = env::var("SIGNER_PRIVATE_KEY")
+        .context("SIGNER_PRIVATE_KEY environment variable not set")?;
     let signer: PrivateKeySigner = private_key.parse().context("Invalid private key format")?;
     let signer_address = signer.address();
 

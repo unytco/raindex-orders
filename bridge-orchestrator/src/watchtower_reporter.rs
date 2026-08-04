@@ -254,13 +254,14 @@ async fn run_tick(
     // already-present db file, which is rounded-to-nothing next to our
     // 60s reporter period.
     let db_clone = db.clone();
-    let stats: BridgeAggregateStats = tokio::task::spawn_blocking(move || -> Result<BridgeAggregateStats> {
-        let conn = db_clone.open_read_only_connection()?;
-        crate::state::compute_aggregate_stats(&conn)
-    })
-    .await
-    .context("reporter: spawn_blocking join")?
-    .context("reporter: aggregate_stats")?;
+    let stats: BridgeAggregateStats =
+        tokio::task::spawn_blocking(move || -> Result<BridgeAggregateStats> {
+            let conn = db_clone.open_read_only_connection()?;
+            crate::state::compute_aggregate_stats(&conn)
+        })
+        .await
+        .context("reporter: spawn_blocking join")?
+        .context("reporter: aggregate_stats")?;
 
     let health = state.snapshot().await;
     let uptime_s = state.uptime_s();
@@ -279,9 +280,7 @@ async fn run_tick(
         self_health: PayloadSelfHealth {
             uptime_s,
             binary_version: BINARY_VERSION,
-            last_cycle_at_iso: health
-                .last_cycle_started_at_ms
-                .and_then(ms_to_rfc3339),
+            last_cycle_at_iso: health.last_cycle_started_at_ms.and_then(ms_to_rfc3339),
             last_cycle_ms: health.last_cycle_duration_ms,
             consecutive_failed_cycles: health.consecutive_failed_cycles,
             reconnect_failures_total: health.reconnect_failures_total,
@@ -291,9 +290,7 @@ async fn run_tick(
             stage_ejections_total: health.stage_ejections_total,
             is_stuck,
             last_error: health.last_error.clone(),
-            last_error_at_iso: health
-                .last_error_at_ms
-                .and_then(ms_to_rfc3339),
+            last_error_at_iso: health.last_error_at_ms.and_then(ms_to_rfc3339),
         },
         backlog: PayloadBacklog {
             detected: stats.detected,
@@ -367,7 +364,8 @@ fn canonical_string(observer_id: &str, ts: &str, nonce: &str, body_sha: &str) ->
 }
 
 fn sign(secret: &[u8], canonical: &str) -> Result<String> {
-    let mut mac = HmacSha256::new_from_slice(secret).context("reporter: invalid HMAC key length")?;
+    let mut mac =
+        HmacSha256::new_from_slice(secret).context("reporter: invalid HMAC key length")?;
     mac.update(canonical.as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
