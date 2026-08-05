@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - the Rainix/Solidity workflow (`.github/workflows/test.yml`) is manual-only (`on: workflow_dispatch`). It has failed for roughly two years on a dead nixpkgs pin in the `lib/rain.orderbook` submodule, which cannot be fixed without bumping that submodule; re-enable it once that happens. The file is kept, not deleted, so the re-enable is a one-line change.
 - upgrade bridge-orchestrator Holochain deps to 0.7 (rave_engine 0.9.0, holochain_client 0.9.0, zfuel 0.9.0, holo_hash / holochain_zome_types 0.7.0). `GetStrategy` is no longer public at `holochain_zome_types::entry`; it is imported from that crate's `prelude`.
-- bridge-orchestrator pins Rust 1.93.1 (`bridge-orchestrator/rust-toolchain.toml`): holochain_zome_types 0.7 needs `str::floor_char_boundary`, stable since 1.91, while the repo's rainix dev shell supplies 1.89. The crate therefore builds on the host toolchain — which is how `automation` has always released it. The pin sits above the 1.91 floor to match the workshop's other Holochain 0.7 crates.
+- bridge-orchestrator pins Rust 1.93.1 (`bridge-orchestrator/rust-toolchain.toml`): holochain_zome_types 0.7 needs `str::floor_char_boundary`, stable since 1.91, while the repo's rainix dev shell supplies 1.89. The crate therefore builds on the host toolchain — which is how `automation` has always released it. The pin sits above the 1.91 floor; the other 0.7 crates pin their own toolchains (1.95) independently.
 - bridge-orchestrator's outbound HTTPS clients (Ethereum RPC, watchtower ingest) validate against bundled webpki roots instead of the host trust store, following the switch to rustls.
 
 ### Fixed

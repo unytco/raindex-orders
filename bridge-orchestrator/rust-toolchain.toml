@@ -3,8 +3,9 @@
 # pins 1.89, below the floor, so the orchestrator builds on the host toolchain
 # instead — which is also how it is released (`automation`'s `host_cargo_build`,
 # deliberately non-nix so the droplet binary carries no /nix/store loader). 1.93.1
-# rather than the bare 1.91 floor to match the workshop's other Holochain 0.7
-# crates. Scoped to this crate so the Solidity/Rain side keeps using the flake.
+# is the host's current stable, above the 1.91 floor; the other 0.7 crates pin
+# their own toolchains (1.95) independently. Scoped to this crate so the
+# Solidity/Rain side keeps using the flake.
 [toolchain]
 channel = "1.93.1"
 components = ["rustfmt", "clippy"]
