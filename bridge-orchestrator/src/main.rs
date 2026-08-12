@@ -39,11 +39,7 @@ enum Command {
     /// Clear orchestrator work items from SQLite.
     Clear {
         /// Delete only rows that are not in progress (succeeded, failed).
-        #[arg(
-            long,
-            conflicts_with = "all",
-            required_unless_present = "all"
-        )]
+        #[arg(long, conflicts_with = "all", required_unless_present = "all")]
         non_in_progress: bool,
         /// Delete all rows from work_items.
         #[arg(

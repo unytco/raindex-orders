@@ -9,14 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- bridge-orchestrator signs zome calls via lair when available: reads `CONDUCTOR_CONFIG` + `LAIR_PASSPHRASE_FILE` (defaulting to the fleet paths) and passes them to ham's `try_lair_signing_from_node`, so it signs as its own agent key with no capability grant committed per connect/reconnect; falls back to client signing when lair is unavailable.
+- CI runs the bridge-orchestrator Rust suite (`.github/workflows/rust.yml`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`) on the crate's pinned toolchain.
+- bridge-orchestrator signs zome calls via lair when available (`CONDUCTOR_CONFIG` + `LAIR_PASSPHRASE_FILE`, defaulting to the fleet paths) — no capability grant committed per connect; falls back to client signing.
 
 ### Changed
 
-- upgrade bridge-orchestrator Holochain deps to 0.6.2-rc.0 (rave_engine 0.6.0; holo_hash / holochain_client / holochain_zome_types)
-- bridge-orchestrator's outbound HTTPS clients (Ethereum RPC, watchtower ingest) validate against bundled webpki roots instead of the host trust store, following the switch to rustls.
+- the Rainix/Solidity workflow (`.github/workflows/test.yml`) is now manual-only (`on: workflow_dispatch`) — it has failed for years on a dead nixpkgs pin in `lib/rain.orderbook`.
+- upgrade bridge-orchestrator Holochain deps to 0.7 (rave_engine 0.9.0, holochain_client 0.9.0, zfuel 0.9.0, holo_hash / holochain_zome_types 0.7.0).
+- bridge-orchestrator pins Rust 1.93.1 (`rust-toolchain.toml`) and builds on the host toolchain, not the rainix dev shell (1.89).
+- bridge-orchestrator's outbound HTTPS clients (Ethereum RPC, watchtower ingest) validate against bundled webpki roots instead of the host trust store.
 
 ### Fixed
 
-- bridge-orchestrator builds with pure-Rust TLS (`alloy` on `reqwest-rustls-tls`), dropping `openssl-sys` from its dependency tree and unblocking the host build.
-- `test_config` test helper now initialises the `conductor_config` / `lair_passphrase_file` fields added by the lair-signing change above. The bridge-orchestrator unit tests compile only under `cargo test` (CI runs the Solidity suite), so the stale helper had gone unnoticed.
+- bridge-orchestrator builds with pure-Rust TLS (`alloy` on `reqwest-rustls-tls`), keeping the host's OpenSSL off the TLS path. 0.7's vendored `openssl-sys` (sqlcipher) means the build host needs a C toolchain, perl and make.
+- `test_config` test helper now initialises the `conductor_config` / `lair_passphrase_file` fields added by the lair-signing change.

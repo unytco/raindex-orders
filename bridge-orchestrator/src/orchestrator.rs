@@ -9,11 +9,11 @@ use ham::{
     is_source_chain_pressure, BackoffConfig, Ham, HamConfig,
 };
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
-use holochain_zome_types::entry::GetStrategy;
+use holochain_zome_types::prelude::GetStrategy;
 use rave_engine::types::{
     CarryForwardUnits, CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, LaneExt,
-    ParkedData, ParkedLinkType, ParkedSpendData, RAVEExecuteInputs, Transaction, TransactionDetails,
-    UnitMap, RAVE,
+    ParkedData, ParkedLinkType, ParkedSpendData, RAVEExecuteInputs, Transaction,
+    TransactionDetails, UnitMap, RAVE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -150,19 +150,14 @@ impl BridgeOrchestrator {
         let mut shutdown = install_shutdown_handler();
         let backoff = backoff_config(&self.cfg);
 
-        let mut ham = match connect_with_backoff(
-            || connect_ham(&self.cfg),
-            &backoff,
-            &mut shutdown,
-        )
-        .await
-        {
-            Some(h) => h,
-            None => {
-                info!("[bridge] shutdown received before initial connect, exiting");
-                return Ok(());
-            }
-        };
+        let mut ham =
+            match connect_with_backoff(|| connect_ham(&self.cfg), &backoff, &mut shutdown).await {
+                Some(h) => h,
+                None => {
+                    info!("[bridge] shutdown received before initial connect, exiting");
+                    return Ok(());
+                }
+            };
         let lock_flow = LockFlow::new(self.cfg.clone(), self.db.clone());
 
         let mut last_bridge_cycle =
@@ -205,152 +200,151 @@ impl BridgeOrchestrator {
                             h.last_cycle_started_at_ms = Some(cycle_started_at_ms);
                         });
                         match self.run_bridge_cycle(&ham).await {
-                        Ok(()) => {
-                            last_bridge_cycle = std::time::Instant::now();
-                            let duration_ms =
-                                cycle_started_instant.elapsed().as_millis() as u64;
-                            self.reporter.update(|h| {
-                                h.last_cycle_finished_at_ms = Some(Self::now_ms());
-                                h.last_cycle_duration_ms = Some(duration_ms);
-                                h.consecutive_failed_cycles = 0;
-                                h.pressure_active = false;
-                                h.pressure_consecutive = 0;
-                            });
-                            // A fully-clean cycle (no error) resets the
-                            // escalating-cooldown counter. Any non-zero
-                            // previous state means we just recovered
-                            // from pressure — log that transition so
-                            // operators see the bounce-back.
-                            if pressure_consecutive > 0 {
-                                info!(
+                            Ok(()) => {
+                                last_bridge_cycle = std::time::Instant::now();
+                                let duration_ms =
+                                    cycle_started_instant.elapsed().as_millis() as u64;
+                                self.reporter.update(|h| {
+                                    h.last_cycle_finished_at_ms = Some(Self::now_ms());
+                                    h.last_cycle_duration_ms = Some(duration_ms);
+                                    h.consecutive_failed_cycles = 0;
+                                    h.pressure_active = false;
+                                    h.pressure_consecutive = 0;
+                                });
+                                // A fully-clean cycle (no error) resets the
+                                // escalating-cooldown counter. Any non-zero
+                                // previous state means we just recovered
+                                // from pressure — log that transition so
+                                // operators see the bounce-back.
+                                if pressure_consecutive > 0 {
+                                    info!(
                                     event = "ham.source_chain_pressure_recovered",
                                     previous_attempts = pressure_consecutive,
                                     "[bridge] source-chain pressure cleared; cooldown counter reset"
                                 );
-                                pressure_consecutive = 0;
+                                    pressure_consecutive = 0;
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!("[bridge] cycle failed: {}", e);
-                            let err_str = e.to_string();
-                            self.reporter.update(|h| {
-                                h.last_cycle_finished_at_ms = Some(Self::now_ms());
-                                h.consecutive_failed_cycles =
-                                    h.consecutive_failed_cycles.saturating_add(1);
-                                h.last_error = Some(err_str.clone());
-                                h.last_error_at_ms = Some(Self::now_ms());
-                            });
-                            if let Err(reset_err) =
-                                self.db.reset_in_flight_to_queued("lock", &e.to_string())
-                            {
-                                error!(
-                                    "[bridge] failed to reset in_flight locks: {}",
-                                    reset_err
-                                );
-                            }
-                            if is_connection_error(&e) {
-                                warn!(event = "ham.disconnected", error = %e);
+                            Err(e) => {
+                                error!("[bridge] cycle failed: {}", e);
+                                let err_str = e.to_string();
                                 self.reporter.update(|h| {
-                                    h.reconnect_failures_total =
-                                        h.reconnect_failures_total.saturating_add(1);
+                                    h.last_cycle_finished_at_ms = Some(Self::now_ms());
+                                    h.consecutive_failed_cycles =
+                                        h.consecutive_failed_cycles.saturating_add(1);
+                                    h.last_error = Some(err_str.clone());
+                                    h.last_error_at_ms = Some(Self::now_ms());
                                 });
-                                match connect_with_backoff(
-                                    || connect_ham(&self.cfg),
-                                    &backoff,
-                                    &mut shutdown,
-                                )
-                                .await
+                                if let Err(reset_err) =
+                                    self.db.reset_in_flight_to_queued("lock", &e.to_string())
                                 {
-                                    Some(new_ham) => {
-                                        ham = new_ham;
-                                        self.reporter.update(|h| {
-                                            h.reconnects_ok_total =
-                                                h.reconnects_ok_total.saturating_add(1);
-                                        });
+                                    error!(
+                                        "[bridge] failed to reset in_flight locks: {}",
+                                        reset_err
+                                    );
+                                }
+                                if is_connection_error(&e) {
+                                    warn!(event = "ham.disconnected", error = %e);
+                                    self.reporter.update(|h| {
+                                        h.reconnect_failures_total =
+                                            h.reconnect_failures_total.saturating_add(1);
+                                    });
+                                    match connect_with_backoff(
+                                        || connect_ham(&self.cfg),
+                                        &backoff,
+                                        &mut shutdown,
+                                    )
+                                    .await
+                                    {
+                                        Some(new_ham) => {
+                                            ham = new_ham;
+                                            self.reporter.update(|h| {
+                                                h.reconnects_ok_total =
+                                                    h.reconnects_ok_total.saturating_add(1);
+                                            });
+                                        }
+                                        None => return Ok(()),
                                     }
-                                    None => return Ok(()),
-                                }
-                            } else if is_source_chain_pressure(&e) || is_request_timeout(&e) {
-                                // Two distinct but similarly-shaped slow-call
-                                // failures that share one cooldown policy:
-                                //   * `is_source_chain_pressure` — server-side
-                                //     workflow timeout / source-chain
-                                //     backpressure (socket is healthy).
-                                //   * `is_request_timeout` — client-side
-                                //     per-request timeout fired while the
-                                //     zome call was still running (socket is
-                                //     also healthy).
-                                // In both cases reconnecting is counter-
-                                // productive, so we keep the socket open and
-                                // pause before the next cycle instead of
-                                // retrying at full tempo. The lock is already
-                                // queued for retry by the
-                                // `reset_in_flight_to_queued` call above; the
-                                // next cycle's reconcile prelude will
-                                // observe whether the write landed silently
-                                // and advance the row's `step` accordingly.
-                                //
-                                // The two classes share cooldown shape and
-                                // severity thresholds so operators get a
-                                // single consistent backoff curve, but they
-                                // emit distinct event keys
-                                // (`ham.source_chain_pressure*` vs
-                                // `ham.request_timeout*`) so dashboards and
-                                // alerts can tell them apart.
-                                let request_timeout = is_request_timeout(&e);
-                                pressure_consecutive =
-                                    pressure_consecutive.saturating_add(1);
-                                let cooldown_ms = Self::pressure_cooldown_ms(
-                                    self.cfg.ham_pressure_cooldown_ms,
-                                    self.cfg.ham_pressure_cooldown_max_ms,
-                                    pressure_consecutive,
-                                );
-                                let severity = Self::pressure_severity(
-                                    pressure_consecutive,
-                                    cooldown_ms,
-                                    self.cfg.ham_pressure_cooldown_max_ms,
-                                );
-                                match (request_timeout, severity) {
-                                    (true, PressureSeverity::Stuck) => error!(
-                                        event = "ham.request_timeout_stuck",
-                                        attempt = pressure_consecutive,
+                                } else if is_source_chain_pressure(&e) || is_request_timeout(&e) {
+                                    // Two distinct but similarly-shaped slow-call
+                                    // failures that share one cooldown policy:
+                                    //   * `is_source_chain_pressure` — server-side
+                                    //     workflow timeout / source-chain
+                                    //     backpressure (socket is healthy).
+                                    //   * `is_request_timeout` — client-side
+                                    //     per-request timeout fired while the
+                                    //     zome call was still running (socket is
+                                    //     also healthy).
+                                    // In both cases reconnecting is counter-
+                                    // productive, so we keep the socket open and
+                                    // pause before the next cycle instead of
+                                    // retrying at full tempo. The lock is already
+                                    // queued for retry by the
+                                    // `reset_in_flight_to_queued` call above; the
+                                    // next cycle's reconcile prelude will
+                                    // observe whether the write landed silently
+                                    // and advance the row's `step` accordingly.
+                                    //
+                                    // The two classes share cooldown shape and
+                                    // severity thresholds so operators get a
+                                    // single consistent backoff curve, but they
+                                    // emit distinct event keys
+                                    // (`ham.source_chain_pressure*` vs
+                                    // `ham.request_timeout*`) so dashboards and
+                                    // alerts can tell them apart.
+                                    let request_timeout = is_request_timeout(&e);
+                                    pressure_consecutive = pressure_consecutive.saturating_add(1);
+                                    let cooldown_ms = Self::pressure_cooldown_ms(
+                                        self.cfg.ham_pressure_cooldown_ms,
+                                        self.cfg.ham_pressure_cooldown_max_ms,
+                                        pressure_consecutive,
+                                    );
+                                    let severity = Self::pressure_severity(
+                                        pressure_consecutive,
                                         cooldown_ms,
-                                        error = %e,
-                                        "[bridge] ham per-request timeout persists; root cause is upstream of the orchestrator"
-                                    ),
-                                    (true, PressureSeverity::Warn) => warn!(
-                                        event = "ham.request_timeout",
-                                        attempt = pressure_consecutive,
-                                        cooldown_ms,
-                                        error = %e,
-                                    ),
-                                    (false, PressureSeverity::Stuck) => error!(
-                                        event = "ham.source_chain_pressure_stuck",
-                                        attempt = pressure_consecutive,
-                                        cooldown_ms,
-                                        error = %e,
-                                        "[bridge] conductor source-chain pressure persists; check Holochain conductor health"
-                                    ),
-                                    (false, PressureSeverity::Warn) => warn!(
-                                        event = "ham.source_chain_pressure",
-                                        attempt = pressure_consecutive,
-                                        cooldown_ms,
-                                        error = %e,
-                                    ),
-                                }
-                                let cooldown = Duration::from_millis(cooldown_ms);
-                                self.reporter.update(|h| {
-                                    h.pressure_active = true;
-                                    h.pressure_consecutive = pressure_consecutive;
-                                });
-                                tokio::select! {
-                                    _ = tokio::time::sleep(cooldown) => {}
-                                    _ = shutdown.changed() => {}
+                                        self.cfg.ham_pressure_cooldown_max_ms,
+                                    );
+                                    match (request_timeout, severity) {
+                                        (true, PressureSeverity::Stuck) => error!(
+                                            event = "ham.request_timeout_stuck",
+                                            attempt = pressure_consecutive,
+                                            cooldown_ms,
+                                            error = %e,
+                                            "[bridge] ham per-request timeout persists; root cause is upstream of the orchestrator"
+                                        ),
+                                        (true, PressureSeverity::Warn) => warn!(
+                                            event = "ham.request_timeout",
+                                            attempt = pressure_consecutive,
+                                            cooldown_ms,
+                                            error = %e,
+                                        ),
+                                        (false, PressureSeverity::Stuck) => error!(
+                                            event = "ham.source_chain_pressure_stuck",
+                                            attempt = pressure_consecutive,
+                                            cooldown_ms,
+                                            error = %e,
+                                            "[bridge] conductor source-chain pressure persists; check Holochain conductor health"
+                                        ),
+                                        (false, PressureSeverity::Warn) => warn!(
+                                            event = "ham.source_chain_pressure",
+                                            attempt = pressure_consecutive,
+                                            cooldown_ms,
+                                            error = %e,
+                                        ),
+                                    }
+                                    let cooldown = Duration::from_millis(cooldown_ms);
+                                    self.reporter.update(|h| {
+                                        h.pressure_active = true;
+                                        h.pressure_consecutive = pressure_consecutive;
+                                    });
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(cooldown) => {}
+                                        _ = shutdown.changed() => {}
+                                    }
                                 }
                             }
                         }
-                        }
-                    },
+                    }
                     Err(e) => {
                         if is_connection_error(&e) {
                             warn!(event = "ham.probe.failed", error = %e);
@@ -369,10 +363,7 @@ impl BridgeOrchestrator {
                                 None => return Ok(()),
                             }
                         } else {
-                            warn!(
-                                "[bridge] probe failed with non-connection error: {}",
-                                e
-                            );
+                            warn!("[bridge] probe failed with non-connection error: {}", e);
                         }
                     }
                 }
@@ -422,12 +413,12 @@ impl BridgeOrchestrator {
                 &Some(GetStrategy::Local),
             )
             .await?;
-        let context = self.resolve_deposit_context(ham, &global_definition).await?;
+        let context = self
+            .resolve_deposit_context(ham, &global_definition)
+            .await?;
 
         if context.bridging_agent != self.cfg.bridging_agent_pubkey {
-            warn!(
-                "[bridge] skipping cycle: configured bridging agent does not match lane/global"
-            );
+            warn!("[bridge] skipping cycle: configured bridging agent does not match lane/global");
             return Ok(());
         }
 
@@ -484,15 +475,13 @@ impl BridgeOrchestrator {
         // giving operators a single-line picture of the whole cycle.
         let reconcile = self.reconcile_pipeline(&cl_parked_initial, &br_parked_initial)?;
 
-        let s1_rows = self
-            .db
-            .list_pending_by_step("lock", WorkStep::New, 5000)?;
-        let s3_rows_initial = self
-            .db
-            .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?;
-        let br_spend_pending_initial = self
-            .db
-            .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?;
+        let s1_rows = self.db.list_pending_by_step("lock", WorkStep::New, 5000)?;
+        let s3_rows_initial =
+            self.db
+                .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?;
+        let br_spend_pending_initial =
+            self.db
+                .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?;
         if s1_rows.is_empty()
             && s3_rows_initial.is_empty()
             && br_spend_pending_initial.is_empty()
@@ -592,8 +581,7 @@ impl BridgeOrchestrator {
         // Consumed-set MUST be derived from the capped slice so we never
         // advance a DB row whose `cl_link_hash` wasn't actually sent to
         // `execute_rave` this cycle.
-        let consumed_cl_ids: HashSet<String> =
-            cl_links.iter().map(|t| t.id.to_string()).collect();
+        let consumed_cl_ids: HashSet<String> = cl_links.iter().map(|t| t.id.to_string()).collect();
         let mut cl_rave_advanced = 0usize;
         if !cl_links.is_empty() {
             if deferred_cl_links > 0 {
@@ -631,13 +619,10 @@ impl BridgeOrchestrator {
             )
             .await?;
             let cl_rave_hash = rave_result.1.to_string();
-            info!(
-                "[bridge/s2] RAVE executed action_hash={}",
-                rave_result.1
-            );
-            let cl_created_rows = self
-                .db
-                .list_pending_by_step("lock", WorkStep::ClLinkCreated, 5000)?;
+            info!("[bridge/s2] RAVE executed action_hash={}", rave_result.1);
+            let cl_created_rows =
+                self.db
+                    .list_pending_by_step("lock", WorkStep::ClLinkCreated, 5000)?;
             for row in cl_created_rows {
                 if let Some(hash) = &row.cl_link_hash {
                     if consumed_cl_ids.contains(hash) {
@@ -712,8 +697,7 @@ impl BridgeOrchestrator {
                     total_spend, spend_hash
                 );
                 for id in &s3_batch.ids {
-                    self.db
-                        .advance_to_br_spend_created(*id, &spend_hash_str)?;
+                    self.db.advance_to_br_spend_created(*id, &spend_hash_str)?;
                 }
                 s3_written = s3_batch.ids.len();
                 if self.should_eject(s3_elapsed_ms) {
@@ -880,8 +864,7 @@ impl BridgeOrchestrator {
         if !rave_links.is_empty() {
             info!(
                 "[bridge/s4] RAVE: {} deposit + {} withdrawal links",
-                retained_deposit_count,
-                withdrawal_count
+                retained_deposit_count, withdrawal_count
             );
 
             let (rave_result, _s4_elapsed_ms): ((RAVE, ActionHash), u128) = timed_call(
@@ -905,13 +888,10 @@ impl BridgeOrchestrator {
             )
             .await?;
             let br_rave_hash = rave_result.1.to_string();
-            info!(
-                "[bridge/s4] RAVE executed action_hash={}",
-                rave_result.1,
-            );
-            let br_spend_rows = self
-                .db
-                .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?;
+            info!("[bridge/s4] RAVE executed action_hash={}", rave_result.1,);
+            let br_spend_rows =
+                self.db
+                    .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?;
             for row in br_spend_rows {
                 if let Some(hash) = &row.br_spend_hash {
                     if consumed_deposit_spend_ids.contains(hash) {
@@ -983,10 +963,8 @@ impl BridgeOrchestrator {
     ) -> Result<ReconcileCounts> {
         let cl_by_tx_hash = build_tx_hash_to_link_id(cl_parked);
         let br_by_tx_hash = build_tx_hash_to_link_id(br_parked);
-        let cl_live_ids: HashSet<String> =
-            cl_parked.iter().map(|t| t.id.to_string()).collect();
-        let br_live_ids: HashSet<String> =
-            br_parked.iter().map(|t| t.id.to_string()).collect();
+        let cl_live_ids: HashSet<String> = cl_parked.iter().map(|t| t.id.to_string()).collect();
+        let br_live_ids: HashSet<String> = br_parked.iter().map(|t| t.id.to_string()).collect();
         let mut counts = ReconcileCounts::default();
 
         for row in self.db.list_pending_by_step("lock", WorkStep::New, 5000)? {
@@ -1315,7 +1293,10 @@ impl BridgeOrchestrator {
             payload.lock_id, amount, payload.holochain_agent, payload.tx_hash
         );
 
-        Ok((proof, UnitMap::from(vec![(self.cfg.unit_index, amount.as_str())])))
+        Ok((
+            proof,
+            UnitMap::from(vec![(self.cfg.unit_index, amount.as_str())]),
+        ))
     }
 
     async fn resolve_deposit_context(
@@ -1677,8 +1658,7 @@ mod tests {
     }
 
     fn test_config(db_path: String) -> Config {
-        let agent_pubkey: AgentPubKeyB64 =
-            AgentPubKey::from_raw_32(vec![1u8; 32]).into();
+        let agent_pubkey: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1u8; 32]).into();
         Config {
             network: Network::Sepolia,
             rpc_url: "http://localhost:0".to_string(),
@@ -1837,7 +1817,10 @@ mod tests {
             UnitMap::from(vec![(1_u32, "15")]),
         ];
         let total = accumulate_amounts(&amounts).expect("amount accumulation should succeed");
-        assert_eq!(total.get("1").map(|v| v.to_string()), Some("25".to_string()));
+        assert_eq!(
+            total.get("1").map(|v| v.to_string()),
+            Some("25".to_string())
+        );
     }
 
     #[test]
@@ -1848,7 +1831,10 @@ mod tests {
         let (unchanged, deferred) = apply_rave_link_cap(links.clone(), None);
         assert_eq!(deferred, 0);
         assert_eq!(
-            unchanged.iter().map(|t| t.id.to_string()).collect::<Vec<_>>(),
+            unchanged
+                .iter()
+                .map(|t| t.id.to_string())
+                .collect::<Vec<_>>(),
             original_ids
         );
 
@@ -1858,7 +1844,10 @@ mod tests {
         let (unchanged2, deferred2) = apply_rave_link_cap(links, Some(0));
         assert_eq!(deferred2, 0);
         assert_eq!(
-            unchanged2.iter().map(|t| t.id.to_string()).collect::<Vec<_>>(),
+            unchanged2
+                .iter()
+                .map(|t| t.id.to_string())
+                .collect::<Vec<_>>(),
             original_ids
         );
     }
@@ -1974,7 +1963,10 @@ mod tests {
         let tx_spend = parked_spend_tx(0x22, "0xdeadbeef");
         let expected = tx_spend.id.to_string();
         let map = build_tx_hash_to_link_id(&[tx_spend]);
-        assert_eq!(map.get("0xdeadbeef").map(String::as_str), Some(expected.as_str()));
+        assert_eq!(
+            map.get("0xdeadbeef").map(String::as_str),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -1994,7 +1986,10 @@ mod tests {
             consumed_link: false,
         };
         let map = build_tx_hash_to_link_id(&[rave_tx]);
-        assert!(map.is_empty(), "payloads missing proof_of_deposit must not be indexed");
+        assert!(
+            map.is_empty(),
+            "payloads missing proof_of_deposit must not be indexed"
+        );
     }
 
     #[test]
@@ -2416,11 +2411,26 @@ mod tests {
         // then saturation at the cap.
         let base = 30_000u64;
         let cap = 90_000u64;
-        assert_eq!(BridgeOrchestrator::pressure_cooldown_ms(base, cap, 1), 30_000);
-        assert_eq!(BridgeOrchestrator::pressure_cooldown_ms(base, cap, 2), 60_000);
-        assert_eq!(BridgeOrchestrator::pressure_cooldown_ms(base, cap, 3), 90_000);
-        assert_eq!(BridgeOrchestrator::pressure_cooldown_ms(base, cap, 4), 90_000);
-        assert_eq!(BridgeOrchestrator::pressure_cooldown_ms(base, cap, 50), 90_000);
+        assert_eq!(
+            BridgeOrchestrator::pressure_cooldown_ms(base, cap, 1),
+            30_000
+        );
+        assert_eq!(
+            BridgeOrchestrator::pressure_cooldown_ms(base, cap, 2),
+            60_000
+        );
+        assert_eq!(
+            BridgeOrchestrator::pressure_cooldown_ms(base, cap, 3),
+            90_000
+        );
+        assert_eq!(
+            BridgeOrchestrator::pressure_cooldown_ms(base, cap, 4),
+            90_000
+        );
+        assert_eq!(
+            BridgeOrchestrator::pressure_cooldown_ms(base, cap, 50),
+            90_000
+        );
     }
 
     #[test]

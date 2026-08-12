@@ -1,0 +1,12 @@
+# Holochain 0.7 raised this crate's Rust floor to 1.91: holochain_zome_types 0.7
+# uses `str::floor_char_boundary`, stable since then. The repo's rainix dev shell
+# pins 1.89, below the floor, so the orchestrator builds on the host toolchain
+# instead — which is also how it is released (`automation`'s `host_cargo_build`,
+# deliberately non-nix so the droplet binary carries no /nix/store loader). 1.93.1
+# is the host's current stable, above the 1.91 floor; the other 0.7 crates pin
+# their own toolchains (1.95) independently. Scoped to this crate so the
+# Solidity/Rain side keeps using the flake.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

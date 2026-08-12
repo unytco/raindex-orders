@@ -1,5 +1,7 @@
 name: Rainix CI
-on: [push]
+# Disabled (manual-only): the rainix/Solidity path is broken on a dead nixpkgs pin
+# in the `lib/rain.orderbook` submodule — re-enable once that submodule is bumped.
+on: workflow_dispatch
 
 jobs:
   standard-tests:
