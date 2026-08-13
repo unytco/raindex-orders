@@ -21,6 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- bridge-orchestrator now has a terminal fallback for a failed cycle whose error matches none of ham's classifiers (`is_connection_error` / `is_source_chain_pressure` / `is_request_timeout`): instead of falling off the retry chain and re-running at poll cadence with no cooldown, it cools down before retrying — reusing the source-chain-pressure escalation (doubling backoff to the cap, and `warn!` → `error!` via `ham.unclassified_error` / `ham.unclassified_error_stuck`) on a separate counter, so a persistent unknown failure alerts instead of retrying quietly. The cycle-failure disposition is now a single unit-tested `classify_cycle_failure` (reconnect / cooldown / unclassified-cooldown). Fixes the consumer half of the unclassified-error gap; ham's half (e.g. `ResponderDropped` → reconnect) lands once the pinned `ham` rev is bumped.
+- bridge-orchestrator cools down on a cycle error that matches no ham classifier, instead of hot-looping.
 - bridge-orchestrator builds with pure-Rust TLS (`alloy` on `reqwest-rustls-tls`), keeping the host's OpenSSL off the TLS path. 0.7's vendored `openssl-sys` (sqlcipher) means the build host needs a C toolchain, perl and make.
 - `test_config` test helper now initialises the `conductor_config` / `lair_passphrase_file` fields added by the lair-signing change.
