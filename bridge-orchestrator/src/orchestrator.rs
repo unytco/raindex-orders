@@ -437,6 +437,14 @@ impl BridgeOrchestrator {
                                             ),
                                         }
                                         let cooldown = Duration::from_millis(cooldown_ms);
+                                        // This failure is *not* source-chain pressure, so drop any
+                                        // flag a previous pressure cycle left set — it is otherwise
+                                        // only cleared by a fully-clean cycle, which would leave
+                                        // watchtower reporting "check conductor health" while the
+                                        // actual failure class is unknown.
+                                        self.reporter.update(|h| {
+                                            h.pressure_active = false;
+                                        });
                                         tokio::select! {
                                             _ = tokio::time::sleep(cooldown) => {}
                                             _ = shutdown.changed() => {}
