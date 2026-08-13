@@ -6,7 +6,7 @@ use crate::watchtower_reporter::{self, ReporterState};
 use anyhow::{Context, Result};
 use ham::{
     connect_with_backoff, install_shutdown_handler, is_connection_error, is_request_timeout,
-    is_source_chain_pressure, BackoffConfig, Ham, HamConfig,
+    is_source_chain_pressure, BackoffConfig, Ham, HamConfig, ShutdownRx,
 };
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use holochain_zome_types::prelude::GetStrategy;
@@ -70,6 +70,16 @@ fn classify_cycle_failure(e: &anyhow::Error) -> CycleFailureAction {
         CycleFailureAction::Cooldown
     } else {
         CycleFailureAction::UnclassifiedCooldown
+    }
+}
+
+/// Wait `duration_ms`, returning early if shutdown is signalled, so the loop
+/// never sits out a full cooldown or poll interval after a Ctrl-C. Only wakes
+/// the wait — the loop's own `shutdown.borrow()` checks are what exit it.
+async fn sleep_or_shutdown(duration_ms: u64, shutdown: &mut ShutdownRx) {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(duration_ms)) => {}
+        _ = shutdown.changed() => {}
     }
 }
 
@@ -146,6 +156,22 @@ impl BridgeOrchestrator {
         } else {
             PressureSeverity::Warn
         }
+    }
+
+    /// Pair the escalating cooldown with the severity it implies for a given
+    /// consecutive-failure count. Both cooldown classes (source-chain pressure
+    /// and the unclassified fallback) deliberately share this one backoff
+    /// curve, so operators get a single consistent progression; they differ
+    /// only in which counter they feed it and which events they emit.
+    fn pressure_backoff(&self, attempt: u32) -> (u64, PressureSeverity) {
+        let cooldown_ms = Self::pressure_cooldown_ms(
+            self.cfg.ham_pressure_cooldown_ms,
+            self.cfg.ham_pressure_cooldown_max_ms,
+            attempt,
+        );
+        let severity =
+            Self::pressure_severity(attempt, cooldown_ms, self.cfg.ham_pressure_cooldown_max_ms);
+        (cooldown_ms, severity)
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -349,16 +375,8 @@ impl BridgeOrchestrator {
                                         let request_timeout = is_request_timeout(&e);
                                         pressure_consecutive =
                                             pressure_consecutive.saturating_add(1);
-                                        let cooldown_ms = Self::pressure_cooldown_ms(
-                                            self.cfg.ham_pressure_cooldown_ms,
-                                            self.cfg.ham_pressure_cooldown_max_ms,
-                                            pressure_consecutive,
-                                        );
-                                        let severity = Self::pressure_severity(
-                                            pressure_consecutive,
-                                            cooldown_ms,
-                                            self.cfg.ham_pressure_cooldown_max_ms,
-                                        );
+                                        let (cooldown_ms, severity) =
+                                            self.pressure_backoff(pressure_consecutive);
                                         match (request_timeout, severity) {
                                             (true, PressureSeverity::Stuck) => error!(
                                                 event = "ham.request_timeout_stuck",
@@ -387,15 +405,11 @@ impl BridgeOrchestrator {
                                                 error = %e,
                                             ),
                                         }
-                                        let cooldown = Duration::from_millis(cooldown_ms);
                                         self.reporter.update(|h| {
                                             h.pressure_active = true;
                                             h.pressure_consecutive = pressure_consecutive;
                                         });
-                                        tokio::select! {
-                                            _ = tokio::time::sleep(cooldown) => {}
-                                            _ = shutdown.changed() => {}
-                                        }
+                                        sleep_or_shutdown(cooldown_ms, &mut shutdown).await;
                                     }
                                     CycleFailureAction::UnclassifiedCooldown => {
                                         // Terminal safety net (B111): an error matching none of
@@ -410,16 +424,8 @@ impl BridgeOrchestrator {
                                         // and `last_error` were already recorded above.
                                         unclassified_consecutive =
                                             unclassified_consecutive.saturating_add(1);
-                                        let cooldown_ms = Self::pressure_cooldown_ms(
-                                            self.cfg.ham_pressure_cooldown_ms,
-                                            self.cfg.ham_pressure_cooldown_max_ms,
-                                            unclassified_consecutive,
-                                        );
-                                        let severity = Self::pressure_severity(
-                                            unclassified_consecutive,
-                                            cooldown_ms,
-                                            self.cfg.ham_pressure_cooldown_max_ms,
-                                        );
+                                        let (cooldown_ms, severity) =
+                                            self.pressure_backoff(unclassified_consecutive);
                                         match severity {
                                             PressureSeverity::Stuck => error!(
                                                 event = "ham.unclassified_error_stuck",
@@ -436,7 +442,6 @@ impl BridgeOrchestrator {
                                                 "[bridge] cycle failed with an error matching no ham classifier; cooling down before retry"
                                             ),
                                         }
-                                        let cooldown = Duration::from_millis(cooldown_ms);
                                         // This failure is *not* source-chain pressure, so clear the
                                         // pressure reporter state (active + consecutive) an earlier
                                         // pressure cycle left behind — it is otherwise only cleared
@@ -450,10 +455,7 @@ impl BridgeOrchestrator {
                                             h.pressure_active = false;
                                             h.pressure_consecutive = 0;
                                         });
-                                        tokio::select! {
-                                            _ = tokio::time::sleep(cooldown) => {}
-                                            _ = shutdown.changed() => {}
-                                        }
+                                        sleep_or_shutdown(cooldown_ms, &mut shutdown).await;
                                     }
                                 }
                             }
@@ -485,10 +487,7 @@ impl BridgeOrchestrator {
 
             // Interruptible poll-interval sleep so shutdown is observed
             // promptly (never mid-write).
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(self.cfg.poll_interval_ms)) => {}
-                _ = shutdown.changed() => {}
-            }
+            sleep_or_shutdown(self.cfg.poll_interval_ms, &mut shutdown).await;
         }
     }
 
@@ -2696,5 +2695,64 @@ mod tests {
                 "unclassified error {msg:?} must route to the terminal cooldown fallback"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Shared cooldown-helper tests
+    //
+    // Both cooldown branches route through `pressure_backoff` and
+    // `sleep_or_shutdown`, so these pin the two seams the branches no
+    // longer spell out inline.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pressure_backoff_pairs_each_cooldown_with_its_severity() {
+        // The helper must stay exactly the composition of the two functions
+        // it wraps — both cooldown branches now depend on that pairing.
+        let orch = test_orchestrator("pressure-backoff");
+        let base = orch.cfg.ham_pressure_cooldown_ms;
+        let cap = orch.cfg.ham_pressure_cooldown_max_ms;
+        for attempt in 0..8 {
+            let expected_cooldown = BridgeOrchestrator::pressure_cooldown_ms(base, cap, attempt);
+            assert_eq!(
+                orch.pressure_backoff(attempt),
+                (
+                    expected_cooldown,
+                    BridgeOrchestrator::pressure_severity(attempt, expected_cooldown, cap)
+                ),
+                "attempt {attempt} must match the underlying pair"
+            );
+        }
+
+        // Pin the concrete curve the defaults produce (30s → 60s → 90s →
+        // capped), so a change to either half shows up here rather than only
+        // at the two call sites.
+        assert_eq!(orch.pressure_backoff(1), (30_000, PressureSeverity::Warn));
+        assert_eq!(orch.pressure_backoff(2), (60_000, PressureSeverity::Warn));
+        assert_eq!(orch.pressure_backoff(3), (90_000, PressureSeverity::Warn));
+        assert_eq!(orch.pressure_backoff(4), (90_000, PressureSeverity::Stuck));
+    }
+
+    #[tokio::test]
+    async fn sleep_or_shutdown_wakes_immediately_on_shutdown() {
+        // The wait stays interruptible: a shutdown arriving mid-cooldown
+        // returns at once instead of sitting out the full backoff.
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sleep_or_shutdown(60_000, &mut rx))
+            .await
+            .expect("shutdown must cut the cooldown short");
+    }
+
+    #[tokio::test]
+    async fn sleep_or_shutdown_waits_out_the_duration_without_shutdown() {
+        // `_tx` stays bound so the channel is not closed under the receiver.
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let started = std::time::Instant::now();
+        sleep_or_shutdown(50, &mut rx).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "cooldown must not return before its duration elapses"
+        );
     }
 }
