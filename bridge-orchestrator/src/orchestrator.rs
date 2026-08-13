@@ -2,11 +2,11 @@ use crate::config::Config;
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{generate_coupon, signer_context_from_env};
 use crate::state::{StateStore, WorkItem, WorkStep};
-use crate::watchtower_reporter::{self, ReporterState};
+use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use anyhow::{Context, Result};
 use ham::{
     connect_with_backoff, install_shutdown_handler, is_connection_error, is_request_timeout,
-    is_source_chain_pressure, BackoffConfig, Ham, HamConfig,
+    is_source_chain_pressure, BackoffConfig, Ham, HamConfig, ShutdownRx,
 };
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use holochain_zome_types::prelude::GetStrategy;
@@ -35,6 +35,52 @@ pub struct BridgeOrchestrator {
 enum PressureSeverity {
     Warn,
     Stuck,
+}
+
+/// How the cycle loop should react to a failed bridge cycle, decided purely
+/// from the error's `ham` classification. Extracted from the loop so the
+/// three-way disposition — including the terminal catch-all that keeps an
+/// unclassified error off a hot retry loop — is unit-testable without a live
+/// conductor.
+#[derive(Debug, PartialEq, Eq)]
+enum CycleFailureAction {
+    /// A transport/connection failure (`is_connection_error`): drop and
+    /// rebuild the socket.
+    Reconnect,
+    /// Server-side source-chain pressure or a client-side per-request timeout
+    /// (`is_source_chain_pressure` / `is_request_timeout`): the socket is
+    /// healthy, so keep it and cool down before retrying.
+    Cooldown,
+    /// Matches none of `ham`'s classifiers. Safety net: cool down (never
+    /// reconnect — the socket may be perfectly fine, e.g. write backpressure or
+    /// an oversize payload) so an unknown or newly-introduced failure mode
+    /// degrades to a slow retry instead of a hot loop.
+    UnclassifiedCooldown,
+}
+
+/// Classify a failed-cycle error into the action the loop takes, in the same
+/// order the loop applies the checks: connection first (reconnect), then the
+/// two slow-call classes (cooldown), then the terminal fallback. Keeping the
+/// dispatch in one pure function is what lets the "nothing falls through to a
+/// full-tempo retry" contract be tested directly.
+fn classify_cycle_failure(e: &anyhow::Error) -> CycleFailureAction {
+    if is_connection_error(e) {
+        CycleFailureAction::Reconnect
+    } else if is_source_chain_pressure(e) || is_request_timeout(e) {
+        CycleFailureAction::Cooldown
+    } else {
+        CycleFailureAction::UnclassifiedCooldown
+    }
+}
+
+/// Wait `duration_ms`, returning early if shutdown is signalled, so the loop
+/// never sits out a full cooldown or poll interval after a Ctrl-C. Only wakes
+/// the wait — the loop's own `shutdown.borrow()` checks are what exit it.
+async fn sleep_or_shutdown(duration_ms: u64, shutdown: &mut ShutdownRx) {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(duration_ms)) => {}
+        _ = shutdown.changed() => {}
+    }
 }
 
 impl BridgeOrchestrator {
@@ -112,6 +158,22 @@ impl BridgeOrchestrator {
         }
     }
 
+    /// Pair the escalating cooldown with the severity it implies for a given
+    /// consecutive-failure count. Both cooldown classes (source-chain pressure
+    /// and the unclassified fallback) deliberately share this one backoff
+    /// curve, so operators get a single consistent progression; they differ
+    /// only in which counter they feed it and which events they emit.
+    fn pressure_backoff(&self, attempt: u32) -> (u64, PressureSeverity) {
+        let cooldown_ms = Self::pressure_cooldown_ms(
+            self.cfg.ham_pressure_cooldown_ms,
+            self.cfg.ham_pressure_cooldown_max_ms,
+            attempt,
+        );
+        let severity =
+            Self::pressure_severity(attempt, cooldown_ms, self.cfg.ham_pressure_cooldown_max_ms);
+        (cooldown_ms, severity)
+    }
+
     pub async fn run(&self) -> Result<()> {
         info!(
             "bridge-orchestrator started network={:?} poll={}ms bridge_cycle={}ms",
@@ -170,6 +232,14 @@ impl BridgeOrchestrator {
         // zero on the first fully-clean cycle.
         let mut pressure_consecutive: u32 = 0;
 
+        // Sibling counter for consecutive cycles ending in an error that
+        // matches none of ham's classifiers (the terminal-fallback class).
+        // Same escalation shape as `pressure_consecutive` — drives the doubling
+        // cooldown and the `warn!` → `error!` bump so a persistent *unknown*
+        // failure alerts instead of retrying quietly forever. Reset on the
+        // first fully-clean cycle.
+        let mut unclassified_consecutive: u32 = 0;
+
         loop {
             if *shutdown.borrow() {
                 info!("[bridge] shutdown signal received, exiting cleanly");
@@ -208,8 +278,7 @@ impl BridgeOrchestrator {
                                     h.last_cycle_finished_at_ms = Some(Self::now_ms());
                                     h.last_cycle_duration_ms = Some(duration_ms);
                                     h.consecutive_failed_cycles = 0;
-                                    h.pressure_active = false;
-                                    h.pressure_consecutive = 0;
+                                    h.set_cycle_class(CycleClass::None);
                                 });
                                 // A fully-clean cycle (no error) resets the
                                 // escalating-cooldown counter. Any non-zero
@@ -223,6 +292,14 @@ impl BridgeOrchestrator {
                                     "[bridge] source-chain pressure cleared; cooldown counter reset"
                                 );
                                     pressure_consecutive = 0;
+                                }
+                                if unclassified_consecutive > 0 {
+                                    info!(
+                                        event = "ham.unclassified_error_recovered",
+                                        previous_attempts = unclassified_consecutive,
+                                        "[bridge] unclassified-error streak cleared; cooldown counter reset"
+                                    );
+                                    unclassified_consecutive = 0;
                                 }
                             }
                             Err(e) => {
@@ -243,103 +320,151 @@ impl BridgeOrchestrator {
                                         reset_err
                                     );
                                 }
-                                if is_connection_error(&e) {
-                                    warn!(event = "ham.disconnected", error = %e);
-                                    self.reporter.update(|h| {
-                                        h.reconnect_failures_total =
-                                            h.reconnect_failures_total.saturating_add(1);
-                                    });
-                                    match connect_with_backoff(
-                                        || connect_ham(&self.cfg),
-                                        &backoff,
-                                        &mut shutdown,
-                                    )
-                                    .await
-                                    {
-                                        Some(new_ham) => {
-                                            ham = new_ham;
-                                            self.reporter.update(|h| {
-                                                h.reconnects_ok_total =
-                                                    h.reconnects_ok_total.saturating_add(1);
-                                            });
+                                match classify_cycle_failure(&e) {
+                                    CycleFailureAction::Reconnect => {
+                                        warn!(event = "ham.disconnected", error = %e);
+                                        // A lost socket is neither cooldown class, so drop
+                                        // whichever one an earlier cycle published: it would
+                                        // otherwise outlive its condition and — since the
+                                        // dashboard ranks a cooldown class above "failing
+                                        // cycles" — hide a reconnect loop behind a stale
+                                        // pressure or unclassified badge until the next
+                                        // fully-clean cycle.
+                                        self.reporter.update(|h| {
+                                            h.reconnect_failures_total =
+                                                h.reconnect_failures_total.saturating_add(1);
+                                            h.set_cycle_class(CycleClass::None);
+                                        });
+                                        match connect_with_backoff(
+                                            || connect_ham(&self.cfg),
+                                            &backoff,
+                                            &mut shutdown,
+                                        )
+                                        .await
+                                        {
+                                            Some(new_ham) => {
+                                                ham = new_ham;
+                                                self.reporter.update(|h| {
+                                                    h.reconnects_ok_total =
+                                                        h.reconnects_ok_total.saturating_add(1);
+                                                });
+                                            }
+                                            None => return Ok(()),
                                         }
-                                        None => return Ok(()),
                                     }
-                                } else if is_source_chain_pressure(&e) || is_request_timeout(&e) {
-                                    // Two distinct but similarly-shaped slow-call
-                                    // failures that share one cooldown policy:
-                                    //   * `is_source_chain_pressure` — server-side
-                                    //     workflow timeout / source-chain
-                                    //     backpressure (socket is healthy).
-                                    //   * `is_request_timeout` — client-side
-                                    //     per-request timeout fired while the
-                                    //     zome call was still running (socket is
-                                    //     also healthy).
-                                    // In both cases reconnecting is counter-
-                                    // productive, so we keep the socket open and
-                                    // pause before the next cycle instead of
-                                    // retrying at full tempo. The lock is already
-                                    // queued for retry by the
-                                    // `reset_in_flight_to_queued` call above; the
-                                    // next cycle's reconcile prelude will
-                                    // observe whether the write landed silently
-                                    // and advance the row's `step` accordingly.
-                                    //
-                                    // The two classes share cooldown shape and
-                                    // severity thresholds so operators get a
-                                    // single consistent backoff curve, but they
-                                    // emit distinct event keys
-                                    // (`ham.source_chain_pressure*` vs
-                                    // `ham.request_timeout*`) so dashboards and
-                                    // alerts can tell them apart.
-                                    let request_timeout = is_request_timeout(&e);
-                                    pressure_consecutive = pressure_consecutive.saturating_add(1);
-                                    let cooldown_ms = Self::pressure_cooldown_ms(
-                                        self.cfg.ham_pressure_cooldown_ms,
-                                        self.cfg.ham_pressure_cooldown_max_ms,
-                                        pressure_consecutive,
-                                    );
-                                    let severity = Self::pressure_severity(
-                                        pressure_consecutive,
-                                        cooldown_ms,
-                                        self.cfg.ham_pressure_cooldown_max_ms,
-                                    );
-                                    match (request_timeout, severity) {
-                                        (true, PressureSeverity::Stuck) => error!(
-                                            event = "ham.request_timeout_stuck",
-                                            attempt = pressure_consecutive,
-                                            cooldown_ms,
-                                            error = %e,
-                                            "[bridge] ham per-request timeout persists; root cause is upstream of the orchestrator"
-                                        ),
-                                        (true, PressureSeverity::Warn) => warn!(
-                                            event = "ham.request_timeout",
-                                            attempt = pressure_consecutive,
-                                            cooldown_ms,
-                                            error = %e,
-                                        ),
-                                        (false, PressureSeverity::Stuck) => error!(
-                                            event = "ham.source_chain_pressure_stuck",
-                                            attempt = pressure_consecutive,
-                                            cooldown_ms,
-                                            error = %e,
-                                            "[bridge] conductor source-chain pressure persists; check Holochain conductor health"
-                                        ),
-                                        (false, PressureSeverity::Warn) => warn!(
-                                            event = "ham.source_chain_pressure",
-                                            attempt = pressure_consecutive,
-                                            cooldown_ms,
-                                            error = %e,
-                                        ),
+                                    CycleFailureAction::Cooldown => {
+                                        // Two distinct but similarly-shaped slow-call
+                                        // failures that share one cooldown policy:
+                                        //   * `is_source_chain_pressure` — server-side
+                                        //     workflow timeout / source-chain
+                                        //     backpressure (socket is healthy).
+                                        //   * `is_request_timeout` — client-side
+                                        //     per-request timeout fired while the
+                                        //     zome call was still running (socket is
+                                        //     also healthy).
+                                        // In both cases reconnecting is counter-
+                                        // productive, so we keep the socket open and
+                                        // pause before the next cycle instead of
+                                        // retrying at full tempo. The lock is already
+                                        // queued for retry by the
+                                        // `reset_in_flight_to_queued` call above; the
+                                        // next cycle's reconcile prelude will
+                                        // observe whether the write landed silently
+                                        // and advance the row's `step` accordingly.
+                                        //
+                                        // The two classes share cooldown shape and
+                                        // severity thresholds so operators get a
+                                        // single consistent backoff curve, but they
+                                        // emit distinct event keys
+                                        // (`ham.source_chain_pressure*` vs
+                                        // `ham.request_timeout*`) so dashboards and
+                                        // alerts can tell them apart.
+                                        let request_timeout = is_request_timeout(&e);
+                                        pressure_consecutive =
+                                            pressure_consecutive.saturating_add(1);
+                                        let (cooldown_ms, severity) =
+                                            self.pressure_backoff(pressure_consecutive);
+                                        match (request_timeout, severity) {
+                                            (true, PressureSeverity::Stuck) => error!(
+                                                event = "ham.request_timeout_stuck",
+                                                attempt = pressure_consecutive,
+                                                cooldown_ms,
+                                                error = %e,
+                                                "[bridge] ham per-request timeout persists; root cause is upstream of the orchestrator"
+                                            ),
+                                            (true, PressureSeverity::Warn) => warn!(
+                                                event = "ham.request_timeout",
+                                                attempt = pressure_consecutive,
+                                                cooldown_ms,
+                                                error = %e,
+                                            ),
+                                            (false, PressureSeverity::Stuck) => error!(
+                                                event = "ham.source_chain_pressure_stuck",
+                                                attempt = pressure_consecutive,
+                                                cooldown_ms,
+                                                error = %e,
+                                                "[bridge] conductor source-chain pressure persists; check Holochain conductor health"
+                                            ),
+                                            (false, PressureSeverity::Warn) => warn!(
+                                                event = "ham.source_chain_pressure",
+                                                attempt = pressure_consecutive,
+                                                cooldown_ms,
+                                                error = %e,
+                                            ),
+                                        }
+                                        self.reporter.update(|h| {
+                                            h.set_cycle_class(CycleClass::Pressure(
+                                                pressure_consecutive,
+                                            ));
+                                        });
+                                        sleep_or_shutdown(cooldown_ms, &mut shutdown).await;
                                     }
-                                    let cooldown = Duration::from_millis(cooldown_ms);
-                                    self.reporter.update(|h| {
-                                        h.pressure_active = true;
-                                        h.pressure_consecutive = pressure_consecutive;
-                                    });
-                                    tokio::select! {
-                                        _ = tokio::time::sleep(cooldown) => {}
-                                        _ = shutdown.changed() => {}
+                                    CycleFailureAction::UnclassifiedCooldown => {
+                                        // Terminal safety net (B111): an error matching none of
+                                        // ham's classifiers must not fall off the chain and retry
+                                        // at poll cadence with no cooldown. We deliberately do NOT
+                                        // reconnect (the socket may be healthy — e.g. write
+                                        // backpressure or an oversize payload); instead we reuse the
+                                        // source-chain-pressure escalation on a *separate* counter,
+                                        // so a persistent unknown failure backs off (doubling to the
+                                        // cap) and escalates `warn!` → `error!` for alerting rather
+                                        // than retrying quietly forever. `consecutive_failed_cycles`
+                                        // and `last_error` were already recorded above.
+                                        unclassified_consecutive =
+                                            unclassified_consecutive.saturating_add(1);
+                                        let (cooldown_ms, severity) =
+                                            self.pressure_backoff(unclassified_consecutive);
+                                        match severity {
+                                            PressureSeverity::Stuck => error!(
+                                                event = "ham.unclassified_error_stuck",
+                                                attempt = unclassified_consecutive,
+                                                cooldown_ms,
+                                                error = %e,
+                                                "[bridge] cycle keeps failing with errors matching no ham classifier; investigate — not a known transport or backpressure failure"
+                                            ),
+                                            PressureSeverity::Warn => warn!(
+                                                event = "ham.unclassified_error",
+                                                attempt = unclassified_consecutive,
+                                                cooldown_ms,
+                                                error = %e,
+                                                "[bridge] cycle failed with an error matching no ham classifier; cooling down before retry"
+                                            ),
+                                        }
+                                        // Publish the unclassified streak so watchtower can surface it
+                                        // (parity with pressure). Setting the class also clears the pressure pair
+                                        // an earlier pressure cycle left behind: this failure is
+                                        // *not* source-chain pressure, and leaving that pair set
+                                        // would have watchtower saying "check conductor health"
+                                        // while the actual failure class is unknown. The *local*
+                                        // escalation counters are deliberately untouched — each
+                                        // counts its class's failures since the last clean cycle,
+                                        // so the backoff curve survives a class switch.
+                                        self.reporter.update(|h| {
+                                            h.set_cycle_class(CycleClass::Unclassified(
+                                                unclassified_consecutive,
+                                            ));
+                                        });
+                                        sleep_or_shutdown(cooldown_ms, &mut shutdown).await;
                                     }
                                 }
                             }
@@ -348,9 +473,13 @@ impl BridgeOrchestrator {
                     Err(e) => {
                         if is_connection_error(&e) {
                             warn!(event = "ham.probe.failed", error = %e);
+                            // Same reasoning as the disconnect arm above: the probe
+                            // failing on a dead socket ends any cooldown class an
+                            // earlier cycle published.
                             self.reporter.update(|h| {
                                 h.reconnect_failures_total =
                                     h.reconnect_failures_total.saturating_add(1);
+                                h.set_cycle_class(CycleClass::None);
                             });
                             match connect_with_backoff(
                                 || connect_ham(&self.cfg),
@@ -371,10 +500,7 @@ impl BridgeOrchestrator {
 
             // Interruptible poll-interval sleep so shutdown is observed
             // promptly (never mid-write).
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(self.cfg.poll_interval_ms)) => {}
-                _ = shutdown.changed() => {}
-            }
+            sleep_or_shutdown(self.cfg.poll_interval_ms, &mut shutdown).await;
         }
     }
 
@@ -2520,5 +2646,126 @@ mod tests {
         orch.cfg.slow_call_threshold_ms = 0;
         assert!(!orch.should_eject(60_000));
         assert!(!orch.should_eject(u128::MAX));
+    }
+
+    // -----------------------------------------------------------------
+    // Cycle-failure disposition tests
+    //
+    // `classify_cycle_failure` is the single source of truth for the
+    // cycle loop's three-way reaction to a failed cycle. These pin each
+    // branch — most importantly the terminal `UnclassifiedCooldown`
+    // fallback (B111): before it existed, an error matching none of ham's
+    // classifiers fell off the end of the chain and retried at full tempo.
+    //
+    // Errors are fed as their rendered `Display` text, exactly as a `Ham`
+    // caller receives them (every `Ham` method wraps upstream with
+    // `anyhow!("…: {}", e)`). The strings here are ones the *currently
+    // pinned* ham classifies deterministically — `ResponderDropped` (now
+    // `is_connection_error` on ham's side) is pinned in ham's own suite,
+    // not here, since this crate builds against the pinned `ham` rev.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classify_cycle_failure_routes_connection_errors_to_reconnect() {
+        let e = anyhow::anyhow!(
+            "Failed to call zome: Websocket error: Websocket closed: No connection"
+        );
+        assert_eq!(classify_cycle_failure(&e), CycleFailureAction::Reconnect);
+    }
+
+    #[test]
+    fn classify_cycle_failure_routes_slow_calls_to_cooldown() {
+        // Server-side source-chain pressure and a client-side per-request
+        // timeout share the one cooldown disposition (socket stays up).
+        let pressure =
+            anyhow::anyhow!("Failed to call zome: Source chain error: deadline has elapsed");
+        assert_eq!(
+            classify_cycle_failure(&pressure),
+            CycleFailureAction::Cooldown
+        );
+        let timeout = anyhow::anyhow!("Failed to call zome: Websocket error: Timeout");
+        assert_eq!(
+            classify_cycle_failure(&timeout),
+            CycleFailureAction::Cooldown
+        );
+    }
+
+    #[test]
+    fn classify_cycle_failure_routes_unclassified_errors_to_the_terminal_fallback() {
+        // The B111 fix: an error matching none of ham's classifiers must
+        // route to the cooldown fallback instead of a full-tempo retry. A
+        // zome/guest logic error is the common live case; a deserialize
+        // failure another; plus a wholly unexpected string.
+        for msg in [
+            "Failed to call zome: guest error: validation failed",
+            "Failed to deserialize response: invalid type",
+            "some entirely unexpected failure",
+        ] {
+            let e = anyhow::anyhow!("{msg}");
+            assert_eq!(
+                classify_cycle_failure(&e),
+                CycleFailureAction::UnclassifiedCooldown,
+                "unclassified error {msg:?} must route to the terminal cooldown fallback"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Shared cooldown-helper tests
+    //
+    // Both cooldown branches route through `pressure_backoff` and
+    // `sleep_or_shutdown`, so these pin the two seams the branches no
+    // longer spell out inline.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pressure_backoff_pairs_each_cooldown_with_its_severity() {
+        // The helper must stay exactly the composition of the two functions
+        // it wraps — both cooldown branches now depend on that pairing.
+        let orch = test_orchestrator("pressure-backoff");
+        let base = orch.cfg.ham_pressure_cooldown_ms;
+        let cap = orch.cfg.ham_pressure_cooldown_max_ms;
+        for attempt in 0..8 {
+            let expected_cooldown = BridgeOrchestrator::pressure_cooldown_ms(base, cap, attempt);
+            assert_eq!(
+                orch.pressure_backoff(attempt),
+                (
+                    expected_cooldown,
+                    BridgeOrchestrator::pressure_severity(attempt, expected_cooldown, cap)
+                ),
+                "attempt {attempt} must match the underlying pair"
+            );
+        }
+
+        // Pin the concrete curve the defaults produce (30s → 60s → 90s →
+        // capped), so a change to either half shows up here rather than only
+        // at the two call sites.
+        assert_eq!(orch.pressure_backoff(1), (30_000, PressureSeverity::Warn));
+        assert_eq!(orch.pressure_backoff(2), (60_000, PressureSeverity::Warn));
+        assert_eq!(orch.pressure_backoff(3), (90_000, PressureSeverity::Warn));
+        assert_eq!(orch.pressure_backoff(4), (90_000, PressureSeverity::Stuck));
+    }
+
+    #[tokio::test]
+    async fn sleep_or_shutdown_wakes_immediately_on_shutdown() {
+        // The wait stays interruptible: a shutdown arriving mid-cooldown
+        // returns at once instead of sitting out the full backoff.
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sleep_or_shutdown(60_000, &mut rx))
+            .await
+            .expect("shutdown must cut the cooldown short");
+    }
+
+    #[tokio::test]
+    async fn sleep_or_shutdown_waits_out_the_duration_without_shutdown() {
+        // `_tx` stays bound so the channel is not closed under the receiver.
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let started = std::time::Instant::now();
+        sleep_or_shutdown(50, &mut rx).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "cooldown must not return before its duration elapses"
+        );
     }
 }
