@@ -437,13 +437,18 @@ impl BridgeOrchestrator {
                                             ),
                                         }
                                         let cooldown = Duration::from_millis(cooldown_ms);
-                                        // This failure is *not* source-chain pressure, so drop any
-                                        // flag a previous pressure cycle left set — it is otherwise
-                                        // only cleared by a fully-clean cycle, which would leave
-                                        // watchtower reporting "check conductor health" while the
-                                        // actual failure class is unknown.
+                                        // This failure is *not* source-chain pressure, so clear the
+                                        // pressure reporter state (active + consecutive) an earlier
+                                        // pressure cycle left behind — it is otherwise only cleared
+                                        // by a fully-clean cycle, which would leave watchtower
+                                        // reporting "check conductor health" with a stale streak
+                                        // count while the actual failure class is unknown. The
+                                        // *local* escalation counter is deliberately untouched: it
+                                        // counts failures since the last clean cycle regardless of
+                                        // class, so a bridge failing every cycle still escalates.
                                         self.reporter.update(|h| {
                                             h.pressure_active = false;
+                                            h.pressure_consecutive = 0;
                                         });
                                         tokio::select! {
                                             _ = tokio::time::sleep(cooldown) => {}
