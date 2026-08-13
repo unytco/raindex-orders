@@ -54,9 +54,53 @@ pub struct ReporterHealth {
     pub reconnects_ok_total: u32,
     pub pressure_active: bool,
     pub pressure_consecutive: u32,
+    pub unclassified_active: bool,
+    pub unclassified_consecutive: u32,
     pub stage_ejections_total: u32,
     pub last_error: Option<String>,
     pub last_error_at_ms: Option<i64>,
+}
+
+/// Which cooldown class the last cycle ended in, carrying that class's
+/// escalation count. The reporter publishes a pair of fields per class, and
+/// at most one class may be active: two live classes would tell an operator
+/// to chase two causes for one failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleClass {
+    /// No cooldown class is in effect — either a clean cycle, or a failure
+    /// whose signal is carried elsewhere (a connection loss reports through
+    /// `reconnect_failures_total`, not a cooldown pair).
+    None,
+    /// Source-chain pressure or a per-request timeout: the conductor is slow
+    /// but the socket is healthy.
+    Pressure(u32),
+    /// An error matching none of ham's classifiers (B111).
+    Unclassified(u32),
+}
+
+impl ReporterHealth {
+    /// Publish `class` as the one active cooldown class, clearing the other.
+    /// Every arm of the cycle loop that resolves a failure routes through
+    /// here, so a class can never outlive the condition that set it — a
+    /// stale flag would keep watchtower naming the wrong cause after the
+    /// failure mode has moved on.
+    pub fn set_cycle_class(&mut self, class: CycleClass) {
+        self.pressure_active = false;
+        self.pressure_consecutive = 0;
+        self.unclassified_active = false;
+        self.unclassified_consecutive = 0;
+        match class {
+            CycleClass::None => {}
+            CycleClass::Pressure(attempts) => {
+                self.pressure_active = true;
+                self.pressure_consecutive = attempts;
+            }
+            CycleClass::Unclassified(attempts) => {
+                self.unclassified_active = true;
+                self.unclassified_consecutive = attempts;
+            }
+        }
+    }
 }
 
 /// Handle the orchestrator uses to publish health updates. Cloneable
@@ -138,10 +182,38 @@ struct PayloadSelfHealth<'a> {
     reconnects_ok_total: u32,
     pressure_active: bool,
     pressure_consecutive: u32,
+    unclassified_active: bool,
+    unclassified_consecutive: u32,
     stage_ejections_total: u32,
     is_stuck: bool,
     last_error: Option<String>,
     last_error_at_iso: Option<String>,
+}
+
+impl PayloadSelfHealth<'static> {
+    /// Project the in-memory counters onto the wire shape. Extracted from
+    /// `run_tick` so the cross-repo contract — watchtower mirrors these
+    /// field names by hand — is pinned by a test instead of only being
+    /// exercised by a live POST.
+    fn from_health(health: &ReporterHealth, uptime_s: u64, is_stuck: bool) -> Self {
+        Self {
+            uptime_s,
+            binary_version: BINARY_VERSION,
+            last_cycle_at_iso: health.last_cycle_started_at_ms.and_then(ms_to_rfc3339),
+            last_cycle_ms: health.last_cycle_duration_ms,
+            consecutive_failed_cycles: health.consecutive_failed_cycles,
+            reconnect_failures_total: health.reconnect_failures_total,
+            reconnects_ok_total: health.reconnects_ok_total,
+            pressure_active: health.pressure_active,
+            pressure_consecutive: health.pressure_consecutive,
+            unclassified_active: health.unclassified_active,
+            unclassified_consecutive: health.unclassified_consecutive,
+            stage_ejections_total: health.stage_ejections_total,
+            is_stuck,
+            last_error: health.last_error.clone(),
+            last_error_at_iso: health.last_error_at_ms.and_then(ms_to_rfc3339),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -277,21 +349,7 @@ async fn run_tick(
         observer_id: &cfg.observer_id,
         collected_at: chrono::Utc::now().to_rfc3339(),
         dna_b64: &cfg.dna_b64,
-        self_health: PayloadSelfHealth {
-            uptime_s,
-            binary_version: BINARY_VERSION,
-            last_cycle_at_iso: health.last_cycle_started_at_ms.and_then(ms_to_rfc3339),
-            last_cycle_ms: health.last_cycle_duration_ms,
-            consecutive_failed_cycles: health.consecutive_failed_cycles,
-            reconnect_failures_total: health.reconnect_failures_total,
-            reconnects_ok_total: health.reconnects_ok_total,
-            pressure_active: health.pressure_active,
-            pressure_consecutive: health.pressure_consecutive,
-            stage_ejections_total: health.stage_ejections_total,
-            is_stuck,
-            last_error: health.last_error.clone(),
-            last_error_at_iso: health.last_error_at_ms.and_then(ms_to_rfc3339),
-        },
+        self_health: PayloadSelfHealth::from_health(&health, uptime_s, is_stuck),
         backlog: PayloadBacklog {
             detected: stats.detected,
             queued: stats.queued,
@@ -408,9 +466,101 @@ mod tests {
         state.update(|h| {
             h.consecutive_failed_cycles = 2;
             h.pressure_active = true;
+            h.unclassified_active = true;
+            h.unclassified_consecutive = 3;
         });
         let snap = state.snapshot().await;
         assert_eq!(snap.consecutive_failed_cycles, 2);
         assert!(snap.pressure_active);
+        assert!(snap.unclassified_active);
+        assert_eq!(snap.unclassified_consecutive, 3);
+    }
+
+    #[test]
+    fn set_cycle_class_activates_one_class_and_clears_the_other() {
+        // The invariant every arm of the cycle loop depends on: publishing a
+        // class must clear its sibling, so watchtower never names two causes
+        // for one failure and a class never outlives its condition. Each case
+        // starts from *both* classes set, which is the state a missed clear
+        // would leave behind.
+        let both_set = ReporterHealth {
+            pressure_active: true,
+            pressure_consecutive: 5,
+            unclassified_active: true,
+            unclassified_consecutive: 6,
+            ..Default::default()
+        };
+
+        for (class, expected) in [
+            (CycleClass::None, (false, 0, false, 0)),
+            (CycleClass::Pressure(3), (true, 3, false, 0)),
+            (CycleClass::Unclassified(4), (false, 0, true, 4)),
+        ] {
+            let mut h = both_set.clone();
+            h.set_cycle_class(class);
+            assert_eq!(
+                (
+                    h.pressure_active,
+                    h.pressure_consecutive,
+                    h.unclassified_active,
+                    h.unclassified_consecutive
+                ),
+                expected,
+                "{class:?} must leave exactly its own pair set"
+            );
+        }
+    }
+
+    #[test]
+    fn set_cycle_class_leaves_the_other_health_counters_alone() {
+        // The class setter owns only the two cooldown pairs. It must not
+        // disturb the failure/reconnect counters the same `update` closure
+        // bumps beside it, or the reconnect arms would zero their own signal.
+        let mut h = ReporterHealth {
+            consecutive_failed_cycles: 9,
+            reconnect_failures_total: 2,
+            reconnects_ok_total: 1,
+            stage_ejections_total: 4,
+            last_error: Some("boom".into()),
+            ..Default::default()
+        };
+        h.set_cycle_class(CycleClass::Unclassified(2));
+        assert_eq!(h.consecutive_failed_cycles, 9);
+        assert_eq!(h.reconnect_failures_total, 2);
+        assert_eq!(h.reconnects_ok_total, 1);
+        assert_eq!(h.stage_ejections_total, 4);
+        assert_eq!(h.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn self_health_payload_carries_each_failure_class_under_its_own_key() {
+        // Watchtower mirrors these field names by hand, so the wire keys
+        // are a cross-repo contract. Pin both streak pairs, and pin them
+        // from *opposite* states so a mapping that crossed the two classes
+        // (or aliased one onto the other) fails here rather than surfacing
+        // as a mislabelled alert.
+        let pressure = ReporterHealth {
+            pressure_active: true,
+            pressure_consecutive: 7,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(PayloadSelfHealth::from_health(&pressure, 0, false))
+            .expect("serialize self_health");
+        assert_eq!(json["pressure_active"], serde_json::json!(true));
+        assert_eq!(json["pressure_consecutive"], serde_json::json!(7));
+        assert_eq!(json["unclassified_active"], serde_json::json!(false));
+        assert_eq!(json["unclassified_consecutive"], serde_json::json!(0));
+
+        let unclassified = ReporterHealth {
+            unclassified_active: true,
+            unclassified_consecutive: 4,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(PayloadSelfHealth::from_health(&unclassified, 0, false))
+            .expect("serialize self_health");
+        assert_eq!(json["unclassified_active"], serde_json::json!(true));
+        assert_eq!(json["unclassified_consecutive"], serde_json::json!(4));
+        assert_eq!(json["pressure_active"], serde_json::json!(false));
+        assert_eq!(json["pressure_consecutive"], serde_json::json!(0));
     }
 }

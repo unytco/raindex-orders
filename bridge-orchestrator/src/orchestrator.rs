@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{generate_coupon, signer_context_from_env};
 use crate::state::{StateStore, WorkItem, WorkStep};
-use crate::watchtower_reporter::{self, ReporterState};
+use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use anyhow::{Context, Result};
 use ham::{
     connect_with_backoff, install_shutdown_handler, is_connection_error, is_request_timeout,
@@ -278,8 +278,7 @@ impl BridgeOrchestrator {
                                     h.last_cycle_finished_at_ms = Some(Self::now_ms());
                                     h.last_cycle_duration_ms = Some(duration_ms);
                                     h.consecutive_failed_cycles = 0;
-                                    h.pressure_active = false;
-                                    h.pressure_consecutive = 0;
+                                    h.set_cycle_class(CycleClass::None);
                                 });
                                 // A fully-clean cycle (no error) resets the
                                 // escalating-cooldown counter. Any non-zero
@@ -324,9 +323,17 @@ impl BridgeOrchestrator {
                                 match classify_cycle_failure(&e) {
                                     CycleFailureAction::Reconnect => {
                                         warn!(event = "ham.disconnected", error = %e);
+                                        // A lost socket is neither cooldown class, so drop
+                                        // whichever one an earlier cycle published: it would
+                                        // otherwise outlive its condition and — since the
+                                        // dashboard ranks a cooldown class above "failing
+                                        // cycles" — hide a reconnect loop behind a stale
+                                        // pressure or unclassified badge until the next
+                                        // fully-clean cycle.
                                         self.reporter.update(|h| {
                                             h.reconnect_failures_total =
                                                 h.reconnect_failures_total.saturating_add(1);
+                                            h.set_cycle_class(CycleClass::None);
                                         });
                                         match connect_with_backoff(
                                             || connect_ham(&self.cfg),
@@ -406,8 +413,9 @@ impl BridgeOrchestrator {
                                             ),
                                         }
                                         self.reporter.update(|h| {
-                                            h.pressure_active = true;
-                                            h.pressure_consecutive = pressure_consecutive;
+                                            h.set_cycle_class(CycleClass::Pressure(
+                                                pressure_consecutive,
+                                            ));
                                         });
                                         sleep_or_shutdown(cooldown_ms, &mut shutdown).await;
                                     }
@@ -442,18 +450,19 @@ impl BridgeOrchestrator {
                                                 "[bridge] cycle failed with an error matching no ham classifier; cooling down before retry"
                                             ),
                                         }
-                                        // This failure is *not* source-chain pressure, so clear the
-                                        // pressure reporter state (active + consecutive) an earlier
-                                        // pressure cycle left behind — it is otherwise only cleared
-                                        // by a fully-clean cycle, which would leave watchtower
-                                        // reporting "check conductor health" with a stale streak
-                                        // count while the actual failure class is unknown. The
-                                        // *local* escalation counter is deliberately untouched: it
-                                        // counts failures since the last clean cycle regardless of
-                                        // class, so a bridge failing every cycle still escalates.
+                                        // Publish the unclassified streak so watchtower can alert
+                                        // on it. Setting the class also clears the pressure pair
+                                        // an earlier pressure cycle left behind: this failure is
+                                        // *not* source-chain pressure, and leaving that pair set
+                                        // would have watchtower saying "check conductor health"
+                                        // while the actual failure class is unknown. The *local*
+                                        // escalation counters are deliberately untouched — each
+                                        // counts its class's failures since the last clean cycle,
+                                        // so the backoff curve survives a class switch.
                                         self.reporter.update(|h| {
-                                            h.pressure_active = false;
-                                            h.pressure_consecutive = 0;
+                                            h.set_cycle_class(CycleClass::Unclassified(
+                                                unclassified_consecutive,
+                                            ));
                                         });
                                         sleep_or_shutdown(cooldown_ms, &mut shutdown).await;
                                     }
@@ -464,9 +473,13 @@ impl BridgeOrchestrator {
                     Err(e) => {
                         if is_connection_error(&e) {
                             warn!(event = "ham.probe.failed", error = %e);
+                            // Same reasoning as the disconnect arm above: the probe
+                            // failing on a dead socket ends any cooldown class an
+                            // earlier cycle published.
                             self.reporter.update(|h| {
                                 h.reconnect_failures_total =
                                     h.reconnect_failures_total.saturating_add(1);
+                                h.set_cycle_class(CycleClass::None);
                             });
                             match connect_with_backoff(
                                 || connect_ham(&self.cfg),
