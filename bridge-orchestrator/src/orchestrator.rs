@@ -450,8 +450,8 @@ impl BridgeOrchestrator {
                                                 "[bridge] cycle failed with an error matching no ham classifier; cooling down before retry"
                                             ),
                                         }
-                                        // Publish the unclassified streak so watchtower can alert
-                                        // on it. Setting the class also clears the pressure pair
+                                        // Publish the unclassified streak so watchtower can surface it
+                                        // (parity with pressure). Setting the class also clears the pressure pair
                                         // an earlier pressure cycle left behind: this failure is
                                         // *not* source-chain pressure, and leaving that pair set
                                         // would have watchtower saying "check conductor health"
