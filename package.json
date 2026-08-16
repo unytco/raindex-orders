@@ -1,4 +1,8 @@
 {
+  "scripts": {
+    "format": "forge fmt",
+    "format:check": "forge fmt --check"
+  },
   "dependencies": {
     "@rainlanguage/dotrain": "^6.0.1-alpha.24"
   }
