@@ -24,12 +24,7 @@ contract TestHoloLockVault is Test {
     bytes32 public constant AGENT_1 = keccak256("holochain-agent-1");
     bytes32 public constant AGENT_2 = keccak256("holochain-agent-2");
 
-    event Lock(
-        address indexed sender,
-        uint256 amount,
-        bytes32 indexed holochainAgent,
-        uint256 lockId
-    );
+    event Lock(address indexed sender, uint256 amount, bytes32 indexed holochainAgent, uint256 lockId);
 
     event AdminWithdraw(address indexed admin, uint256 amount, address indexed to);
     event AdminChanged(address indexed oldAdmin, address indexed newAdmin);
@@ -44,13 +39,7 @@ contract TestHoloLockVault is Test {
         orderbook = new MockOrderBook();
 
         // Deploy HoloLockVault
-        lockVault = new HoloLockVault(
-            address(token),
-            address(orderbook),
-            VAULT_ID,
-            admin,
-            MIN_LOCK_AMOUNT
-        );
+        lockVault = new HoloLockVault(address(token), address(orderbook), VAULT_ID, admin, MIN_LOCK_AMOUNT);
 
         // Mint tokens to users
         token.mint(user1, 1000e18);
@@ -74,35 +63,17 @@ contract TestHoloLockVault is Test {
 
     function testConstructorRevertsZeroToken() public {
         vm.expectRevert("HoloLockVault: zero token address");
-        new HoloLockVault(
-            address(0),
-            address(orderbook),
-            VAULT_ID,
-            admin,
-            MIN_LOCK_AMOUNT
-        );
+        new HoloLockVault(address(0), address(orderbook), VAULT_ID, admin, MIN_LOCK_AMOUNT);
     }
 
     function testConstructorRevertsZeroOrderbook() public {
         vm.expectRevert("HoloLockVault: zero orderbook address");
-        new HoloLockVault(
-            address(token),
-            address(0),
-            VAULT_ID,
-            admin,
-            MIN_LOCK_AMOUNT
-        );
+        new HoloLockVault(address(token), address(0), VAULT_ID, admin, MIN_LOCK_AMOUNT);
     }
 
     function testConstructorRevertsZeroAdmin() public {
         vm.expectRevert("HoloLockVault: zero admin address");
-        new HoloLockVault(
-            address(token),
-            address(orderbook),
-            VAULT_ID,
-            address(0),
-            MIN_LOCK_AMOUNT
-        );
+        new HoloLockVault(address(token), address(orderbook), VAULT_ID, address(0), MIN_LOCK_AMOUNT);
     }
 
     // ========== Lock Tests ==========

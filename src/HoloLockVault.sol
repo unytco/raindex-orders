@@ -21,12 +21,7 @@ contract HoloLockVault {
     /// @param amount The amount of HOT locked (in wei, 18 decimals)
     /// @param holochainAgent The 32-byte Holochain agent public key to receive HoloFuel
     /// @param lockId Unique identifier for this lock operation
-    event Lock(
-        address indexed sender,
-        uint256 amount,
-        bytes32 indexed holochainAgent,
-        uint256 lockId
-    );
+    event Lock(address indexed sender, uint256 amount, bytes32 indexed holochainAgent, uint256 lockId);
 
     /// @notice Emitted when admin withdraws tokens (emergency only)
     /// @param admin The admin address performing the withdrawal
@@ -69,13 +64,7 @@ contract HoloLockVault {
     /// @param _vaultId The vault ID to deposit into
     /// @param _admin The admin address for emergency functions
     /// @param _minLockAmount Minimum amount that can be locked
-    constructor(
-        address _token,
-        address _orderbook,
-        uint256 _vaultId,
-        address _admin,
-        uint256 _minLockAmount
-    ) {
+    constructor(address _token, address _orderbook, uint256 _vaultId, address _admin, uint256 _minLockAmount) {
         require(_token != address(0), "HoloLockVault: zero token address");
         require(_orderbook != address(0), "HoloLockVault: zero orderbook address");
         require(_admin != address(0), "HoloLockVault: zero admin address");
