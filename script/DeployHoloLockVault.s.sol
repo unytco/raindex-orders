@@ -39,13 +39,8 @@ contract DeploySepoliaHoloLockVault is Script {
 
         vm.startBroadcast();
 
-        HoloLockVault lockVault = new HoloLockVault(
-            token,
-            address(SEPOLIA_ORDERBOOK),
-            HOLO_VAULT_ID,
-            admin,
-            MIN_LOCK_AMOUNT
-        );
+        HoloLockVault lockVault =
+            new HoloLockVault(token, address(SEPOLIA_ORDERBOOK), HOLO_VAULT_ID, admin, MIN_LOCK_AMOUNT);
 
         vm.stopBroadcast();
 
@@ -67,13 +62,8 @@ contract DeployMainnetHoloLockVault is Script {
 
         vm.startBroadcast();
 
-        HoloLockVault lockVault = new HoloLockVault(
-            address(MAINNET_HOT),
-            address(MAINNET_ORDERBOOK),
-            HOLO_VAULT_ID,
-            admin,
-            MIN_LOCK_AMOUNT
-        );
+        HoloLockVault lockVault =
+            new HoloLockVault(address(MAINNET_HOT), address(MAINNET_ORDERBOOK), HOLO_VAULT_ID, admin, MIN_LOCK_AMOUNT);
 
         vm.stopBroadcast();
 
@@ -99,13 +89,7 @@ contract DeployHoloLockVaultCustomToken is Script {
 
         vm.startBroadcast();
 
-        HoloLockVault lockVault = new HoloLockVault(
-            token,
-            orderbook,
-            vaultId,
-            admin,
-            minLockAmount
-        );
+        HoloLockVault lockVault = new HoloLockVault(token, orderbook, vaultId, admin, minLockAmount);
 
         vm.stopBroadcast();
 
