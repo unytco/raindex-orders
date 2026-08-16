@@ -34,6 +34,12 @@ contract HoloLockVault {
     /// @param newAdmin The new admin address
     event AdminChanged(address indexed oldAdmin, address indexed newAdmin);
 
+    // Storage layout is append-only. This contract is deployed and holds user funds, so
+    // a new variable goes after the last one below: nothing already here is reordered,
+    // retyped or removed. The live contract keeps reading the same slots, and shifting
+    // them makes it read another field's bytes as this one. (The immutables directly
+    // below live in bytecode rather than a slot, so they are not part of that layout.)
+
     /// @notice The token being locked (HOT on mainnet)
     IERC20 public immutable token;
 
