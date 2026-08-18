@@ -1,0 +1,150 @@
+name: Release
+
+# Cut a release by pushing a semver tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridge-orchestrator
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      # No `submodules:` -- the crate needs only crates.io and the public `ham`
+      # git dep, while a recursive checkout pulls ~1.4 GB of Solidity submodules.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate tag is semver
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # semver.org's official regex, with a leading "v".
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+
+          if [[ ! "$TAG" =~ $semver ]]; then
+            echo "::error::Tag '$TAG' is not semver. Expected vMAJOR.MINOR.PATCH[-prerelease][+build], e.g. v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+
+          version="${TAG#v}"
+
+          # Drop build metadata before looking for a prerelease suffix, so that
+          # v1.2.3+build-7 is not misread as one.
+          if [[ "${version%%+*}" == *-* ]]; then
+            prerelease=true
+          else
+            prerelease=false
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version (prerelease: $prerelease)"
+
+      # The asset name carries no version, so `--version` is what identifies a
+      # build -- and clap takes that from Cargo.toml. Also the first cargo call,
+      # which is what makes rustup install the pinned toolchain.
+      - name: Verify Cargo.toml matches tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          manifest="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')"
+
+          if [[ "$manifest" != "$VERSION" ]]; then
+            echo "::error::Tag says $VERSION but Cargo.toml says $manifest. Bump the crate version and commit it before tagging."
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: bridge-orchestrator
+
+      # --locked: `ham` tracks a branch, so Cargo.lock is the only record of
+      # which commit a release was built against.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Stage assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release
+          cp target/release/bridge-orchestrator release/
+
+          reported="$(./release/bridge-orchestrator --version | awk '{print $NF}')"
+          if [[ "$reported" != "$VERSION" ]]; then
+            echo "::error::Built binary reports version '$reported', expected '$VERSION'."
+            exit 1
+          fi
+
+          # Bare filename in the digest, so `sha256sum -c` works as-is beside
+          # the downloaded binary.
+          ( cd release && sha256sum bridge-orchestrator > bridge-orchestrator.sha256 )
+
+          ls -lh release/bridge-orchestrator
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: bridge-orchestrator/release/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Separate job so that compiling 600+ third-party crates, and the actions
+  # around it, never run with a token that can write releases.
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: release
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          assets=(release/bridge-orchestrator release/bridge-orchestrator.sha256)
+
+          # Converge rather than fail when re-running a partially failed release.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets."
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            args=(--title "$TAG" --generate-notes)
+            if [[ "$PRERELEASE" == "true" ]]; then
+              args+=(--prerelease)
+            fi
+            gh release create "$TAG" "${args[@]}" "${assets[@]}"
+          fi
