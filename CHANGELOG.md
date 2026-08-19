@@ -16,12 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - the Rainix/Solidity workflow (`.github/workflows/test.yml`) is now manual-only (`on: workflow_dispatch`) — it has failed for years on a dead nixpkgs pin in `lib/rain.orderbook`.
-- upgrade bridge-orchestrator Holochain deps to 0.7 (rave_engine 0.9.0, holochain_client 0.9.0, zfuel 0.9.0, holo_hash / holochain_zome_types 0.7.0).
+- upgrade bridge-orchestrator Holochain deps to 0.7 (rave_engine 0.10.0, holochain_client 0.9.0, zfuel 0.9.1, holo_hash / holochain_zome_types 0.7.0), with rave_engine and zfuel pinned exactly rather than by caret range: both define on-chain type shapes it decodes, and this family ships serialization changes in patch releases.
 - bridge-orchestrator pins Rust 1.93.1 (`rust-toolchain.toml`) and builds on the host toolchain, not the rainix dev shell (1.89).
 - bridge-orchestrator's outbound HTTPS clients (Ethereum RPC, watchtower ingest) validate against bundled webpki roots instead of the host trust store.
 
 ### Fixed
 
+- bridge-orchestrator decodes a global definition carrying rave_engine 0.10.0's per-unit `unit_fees`, and sizes the parked-spend link tag from the widest fee map the zome can write back rather than from a zero.
 - bridge-orchestrator cools down on a cycle error that matches no ham classifier, instead of hot-looping.
 - bridge-orchestrator builds with pure-Rust TLS (`alloy` on `reqwest-rustls-tls`), keeping the host's OpenSSL off the TLS path. 0.7's vendored `openssl-sys` (sqlcipher) means the build host needs a C toolchain, perl and make.
 - `test_config` test helper now initialises the `conductor_config` / `lair_passphrase_file` fields added by the lair-signing change.

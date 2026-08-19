@@ -6673,9 +6673,9 @@ dependencies = [
 
 [[package]]
 name = "zfuel"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d909cb587cca4f18aebba81e00c4b08a01bd5baa0245ddea9fe3cc2a286aa829"
+checksum = "9f4b5e891e58f89725ca0fbd2cab87a60fe44ec46b7621acc934840c3fd23d97"
 dependencies = [
  "holochain_wasmer_common",
  "lazy_static",

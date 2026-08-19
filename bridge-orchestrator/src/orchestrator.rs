@@ -13,7 +13,7 @@ use holochain_zome_types::prelude::GetStrategy;
 use rave_engine::types::{
     CarryForwardUnits, CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, LaneExt,
     ParkedData, ParkedLinkType, ParkedSpendData, RAVEExecuteInputs, Transaction,
-    TransactionDetails, UnitMap, RAVE,
+    TransactionDetails, UnitFee, UnitMap, RAVE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -498,23 +498,19 @@ impl BridgeOrchestrator {
                 }
             }
 
-            // Interruptible poll-interval sleep so shutdown is observed
-            // promptly (never mid-write).
+            // Interruptible so shutdown is never observed mid-write.
             sleep_or_shutdown(self.cfg.poll_interval_ms, &mut shutdown).await;
         }
     }
 
     /// Single unified bridge cycle built as a four-stage pipeline.
     ///
-    /// Each lock row carries a `step` column (see [`WorkStep`]) that
-    /// explicitly tracks which zome calls have been proven to have landed
-    /// on-chain. Every stage advances rows by comparing their recorded
-    /// ActionHash against a freshly-fetched live-link set — there is no
-    /// reliance on walking past RAVE history. The advancement is emergent
-    /// from the fact that `execute_rave` is invoked with the just-read
-    /// live link set, so a silently-committed RAVE simply drops the
-    /// consumed links out of the next fetch, and rows whose hashes are no
-    /// longer in the live set advance automatically.
+    /// Each lock row's `step` column (see [`WorkStep`]) tracks which zome calls
+    /// have been proven to land on-chain. A stage advances a row by comparing
+    /// its recorded ActionHash against a freshly-fetched live-link set, never by
+    /// walking past RAVE history: `execute_rave` is invoked with the just-read
+    /// live set, so a silently-committed RAVE drops the consumed links out of
+    /// the next fetch and the rows behind them advance on their own.
     ///
     /// 1. Resolve context + fetch live parked links on both EAs.
     /// 2. Reconcile — promote rows through the pipeline based on what chain
@@ -551,11 +547,9 @@ impl BridgeOrchestrator {
         let tag_cap = self.cfg.max_link_tag_bytes;
         let coupons_budget = self.cfg.coupons_target_bytes;
 
-        // Per-cycle safety valve: promote any queued lock that has already
-        // exhausted its retry budget to `failed` before we fetch the work
-        // list. Without this a permanently broken lock would keep retrying
-        // forever in a long-running session (the `recover_stale_items`
-        // equivalent only runs at startup).
+        // Per-cycle safety valve: `recover_stale_items` only runs at startup, so
+        // without this a permanently broken lock retries forever in a long
+        // session.
         let promoted = self.db.fail_exhausted_queued("lock")?;
         if promoted > 0 {
             warn!(
@@ -788,6 +782,10 @@ impl BridgeOrchestrator {
             tag_cap,
             &global_definition_hash,
             &context.lane_definitions,
+            &global_definition
+                .system_rave_agreements
+                .compute_transaction_fee
+                .unit_fees,
         )?;
         let s3_attempted = !s3_batch.ids.is_empty();
         let mut s3_written = 0usize;
@@ -1303,6 +1301,7 @@ impl BridgeOrchestrator {
         tag_cap: usize,
         global_definition_hash: &ActionHash,
         lane_definitions: &[ActionHash],
+        unit_fees: &[UnitFee],
     ) -> Result<ProofBatch> {
         let mut out = ProofBatch::default();
         for item in rows {
@@ -1338,6 +1337,7 @@ impl BridgeOrchestrator {
                 &payload,
                 global_definition_hash,
                 lane_definitions,
+                unit_fees,
             ) {
                 Ok(n) => n,
                 Err(e) => {
@@ -1588,12 +1588,8 @@ fn accumulate_amounts(amounts: &[UnitMap]) -> Result<UnitMap> {
 /// Truncate `links` to at most `cap` entries. Returns the (possibly
 /// truncated) Vec and the count of deferred entries.
 ///
-/// `cap == None` or `cap == Some(0)` is treated as "no cap" and returns
-/// the input unchanged with `deferred = 0`. The helper is intentionally
-/// order-preserving (`Vec::truncate`) so callers that rely on the input
-/// ordering — e.g. S4 keeping deposits ahead of withdrawals so the cap
-/// preferentially defers withdrawals — get deterministic behavior
-/// without an explicit sort step.
+/// `cap == None` or `cap == Some(0)` means no cap. Order-preserving, so S4 can
+/// keep deposits ahead of withdrawals and have the cap defer withdrawals first.
 fn apply_rave_link_cap(
     mut links: Vec<Transaction>,
     cap: Option<usize>,
@@ -1608,8 +1604,7 @@ fn apply_rave_link_cap(
     }
 }
 
-/// Establish a fresh `Ham` connection. Thin wrapper that centralizes the
-/// connect call so both startup and reconnect flows share one path.
+/// One connect path, shared by startup and reconnect.
 async fn connect_ham(cfg: &Config) -> Result<Ham> {
     Ham::connect(
         HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
@@ -1650,17 +1645,39 @@ fn estimate_parked_data_tag_bytes(total_amount: &UnitMap, payload: &Value) -> Re
     Ok(bytes)
 }
 
-/// Estimate the msgpack link-tag size a `ParkedSpendData` write with the
-/// given aggregate proofs payload would produce. Runtime-computed numeric
-/// fields (new_balance / proposed_balance) are filled with worst-case-sized
-/// placeholders derived from `total_amount`.
+/// Estimate the msgpack link-tag size a `ParkedSpendData` write with the given
+/// aggregate proofs payload would produce. The zome fills the balance and fee
+/// fields: `fees_owed` gets the widest map it can write, the balances get this
+/// batch's deposit sum rather than the agent's running ledger, which is where
+/// the estimate stays optimistic.
 fn estimate_parked_spend_tag_bytes(
     total_amount: &UnitMap,
     payload: &Value,
     global_definition: &ActionHash,
     lane_definitions: &[ActionHash],
+    unit_fees: &[UnitFee],
 ) -> Result<usize> {
-    let parked_spend = ParkedSpendData {
+    let parked_spend = parked_spend_placeholder(
+        total_amount,
+        payload,
+        global_definition,
+        lane_definitions,
+        unit_fees,
+    );
+    let bytes = rmp_serde::to_vec(&parked_spend)
+        .context("failed to msgpack-encode ParkedSpendData for tag-size estimation")?
+        .len();
+    Ok(bytes)
+}
+
+fn parked_spend_placeholder(
+    total_amount: &UnitMap,
+    payload: &Value,
+    global_definition: &ActionHash,
+    lane_definitions: &[ActionHash],
+    unit_fees: &[UnitFee],
+) -> ParkedSpendData {
+    ParkedSpendData {
         ct_role_id: "bridging_agent".to_string(),
         amount: total_amount.clone(),
         payload: payload.clone(),
@@ -1668,21 +1685,35 @@ fn estimate_parked_spend_tag_bytes(
         lane_definitions: lane_definitions.to_vec(),
         new_balance: total_amount.clone(),
         carry_forward_units: CarryForwardUnits::new(),
-        fees_owed: ZFuel::zero(),
+        fees_owed: widest_fees_owed(unit_fees),
         proposed_balance: total_amount.clone(),
-    };
-    let bytes = rmp_serde::to_vec(&parked_spend)
-        .context("failed to msgpack-encode ParkedSpendData for tag-size estimation")?
-        .len();
-    Ok(bytes)
+    }
 }
 
-/// Normalise a tx_hash to the canonical form used for all reconciler
-/// lookups: trimmed of surrounding whitespace and lowercased. Every
-/// call site that reads or writes a `tx_hash` for cross-boundary
-/// comparison (proof emission, reconciler probe, live-parked index)
-/// MUST route through this helper so the invariant is enforced
-/// symmetrically on both sides of the equality check.
+/// The widest `fees_owed` the zome can write into a spend tag. Nothing accrues
+/// in a unit the global definition does not charge, so the charged units are the
+/// key set; sizing it from the spend's own units would under-count a network
+/// charging units the batch does not touch.
+///
+/// Amounts are the longest string `ZFuel` prints, not the unit's trigger, which
+/// bounds the value and not the encoded width: collection is tested against the
+/// ledger as it stood before the spend, so this spend's fee lands on top of an
+/// amount already at the trigger, and `ZFuel` prints decimals only when they are
+/// non-zero. `fee_cap` and the exemptions are ignored for the same reason, both
+/// only narrowing what is written. Not covered: a unit dropped from `unit_fees`
+/// keeps what it had accrued until a collection sweeps the ledger.
+fn widest_fees_owed(unit_fees: &[UnitFee]) -> UnitMap {
+    UnitMap::load(
+        unit_fees
+            .iter()
+            .map(|fee| (fee.index_key(), ZFuel::new_with_default_precision(i64::MIN)))
+            .collect(),
+    )
+}
+
+/// Canonical form for every `tx_hash` compared across the Ethereum and
+/// Holochain boundary: proof emission, reconciler probe and live-parked index
+/// all route through this, so the equality check is symmetric.
 fn normalize_tx_hash(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
@@ -1720,12 +1751,9 @@ fn build_tx_hash_to_link_id(parked: &[Transaction]) -> HashMap<String, String> {
     out
 }
 
-/// Wrap a zome-call future with elapsed-ms measurement and structured
-/// logging. `stage` identifies the pipeline stage ("s1".."s4") and
-/// `fn_name` the zome function. Returns the call result paired with the
-/// measured elapsed time in milliseconds so callers can drive
-/// stage-ejection policy. On error the elapsed is still logged (at
-/// `warn!`) before the error is propagated to the caller.
+/// Wrap a zome-call future with elapsed-ms measurement and structured logging.
+/// The elapsed time comes back with the result so callers can drive
+/// stage-ejection policy, and is logged on the error path too.
 async fn timed_call<F, T>(stage: &str, fn_name: &str, fut: F) -> Result<(T, u128)>
 where
     F: std::future::Future<Output = Result<T>>,
@@ -1774,6 +1802,7 @@ mod tests {
     use holochain_zome_types::timestamp::Timestamp;
     use rave_engine::types::TransactionType;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use zfuel::fraction::Fraction;
 
     fn test_db_path(name: &str) -> String {
         let ts = SystemTime::now()
@@ -1892,7 +1921,7 @@ mod tests {
                 global_definition: action_hash(0xAA).into(),
                 lane_definitions: vec![],
                 new_balance: UnitMap::new(),
-                fees_owed: ZFuel::zero(),
+                fees_owed: UnitMap::new(),
                 proposed_balance: UnitMap::new(),
                 attached_payload: json!({
                     "proof_of_deposit": [{ "tx_hash": tx_hash }]
@@ -1946,6 +1975,275 @@ mod tests {
         assert_eq!(
             total.get("1").map(|v| v.to_string()),
             Some("25".to_string())
+        );
+    }
+
+    fn unit_fee(unit_index: u8, trigger: &str) -> UnitFee {
+        UnitFee {
+            // Seeded apart from `unit_index`: nothing binds the two.
+            unit_definition: action_hash(0xD0 ^ unit_index).into(),
+            unit_index,
+            spender_pay_percent: Fraction::new(1, 100).unwrap(),
+            fee_cap: None,
+            fee_trigger: trigger.parse().unwrap(),
+            exempt_agents: vec![],
+        }
+    }
+
+    fn widest_amount() -> ZFuel {
+        ZFuel::new_with_default_precision(i64::MIN)
+    }
+
+    fn pending_rows(orch: &BridgeOrchestrator) -> Vec<WorkItem> {
+        orch.db
+            .list_pending_by_step("lock", WorkStep::New, 100)
+            .unwrap()
+    }
+
+    fn spend_estimate(total: &UnitMap, proofs: &[Value], unit_fees: &[UnitFee]) -> usize {
+        estimate_parked_spend_tag_bytes(
+            total,
+            &json!({ "proof_of_deposit": proofs }),
+            &action_hash(0xAA),
+            &[],
+            unit_fees,
+        )
+        .expect("spend tag estimation must succeed")
+    }
+
+    #[test]
+    fn widest_fees_owed_covers_every_charged_unit_at_the_longest_amount_zfuel_prints() {
+        let widest = widest_fees_owed(&[unit_fee(0, "100"), unit_fee(7, "250.5")]);
+        let expected = UnitMap::load(
+            [
+                ("0".to_string(), widest_amount()),
+                ("7".to_string(), widest_amount()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(widest, expected);
+        assert_eq!(widest_amount().to_string(), "-9223372036854.775808");
+    }
+
+    #[test]
+    fn widest_fees_owed_ignores_everything_that_only_narrows_a_charge() {
+        let plain = unit_fee(0, "100");
+        let mut narrowed = unit_fee(0, "999999");
+        narrowed.fee_cap = Some("1".parse().unwrap());
+        narrowed.exempt_agents = vec![AgentPubKey::from_raw_32(vec![1u8; 32]).into()];
+
+        assert_eq!(widest_fees_owed(&[plain]), widest_fees_owed(&[narrowed]));
+    }
+
+    #[test]
+    fn spend_tag_estimate_matches_the_zome_link_tag_encoder() {
+        // Nothing but this assertion holds the estimate and the real tag to the
+        // same encoding across a rave_engine bump.
+        let total = UnitMap::from(vec![(1_u32, "10")]);
+        let payload = json!({ "proof_of_deposit": [{ "tx_hash": "0x01" }] });
+        let gd = action_hash(0xAA);
+        let lanes = [action_hash(0xB1), action_hash(0xB2)];
+        let fees = [unit_fee(0, "100"), unit_fee(1, "250.5")];
+
+        let placeholder = parked_spend_placeholder(&total, &payload, &gd, &lanes, &fees);
+        let tag = ParkedLinkType::ParkedSpendBalance(placeholder)
+            .link_tag()
+            .expect("the zome encoder must accept the placeholder");
+
+        assert_eq!(
+            estimate_parked_spend_tag_bytes(&total, &payload, &gd, &lanes, &fees).unwrap(),
+            tag.0.len()
+        );
+    }
+
+    #[test]
+    fn spend_tag_estimate_costs_a_fixed_width_per_charged_unit() {
+        let total = UnitMap::from(vec![(1_u32, "10")]);
+        let proofs = vec![json!({ "tx_hash": "0x01" })];
+
+        // One msgpack map entry: a one-character fixstr key and the 21-character
+        // fixstr `widest_amount` renders to, each with its one-byte header.
+        let per_unit = 2 + 22;
+        let uncharged = spend_estimate(&total, &proofs, &[]);
+        let one = spend_estimate(&total, &proofs, &[unit_fee(0, "100")]);
+        let three = spend_estimate(
+            &total,
+            &proofs,
+            &[
+                unit_fee(0, "100"),
+                unit_fee(1, "250.5"),
+                unit_fee(2, "1000"),
+            ],
+        );
+
+        assert_eq!(one - uncharged, per_unit);
+        assert_eq!(three - uncharged, 3 * per_unit);
+    }
+
+    #[test]
+    fn spend_batch_packs_to_the_cap_and_defers_the_proof_that_would_cross_it() {
+        let orch = test_orchestrator("spend-batch-cap");
+        let id_a = enqueue_lock(&orch, "lock:cap:a", "0xc1");
+        enqueue_lock(&orch, "lock:cap:b", "0xc2");
+        let rows = pending_rows(&orch);
+        assert_eq!(rows.len(), 2, "both rows must be pending");
+
+        let gd = action_hash(0xAA);
+        let fees = [unit_fee(0, "100"), unit_fee(1, "250.5")];
+
+        let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
+        let (proof_b, amount_b) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let both = accumulate_amounts(&[amount_a, amount_b]).unwrap();
+        let both_bytes = spend_estimate(&both, &[proof_a, proof_b], &fees);
+
+        let exact = orch
+            .build_spend_batch(&rows, both_bytes, &gd, &[], &fees)
+            .unwrap();
+        assert_eq!(exact.ids.len(), 2, "a tag of exactly the cap still fits");
+        assert!(!exact.capped);
+        assert_eq!(exact.tag_bytes, both_bytes);
+
+        let short = orch
+            .build_spend_batch(&rows, both_bytes - 1, &gd, &[], &fees)
+            .unwrap();
+        assert_eq!(
+            short.ids,
+            vec![id_a],
+            "one byte over the cap defers the crossing proof, head order preserved"
+        );
+        assert!(short.capped);
+
+        let wider = orch
+            .build_spend_batch(
+                &rows,
+                both_bytes,
+                &gd,
+                &[],
+                &[fees[0].clone(), fees[1].clone(), unit_fee(2, "9999.999999")],
+            )
+            .unwrap();
+        assert_eq!(
+            wider.ids,
+            vec![id_a],
+            "a network charging one more unit defers a proof at the same cap"
+        );
+        assert!(wider.capped);
+
+        assert_eq!(
+            pending_rows(&orch).len(),
+            2,
+            "a deferred proof stays pending for the next cycle, it is never failed"
+        );
+    }
+
+    #[test]
+    fn spend_batch_permanently_fails_a_proof_that_cannot_fit_alone() {
+        let orch = test_orchestrator("spend-batch-oversized");
+        let id_a = enqueue_lock(&orch, "lock:over:a", "0xd1");
+        let id_b = enqueue_lock(&orch, "lock:over:b", "0xd2");
+        let rows = pending_rows(&orch);
+
+        let gd = action_hash(0xAA);
+        let fees = [unit_fee(0, "100")];
+        let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
+        let single_bytes = spend_estimate(&amount_a, &[proof_a], &fees);
+
+        let batch = orch
+            .build_spend_batch(&rows, single_bytes - 1, &gd, &[], &fees)
+            .unwrap();
+        assert!(batch.ids.is_empty(), "no proof fits under the cap");
+        assert!(
+            !batch.capped,
+            "a row that cannot fit alone is failed, not deferred"
+        );
+
+        let failed = orch
+            .db
+            .list_work_items("lock", crate::state::WorkState::Failed, 100)
+            .unwrap();
+        assert_eq!(
+            failed.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![id_a, id_b],
+            "every row that cannot fit alone is failed"
+        );
+        let row = &failed[0];
+        assert_eq!(row.error_class.as_deref(), Some("permanent"));
+        let error = row.last_error.clone().unwrap();
+        assert!(
+            error.contains(&single_bytes.to_string())
+                && error.contains(&(single_bytes - 1).to_string()),
+            "the operator needs the size and the cap: {error}"
+        );
+
+        // One oversized proof must not cost the rows behind it.
+        let orch = test_orchestrator("spend-batch-oversized-tail");
+        enqueue_lock(&orch, &format!("lock:{}", "x".repeat(400)), "0xd3");
+        let id_tail = enqueue_lock(&orch, "lock:tail:b", "0xd4");
+        let rows = pending_rows(&orch);
+        let batch = orch
+            .build_spend_batch(&rows, single_bytes, &gd, &[], &fees)
+            .unwrap();
+        assert_eq!(
+            batch.ids,
+            vec![id_tail],
+            "the proof behind an oversized one is still packed"
+        );
+    }
+
+    #[test]
+    fn global_definition_decodes_with_per_unit_fees() {
+        // The shape `get_current_global_definition` returns. Decoding it against
+        // the 0.9.0 scalar-and-percentage fee took every bridge cycle down.
+        let hash = ActionHashB64::from(action_hash(1)).to_string();
+        let agent = AgentPubKeyB64::from(AgentPubKey::from_raw_32(vec![2u8; 32])).to_string();
+        let global_definition: GlobalDefinitionExt = serde_json::from_value(json!({
+            "id": hash,
+            "lane_def": {
+                "effective_start_date": 0,
+                "expiration_date": 9_223_372_036_854_775_807i64,
+                "special_agents": {
+                    "bridging_agent": { "pub_key": agent, "address_book_data": null }
+                },
+                "rave_agreements": {
+                    "credit_limit_adjustment": hash,
+                    "bridging_agreement": hash,
+                    "proof_of_service": hash
+                }
+            },
+            "oracles": { "pricing_oracle": null },
+            "system_rave_agreements": {
+                "compute_credit_limit": hash,
+                "compute_transaction_fee": {
+                    "agreement": hash,
+                    "unit_fees": [{
+                        "unit_definition": hash,
+                        "unit_index": 1,
+                        "spender_pay_percent": { "numerator": 1, "denominator": 100 },
+                        "fee_cap": "5",
+                        "fee_trigger": "100",
+                        "exempt_agents": []
+                    }]
+                }
+            },
+            "migration": {
+                "closing_notaries": [],
+                "closing_threshold": 0,
+                "upgrade_targets": [],
+                "opening_predecessors": []
+            }
+        }))
+        .expect("a per-unit-fee global definition must decode");
+
+        let unit_fees = &global_definition
+            .system_rave_agreements
+            .compute_transaction_fee
+            .unit_fees;
+        assert_eq!(unit_fees.len(), 1);
+        assert_eq!(unit_fees[0].index_key(), "1");
+        assert_eq!(
+            widest_fees_owed(unit_fees).get_unit_indexes(),
+            vec!["1".to_string()]
         );
     }
 
@@ -2292,10 +2590,6 @@ mod tests {
         // would have NULL cl_link_hash and the reconciler's S2 probe
         // (cl_link_hash no longer live → advance) could never fire
         // for it.
-        //
-        // This test locks in the invariant against future refactors
-        // by simulating exactly what the cycle does after a
-        // successful batched call.
         let orch = test_orchestrator("batched-cl-attribution");
         let id_a = enqueue_lock(&orch, "lock:batched:a", "0xb1");
         let id_b = enqueue_lock(&orch, "lock:batched:b", "0xb2");
@@ -2319,9 +2613,6 @@ mod tests {
         assert!(batch.ids.contains(&id_b));
         assert!(batch.ids.contains(&id_c));
 
-        // Simulate the "successful batched call" side of the cycle:
-        // every id in `batch.ids` is advanced with the shared audit
-        // hash returned by `create_parked_link`.
         let shared_hash = "uhCkkSHARED";
         for id in &batch.ids {
             orch.db
