@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- bridge-orchestrator decodes a global definition carrying rave_engine 0.10.0's per-unit `unit_fees`, and sizes the parked-spend link tag from the widest fee map the zome can write back rather than from a zero.
+- **bridge-orchestrator reads a network that states fees per unit, and stops under-measuring a batch of proofs.** A per-unit fee configuration made every bridge cycle fail at its first call. Separately, the parked-spend link tag was measured with no fees in it at all, so a batch could be packed that Holochain then refused, failing every proof in it and stranding those deposits after eight attempts. The measurement is now taken from the widest fee map the zome can write, and is checked against the code that builds the real tag.
 - bridge-orchestrator cools down on a cycle error that matches no ham classifier, instead of hot-looping.
 - bridge-orchestrator builds with pure-Rust TLS (`alloy` on `reqwest-rustls-tls`), keeping the host's OpenSSL off the TLS path. 0.7's vendored `openssl-sys` (sqlcipher) means the build host needs a C toolchain, perl and make.
 - `test_config` test helper now initialises the `conductor_config` / `lair_passphrase_file` fields added by the lair-signing change.
