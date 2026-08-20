@@ -635,7 +635,7 @@ impl BridgeOrchestrator {
             for id in &s1_batch.ids {
                 self.db.mark_in_flight(*id)?;
             }
-            let total_cl = accumulate_amounts(&s1_batch.amounts)?;
+            let total_cl = UnitMap::sum_vec(s1_batch.amounts.clone())?;
             let parked_data = ParkedData {
                 ct_role_id: "oracle".to_string(),
                 amount: Some(total_cl.clone()),
@@ -790,7 +790,7 @@ impl BridgeOrchestrator {
         let s3_attempted = !s3_batch.ids.is_empty();
         let mut s3_written = 0usize;
         if s3_attempted {
-            let total_spend = accumulate_amounts(&s3_batch.amounts)?;
+            let total_spend = UnitMap::sum_vec(s3_batch.amounts.clone())?;
             if !total_spend.is_zero() {
                 for id in &s3_batch.ids {
                     self.db.mark_in_flight(*id)?;
@@ -1233,7 +1233,7 @@ impl BridgeOrchestrator {
             let mut tentative_amounts = out.amounts.clone();
             tentative_amounts.push(amount.clone());
 
-            let total = accumulate_amounts(&tentative_amounts)?;
+            let total = UnitMap::sum_vec(tentative_amounts.clone())?;
             let payload = json!({ "proof_of_deposit": &tentative_proofs });
             let tag_bytes = match estimate_parked_data_tag_bytes(&total, &payload) {
                 Ok(n) => n,
@@ -1330,7 +1330,7 @@ impl BridgeOrchestrator {
             let mut tentative_amounts = out.amounts.clone();
             tentative_amounts.push(amount.clone());
 
-            let total = accumulate_amounts(&tentative_amounts)?;
+            let total = UnitMap::sum_vec(tentative_amounts.clone())?;
             let payload = json!({ "proof_of_deposit": &tentative_proofs });
             let tag_bytes = match estimate_parked_spend_tag_bytes(
                 &total,
@@ -1575,14 +1575,6 @@ struct DepositContext {
     bridging_agent: holo_hash::AgentPubKeyB64,
     credit_limit_adjustment: ActionHashB64,
     bridging_agreement: ActionHashB64,
-}
-
-fn accumulate_amounts(amounts: &[UnitMap]) -> Result<UnitMap> {
-    let mut total = UnitMap::new();
-    for amount in amounts {
-        total.add(amount.clone())?;
-    }
-    Ok(total)
 }
 
 /// Truncate `links` to at most `cap` entries. Returns the (possibly
@@ -1971,7 +1963,7 @@ mod tests {
             UnitMap::from(vec![(1_u32, "10")]),
             UnitMap::from(vec![(1_u32, "15")]),
         ];
-        let total = accumulate_amounts(&amounts).expect("amount accumulation should succeed");
+        let total = UnitMap::sum_vec(amounts).expect("amount accumulation should succeed");
         assert_eq!(
             total.get("1").map(|v| v.to_string()),
             Some("25".to_string())
@@ -2094,7 +2086,7 @@ mod tests {
 
         let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
         let (proof_b, amount_b) = orch.extract_lock_proof(&rows[1]).unwrap();
-        let both = accumulate_amounts(&[amount_a, amount_b]).unwrap();
+        let both = UnitMap::sum_vec(vec![amount_a, amount_b]).unwrap();
         let both_bytes = spend_estimate(&both, &[proof_a, proof_b], &fees);
 
         let exact = orch
