@@ -72,11 +72,12 @@ pub struct Config {
     /// at this cap and log severity escalates from `warn!` to `error!` so
     /// operators can alert. The first fully-clean cycle resets the counter.
     pub ham_pressure_cooldown_max_ms: u64,
-    /// If a write-bearing zome call inside `run_bridge_cycle` takes longer
+    /// If a measured zome call inside `run_bridge_cycle` takes longer
     /// than this many milliseconds, the orchestrator ejects the rest of the
     /// cycle instead of stacking more pressure on a slow conductor. The
-    /// reconciler advances the skipped stages next cycle. Set to `0` to
-    /// disable stage-ejection entirely.
+    /// measured calls are each stage's write and the ledger read that sizes
+    /// the spend tag, so a slow read ends a cycle before anything is
+    /// written. Set to `0` to disable stage-ejection entirely.
     pub slow_call_threshold_ms: u128,
     /// Optional per-cycle cap on the number of parked links fed into an
     /// `execute_rave` call. Applied independently to the S2 credit-limit

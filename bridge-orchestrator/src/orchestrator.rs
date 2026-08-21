@@ -106,28 +106,45 @@ impl BridgeOrchestrator {
         self.cfg.bridge_cycle_interval_ms.saturating_mul(3)
     }
 
-    /// Returns `true` when the last write-bearing zome call was slow
-    /// enough that we should not stack any more source-chain pressure in
-    /// this cycle. Stage-ejection is disabled when the threshold is `0`.
+    /// Returns `true` when the last measured zome call was slow enough
+    /// that we should not stack any more source-chain pressure in this
+    /// cycle. Stage-ejection is disabled when the threshold is `0`.
     fn should_eject(&self, elapsed_ms: u128) -> bool {
         let threshold = self.cfg.slow_call_threshold_ms;
         threshold > 0 && elapsed_ms > threshold
     }
 
-    /// Emit the structured ejection warning so operators can see which
-    /// stage tripped the threshold. The reconciler will drive the
-    /// skipped stages forward on the next cycle.
-    fn log_stage_ejected(&self, stage: &str, elapsed_ms: u128) {
+    /// Emit the structured ejection warning so operators can see which call
+    /// tripped the threshold. Whatever the ejected cycle had already written
+    /// is picked up by the reconciler next cycle; the rest is simply retried.
+    fn log_stage_ejected(&self, stage: &str, fn_name: &str, elapsed_ms: u128) {
         warn!(
             event = "bridge.stage_ejected",
             stage,
+            fn_name,
             elapsed_ms = elapsed_ms as u64,
             threshold_ms = self.cfg.slow_call_threshold_ms as u64,
-            "[bridge/cycle] stage ejected — skipping remaining stages; reconciler will advance next cycle"
+            "[bridge/cycle] stage ejected, skipping remaining stages"
         );
         self.reporter.update(|h| {
             h.stage_ejections_total = h.stage_ejections_total.saturating_add(1);
         });
+    }
+
+    /// `None` means the read was slow enough to eject the stage before the
+    /// spend, the same verdict the calls around it get.
+    async fn spend_tag_ledger(
+        &self,
+        read: impl std::future::Future<Output = Result<Ledger>>,
+    ) -> Result<Option<Ledger>> {
+        let (ledger, elapsed_ms) = timed_call("s3", "get_ledger", read)
+            .await
+            .context("failed to read the bridging agent's ledger")?;
+        if self.should_eject(elapsed_ms) {
+            self.log_stage_ejected("s3", "get_ledger", elapsed_ms);
+            return Ok(None);
+        }
+        Ok(Some(ledger))
     }
 
     /// Compute the next source-chain-pressure cooldown given the
@@ -673,7 +690,7 @@ impl BridgeOrchestrator {
                 self.db.advance_to_cl_link_created(*id, &cl_link_hash)?;
             }
             if self.should_eject(s1_elapsed_ms) {
-                self.log_stage_ejected("s1", s1_elapsed_ms);
+                self.log_stage_ejected("s1", "create_parked_link", s1_elapsed_ms);
                 return Ok(());
             }
         }
@@ -767,7 +784,7 @@ impl BridgeOrchestrator {
                 cl_rave_advanced
             );
             if self.should_eject(s2_elapsed_ms) {
-                self.log_stage_ejected("s2", s2_elapsed_ms);
+                self.log_stage_ejected("s2", "execute_rave", s2_elapsed_ms);
                 return Ok(());
             }
         }
@@ -782,17 +799,25 @@ impl BridgeOrchestrator {
         let s3_rows = self
             .db
             .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?;
-        // Read on the same connection as the write, and immediately before it:
-        // the tag carries this agent's ledger as it stands when the zome reads
-        // it, and every zome call in between would move it.
         let s3_batch = if s3_rows.is_empty() {
             ProofBatch::default()
         } else {
+            // Read on the same connection as the write, and immediately before
+            // it: the tag carries this agent's ledger as it stands when the
+            // zome reads it, and every zome call in between would move it.
+            let Some(ledger) = self
+                .spend_tag_ledger(ham.call_zome(
+                    &self.cfg.role_name,
+                    "transactor",
+                    "get_ledger",
+                    &(),
+                ))
+                .await?
+            else {
+                return Ok(());
+            };
             let tag_context = SpendTagContext {
-                ledger: ham
-                    .call_zome(&self.cfg.role_name, "transactor", "get_ledger", &())
-                    .await
-                    .context("failed to read the bridging agent's ledger")?,
+                ledger,
                 global_definition: global_definition_hash.clone(),
                 lane_definitions: lane_definitions_written(&context),
                 unit_fees: global_definition
@@ -841,7 +866,7 @@ impl BridgeOrchestrator {
                 }
                 s3_written = s3_batch.ids.len();
                 if self.should_eject(s3_elapsed_ms) {
-                    self.log_stage_ejected("s3", s3_elapsed_ms);
+                    self.log_stage_ejected("s3", "create_parked_spend", s3_elapsed_ms);
                     return Ok(());
                 }
             } else {
@@ -1847,7 +1872,7 @@ where
             stage,
             fn_name,
             elapsed_ms = elapsed_ms as u64,
-            error = %e,
+            error = %format!("{e:#}"),
             "zome call failed"
         ),
     }
@@ -3280,27 +3305,10 @@ mod tests {
 
     // -----------------------------------------------------------------
     // Deadline-elapsed mitigation tests
-    //
-    // These pin down the three primitives used by the cycle loop's
-    // source-chain-pressure handling:
-    //   * `timed_call` — always reports elapsed_ms and preserves the
-    //     result type through the wrapper;
-    //   * `pressure_cooldown_ms` — doubles from `base` up to `cap` and
-    //     never exceeds the cap (the progression ops will see with
-    //     defaults 30s → 60s → 90s → 90s …);
-    //   * `pressure_severity` — attempts 1..=3 stay at `Warn`, and the
-    //     severity flips to `Stuck` only once the cooldown is at the
-    //     cap AND we've been stuck there for more than one cycle;
-    //   * `should_eject` — honours the `slow_call_threshold_ms=0`
-    //     disable switch and the strict `>` comparison.
     // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn timed_call_propagates_ok_result_with_elapsed_ms() {
-        // Sanity: on a successful future the wrapper returns the inner
-        // value unchanged and a non-zero elapsed measurement. We use
-        // a short sleep to guarantee elapsed_ms > 0 without making the
-        // test flaky.
         let (value, elapsed_ms) = timed_call("test", "noop", async {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             Ok::<_, anyhow::Error>(42u32)
@@ -3317,9 +3325,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_call_propagates_err_without_panicking() {
-        // On error the wrapper still must not panic and must return
-        // the original error unchanged. We don't assert on elapsed
-        // here because the error path doesn't return it.
+        // The error path returns no elapsed to assert on.
         let result: Result<(u32, u128)> = timed_call("test", "boom", async {
             Err::<u32, _>(anyhow::anyhow!("kaboom"))
         })
@@ -3329,6 +3335,56 @@ mod tests {
             format!("{}", result.unwrap_err()).contains("kaboom"),
             "error should be propagated unchanged"
         );
+    }
+
+    fn stage_ejections(orch: &BridgeOrchestrator) -> u32 {
+        let mut total = None;
+        orch.reporter
+            .update(|h| total = Some(h.stage_ejections_total));
+        total.expect("reporter state was contended")
+    }
+
+    #[tokio::test]
+    async fn spend_tag_ledger_ejects_a_slow_read_before_the_spend() {
+        let mut orch = test_orchestrator("spend-tag-ledger-slow");
+        orch.cfg.slow_call_threshold_ms = 5;
+        let ledger = orch
+            .spend_tag_ledger(async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Ok(Ledger::empty())
+            })
+            .await
+            .expect("a slow read ejects the stage rather than failing the cycle");
+        assert!(ledger.is_none());
+        assert_eq!(stage_ejections(&orch), 1);
+    }
+
+    #[tokio::test]
+    async fn spend_tag_ledger_returns_a_prompt_read() {
+        let mut orch = test_orchestrator("spend-tag-ledger-prompt");
+        orch.cfg.slow_call_threshold_ms = 15_000;
+        let read = Ledger::new(vec![(1, "5")], vec![], vec![(2, "1")], vec![]);
+        let ledger = orch
+            .spend_tag_ledger({
+                let read = read.clone();
+                async move { Ok(read) }
+            })
+            .await
+            .expect("a prompt read is the ledger the tag is sized from");
+        assert_eq!(ledger, Some(read));
+        assert_eq!(stage_ejections(&orch), 0);
+    }
+
+    #[tokio::test]
+    async fn spend_tag_ledger_propagates_a_failed_read() {
+        let orch = test_orchestrator("spend-tag-ledger-failed");
+        let err = orch
+            .spend_tag_ledger(async { Err::<Ledger, _>(anyhow::anyhow!("conductor gone")) })
+            .await
+            .expect_err("a failed read is the cycle's error, not an empty ledger");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("failed to read the bridging agent's ledger"));
+        assert!(chain.contains("conductor gone"));
     }
 
     #[test]
