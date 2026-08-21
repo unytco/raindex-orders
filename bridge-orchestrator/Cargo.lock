@@ -4301,9 +4301,9 @@ dependencies = [
 
 [[package]]
 name = "rave_engine"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27cb690d0ccfe1fdd31e28893d2da62cdceed9d8e87fba52d7c6b197881073ec"
+checksum = "235c1382a21ad2aac692991172e4dbe377fc49d16bf58d85bc30ee17701d6a87"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -6673,9 +6673,9 @@ dependencies = [
 
 [[package]]
 name = "zfuel"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d909cb587cca4f18aebba81e00c4b08a01bd5baa0245ddea9fe3cc2a286aa829"
+checksum = "9f4b5e891e58f89725ca0fbd2cab87a60fe44ec46b7621acc934840c3fd23d97"
 dependencies = [
  "holochain_wasmer_common",
  "lazy_static",

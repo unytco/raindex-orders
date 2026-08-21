@@ -31,9 +31,6 @@ pub struct Config {
     pub confirmations: u64,
     pub poll_interval_ms: u64,
     pub bridge_cycle_interval_ms: u64,
-    /// Maximum size (in bytes) for a single Holochain link tag.
-    /// Holochain's protocol MAX_TAG_SIZE is 1000; we default to 800 to leave
-    /// headroom for future overhead.
     pub max_link_tag_bytes: usize,
     /// Target size (in bytes) for the aggregated withdrawal coupons map carried
     /// inside `execute_rave` executor_inputs (not a link tag, so not bound by
@@ -75,11 +72,12 @@ pub struct Config {
     /// at this cap and log severity escalates from `warn!` to `error!` so
     /// operators can alert. The first fully-clean cycle resets the counter.
     pub ham_pressure_cooldown_max_ms: u64,
-    /// If a write-bearing zome call inside `run_bridge_cycle` takes longer
+    /// If a measured zome call inside `run_bridge_cycle` takes longer
     /// than this many milliseconds, the orchestrator ejects the rest of the
     /// cycle instead of stacking more pressure on a slow conductor. The
-    /// reconciler advances the skipped stages next cycle. Set to `0` to
-    /// disable stage-ejection entirely.
+    /// measured calls are each stage's write and the ledger read that sizes
+    /// the spend tag, so a slow read ends a cycle before anything is
+    /// written. Set to `0` to disable stage-ejection entirely.
     pub slow_call_threshold_ms: u128,
     /// Optional per-cycle cap on the number of parked links fed into an
     /// `execute_rave` call. Applied independently to the S2 credit-limit
@@ -199,10 +197,12 @@ impl Config {
                 "DEPOSIT_BATCH_TARGET_KB is deprecated and has no effect; use MAX_LINK_TAG_BYTES (link tag cap, default 800) and COUPONS_TARGET_KB (withdrawal coupons aggregate size, default 512 KB) instead"
             );
         }
-        let max_link_tag_bytes = env::var("MAX_LINK_TAG_BYTES")
-            .unwrap_or_else(|_| "800".into())
-            .parse()
-            .context("Invalid MAX_LINK_TAG_BYTES")?;
+        let max_link_tag_bytes = capped_link_tag_bytes(
+            env::var("MAX_LINK_TAG_BYTES")
+                .unwrap_or_else(|_| LINK_TAG_BYTES_DEFAULT.to_string())
+                .parse()
+                .context("Invalid MAX_LINK_TAG_BYTES")?,
+        );
         let coupons_target_kb: u64 = env::var("COUPONS_TARGET_KB")
             .unwrap_or_else(|_| "512".into())
             .parse()
@@ -448,6 +448,29 @@ impl WatchtowerReporterConfig {
     }
 }
 
+pub(crate) const LINK_TAG_BYTES_DEFAULT: usize = 800;
+
+/// Holochain refuses a link tag over its own MAX_TAG_SIZE of 1000. The last 100
+/// bytes are left to no configuration at all: they cover the agent's ledger
+/// moving between the cycle reading it and the zome writing it, which is the
+/// one part of a tag's size the estimate cannot see.
+pub(crate) const LINK_TAG_BYTES_CEILING: usize = 900;
+const _: () = assert!(LINK_TAG_BYTES_CEILING < 1000);
+
+/// A tag holds a deposit proof, the agent's ledger and the network's lanes, and
+/// the smallest of those measured on its own is over 400 bytes. A cap under
+/// this is a typo, not a policy, and it would hold back every deposit.
+const LINK_TAG_BYTES_FLOOR: usize = 600;
+
+fn capped_link_tag_bytes(configured: usize) -> usize {
+    if !(LINK_TAG_BYTES_FLOOR..=LINK_TAG_BYTES_CEILING).contains(&configured) {
+        tracing::warn!(
+            "MAX_LINK_TAG_BYTES={configured} is outside {LINK_TAG_BYTES_FLOOR}..={LINK_TAG_BYTES_CEILING}, using the nearer bound"
+        );
+    }
+    configured.clamp(LINK_TAG_BYTES_FLOOR, LINK_TAG_BYTES_CEILING)
+}
+
 /// Strip a single leading `u` multibase prefix (base64url) so the reporter's
 /// stored DNA matches the 52-char form the Holochain observer uses across
 /// the rest of the Watchtower schema. Both forms encode the same hash;
@@ -460,6 +483,27 @@ fn normalize_dna_b64(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_tag_bytes_cannot_be_raised_above_the_ceiling() {
+        assert_eq!(capped_link_tag_bytes(1000), LINK_TAG_BYTES_CEILING);
+        assert_eq!(
+            capped_link_tag_bytes(LINK_TAG_BYTES_CEILING + 1),
+            LINK_TAG_BYTES_CEILING
+        );
+        assert_eq!(capped_link_tag_bytes(LINK_TAG_BYTES_DEFAULT), 800);
+        assert_eq!(capped_link_tag_bytes(700), 700);
+    }
+
+    #[test]
+    fn link_tag_bytes_cannot_be_lowered_below_a_single_proof() {
+        assert_eq!(capped_link_tag_bytes(0), LINK_TAG_BYTES_FLOOR);
+        assert_eq!(capped_link_tag_bytes(80), LINK_TAG_BYTES_FLOOR);
+        assert_eq!(
+            capped_link_tag_bytes(LINK_TAG_BYTES_FLOOR - 1),
+            LINK_TAG_BYTES_FLOOR
+        );
+    }
 
     #[test]
     fn normalize_dna_b64_strips_leading_u() {
