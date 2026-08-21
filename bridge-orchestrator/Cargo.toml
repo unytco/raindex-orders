@@ -32,11 +32,8 @@ hmac = "0.12"
 holo_hash = { version = "0.7.0", features = ["encoding"] }
 holochain_client = "0.9.0"
 holochain_zome_types = "0.7.0"
-# Exact, not caret: these two define the on-chain type shapes this binary decodes.
-# On a 0.x crate a caret range still takes patch releases, and this family ships
-# serialization changes in them: zfuel 0.9.1 over 0.9.0 is the serde derives on
-# `Fraction` that `UnitFee.spender_pay_percent` needs to encode at all. Such a
-# release arrives on a routine `cargo update` and only fails against a conductor.
+# Exact, not caret: these define on-chain type shapes, and this family ships
+# serialization changes in patch releases.
 rave_engine = "=0.10.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmp-serde = "1.1"
