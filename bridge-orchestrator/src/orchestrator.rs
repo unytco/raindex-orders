@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, LINK_TAG_BYTES_CEILING};
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{generate_coupon, signer_context_from_env};
 use crate::state::{StateStore, WorkItem, WorkStep};
@@ -11,7 +11,7 @@ use ham::{
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use holochain_zome_types::prelude::GetStrategy;
 use rave_engine::types::{
-    CarryForwardUnits, CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, LaneExt,
+    CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, LaneExt, Ledger,
     ParkedData, ParkedLinkType, ParkedSpendData, RAVEExecuteInputs, Transaction,
     TransactionDetails, UnitFee, UnitMap, RAVE,
 };
@@ -21,6 +21,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use zfuel::fuel::ZFuel;
+
+const BRIDGING_AGENT_ROLE: &str = "bridging_agent";
+const ORACLE_ROLE: &str = "oracle";
 
 pub struct BridgeOrchestrator {
     cfg: Config,
@@ -303,8 +306,11 @@ impl BridgeOrchestrator {
                                 }
                             }
                             Err(e) => {
-                                error!("[bridge] cycle failed: {}", e);
-                                let err_str = e.to_string();
+                                // `{:#}` and not `{}`: an `anyhow` chain prints
+                                // only its outermost context otherwise, which
+                                // here is our wording, not the conductor's.
+                                let err_str = format!("{e:#}");
+                                error!("[bridge] cycle failed: {}", err_str);
                                 self.reporter.update(|h| {
                                     h.last_cycle_finished_at_ms = Some(Self::now_ms());
                                     h.consecutive_failed_cycles =
@@ -313,7 +319,7 @@ impl BridgeOrchestrator {
                                     h.last_error_at_ms = Some(Self::now_ms());
                                 });
                                 if let Err(reset_err) =
-                                    self.db.reset_in_flight_to_queued("lock", &e.to_string())
+                                    self.db.reset_in_flight_to_queued("lock", &err_str)
                                 {
                                     error!(
                                         "[bridge] failed to reset in_flight locks: {}",
@@ -322,7 +328,7 @@ impl BridgeOrchestrator {
                                 }
                                 match classify_cycle_failure(&e) {
                                     CycleFailureAction::Reconnect => {
-                                        warn!(event = "ham.disconnected", error = %e);
+                                        warn!(event = "ham.disconnected", error = %err_str);
                                         // A lost socket is neither cooldown class, so drop
                                         // whichever one an earlier cycle published: it would
                                         // otherwise outlive its condition and — since the
@@ -389,27 +395,27 @@ impl BridgeOrchestrator {
                                                 event = "ham.request_timeout_stuck",
                                                 attempt = pressure_consecutive,
                                                 cooldown_ms,
-                                                error = %e,
+                                                error = %err_str,
                                                 "[bridge] ham per-request timeout persists; root cause is upstream of the orchestrator"
                                             ),
                                             (true, PressureSeverity::Warn) => warn!(
                                                 event = "ham.request_timeout",
                                                 attempt = pressure_consecutive,
                                                 cooldown_ms,
-                                                error = %e,
+                                                error = %err_str,
                                             ),
                                             (false, PressureSeverity::Stuck) => error!(
                                                 event = "ham.source_chain_pressure_stuck",
                                                 attempt = pressure_consecutive,
                                                 cooldown_ms,
-                                                error = %e,
+                                                error = %err_str,
                                                 "[bridge] conductor source-chain pressure persists; check Holochain conductor health"
                                             ),
                                             (false, PressureSeverity::Warn) => warn!(
                                                 event = "ham.source_chain_pressure",
                                                 attempt = pressure_consecutive,
                                                 cooldown_ms,
-                                                error = %e,
+                                                error = %err_str,
                                             ),
                                         }
                                         self.reporter.update(|h| {
@@ -439,14 +445,14 @@ impl BridgeOrchestrator {
                                                 event = "ham.unclassified_error_stuck",
                                                 attempt = unclassified_consecutive,
                                                 cooldown_ms,
-                                                error = %e,
+                                                error = %err_str,
                                                 "[bridge] cycle keeps failing with errors matching no ham classifier; investigate — not a known transport or backpressure failure"
                                             ),
                                             PressureSeverity::Warn => warn!(
                                                 event = "ham.unclassified_error",
                                                 attempt = unclassified_consecutive,
                                                 cooldown_ms,
-                                                error = %e,
+                                                error = %err_str,
                                                 "[bridge] cycle failed with an error matching no ham classifier; cooling down before retry"
                                             ),
                                         }
@@ -636,11 +642,10 @@ impl BridgeOrchestrator {
                 self.db.mark_in_flight(*id)?;
             }
             let total_cl = UnitMap::sum_vec(s1_batch.amounts.clone())?;
-            let parked_data = ParkedData {
-                ct_role_id: "oracle".to_string(),
-                amount: Some(total_cl.clone()),
-                payload: json!({ "proof_of_deposit": s1_batch.proofs.clone() }),
-            };
+            let parked_data = parked_data(
+                &total_cl,
+                &json!({ "proof_of_deposit": s1_batch.proofs.clone() }),
+            );
             let (link_result, s1_elapsed_ms): ((ActionHashB64, AgentPubKey), u128) = timed_call(
                 "s1",
                 "create_parked_link",
@@ -777,16 +782,27 @@ impl BridgeOrchestrator {
         let s3_rows = self
             .db
             .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?;
-        let s3_batch = self.build_spend_batch(
-            &s3_rows,
-            tag_cap,
-            &global_definition_hash,
-            &context.lane_definitions,
-            &global_definition
-                .system_rave_agreements
-                .compute_transaction_fee
-                .unit_fees,
-        )?;
+        // Read on the same connection as the write, and immediately before it:
+        // the tag carries this agent's ledger as it stands when the zome reads
+        // it, and every zome call in between would move it.
+        let s3_batch = if s3_rows.is_empty() {
+            ProofBatch::default()
+        } else {
+            let tag_context = SpendTagContext {
+                ledger: ham
+                    .call_zome(&self.cfg.role_name, "transactor", "get_ledger", &())
+                    .await
+                    .context("failed to read the bridging agent's ledger")?,
+                global_definition: global_definition_hash.clone(),
+                lane_definitions: lane_definitions_written(&context),
+                unit_fees: global_definition
+                    .system_rave_agreements
+                    .compute_transaction_fee
+                    .unit_fees
+                    .clone(),
+            };
+            self.build_spend_batch(&s3_rows, tag_cap, &tag_context)?
+        };
         let s3_attempted = !s3_batch.ids.is_empty();
         let mut s3_written = 0usize;
         if s3_attempted {
@@ -805,7 +821,7 @@ impl BridgeOrchestrator {
                         &CreateParkedSpendInput {
                             ea_id: bridging_ea_id.clone(),
                             executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
-                            ct_role_id: Some("bridging_agent".to_string()),
+                            ct_role_id: Some(BRIDGING_AGENT_ROLE.to_string()),
                             amount: total_spend.clone(),
                             spender_payload: json!({
                                 "proof_of_deposit": s3_batch.proofs.clone(),
@@ -1202,17 +1218,17 @@ impl BridgeOrchestrator {
     }
 
     /// Build the S1 `create_parked_link` batch from rows at `step='new'`,
-    /// respecting the link-tag cap. Rows that cannot be processed (bad
-    /// payload, encoder failure, single-proof oversize) are marked
-    /// permanently failed and excluded.
+    /// respecting the link-tag cap. A row whose payload cannot be read,
+    /// encoded, or written at any cap is marked permanently failed and
+    /// excluded; a row the cap alone cannot take waits for the next cycle.
     fn build_cl_batch(&self, rows: &[WorkItem], tag_cap: usize) -> Result<ProofBatch> {
         let mut out = ProofBatch::default();
         for item in rows {
             let (proof, amount) = match self.extract_lock_proof(item) {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!(
-                        "[bridge/s1] proof extraction failed id={} error={}, marking failed",
+                    error!(
+                        "[bridge/s1] proof extraction failed id={} error={}, abandoning the deposit",
                         item.item_id, e
                     );
                     if let Err(db_err) = self
@@ -1238,8 +1254,8 @@ impl BridgeOrchestrator {
             let tag_bytes = match estimate_parked_data_tag_bytes(&total, &payload) {
                 Ok(n) => n,
                 Err(e) => {
-                    warn!(
-                        "[bridge/s1] failed to estimate cl tag size id={} error={}, marking failed",
+                    error!(
+                        "[bridge/s1] failed to estimate cl tag size id={} error={}, abandoning the deposit",
                         item.item_id, e
                     );
                     if let Err(db_err) = self.db.mark_failed_permanent(
@@ -1256,32 +1272,31 @@ impl BridgeOrchestrator {
             };
 
             if tag_bytes > tag_cap {
-                if out.ids.is_empty() {
-                    warn!(
-                        "[bridge/s1] single proof exceeds link tag cap (size={} > cap={}), marking lock id={} failed",
-                        tag_bytes, tag_cap, item.item_id
+                if !out.ids.is_empty() {
+                    info!(
+                        "[bridge/s1] batch cap reached size={} next_tag={} cap={}",
+                        out.ids.len(),
+                        tag_bytes,
+                        tag_cap
                     );
-                    if let Err(db_err) = self.db.mark_failed_permanent(
-                        item.id,
-                        &format!(
-                            "proof exceeds max_link_tag_bytes (size={tag_bytes}, cap={tag_cap})"
-                        ),
-                    ) {
-                        error!(
-                            "[bridge] failed to mark lock {} failed: {}",
-                            item.id, db_err
-                        );
-                    }
-                    continue;
+                    out.capped = true;
+                    break;
                 }
-                info!(
-                    "[bridge/s1] batch cap reached size={} next_tag={} cap={}",
-                    out.ids.len(),
-                    tag_bytes,
-                    tag_cap
-                );
-                out.capped = true;
-                break;
+                // Nothing but this row is in the tag yet, and a CL tag carries
+                // nothing of the network's, so this is the payload on its own.
+                match self.resolve_unfittable_head("s1", item, tag_cap, tag_bytes) {
+                    UnfittableHead::Deferred => {
+                        if !out.capped {
+                            error!(
+                                "[bridge/s1] nothing fits under the cap: proof id={} measures {} against cap={}, every row waits for the next cycle",
+                                item.item_id, tag_bytes, tag_cap
+                            );
+                        }
+                        out.capped = true;
+                        continue;
+                    }
+                    UnfittableHead::Abandoned => continue,
+                }
             }
 
             out.ids.push(item.id);
@@ -1294,22 +1309,21 @@ impl BridgeOrchestrator {
 
     /// Build the S3 `create_parked_spend` batch from rows at
     /// `step='cl_rave_executed'`, respecting the link-tag cap. Same
-    /// failure handling as [`build_cl_batch`].
+    /// failure handling as [`build_cl_batch`], with the agent's ledger in the
+    /// measurement.
     fn build_spend_batch(
         &self,
         rows: &[WorkItem],
         tag_cap: usize,
-        global_definition_hash: &ActionHash,
-        lane_definitions: &[ActionHash],
-        unit_fees: &[UnitFee],
+        tag_context: &SpendTagContext,
     ) -> Result<ProofBatch> {
         let mut out = ProofBatch::default();
         for item in rows {
             let (proof, amount) = match self.extract_lock_proof(item) {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!(
-                        "[bridge/s3] proof extraction failed id={} error={}, marking failed",
+                    error!(
+                        "[bridge/s3] proof extraction failed id={} error={}, abandoning the deposit",
                         item.item_id, e
                     );
                     if let Err(db_err) = self
@@ -1332,17 +1346,11 @@ impl BridgeOrchestrator {
 
             let total = UnitMap::sum_vec(tentative_amounts.clone())?;
             let payload = json!({ "proof_of_deposit": &tentative_proofs });
-            let tag_bytes = match estimate_parked_spend_tag_bytes(
-                &total,
-                &payload,
-                global_definition_hash,
-                lane_definitions,
-                unit_fees,
-            ) {
+            let tag_bytes = match tag_context.estimate_tag_bytes(&total, &payload) {
                 Ok(n) => n,
                 Err(e) => {
-                    warn!(
-                        "[bridge/s3] failed to estimate spend tag size id={} error={}, marking failed",
+                    error!(
+                        "[bridge/s3] failed to estimate spend tag size id={} error={}, abandoning the deposit",
                         item.item_id, e
                     );
                     if let Err(db_err) = self.db.mark_failed_permanent(
@@ -1359,32 +1367,39 @@ impl BridgeOrchestrator {
             };
 
             if tag_bytes > tag_cap {
-                if out.ids.is_empty() {
-                    warn!(
-                        "[bridge/s3] single proof exceeds link tag cap (size={} > cap={}), marking lock id={} failed",
-                        tag_bytes, tag_cap, item.item_id
+                if !out.ids.is_empty() {
+                    info!(
+                        "[bridge/s3] batch cap reached size={} next_tag={} cap={}",
+                        out.ids.len(),
+                        tag_bytes,
+                        tag_cap
                     );
-                    if let Err(db_err) = self.db.mark_failed_permanent(
-                        item.id,
-                        &format!(
-                            "proof exceeds max_link_tag_bytes (size={tag_bytes}, cap={tag_cap})"
-                        ),
-                    ) {
-                        error!(
-                            "[bridge] failed to mark lock {} failed: {}",
-                            item.id, db_err
-                        );
-                    }
-                    continue;
+                    out.capped = true;
+                    break;
                 }
-                info!(
-                    "[bridge/s3] batch cap reached size={} next_tag={} cap={}",
-                    out.ids.len(),
-                    tag_bytes,
-                    tag_cap
-                );
-                out.capped = true;
-                break;
+                // A payload that will not encode can never be written, so it
+                // takes the same verdict as one that is too big.
+                let alone = tag_context
+                    .payload_only()
+                    .estimate_tag_bytes(&amount, &json!({ "proof_of_deposit": [&proof] }))
+                    .unwrap_or(usize::MAX);
+                match self.resolve_unfittable_head("s3", item, tag_cap, alone) {
+                    UnfittableHead::Deferred => {
+                        if !out.capped {
+                            error!(
+                                "[bridge/s3] nothing fits under the cap: proof id={} measures {} against cap={}, of which {} is the ledger, the lanes and the charged units. Every row waits for the next cycle; the cap can be raised to at most {}",
+                                item.item_id,
+                                tag_bytes,
+                                tag_cap,
+                                tag_bytes.saturating_sub(alone),
+                                LINK_TAG_BYTES_CEILING
+                            );
+                        }
+                        out.capped = true;
+                        continue;
+                    }
+                    UnfittableHead::Abandoned => continue,
+                }
             }
 
             out.ids.push(item.id);
@@ -1393,6 +1408,39 @@ impl BridgeOrchestrator {
             out.tag_bytes = tag_bytes;
         }
         Ok(out)
+    }
+
+    /// What becomes of a proof that will not fit while the batch is still
+    /// empty. Only its own payload measuring over the ceiling is the row's
+    /// fault: the cap, the agent's ledger, the network's lanes and its charged
+    /// units all move without it, and a deposit abandoned here is never
+    /// retried.
+    fn resolve_unfittable_head(
+        &self,
+        stage: &str,
+        item: &WorkItem,
+        tag_cap: usize,
+        alone: usize,
+    ) -> UnfittableHead {
+        if alone <= LINK_TAG_BYTES_CEILING {
+            return UnfittableHead::Deferred;
+        }
+        error!(
+            "[bridge/{}] proof id={} cannot be written at any cap (size={} > ceiling={}), abandoning the deposit",
+            stage, item.item_id, alone, LINK_TAG_BYTES_CEILING
+        );
+        if let Err(db_err) = self.db.mark_failed_permanent(
+            item.id,
+            &format!(
+                "proof exceeds the link tag ceiling (size={alone}, ceiling={LINK_TAG_BYTES_CEILING}, cap={tag_cap})"
+            ),
+        ) {
+            error!(
+                "[bridge] failed to mark lock {} failed: {}",
+                item.id, db_err
+            );
+        }
+        UnfittableHead::Abandoned
     }
 
     fn extract_lock_proof(&self, item: &WorkItem) -> Result<(Value, UnitMap)> {
@@ -1430,15 +1478,21 @@ impl BridgeOrchestrator {
         ham: &Ham,
         global_definition: &GlobalDefinitionExt,
     ) -> Result<DepositContext> {
+        let lanes: Vec<LaneExt> = ham
+            .call_zome(
+                &self.cfg.role_name,
+                "transactor",
+                "get_all_lane",
+                &Some(GetStrategy::Local),
+            )
+            .await
+            .context("failed to read the network's lanes")?;
+        let lane_definition_count = lanes
+            .iter()
+            .filter(|lane| lane.definition.is_some())
+            .count();
+
         if let Some(lane_definition_hash) = self.cfg.lane_definition.clone() {
-            let lanes: Vec<LaneExt> = ham
-                .call_zome(
-                    &self.cfg.role_name,
-                    "transactor",
-                    "get_all_lane",
-                    &Some(GetStrategy::Local),
-                )
-                .await?;
             let lane_definition = lanes
                 .into_iter()
                 .filter_map(|lane| lane.definition)
@@ -1450,6 +1504,7 @@ impl BridgeOrchestrator {
                 .context("No bridging agreement set for configured lane definition")?;
             return Ok(DepositContext {
                 lane_definitions: vec![lane_definition_hash.into()],
+                lane_definition_count,
                 bridging_agent: lane_definition.special_agents.bridging_agent.pub_key,
                 credit_limit_adjustment: lane_definition.rave_agreements.credit_limit_adjustment,
                 bridging_agreement,
@@ -1463,11 +1518,17 @@ impl BridgeOrchestrator {
             .context("No bridging agreement set for global lane definition")?;
         Ok(DepositContext {
             lane_definitions: vec![],
+            lane_definition_count,
             bridging_agent: global_lane.special_agents.bridging_agent.pub_key,
             credit_limit_adjustment: global_lane.rave_agreements.credit_limit_adjustment,
             bridging_agreement,
         })
     }
+}
+
+enum UnfittableHead {
+    Deferred,
+    Abandoned,
 }
 
 /// Size-capped proof batch produced by S1/S3 batch builders. `capped=true`
@@ -1571,7 +1632,10 @@ fn decode_holochain_agent_as_pubkey_string(agent_hex: &str) -> Result<String> {
 }
 
 struct DepositContext {
+    /// Empty means the spend names no lane and the zome resolves its own list,
+    /// bounded by `lane_definition_count`.
     lane_definitions: Vec<ActionHash>,
+    lane_definition_count: usize,
     bridging_agent: holo_hash::AgentPubKeyB64,
     credit_limit_adjustment: ActionHashB64,
     bridging_agreement: ActionHashB64,
@@ -1619,86 +1683,103 @@ fn backoff_config(cfg: &Config) -> BackoffConfig {
     }
 }
 
+/// The `ParkedData` a `create_parked_link` writes, which the zome puts in the
+/// link tag exactly as given.
+fn parked_data(total_amount: &UnitMap, payload: &Value) -> ParkedData {
+    ParkedData {
+        ct_role_id: ORACLE_ROLE.to_string(),
+        amount: Some(total_amount.clone()),
+        payload: payload.clone(),
+    }
+}
+
 /// Estimate the msgpack link-tag size a `ParkedData` write with the given
 /// aggregate proofs payload would produce. Used to cap the
 /// `create_parked_link` batch against Holochain's link tag size limit.
 fn estimate_parked_data_tag_bytes(total_amount: &UnitMap, payload: &Value) -> Result<usize> {
-    let parked_data = (
-        ParkedData {
-            ct_role_id: "oracle".to_string(),
-            amount: Some(total_amount.clone()),
-            payload: payload.clone(),
-        },
-        true,
-    );
-    let bytes = rmp_serde::to_vec(&parked_data)
+    let bytes = rmp_serde::to_vec(&(parked_data(total_amount, payload), true))
         .context("failed to msgpack-encode ParkedData for tag-size estimation")?
         .len();
     Ok(bytes)
 }
 
-/// Estimate the msgpack link-tag size a `ParkedSpendData` write with the given
-/// aggregate proofs payload would produce. The zome fills the balance and fee
-/// fields: `fees_owed` gets the widest map it can write, the balances get this
-/// batch's deposit sum rather than the agent's running ledger, which is where
-/// the estimate stays optimistic.
-fn estimate_parked_spend_tag_bytes(
-    total_amount: &UnitMap,
-    payload: &Value,
-    global_definition: &ActionHash,
-    lane_definitions: &[ActionHash],
-    unit_fees: &[UnitFee],
-) -> Result<usize> {
-    let parked_spend = parked_spend_placeholder(
-        total_amount,
-        payload,
-        global_definition,
-        lane_definitions,
-        unit_fees,
-    );
-    let bytes = rmp_serde::to_vec(&parked_spend)
-        .context("failed to msgpack-encode ParkedSpendData for tag-size estimation")?
-        .len();
-    Ok(bytes)
+/// What a `create_parked_spend` writes into its link tag beyond the batch
+/// itself: the agent's running ledger, which the zome copies back into the tag,
+/// and the definitions and per-unit fees the write is measured against.
+struct SpendTagContext {
+    ledger: Ledger,
+    global_definition: ActionHash,
+    lane_definitions: Vec<ActionHash>,
+    unit_fees: Vec<UnitFee>,
 }
 
-fn parked_spend_placeholder(
-    total_amount: &UnitMap,
-    payload: &Value,
-    global_definition: &ActionHash,
-    lane_definitions: &[ActionHash],
-    unit_fees: &[UnitFee],
-) -> ParkedSpendData {
-    ParkedSpendData {
-        ct_role_id: "bridging_agent".to_string(),
-        amount: total_amount.clone(),
-        payload: payload.clone(),
-        global_definition: global_definition.clone(),
-        lane_definitions: lane_definitions.to_vec(),
-        new_balance: total_amount.clone(),
-        carry_forward_units: CarryForwardUnits::new(),
-        fees_owed: widest_fees_owed(unit_fees),
-        proposed_balance: total_amount.clone(),
+impl SpendTagContext {
+    fn estimate_tag_bytes(&self, total_amount: &UnitMap, payload: &Value) -> Result<usize> {
+        let bytes = rmp_serde::to_vec(&self.widest_spend_data(total_amount, payload))
+            .context("failed to msgpack-encode ParkedSpendData for tag-size estimation")?
+            .len();
+        Ok(bytes)
+    }
+
+    /// The widest `ParkedSpendData` the zome can write for this batch. A parked
+    /// spend is a `DirectCommitment`, which takes the balance the ledger holds
+    /// and applies this spend and its fee, adds that fee to what is owed, and
+    /// leaves the proposed balance and the carry-forward units as they stand.
+    fn widest_spend_data(&self, total_amount: &UnitMap, payload: &Value) -> ParkedSpendData {
+        let charged: Vec<String> = self.unit_fees.iter().map(UnitFee::index_key).collect();
+        let spent = total_amount.get_unit_indexes();
+        let widest_over = |held: Vec<String>, added: &[String]| {
+            widest_amounts(held.into_iter().chain(added.iter().cloned()))
+        };
+        ParkedSpendData {
+            ct_role_id: BRIDGING_AGENT_ROLE.to_string(),
+            amount: total_amount.clone(),
+            payload: payload.clone(),
+            global_definition: self.global_definition.clone(),
+            lane_definitions: self.lane_definitions.clone(),
+            new_balance: widest_over(
+                self.ledger.balance.get_unit_indexes(),
+                &[spent, charged.clone()].concat(),
+            ),
+            carry_forward_units: self.ledger.carry_forward_units.clone(),
+            fees_owed: widest_over(self.ledger.fees_owed.get_unit_indexes(), &charged),
+            proposed_balance: widest_over(self.ledger.proposed_balance.get_unit_indexes(), &[]),
+        }
+    }
+
+    /// The same tag with everything the network puts in it stripped out: the
+    /// ledger, the lanes and the charged units all move on their own, so only
+    /// what is left says a proof can never be written rather than not now.
+    fn payload_only(&self) -> Self {
+        Self {
+            ledger: Ledger::empty(),
+            global_definition: self.global_definition.clone(),
+            lane_definitions: vec![],
+            unit_fees: vec![],
+        }
     }
 }
 
-/// The widest `fees_owed` the zome can write into a spend tag. Nothing accrues
-/// in a unit the global definition does not charge, so the charged units are the
-/// key set; sizing it from the spend's own units would under-count a network
-/// charging units the batch does not touch.
-///
-/// Amounts are the longest string `ZFuel` prints, not the unit's trigger, which
-/// bounds the value and not the encoded width: collection is tested against the
-/// ledger as it stood before the spend, so this spend's fee lands on top of an
-/// amount already at the trigger, and `ZFuel` prints decimals only when they are
-/// non-zero. `fee_cap` and the exemptions are ignored for the same reason, both
-/// only narrowing what is written. Not covered: a unit dropped from `unit_fees`
-/// keeps what it had accrued until a collection sweeps the ledger.
-fn widest_fees_owed(unit_fees: &[UnitFee]) -> UnitMap {
+/// The lane definitions the tag will carry. A spend that names none leaves the
+/// zome to resolve its own list, which it writes into the tag, so the estimate
+/// stands in for every lane definition it could resolve.
+fn lane_definitions_written(context: &DepositContext) -> Vec<ActionHash> {
+    if context.lane_definitions.is_empty() {
+        vec![ActionHash::from_raw_32(vec![0; 32]); context.lane_definition_count]
+    } else {
+        context.lane_definitions.clone()
+    }
+}
+
+/// The given units at the longest amount `ZFuel` prints. Only the key set can
+/// be known before the write: a balance moves with every transaction, and a fee
+/// lands on top of an amount already at its trigger, which `fee_cap` and the
+/// exemptions only ever narrow.
+fn widest_amounts(units: impl IntoIterator<Item = String>) -> UnitMap {
     UnitMap::load(
-        unit_fees
-            .iter()
-            .map(|fee| (fee.index_key(), ZFuel::new_with_default_precision(i64::MIN)))
+        units
+            .into_iter()
+            .map(|unit| (unit, ZFuel::new_with_default_precision(i64::MIN)))
             .collect(),
     )
 }
@@ -1795,6 +1876,7 @@ mod tests {
     use rave_engine::types::TransactionType;
     use std::time::{SystemTime, UNIX_EPOCH};
     use zfuel::fraction::Fraction;
+    use zfuel::fuel::Precision;
 
     fn test_db_path(name: &str) -> String {
         let ts = SystemTime::now()
@@ -1992,20 +2074,45 @@ mod tests {
             .unwrap()
     }
 
-    fn spend_estimate(total: &UnitMap, proofs: &[Value], unit_fees: &[UnitFee]) -> usize {
-        estimate_parked_spend_tag_bytes(
-            total,
-            &json!({ "proof_of_deposit": proofs }),
-            &action_hash(0xAA),
-            &[],
-            unit_fees,
-        )
-        .expect("spend tag estimation must succeed")
+    fn tag_context(ledger: Ledger, unit_fees: &[UnitFee]) -> SpendTagContext {
+        SpendTagContext {
+            ledger,
+            global_definition: action_hash(0xAA),
+            lane_definitions: vec![action_hash(0xB1), action_hash(0xB2)],
+            unit_fees: unit_fees.to_vec(),
+        }
+    }
+
+    fn cl_estimate(total: &UnitMap, proofs: &[Value]) -> usize {
+        estimate_parked_data_tag_bytes(total, &json!({ "proof_of_deposit": proofs }))
+            .expect("cl tag estimation must succeed")
+    }
+
+    fn spend_estimate(ctx: &SpendTagContext, total: &UnitMap, proofs: &[Value]) -> usize {
+        ctx.estimate_tag_bytes(total, &json!({ "proof_of_deposit": proofs }))
+            .expect("spend tag estimation must succeed")
+    }
+
+    fn spend_tag(ledger: Ledger, total: &UnitMap, unit_fees: &[UnitFee]) -> ParkedSpendData {
+        tag_context(ledger, unit_fees).widest_spend_data(total, &json!({ "proof_of_deposit": [] }))
+    }
+
+    fn tag_len(data: ParkedSpendData) -> usize {
+        ParkedLinkType::ParkedSpendBalance(data)
+            .link_tag()
+            .expect("the zome encoder must accept the tag")
+            .0
+            .len()
     }
 
     #[test]
-    fn widest_fees_owed_covers_every_charged_unit_at_the_longest_amount_zfuel_prints() {
-        let widest = widest_fees_owed(&[unit_fee(0, "100"), unit_fee(7, "250.5")]);
+    fn fees_owed_covers_every_charged_unit_at_the_longest_amount_zfuel_prints() {
+        let owed = spend_tag(
+            Ledger::empty(),
+            &UnitMap::new(),
+            &[unit_fee(0, "100"), unit_fee(7, "250.5")],
+        )
+        .fees_owed;
         let expected = UnitMap::load(
             [
                 ("0".to_string(), widest_amount()),
@@ -2014,63 +2121,328 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        assert_eq!(widest, expected);
+        assert_eq!(owed, expected);
         assert_eq!(widest_amount().to_string(), "-9223372036854.775808");
     }
 
     #[test]
-    fn widest_fees_owed_ignores_everything_that_only_narrows_a_charge() {
+    fn fees_owed_keeps_what_the_ledger_owes_in_a_unit_no_longer_charged() {
+        let ledger = Ledger::new(vec![], vec![], vec![(4, "2")], vec![]);
+        assert_eq!(
+            spend_tag(ledger, &UnitMap::new(), &[unit_fee(0, "100")])
+                .fees_owed
+                .get_unit_indexes(),
+            vec!["0".to_string(), "4".to_string()]
+        );
+    }
+
+    #[test]
+    fn fees_owed_ignores_everything_that_only_narrows_a_charge() {
         let plain = unit_fee(0, "100");
         let mut narrowed = unit_fee(0, "999999");
         narrowed.fee_cap = Some("1".parse().unwrap());
         narrowed.exempt_agents = vec![AgentPubKey::from_raw_32(vec![1u8; 32]).into()];
 
-        assert_eq!(widest_fees_owed(&[plain]), widest_fees_owed(&[narrowed]));
+        assert_eq!(
+            spend_tag(Ledger::empty(), &UnitMap::new(), &[plain]).fees_owed,
+            spend_tag(Ledger::empty(), &UnitMap::new(), &[narrowed]).fees_owed
+        );
     }
 
     #[test]
-    fn spend_tag_estimate_matches_the_zome_link_tag_encoder() {
-        // Nothing but this assertion holds the estimate and the real tag to the
-        // same encoding across a rave_engine bump.
+    fn a_spend_link_tag_is_the_bare_msgpack_of_parked_spend_data() {
+        // The estimate counts the struct; the zome writes the tag. A variant
+        // header or any framing on either side would put them apart, and
+        // nothing else here would notice.
         let total = UnitMap::from(vec![(1_u32, "10")]);
         let payload = json!({ "proof_of_deposit": [{ "tx_hash": "0x01" }] });
-        let gd = action_hash(0xAA);
-        let lanes = [action_hash(0xB1), action_hash(0xB2)];
-        let fees = [unit_fee(0, "100"), unit_fee(1, "250.5")];
+        let ctx = tag_context(
+            Ledger::new(
+                vec![(2, "-9223372036854.775807"), (3, "4"), (11, "0.5")],
+                vec![(3, vec!["2", "3"])],
+                vec![(0, "0.5")],
+                vec![(2, "7"), (11, "1")],
+            ),
+            &[unit_fee(0, "100"), unit_fee(1, "250.5")],
+        );
+        let data = ctx.widest_spend_data(&total, &payload);
 
-        let placeholder = parked_spend_placeholder(&total, &payload, &gd, &lanes, &fees);
-        let tag = ParkedLinkType::ParkedSpendBalance(placeholder)
+        let tag = ParkedLinkType::ParkedSpendBalance(data.clone())
             .link_tag()
-            .expect("the zome encoder must accept the placeholder");
+            .expect("the zome encoder must accept the tag");
 
+        assert_eq!(rmp_serde::to_vec(&data).unwrap(), tag.0);
         assert_eq!(
-            estimate_parked_spend_tag_bytes(&total, &payload, &gd, &lanes, &fees).unwrap(),
+            ctx.estimate_tag_bytes(&total, &payload).unwrap(),
             tag.0.len()
         );
     }
+
+    #[test]
+    fn a_cl_link_tag_is_the_bare_msgpack_of_parked_data_and_its_flag() {
+        let total = UnitMap::from(vec![(1_u32, "10")]);
+        let payload = json!({ "proof_of_deposit": [{ "tx_hash": "0x01" }] });
+        let data = parked_data(&total, &payload);
+
+        let tag = ParkedLinkType::ParkedData((data.clone(), true))
+            .link_tag()
+            .expect("the zome encoder must accept the tag");
+
+        assert_eq!(rmp_serde::to_vec(&(data, true)).unwrap(), tag.0);
+        assert_eq!(
+            estimate_parked_data_tag_bytes(&total, &payload).unwrap(),
+            tag.0.len()
+        );
+    }
+
+    #[test]
+    fn no_legal_zfuel_prints_wider_than_the_widest_amount() {
+        let widest = widest_amount().to_string().len();
+        for value in Precision::MIN..=Precision::MAX {
+            let precision = Precision::new(value).unwrap();
+            // The default precision's negative bound is i64::MIN, which negates
+            // to itself.
+            let extremes = [
+                ZFuel::max_units_at(precision) as i64,
+                (ZFuel::min_units_abs_at(precision) as i64).wrapping_neg(),
+            ];
+            for units in extremes {
+                let amount = ZFuel::new(units, precision).expect("a bound is in range");
+                assert!(
+                    amount.to_string().len() <= widest,
+                    "{amount} at precision {value} is wider than the {widest} bytes charged for it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spend_tag_estimate_upper_bounds_the_widest_the_zome_could_write() {
+        let held = || {
+            Ledger::new(
+                vec![
+                    (0, "12.5"),
+                    (2, "-9223372036854.775807"),
+                    (3, "1"),
+                    (5, "0.000001"),
+                ],
+                vec![(3, vec!["2", "3"])],
+                vec![(0, "0.5")],
+                vec![(2, "7")],
+            )
+        };
+        let one = || UnitMap::from(vec![(1_u32, "10")]);
+        let cases: Vec<(&str, Ledger, UnitMap, Vec<UnitFee>)> = vec![
+            (
+                "an empty ledger",
+                Ledger::empty(),
+                one(),
+                vec![unit_fee(1, "100")],
+            ),
+            ("nothing charged", held(), one(), vec![]),
+            (
+                "units the batch never names",
+                held(),
+                one(),
+                vec![unit_fee(0, "100"), unit_fee(1, "250.5")],
+            ),
+            (
+                "a fee on a unit in neither the ledger nor the batch",
+                held(),
+                one(),
+                vec![unit_fee(9, "100")],
+            ),
+            (
+                "a multi-unit batch",
+                held(),
+                UnitMap::from(vec![(1_u32, "10"), (9, "2.5")]),
+                vec![unit_fee(0, "100")],
+            ),
+            (
+                "three-character unit keys",
+                Ledger::new(vec![(255, "1")], vec![], vec![], vec![(200, "2")]),
+                UnitMap::from(vec![(200_u32, "10")]),
+                vec![unit_fee(255, "100")],
+            ),
+        ];
+
+        let payload = json!({ "proof_of_deposit": [{ "tx_hash": "0x01" }] });
+        for (name, ledger, amount, fees) in cases {
+            let ctx = tag_context(ledger.clone(), &fees);
+            let charged: Vec<String> = fees.iter().map(UnitFee::index_key).collect();
+            let spent = amount.get_unit_indexes();
+            // What a `DirectCommitment` leaves behind, every entry as wide as
+            // `ZFuel` can print it: the balance takes this spend and its fee,
+            // what is owed takes the fee, the proposed balance is untouched.
+            let written = tag_len(ParkedSpendData {
+                new_balance: widest_amounts(
+                    ledger
+                        .balance
+                        .get_unit_indexes()
+                        .into_iter()
+                        .chain(spent)
+                        .chain(charged.clone()),
+                ),
+                fees_owed: widest_amounts(
+                    ledger
+                        .fees_owed
+                        .get_unit_indexes()
+                        .into_iter()
+                        .chain(charged),
+                ),
+                proposed_balance: widest_amounts(ledger.proposed_balance.get_unit_indexes()),
+                ..ctx.widest_spend_data(&amount, &payload)
+            });
+
+            let estimate = ctx
+                .estimate_tag_bytes(&amount, &payload)
+                .expect("spend tag estimation must succeed");
+            assert!(
+                estimate >= written,
+                "{name}: estimate {estimate} is under the {written} bytes the zome could write"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spend_that_names_no_lane_is_measured_for_the_lanes_the_zome_resolves() {
+        let context = |lane_definitions: Vec<ActionHash>| DepositContext {
+            lane_definitions,
+            lane_definition_count: 3,
+            bridging_agent: AgentPubKey::from_raw_32(vec![1u8; 32]).into(),
+            credit_limit_adjustment: action_hash(0xC1).into(),
+            bridging_agreement: action_hash(0xC2).into(),
+        };
+
+        assert_eq!(lane_definitions_written(&context(vec![])).len(), 3);
+        assert_eq!(
+            lane_definitions_written(&context(vec![action_hash(0xB1)])),
+            vec![action_hash(0xB1)]
+        );
+
+        // The stand-ins are only a size, so they have to cost what the hashes
+        // the zome resolves would cost.
+        let total = UnitMap::from(vec![(1_u32, "10")]);
+        let proofs = vec![json!({ "tx_hash": "0x01" })];
+        let mut resolved = tag_context(Ledger::empty(), &[]);
+        resolved.lane_definitions = vec![action_hash(0xB7), action_hash(0xB8), action_hash(0xB9)];
+        let mut stood_in = tag_context(Ledger::empty(), &[]);
+        stood_in.lane_definitions = lane_definitions_written(&context(vec![]));
+
+        assert_eq!(
+            spend_estimate(&stood_in, &total, &proofs),
+            spend_estimate(&resolved, &total, &proofs)
+        );
+    }
+
+    #[test]
+    fn a_real_deposit_proof_still_fits_alone_under_the_default_cap() {
+        // A cycle where nothing fits makes no progress at all, so one real
+        // deposit has to stay well under the cap on the widest network we run:
+        // six units held and two charged, as the live global definition stands.
+        let ctx = tag_context(
+            Ledger::new(
+                vec![(0, "1"), (1, "2"), (2, "3"), (3, "4"), (4, "5"), (5, "6")],
+                vec![],
+                vec![(0, "1")],
+                vec![],
+            ),
+            &[unit_fee(0, "100"), unit_fee(1, "100")],
+        );
+        let proof = json!({
+            "method": "deposit",
+            "contract_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "amount": "1.5",
+            "depositor_wallet_address": "uhCAkYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj",
+            "lock_id": format!("0x{:064x}:0", 12345),
+            "tx_hash": format!("0x{:064x}", 1),
+        });
+
+        let bytes = spend_estimate(&ctx, &UnitMap::from(vec![(1_u32, "1.5")]), &[proof]);
+        let room_for_growth = 4 * PER_UNIT_TAG_BYTES;
+        assert!(
+            bytes + room_for_growth <= crate::config::LINK_TAG_BYTES_DEFAULT,
+            "a single deposit proof measures {bytes} bytes, leaving under {room_for_growth} bytes of the default cap for the ledger to grow into"
+        );
+    }
+
+    #[test]
+    fn spend_tag_carries_the_carry_forward_units_the_ledger_holds() {
+        let ledger = Ledger::new(vec![], vec![(3, vec!["2", "3"])], vec![], vec![]);
+        let total = UnitMap::from(vec![(1_u32, "10")]);
+        let proofs = vec![json!({ "tx_hash": "0x01" })];
+
+        assert_eq!(
+            spend_tag(ledger.clone(), &total, &[]).carry_forward_units,
+            ledger.carry_forward_units
+        );
+        assert!(
+            spend_estimate(&tag_context(ledger, &[]), &total, &proofs)
+                > spend_estimate(&tag_context(Ledger::empty(), &[]), &total, &proofs),
+            "a carried unit costs tag bytes the estimate has to charge for"
+        );
+    }
+
+    // One msgpack map entry: a one-character fixstr key and the 21-character
+    // fixstr `widest_amount` renders to, each with its one-byte header.
+    const PER_UNIT_TAG_BYTES: usize = 2 + 22;
 
     #[test]
     fn spend_tag_estimate_costs_a_fixed_width_per_charged_unit() {
         let total = UnitMap::from(vec![(1_u32, "10")]);
         let proofs = vec![json!({ "tx_hash": "0x01" })];
 
-        // One msgpack map entry: a one-character fixstr key and the 21-character
-        // fixstr `widest_amount` renders to, each with its one-byte header.
-        let per_unit = 2 + 22;
-        let uncharged = spend_estimate(&total, &proofs, &[]);
-        let one = spend_estimate(&total, &proofs, &[unit_fee(0, "100")]);
-        let three = spend_estimate(
+        // A charged unit reaches the balance, as the fee is deducted, and what
+        // is owed. Not the proposed balance, which a spend leaves alone.
+        let per_charged_unit = 2 * PER_UNIT_TAG_BYTES;
+        let uncharged = spend_estimate(&tag_context(Ledger::empty(), &[]), &total, &proofs);
+        let one = spend_estimate(
+            &tag_context(Ledger::empty(), &[unit_fee(0, "100")]),
             &total,
             &proofs,
-            &[
-                unit_fee(0, "100"),
-                unit_fee(1, "250.5"),
-                unit_fee(2, "1000"),
-            ],
+        );
+        // Charged apart from the spend's own unit, which every map already
+        // names whether it is charged or not.
+        let three = spend_estimate(
+            &tag_context(
+                Ledger::empty(),
+                &[
+                    unit_fee(0, "100"),
+                    unit_fee(2, "250.5"),
+                    unit_fee(3, "1000"),
+                ],
+            ),
+            &total,
+            &proofs,
         );
 
-        assert_eq!(one - uncharged, per_unit);
-        assert_eq!(three - uncharged, 3 * per_unit);
+        assert_eq!(one - uncharged, per_charged_unit);
+        assert_eq!(three - uncharged, 3 * per_charged_unit);
+    }
+
+    #[test]
+    fn spend_tag_estimate_costs_a_fixed_width_per_unit_the_ledger_holds() {
+        let total = UnitMap::from(vec![(1_u32, "10")]);
+        let proofs = vec![json!({ "tx_hash": "0x01" })];
+
+        let empty = spend_estimate(&tag_context(Ledger::empty(), &[]), &total, &proofs);
+        let held = spend_estimate(
+            &tag_context(
+                Ledger::new(
+                    vec![(4, "1"), (9, "2")],
+                    vec![],
+                    vec![(6, "1")],
+                    vec![(7, "3")],
+                ),
+                &[],
+            ),
+            &total,
+            &proofs,
+        );
+
+        // Two units in the balance, one owed, one proposed: four entries the
+        // batch itself never names.
+        assert_eq!(held - empty, 4 * PER_UNIT_TAG_BYTES);
     }
 
     #[test]
@@ -2081,24 +2453,20 @@ mod tests {
         let rows = pending_rows(&orch);
         assert_eq!(rows.len(), 2, "both rows must be pending");
 
-        let gd = action_hash(0xAA);
         let fees = [unit_fee(0, "100"), unit_fee(1, "250.5")];
+        let ctx = tag_context(Ledger::empty(), &fees);
 
         let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
         let (proof_b, amount_b) = orch.extract_lock_proof(&rows[1]).unwrap();
         let both = UnitMap::sum_vec(vec![amount_a, amount_b]).unwrap();
-        let both_bytes = spend_estimate(&both, &[proof_a, proof_b], &fees);
+        let both_bytes = spend_estimate(&ctx, &both, &[proof_a, proof_b]);
 
-        let exact = orch
-            .build_spend_batch(&rows, both_bytes, &gd, &[], &fees)
-            .unwrap();
+        let exact = orch.build_spend_batch(&rows, both_bytes, &ctx).unwrap();
         assert_eq!(exact.ids.len(), 2, "a tag of exactly the cap still fits");
         assert!(!exact.capped);
         assert_eq!(exact.tag_bytes, both_bytes);
 
-        let short = orch
-            .build_spend_batch(&rows, both_bytes - 1, &gd, &[], &fees)
-            .unwrap();
+        let short = orch.build_spend_batch(&rows, both_bytes - 1, &ctx).unwrap();
         assert_eq!(
             short.ids,
             vec![id_a],
@@ -2110,9 +2478,10 @@ mod tests {
             .build_spend_batch(
                 &rows,
                 both_bytes,
-                &gd,
-                &[],
-                &[fees[0].clone(), fees[1].clone(), unit_fee(2, "9999.999999")],
+                &tag_context(
+                    Ledger::empty(),
+                    &[fees[0].clone(), fees[1].clone(), unit_fee(2, "9999.999999")],
+                ),
             )
             .unwrap();
         assert_eq!(
@@ -2130,24 +2499,114 @@ mod tests {
     }
 
     #[test]
-    fn spend_batch_permanently_fails_a_proof_that_cannot_fit_alone() {
-        let orch = test_orchestrator("spend-batch-oversized");
-        let id_a = enqueue_lock(&orch, "lock:over:a", "0xd1");
-        let id_b = enqueue_lock(&orch, "lock:over:b", "0xd2");
+    fn spend_batch_defers_a_writable_proof_the_cap_cannot_take() {
+        // The cap crosses the line here, and on a live network the ledger is as
+        // likely to. Neither is the deposit's fault, and one failed is never
+        // retried.
+        let orch = test_orchestrator("spend-batch-no-room");
+        let id_a = enqueue_lock(&orch, "lock:room:a", "0xd1");
+        let id_b = enqueue_lock(&orch, "lock:room:b", "0xd2");
         let rows = pending_rows(&orch);
 
-        let gd = action_hash(0xAA);
-        let fees = [unit_fee(0, "100")];
+        let ctx = tag_context(Ledger::empty(), &[unit_fee(0, "100")]);
         let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
-        let single_bytes = spend_estimate(&amount_a, &[proof_a], &fees);
+        let single_bytes = spend_estimate(&ctx, &amount_a, &[proof_a]);
 
         let batch = orch
-            .build_spend_batch(&rows, single_bytes - 1, &gd, &[], &fees)
+            .build_spend_batch(&rows, single_bytes - 1, &ctx)
             .unwrap();
         assert!(batch.ids.is_empty(), "no proof fits under the cap");
+        assert!(batch.capped, "every row waits for the next cycle");
+        assert_eq!(
+            pending_rows(&orch).iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![id_a, id_b],
+            "a writable deposit is never abandoned over the cap"
+        );
+        assert!(orch
+            .db
+            .list_work_items("lock", crate::state::WorkState::Failed, 100)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_network_that_fills_the_tag_defers_instead_of_abandoning() {
+        // The lanes and the charged units are the network's, and both grow
+        // without any deposit's help. Neither can be what ends one.
+        let orch = test_orchestrator("spend-batch-network-full");
+        let id_a = enqueue_lock(&orch, "lock:net:a", "0xf1");
+        let rows = pending_rows(&orch);
+
+        let fees: Vec<UnitFee> = (0..12).map(|index| unit_fee(index, "100")).collect();
+        let mut ctx = tag_context(Ledger::empty(), &fees);
+        ctx.lane_definitions = (0..12).map(|seed| action_hash(0xE0 + seed)).collect();
+
+        let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
+        let bytes = spend_estimate(&ctx, &amount_a, &[proof_a]);
         assert!(
-            !batch.capped,
-            "a row that cannot fit alone is failed, not deferred"
+            bytes > crate::config::LINK_TAG_BYTES_CEILING,
+            "the network has to fill the tag on its own for this to mean anything: {bytes}"
+        );
+
+        let batch = orch
+            .build_spend_batch(&rows, crate::config::LINK_TAG_BYTES_DEFAULT, &ctx)
+            .unwrap();
+        assert!(batch.ids.is_empty());
+        assert!(batch.capped);
+        assert!(
+            orch.db
+                .list_work_items("lock", crate::state::WorkState::Failed, 100)
+                .unwrap()
+                .is_empty(),
+            "a deposit is never abandoned for what the network puts in the tag"
+        );
+        assert_eq!(
+            pending_rows(&orch).iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![id_a]
+        );
+    }
+
+    #[test]
+    fn a_deferred_proof_does_not_hold_back_a_smaller_one_behind_it() {
+        let orch = test_orchestrator("spend-batch-defer-tail");
+        enqueue_lock(&orch, &format!("lock:{}", "x".repeat(120)), "0xf2");
+        let id_small = enqueue_lock(&orch, "lock:s", "0xf3");
+        let rows = pending_rows(&orch);
+
+        let ctx = tag_context(Ledger::empty(), &[unit_fee(0, "100")]);
+        let (proof_small, amount_small) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let small_bytes = spend_estimate(&ctx, &amount_small, &[proof_small]);
+
+        let batch = orch.build_spend_batch(&rows, small_bytes, &ctx).unwrap();
+        assert_eq!(
+            batch.ids,
+            vec![id_small],
+            "the smaller proof behind a deferred one is still packed"
+        );
+        assert!(batch.capped);
+        assert!(orch
+            .db
+            .list_work_items("lock", crate::state::WorkState::Failed, 100)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn spend_batch_abandons_only_a_proof_no_cap_could_write() {
+        let orch = test_orchestrator("spend-batch-unwritable");
+        let id_oversized = enqueue_lock(&orch, &format!("lock:{}", "x".repeat(900)), "0xd3");
+        let id_tail = enqueue_lock(&orch, "lock:tail:b", "0xd4");
+        let rows = pending_rows(&orch);
+
+        let ctx = tag_context(Ledger::empty(), &[unit_fee(0, "100")]);
+        let (proof_tail, amount_tail) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let tail_bytes = spend_estimate(&ctx, &amount_tail, &[proof_tail]);
+
+        let batch = orch.build_spend_batch(&rows, tail_bytes, &ctx).unwrap();
+        assert_eq!(
+            batch.ids,
+            vec![id_tail],
+            "the proof behind an unwritable one is still packed"
         );
 
         let failed = orch
@@ -2156,31 +2615,89 @@ mod tests {
             .unwrap();
         assert_eq!(
             failed.iter().map(|r| r.id).collect::<Vec<_>>(),
-            vec![id_a, id_b],
-            "every row that cannot fit alone is failed"
+            vec![id_oversized],
+            "only the proof that cannot be written at all is abandoned"
         );
-        let row = &failed[0];
-        assert_eq!(row.error_class.as_deref(), Some("permanent"));
-        let error = row.last_error.clone().unwrap();
+        assert_eq!(failed[0].error_class.as_deref(), Some("permanent"));
+        let error = failed[0].last_error.clone().unwrap();
         assert!(
-            error.contains(&single_bytes.to_string())
-                && error.contains(&(single_bytes - 1).to_string()),
-            "the operator needs the size and the cap: {error}"
+            error.contains(&LINK_TAG_BYTES_CEILING.to_string()),
+            "the operator needs the line it crossed: {error}"
+        );
+    }
+
+    #[test]
+    fn cl_batch_defers_at_the_cap_and_when_nothing_fits() {
+        let orch = test_orchestrator("cl-batch-cap");
+        let id_a = enqueue_lock(&orch, "lock:cl:a", "0xe1");
+        enqueue_lock(&orch, "lock:cl:b", "0xe2");
+        let rows = pending_rows(&orch);
+
+        let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
+        let (proof_b, amount_b) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let single_bytes = cl_estimate(&amount_a, std::slice::from_ref(&proof_a));
+        let both_bytes = cl_estimate(
+            &UnitMap::sum_vec(vec![amount_a, amount_b]).unwrap(),
+            &[proof_a, proof_b],
         );
 
-        // One oversized proof must not cost the rows behind it.
-        let orch = test_orchestrator("spend-batch-oversized-tail");
-        enqueue_lock(&orch, &format!("lock:{}", "x".repeat(400)), "0xd3");
-        let id_tail = enqueue_lock(&orch, "lock:tail:b", "0xd4");
+        let exact = orch.build_cl_batch(&rows, both_bytes).unwrap();
+        assert_eq!(exact.ids.len(), 2, "a tag of exactly the cap still fits");
+        assert!(!exact.capped);
+        assert_eq!(exact.tag_bytes, both_bytes);
+
+        let short = orch.build_cl_batch(&rows, both_bytes - 1).unwrap();
+        assert_eq!(
+            short.ids,
+            vec![id_a],
+            "one byte over the cap defers the crossing proof"
+        );
+        assert!(short.capped);
+        assert_eq!(
+            pending_rows(&orch).len(),
+            2,
+            "a deferred proof stays pending for the next cycle, it is never failed"
+        );
+
+        let none = orch.build_cl_batch(&rows, single_bytes - 1).unwrap();
+        assert!(none.ids.is_empty(), "no proof fits under the cap");
+        assert!(none.capped, "a writable proof waits for the next cycle");
+        assert!(
+            orch.db
+                .list_work_items("lock", crate::state::WorkState::Failed, 100)
+                .unwrap()
+                .is_empty(),
+            "a writable deposit is never abandoned over the cap"
+        );
+    }
+
+    #[test]
+    fn cl_batch_abandons_only_a_proof_no_cap_could_write() {
+        let orch = test_orchestrator("cl-batch-unwritable");
+        let id_oversized = enqueue_lock(&orch, &format!("lock:{}", "x".repeat(900)), "0xe3");
+        let id_tail = enqueue_lock(&orch, "lock:cl:tail", "0xe4");
         let rows = pending_rows(&orch);
-        let batch = orch
-            .build_spend_batch(&rows, single_bytes, &gd, &[], &fees)
-            .unwrap();
+
+        let (proof_tail, amount_tail) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let tail_bytes = cl_estimate(&amount_tail, std::slice::from_ref(&proof_tail));
+
+        let batch = orch.build_cl_batch(&rows, tail_bytes).unwrap();
         assert_eq!(
             batch.ids,
             vec![id_tail],
-            "the proof behind an oversized one is still packed"
+            "the proof behind an unwritable one is still packed"
         );
+        assert_eq!(batch.tag_bytes, tail_bytes);
+
+        let failed = orch
+            .db
+            .list_work_items("lock", crate::state::WorkState::Failed, 100)
+            .unwrap();
+        assert_eq!(
+            failed.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![id_oversized]
+        );
+        assert_eq!(failed[0].error_class.as_deref(), Some("permanent"));
     }
 
     #[test]
@@ -2234,7 +2751,9 @@ mod tests {
         assert_eq!(unit_fees.len(), 1);
         assert_eq!(unit_fees[0].index_key(), "1");
         assert_eq!(
-            widest_fees_owed(unit_fees).get_unit_indexes(),
+            spend_tag(Ledger::empty(), &UnitMap::new(), unit_fees)
+                .fees_owed
+                .get_unit_indexes(),
             vec!["1".to_string()]
         );
     }

@@ -79,7 +79,7 @@ the env file must be sourced even for `status` and `clear`.
 | `DB_PATH` | No | `./data/bridge_orchestrator.db` |
 | `POLL_INTERVAL_MS` | No | `5000` |
 | `BRIDGE_CYCLE_INTERVAL_MS` | No | `180000` (falls back to `COUPON_POLL_INTERVAL_MS`) |
-| `MAX_LINK_TAG_BYTES` | No | `800` (per-link tag cap, must stay under Holochain MAX_TAG_SIZE=1000) |
+| `MAX_LINK_TAG_BYTES` | No | `800` (per-link tag cap, clamped to 600..=900: the last 100 bytes under Holochain MAX_TAG_SIZE=1000 stay out of reach of any configuration, and a value below 600 is refused as a typo) |
 | `COUPONS_TARGET_KB` | No | `512` (aggregate byte budget for withdrawal coupons map, not a link tag) |
 | `HOLOCHAIN_ADMIN_PORT` | No | `30000` |
 | `HOLOCHAIN_APP_PORT` | No | `30001` |
