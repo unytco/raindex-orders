@@ -24,8 +24,10 @@ jobs:
     outputs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      # No `submodules:` -- the crate needs only crates.io and the public `ham`
-      # git dep, while a recursive checkout pulls ~1.4 GB of Solidity submodules.
+      # No `submodules:` -- the crate needs only crates.io and its git deps, while
+      # a recursive checkout pulls ~1.4 GB of Solidity submodules. `rave_engine`
+      # is one of those git deps and its repo is private, so this job cannot
+      # build until that crate is on crates.io again.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

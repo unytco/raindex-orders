@@ -194,7 +194,7 @@ impl Config {
             .context("Invalid BRIDGE_CYCLE_INTERVAL_MS")?;
         if env::var("DEPOSIT_BATCH_TARGET_KB").is_ok() {
             tracing::warn!(
-                "DEPOSIT_BATCH_TARGET_KB is deprecated and has no effect; use MAX_LINK_TAG_BYTES (link tag cap, default 800) and COUPONS_TARGET_KB (withdrawal coupons aggregate size, default 512 KB) instead"
+                "DEPOSIT_BATCH_TARGET_KB is deprecated and has no effect; use MAX_LINK_TAG_BYTES (link tag cap, default 850) and COUPONS_TARGET_KB (withdrawal coupons aggregate size, default 512 KB) instead"
             );
         }
         let max_link_tag_bytes = capped_link_tag_bytes(
@@ -448,7 +448,10 @@ impl WatchtowerReporterConfig {
     }
 }
 
-pub(crate) const LINK_TAG_BYTES_DEFAULT: usize = 800;
+/// One real deposit proof, plus room for the agent's ledger to grow under the
+/// cap, has to fit on the widest network we run: a cycle whose single deposit
+/// does not fit makes no progress at all.
+pub(crate) const LINK_TAG_BYTES_DEFAULT: usize = 850;
 
 /// Holochain refuses a link tag over its own MAX_TAG_SIZE of 1000. The last 100
 /// bytes are left to no configuration at all: they cover the agent's ledger
@@ -491,7 +494,7 @@ mod tests {
             capped_link_tag_bytes(LINK_TAG_BYTES_CEILING + 1),
             LINK_TAG_BYTES_CEILING
         );
-        assert_eq!(capped_link_tag_bytes(LINK_TAG_BYTES_DEFAULT), 800);
+        assert_eq!(capped_link_tag_bytes(LINK_TAG_BYTES_DEFAULT), 850);
         assert_eq!(capped_link_tag_bytes(700), 700);
     }
 

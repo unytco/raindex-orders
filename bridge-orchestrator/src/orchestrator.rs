@@ -1748,8 +1748,9 @@ impl SpendTagContext {
 
     /// The widest `ParkedSpendData` the zome can write for this batch. A parked
     /// spend is a `DirectCommitment`, which takes the balance the ledger holds
-    /// and applies this spend and its fee, adds that fee to what is owed, and
-    /// leaves the proposed balance and the carry-forward units as they stand.
+    /// and applies this spend and its fee, adds that fee to what is owed and
+    /// states it, and leaves the proposed balance and the carry-forward units as
+    /// they stand.
     fn widest_spend_data(&self, total_amount: &UnitMap, payload: &Value) -> ParkedSpendData {
         let charged: Vec<String> = self.unit_fees.iter().map(UnitFee::index_key).collect();
         let spent = total_amount.get_unit_indexes();
@@ -1759,6 +1760,7 @@ impl SpendTagContext {
         ParkedSpendData {
             ct_role_id: BRIDGING_AGENT_ROLE.to_string(),
             amount: total_amount.clone(),
+            fee: widest_amounts(charged.clone()),
             payload: payload.clone(),
             global_definition: self.global_definition.clone(),
             lane_definitions: self.lane_definitions.clone(),
@@ -1897,8 +1899,11 @@ mod tests {
     use crate::config::{Network, RetentionConfig};
     use alloy::primitives::Address;
     use holo_hash::{ActionHash, AgentPubKey, AgentPubKeyB64};
+    use holochain_client::ExternIO;
     use holochain_zome_types::timestamp::Timestamp;
     use rave_engine::types::TransactionType;
+    use serde::de::IgnoredAny;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::{SystemTime, UNIX_EPOCH};
     use zfuel::fraction::Fraction;
     use zfuel::fuel::Precision;
@@ -1975,6 +1980,7 @@ mod tests {
             id,
             tx_type: TransactionType::Parked,
             amount: UnitMap::new(),
+            fee: UnitMap::new(),
             counterparty: vec![],
             history: vec![],
             timestamp: Timestamp(0),
@@ -2005,6 +2011,7 @@ mod tests {
             id,
             tx_type: TransactionType::ParkedSpend,
             amount: UnitMap::new(),
+            fee: UnitMap::new(),
             counterparty: vec![],
             history: vec![],
             timestamp: Timestamp(0),
@@ -2417,9 +2424,10 @@ mod tests {
         let total = UnitMap::from(vec![(1_u32, "10")]);
         let proofs = vec![json!({ "tx_hash": "0x01" })];
 
-        // A charged unit reaches the balance, as the fee is deducted, and what
-        // is owed. Not the proposed balance, which a spend leaves alone.
-        let per_charged_unit = 2 * PER_UNIT_TAG_BYTES;
+        // A charged unit reaches the balance, as the fee is deducted, what is
+        // owed, and the fee the tag states. Not the proposed balance, which a
+        // spend leaves alone.
+        let per_charged_unit = 3 * PER_UNIT_TAG_BYTES;
         let uncharged = spend_estimate(&tag_context(Ledger::empty(), &[]), &total, &proofs);
         let one = spend_estimate(
             &tag_context(Ledger::empty(), &[unit_fee(0, "100")]),
@@ -3624,6 +3632,102 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(50),
             "cooldown must not return before its duration elapses"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // execute_rave wire contract
+    //
+    // The guest reports a field this payload omits as
+    // `WasmErrorInner::Deserialize(<bytes>)`, with serde's reason
+    // discarded, so the drift is named here instead.
+    // -----------------------------------------------------------------
+
+    /// Encoded the way `Ham::call_zome` puts it on the wire.
+    fn encoded_execute_rave_payload() -> Vec<u8> {
+        let payload = RAVEExecuteInputs {
+            ea_id: action_hash(0xEA),
+            executor_inputs: Value::Null,
+            links: vec![parked_tx(1, "0xfeed")],
+            global_definition: action_hash(0xAA),
+            lane_definitions: vec![action_hash(0xAB)],
+            strategy: GetStrategy::Local,
+        };
+        ExternIO::encode(&payload)
+            .expect("the S2 payload must encode")
+            .0
+    }
+
+    fn keys(map: &BTreeMap<String, IgnoredAny>) -> BTreeSet<&str> {
+        map.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn the_payload_names_every_input_field_the_dna_decodes() {
+        let decoded: BTreeMap<String, IgnoredAny> =
+            rmp_serde::from_slice(&encoded_execute_rave_payload()).unwrap();
+        assert_eq!(
+            keys(&decoded),
+            BTreeSet::from([
+                "ea_id",
+                "executor_inputs",
+                "global_definition",
+                "lane_definitions",
+                "links",
+                "strategy",
+            ])
+        );
+    }
+
+    #[test]
+    fn every_link_names_every_transaction_field_the_dna_decodes() {
+        #[derive(Deserialize)]
+        struct Payload {
+            links: Vec<BTreeMap<String, IgnoredAny>>,
+        }
+        let decoded: Payload = rmp_serde::from_slice(&encoded_execute_rave_payload()).unwrap();
+        assert_eq!(
+            keys(&decoded.links[0]),
+            BTreeSet::from([
+                "amount",
+                "counterparty",
+                "creator",
+                "details",
+                "fee",
+                "history",
+                "id",
+                "timestamp",
+                "tx_type",
+            ])
+        );
+    }
+
+    #[test]
+    fn a_parked_link_names_every_detail_field_the_dna_decodes() {
+        #[derive(Deserialize)]
+        struct Payload {
+            links: Vec<Link>,
+        }
+        #[derive(Deserialize)]
+        struct Link {
+            details: BTreeMap<String, BTreeMap<String, IgnoredAny>>,
+        }
+        let decoded: Payload = rmp_serde::from_slice(&encoded_execute_rave_payload()).unwrap();
+        let parked = decoded.links[0]
+            .details
+            .get("Parked")
+            .expect("a parked link is tagged `Parked`");
+        assert_eq!(
+            keys(parked),
+            BTreeSet::from([
+                "attached_payload",
+                "consumed_link",
+                "ct_role_id",
+                "ea_id",
+                "executor",
+                "role_display_name",
+                "smart_agreement_title",
+            ])
         );
     }
 }

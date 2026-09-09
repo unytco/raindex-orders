@@ -79,7 +79,7 @@ the env file must be sourced even for `status` and `clear`.
 | `DB_PATH` | No | `./data/bridge_orchestrator.db` |
 | `POLL_INTERVAL_MS` | No | `5000` |
 | `BRIDGE_CYCLE_INTERVAL_MS` | No | `180000` (falls back to `COUPON_POLL_INTERVAL_MS`) |
-| `MAX_LINK_TAG_BYTES` | No | `800` (per-link tag cap, clamped to 600..=900: the last 100 bytes under Holochain MAX_TAG_SIZE=1000 stay out of reach of any configuration, and a value below 600 is clamped up to it with a warning at startup, not refused) |
+| `MAX_LINK_TAG_BYTES` | No | `850` (per-link tag cap, clamped to 600..=900: the last 100 bytes under Holochain MAX_TAG_SIZE=1000 stay out of reach of any configuration, and a value below 600 is clamped up to it with a warning at startup, not refused) |
 | `COUPONS_TARGET_KB` | No | `512` (aggregate byte budget for withdrawal coupons map, not a link tag) |
 | `HOLOCHAIN_ADMIN_PORT` | No | `30000` |
 | `HOLOCHAIN_APP_PORT` | No | `30001` |
@@ -287,6 +287,34 @@ bridge-orchestrator clear --non-in-progress
 # Wipe everything (use with caution)
 bridge-orchestrator clear --all
 ```
+
+### Re-queue failed rows
+
+No subcommand does this; go at the database. Stop the service first, and leave
+`step` alone — it records real on-chain progress, so resetting it re-creates
+links that already exist.
+
+```bash
+systemctl stop bridge-orchestrator
+cp "$DB_PATH" "$DB_PATH.bak"
+
+python3 -c "
+import sqlite3, os
+c = sqlite3.connect(os.environ['DB_PATH'])
+n = c.execute('''UPDATE work_items
+                    SET state='queued', attempts=0, next_retry_at=NULL,
+                        error_class=NULL, last_error=NULL,
+                        updated_at=strftime('%s','now')
+                  WHERE state='failed' ''').rowcount
+c.commit(); print('requeued', n)
+"
+
+systemctl start bridge-orchestrator
+```
+
+Add `AND id IN (...)` to target specific rows. `attempts` must be under
+`max_attempts` or the cycle skips the row. Rows left `claimed` or `in_flight`
+need no action — startup re-queues those on its own.
 
 ### systemd service management
 
