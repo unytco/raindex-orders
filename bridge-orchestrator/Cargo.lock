@@ -4301,8 +4301,9 @@ dependencies = [
 
 [[package]]
 name = "rave_engine"
-version = "0.10.0"
-source = "git+https://github.com/unytco/unyt.git?rev=ff14a19a691ba9b9a57cc8ff00153a0a23d73361#ff14a19a691ba9b9a57cc8ff00153a0a23d73361"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ab36d47c97b5016c77544fd0877d54fe75bda0f727989eb146f591d9ac45d3c"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",

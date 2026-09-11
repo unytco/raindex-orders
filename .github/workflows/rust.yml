@@ -19,10 +19,6 @@ jobs:
   orchestrator:
     name: bridge-orchestrator (Rust)
     runs-on: ubuntu-latest
-    # `ham` (git dep) and `zfuel` (crates.io) are public, so cargo fetches them
-    # without a token. `rave_engine` is not: it comes from the private
-    # `unytco/unyt` repo until the DNA's shape is on crates.io again, and this
-    # job cannot read it. Republishing that crate is what makes this job green.
     defaults:
       run:
         working-directory: bridge-orchestrator
