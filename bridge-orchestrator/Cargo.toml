@@ -46,6 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 zfuel = "=0.9.1"
 
+[dev-dependencies]
+# Temp conductor-config / passphrase fixtures for the lair-signing tests.
+tempfile = "3"
+
 [profile.release]
 # Every node re-downloads this on provision; symbols are ~6 MB of that and are
 # not useful without a matching local build.
