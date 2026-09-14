@@ -6,7 +6,8 @@ use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use anyhow::{Context, Result};
 use ham::{
     connect_with_backoff, install_shutdown_handler, is_connection_error, is_request_timeout,
-    is_source_chain_pressure, BackoffConfig, Ham, HamConfig, ShutdownRx,
+    is_source_chain_pressure, BackoffConfig, CapGrantOptIn, Ham, HamConfig, LairCredentials,
+    ShutdownRx,
 };
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use holochain_zome_types::prelude::GetStrategy;
@@ -1701,11 +1702,17 @@ fn apply_rave_link_cap(
 fn ham_config(cfg: &Config) -> Result<HamConfig> {
     HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
         .with_request_timeout_secs(cfg.ham_request_timeout_secs)
-        .with_lair_signing_from_node(
-            std::path::Path::new(&cfg.conductor_config),
-            std::path::Path::new(&cfg.lair_passphrase_file),
+        .with_signing(
+            LairCredentials::Node {
+                conductor_config: cfg.conductor_config.clone().into(),
+                passphrase_file: cfg.lair_passphrase_file.clone().into(),
+            },
+            CapGrantOptIn::Withheld,
         )
-        .context("lair signing is required, and this node cannot offer it")
+        .context(
+            "CONDUCTOR_CONFIG / LAIR_PASSPHRASE_FILE must name a node whose conductor runs an \
+             external lair_server",
+        )
 }
 
 /// One connect path, shared by startup and reconnect. Rebuilds the signing
@@ -2033,9 +2040,11 @@ mod tests {
             "absent-conductor-config.yaml",
             &node,
         ))
-        .expect_err("without lair there is no signing path that does not write to the chain")
-        .to_string();
+        .expect_err("without lair there is no signing path that does not write to the chain");
+        let err = format!("{err:#}");
+        // ham states the fault; the orchestrator names the knobs to turn.
         assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("CONDUCTOR_CONFIG"), "{err}");
     }
 
     fn action_hash(seed: u8) -> ActionHash {
