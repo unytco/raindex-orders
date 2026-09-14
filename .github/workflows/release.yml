@@ -79,8 +79,6 @@ jobs:
         with:
           workspaces: bridge-orchestrator
 
-      # --locked: `ham` tracks a branch, so Cargo.lock is the only record of
-      # which commit a release was built against.
       - name: Build
         run: cargo build --release --locked
 

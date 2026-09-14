@@ -26,7 +26,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
-ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
+ham = { git = "https://github.com/unytco/ham.git", rev = "5bef5c239dec3fd26cfbc472d73b78f0c1ce8831" }
 hex = "0.4"
 hmac = "0.12"
 holo_hash = { version = "0.7.0", features = ["encoding"] }
