@@ -2306,10 +2306,11 @@ dependencies = [
 [[package]]
 name = "ham"
 version = "0.1.0"
-source = "git+https://github.com/unytco/ham.git?rev=d59abb331810d4b4ff0655d4469ef1047fc71a5d#d59abb331810d4b4ff0655d4469ef1047fc71a5d"
+source = "git+https://github.com/unytco/ham.git?rev=4e1063602045e1b2a8aceacd5d75eedc3e3ecba3#4e1063602045e1b2a8aceacd5d75eedc3e3ecba3"
 dependencies = [
  "anyhow",
  "holochain_client",
+ "holochain_conductor_api",
  "lair_keystore_api",
  "rmp-serde",
  "serde",
