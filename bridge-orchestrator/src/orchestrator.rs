@@ -6,7 +6,8 @@ use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use anyhow::{Context, Result};
 use ham::{
     connect_with_backoff, install_shutdown_handler, is_connection_error, is_request_timeout,
-    is_source_chain_pressure, BackoffConfig, Ham, HamConfig, ShutdownRx,
+    is_source_chain_pressure, BackoffConfig, CapGrantOptIn, Ham, HamConfig, LairCredentials,
+    ShutdownRx,
 };
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey};
 use holochain_zome_types::prelude::GetStrategy;
@@ -199,6 +200,13 @@ impl BridgeOrchestrator {
             "bridge-orchestrator started network={:?} poll={}ms bridge_cycle={}ms",
             self.cfg.network, self.cfg.poll_interval_ms, self.cfg.bridge_cycle_interval_ms
         );
+
+        // Checked before anything is spawned: a node that cannot offer lair is
+        // a misconfiguration, and left to the connect closures below it would
+        // be a failure the reconnect loop retries forever instead. The closures
+        // still rebuild it per attempt, so a lair reset that rewrites the
+        // conductor's connection_url is picked up without a restart.
+        ham_config(&self.cfg)?;
 
         // Spawn the watchtower reporter, if configured. The handle is
         // intentionally dropped: the task runs detached, and any
@@ -1685,18 +1693,36 @@ fn apply_rave_link_cap(
     }
 }
 
-/// One connect path, shared by startup and reconnect.
+/// The `HamConfig` every connection this orchestrator makes is built from.
+/// Lair signing is required, never best-effort: the bridging agent carries its
+/// key across migrations, and the signing path `ham` would otherwise use
+/// commits a capability grant to that chain on every connect. Against a chain
+/// that has already closed, that grant is invalid and costs the agent its
+/// migration for good.
+fn ham_config(cfg: &Config) -> Result<HamConfig> {
+    HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
+        .with_request_timeout_secs(cfg.ham_request_timeout_secs)
+        .with_signing(
+            LairCredentials::Node {
+                conductor_config: cfg.conductor_config.clone().into(),
+                passphrase_file: cfg.lair_passphrase_file.clone().into(),
+            },
+            CapGrantOptIn::Withheld,
+        )
+        .context(
+            "CONDUCTOR_CONFIG / LAIR_PASSPHRASE_FILE must name a node whose conductor runs an \
+             external lair_server",
+        )
+}
+
+/// One connect path, shared by startup and reconnect. Rebuilds the signing
+/// config on every attempt: `reset-lair.sh` rewrites the conductor's
+/// `connection_url` under a running orchestrator, and a config read once at
+/// startup would dial the old keystore until someone restarted the service.
 async fn connect_ham(cfg: &Config) -> Result<Ham> {
-    Ham::connect(
-        HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
-            .with_request_timeout_secs(cfg.ham_request_timeout_secs)
-            .try_lair_signing_from_node(
-                std::path::Path::new(&cfg.conductor_config),
-                std::path::Path::new(&cfg.lair_passphrase_file),
-            ),
-    )
-    .await
-    .context("Failed to connect to Holochain")
+    Ham::connect(ham_config(cfg)?)
+        .await
+        .context("Failed to connect to Holochain")
 }
 
 /// Project orchestrator config into the shared [`BackoffConfig`].
@@ -1963,6 +1989,62 @@ mod tests {
             db,
             reporter: ReporterState::new(),
         }
+    }
+
+    const LAIR_URL: &str = "unix:///var/lib/holochain/lair/socket?k=abc123";
+
+    /// A node laid out as the fleet lays one out: a conductor config naming an
+    /// external `lair_server`, and the passphrase that unlocks it.
+    fn node_with_lair() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("conductor-config.yaml"),
+            format!("keystore:\n  type: lair_server\n  connection_url: {LAIR_URL}\n"),
+        )
+        .expect("write conductor config");
+        std::fs::write(dir.path().join("lair-passphrase"), b"deadbeef\n")
+            .expect("write lair passphrase");
+        dir
+    }
+
+    /// `test_config` pointed at `node`'s files instead of the fleet's, so the
+    /// verdict comes from the fixture rather than from whatever this machine
+    /// happens to have at /etc/holochain.
+    fn config_for_node(name: &str, conductor_config: &str, node: &tempfile::TempDir) -> Config {
+        let mut cfg = test_config(test_db_path(name));
+        cfg.conductor_config = node.path().join(conductor_config).display().to_string();
+        cfg.lair_passphrase_file = node.path().join("lair-passphrase").display().to_string();
+        cfg
+    }
+
+    #[test]
+    fn the_orchestrator_connects_through_lair() {
+        let node = node_with_lair();
+        let cfg = ham_config(&config_for_node("lair", "conductor-config.yaml", &node))
+            .expect("a node with an external lair_server configures lair signing");
+        assert_eq!(
+            cfg.lair.expect("lair signing").connection_url.as_str(),
+            LAIR_URL
+        );
+        assert!(
+            !cfg.allow_cap_grant_signing,
+            "the orchestrator never asks ham for the path that writes to the bridging agent's chain"
+        );
+    }
+
+    #[test]
+    fn a_node_without_lair_stops_the_orchestrator() {
+        let node = node_with_lair();
+        let err = ham_config(&config_for_node(
+            "no-lair",
+            "absent-conductor-config.yaml",
+            &node,
+        ))
+        .expect_err("without lair there is no signing path that does not write to the chain");
+        let err = format!("{err:#}");
+        // ham states the fault; the orchestrator names the knobs to turn.
+        assert!(err.contains("lair signing is required"), "{err}");
+        assert!(err.contains("CONDUCTOR_CONFIG"), "{err}");
     }
 
     fn action_hash(seed: u8) -> ActionHash {

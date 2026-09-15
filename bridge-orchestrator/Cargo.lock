@@ -1211,6 +1211,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2305,10 +2306,11 @@ dependencies = [
 [[package]]
 name = "ham"
 version = "0.1.0"
-source = "git+https://github.com/unytco/ham.git?branch=main#4737d6ed676baf6d45cc30d893b7b560568f093d"
+source = "git+https://github.com/unytco/ham.git?rev=4e1063602045e1b2a8aceacd5d75eedc3e3ecba3#4e1063602045e1b2a8aceacd5d75eedc3e3ecba3"
 dependencies = [
  "anyhow",
  "holochain_client",
+ "holochain_conductor_api",
  "lair_keystore_api",
  "rmp-serde",
  "serde",

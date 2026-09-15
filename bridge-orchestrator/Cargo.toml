@@ -26,7 +26,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
-ham = { git = "https://github.com/unytco/ham.git", branch = "main" }
+ham = { git = "https://github.com/unytco/ham.git", rev = "4e1063602045e1b2a8aceacd5d75eedc3e3ecba3" }
 hex = "0.4"
 hmac = "0.12"
 holo_hash = { version = "0.7.0", features = ["encoding"] }
@@ -45,6 +45,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 zfuel = "=0.9.1"
+
+[dev-dependencies]
+# Temp conductor-config / passphrase fixtures for the lair-signing tests.
+tempfile = "3"
 
 [profile.release]
 # Every node re-downloads this on provision; symbols are ~6 MB of that and are
