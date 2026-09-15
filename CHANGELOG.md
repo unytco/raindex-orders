@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - the Rainix/Solidity workflow (`.github/workflows/test.yml`) is now manual-only (`on: workflow_dispatch`) — it has failed for years on a dead nixpkgs pin in `lib/rain.orderbook`.
 - upgrade bridge-orchestrator Holochain deps to 0.7 (rave_engine 0.11.0, holochain_client 0.9.0, zfuel 0.9.1, holo_hash / holochain_zome_types 0.7.0), with zfuel and rave_engine pinned to exact crates.io versions.
 - bridge-orchestrator pins Rust 1.93.1 (`rust-toolchain.toml`) and builds on the host toolchain, not the rainix dev shell (1.89).
-- bridge-orchestrator pins `ham` to an exact revision (`d59abb33`) rather than its `main` branch, so a change to it reaches the orchestrator only in a commit that names the new revision.
+- bridge-orchestrator pins `ham` to an exact revision (`4e10636`) rather than its `main` branch, so a change to it reaches the orchestrator only in a commit that names the new revision.
 - bridge-orchestrator's outbound HTTPS clients (Ethereum RPC, watchtower ingest) validate against bundled webpki roots instead of the host trust store.
 - bridge-orchestrator sums a batch's amounts with rave_engine's `UnitMap::sum_vec` rather than its own copy of the same fold.
 - `MAX_LINK_TAG_BYTES` is clamped to 600..=900, so no configuration can consume the last 100 bytes under Holochain's own 1000-byte link-tag limit, or set a cap too small to write anything.
