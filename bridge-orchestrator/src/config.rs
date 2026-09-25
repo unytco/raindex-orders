@@ -48,7 +48,7 @@ pub struct Config {
     /// fleet path.
     pub lair_passphrase_file: String,
     pub bridging_agent_pubkey: AgentPubKeyB64,
-    pub lane_definition: Option<ActionHashB64>,
+    pub lane_origin: Option<ActionHashB64>,
     pub unit_index: u32,
     /// Per-request timeout applied to the Holochain app websocket. Prevents a
     /// slow or hung zome call from blocking the orchestrator indefinitely.
@@ -230,9 +230,10 @@ impl Config {
                 .context("HOLOCHAIN_BRIDGING_AGENT_PUBKEY required")?,
         )
         .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
-        let lane_definition = env::var("HOLOCHAIN_LANE_DEFINITION")
-            .ok()
-            .and_then(|v| ActionHashB64::from_str(&v).ok());
+        let lane_origin = lane_origin(
+            env::var("HOLOCHAIN_LANE_DEFINITION").ok(),
+            env::var("HOLOCHAIN_LANE_ORIGIN").ok(),
+        )?;
         let unit_index = env::var("HOLOCHAIN_UNIT_INDEX")
             .unwrap_or_else(|_| "1".into())
             .parse()
@@ -310,7 +311,7 @@ impl Config {
             conductor_config,
             lair_passphrase_file,
             bridging_agent_pubkey,
-            lane_definition,
+            lane_origin,
             unit_index,
             ham_request_timeout_secs,
             ham_reconnect_backoff_initial_ms,
@@ -474,6 +475,24 @@ fn capped_link_tag_bytes(configured: usize) -> usize {
     configured.clamp(LINK_TAG_BYTES_FLOOR, LINK_TAG_BYTES_CEILING)
 }
 
+/// Unset or empty bridges on the global definition's lane.
+fn lane_origin(
+    retired_definition: Option<String>,
+    origin: Option<String>,
+) -> Result<Option<ActionHashB64>> {
+    if retired_definition.is_some() {
+        anyhow::bail!(
+            "HOLOCHAIN_LANE_DEFINITION is retired: remove it and set HOLOCHAIN_LANE_ORIGIN to the lane's Network ID"
+        );
+    }
+    match origin.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(origin) => ActionHashB64::from_str(origin).map(Some).with_context(|| {
+            format!("Invalid HOLOCHAIN_LANE_ORIGIN {origin:?}: expected the lane's Network ID")
+        }),
+    }
+}
+
 /// Strip a single leading `u` multibase prefix (base64url) so the reporter's
 /// stored DNA matches the 52-char form the Holochain observer uses across
 /// the rest of the Watchtower schema. Both forms encode the same hash;
@@ -506,6 +525,41 @@ mod tests {
             capped_link_tag_bytes(LINK_TAG_BYTES_FLOOR - 1),
             LINK_TAG_BYTES_FLOOR
         );
+    }
+
+    fn network_id() -> String {
+        ActionHashB64::from(holo_hash::ActionHash::from_raw_32(vec![1; 32])).to_string()
+    }
+
+    #[test]
+    fn a_set_lane_definition_stops_the_orchestrator() {
+        let err = lane_origin(Some(network_id()), Some(network_id()))
+            .expect_err("a retired key would otherwise be dropped in silence");
+        assert!(
+            format!("{err:#}").contains("HOLOCHAIN_LANE_ORIGIN"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_lane_origin_that_does_not_parse_stops_the_orchestrator() {
+        let id = network_id();
+        assert_eq!(lane_origin(None, None).unwrap(), None);
+        assert_eq!(lane_origin(None, Some(" ".into())).unwrap(), None);
+        assert_eq!(
+            lane_origin(None, Some(format!(" {id}\n"))).unwrap(),
+            Some(ActionHashB64::from_str(&id).unwrap())
+        );
+        let truncated = format!("{}...{}", &id[..8], &id[id.len() - 6..]);
+        for typo in ["local-no-live-lane", &truncated, &id[1..]] {
+            let err = lane_origin(None, Some(typo.into())).expect_err(
+                "a value that does not parse would leave the bridge on the global lane",
+            );
+            assert!(
+                format!("{err:#}").contains("Invalid HOLOCHAIN_LANE_ORIGIN"),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]
