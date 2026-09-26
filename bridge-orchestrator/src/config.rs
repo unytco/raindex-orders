@@ -1,7 +1,7 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use holo_hash::{ActionHashB64, AgentPubKeyB64};
+use holo_hash::AgentPubKeyB64;
 use std::env;
 use std::str::FromStr;
 
@@ -48,8 +48,7 @@ pub struct Config {
     /// fleet path.
     pub lair_passphrase_file: String,
     pub bridging_agent_pubkey: AgentPubKeyB64,
-    pub lane_origin: Option<ActionHashB64>,
-    pub unit_index: u32,
+    pub hot_unit_index: u32,
     /// Per-request timeout applied to the Holochain app websocket. Prevents a
     /// slow or hung zome call from blocking the orchestrator indefinitely.
     pub ham_request_timeout_secs: u64,
@@ -157,6 +156,8 @@ pub struct WatchtowerReporterConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let setting = |key: &str| env::var(key).ok();
+        refuse_retired_settings(setting)?;
         let network: Network = env::var("NETWORK")
             .unwrap_or_else(|_| "sepolia".to_string())
             .parse()
@@ -230,14 +231,7 @@ impl Config {
                 .context("HOLOCHAIN_BRIDGING_AGENT_PUBKEY required")?,
         )
         .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
-        let lane_origin = lane_origin(
-            env::var("HOLOCHAIN_LANE_DEFINITION").ok(),
-            env::var("HOLOCHAIN_LANE_ORIGIN").ok(),
-        )?;
-        let unit_index = env::var("HOLOCHAIN_UNIT_INDEX")
-            .unwrap_or_else(|_| "1".into())
-            .parse()
-            .context("Invalid HOLOCHAIN_UNIT_INDEX")?;
+        let hot_unit_index = hot_unit_index(setting)?;
         let ham_request_timeout_secs = env::var("HAM_REQUEST_TIMEOUT_SECS")
             .unwrap_or_else(|_| "120".into())
             .parse()
@@ -311,8 +305,7 @@ impl Config {
             conductor_config,
             lair_passphrase_file,
             bridging_agent_pubkey,
-            lane_origin,
-            unit_index,
+            hot_unit_index,
             ham_request_timeout_secs,
             ham_reconnect_backoff_initial_ms,
             ham_reconnect_backoff_max_ms,
@@ -475,22 +468,31 @@ fn capped_link_tag_bytes(configured: usize) -> usize {
     configured.clamp(LINK_TAG_BYTES_FLOOR, LINK_TAG_BYTES_CEILING)
 }
 
-/// Unset or empty bridges on the global definition's lane.
-fn lane_origin(
-    retired_definition: Option<String>,
-    origin: Option<String>,
-) -> Result<Option<ActionHashB64>> {
-    if retired_definition.is_some() {
-        anyhow::bail!(
-            "HOLOCHAIN_LANE_DEFINITION is retired: remove it and set HOLOCHAIN_LANE_ORIGIN to the lane's Network ID"
-        );
+/// An older deploy that still sets one of these would otherwise run on defaults.
+const RETIRED_SETTINGS: [(&str, &str); 2] = [
+    (
+        "HOLOCHAIN_LANE_DEFINITION",
+        "remove it. The bridge runs on the lane in force whose bridging agent is HOLOCHAIN_BRIDGING_AGENT_PUBKEY and whose service units include HOT_UNIT_INDEX",
+    ),
+    ("HOLOCHAIN_UNIT_INDEX", "rename it to HOT_UNIT_INDEX"),
+];
+
+fn refuse_retired_settings(setting: impl Fn(&str) -> Option<String>) -> Result<()> {
+    match RETIRED_SETTINGS
+        .iter()
+        .find(|(key, _)| setting(key).is_some())
+    {
+        Some((key, replacement)) => anyhow::bail!("{key} is retired: {replacement}"),
+        None => Ok(()),
     }
-    match origin.as_deref().map(str::trim) {
-        None | Some("") => Ok(None),
-        Some(origin) => ActionHashB64::from_str(origin).map(Some).with_context(|| {
-            format!("Invalid HOLOCHAIN_LANE_ORIGIN {origin:?}: expected the lane's Network ID")
-        }),
-    }
+}
+
+fn hot_unit_index(setting: impl Fn(&str) -> Option<String>) -> Result<u32> {
+    setting("HOT_UNIT_INDEX")
+        .as_deref()
+        .unwrap_or("1")
+        .parse()
+        .context("Invalid HOT_UNIT_INDEX")
 }
 
 /// Strip a single leading `u` multibase prefix (base64url) so the reporter's
@@ -527,39 +529,54 @@ mod tests {
         );
     }
 
-    fn network_id() -> String {
-        ActionHashB64::from(holo_hash::ActionHash::from_raw_32(vec![1; 32])).to_string()
+    fn settings<'a>(set: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        |key| {
+            set.iter()
+                .find(|(set_key, _)| *set_key == key)
+                .map(|(_, value)| value.to_string())
+        }
     }
 
     #[test]
-    fn a_set_lane_definition_stops_the_orchestrator() {
-        let err = lane_origin(Some(network_id()), Some(network_id()))
-            .expect_err("a retired key would otherwise be dropped in silence");
+    fn each_retired_setting_stops_the_orchestrator_naming_its_replacement() {
+        for (key, replacement) in [
+            (
+                "HOLOCHAIN_LANE_DEFINITION",
+                "HOLOCHAIN_BRIDGING_AGENT_PUBKEY",
+            ),
+            ("HOLOCHAIN_UNIT_INDEX", "HOT_UNIT_INDEX"),
+        ] {
+            for value in ["1", ""] {
+                let err =
+                    refuse_retired_settings(settings(&[("HOT_UNIT_INDEX", "1"), (key, value)]))
+                        .expect_err("a retired setting would otherwise be dropped in silence");
+                let message = format!("{err:#}");
+                assert!(
+                    message.starts_with(&format!("{key} is retired")),
+                    "{message}"
+                );
+                assert!(message.contains(replacement), "{message}");
+            }
+        }
+        refuse_retired_settings(settings(&[("HOT_UNIT_INDEX", "1")])).unwrap();
+    }
+
+    #[test]
+    fn hot_unit_index_parses_and_defaults_to_one() {
+        assert_eq!(hot_unit_index(settings(&[])).unwrap(), 1);
+        assert_eq!(
+            hot_unit_index(settings(&[("HOT_UNIT_INDEX", "3")])).unwrap(),
+            3
+        );
+        assert_eq!(
+            hot_unit_index(settings(&[("HOLOCHAIN_UNIT_INDEX", "3")])).unwrap(),
+            1
+        );
+        let err = hot_unit_index(settings(&[("HOT_UNIT_INDEX", "hot")])).unwrap_err();
         assert!(
-            format!("{err:#}").contains("HOLOCHAIN_LANE_ORIGIN"),
+            format!("{err:#}").contains("Invalid HOT_UNIT_INDEX"),
             "{err:#}"
         );
-    }
-
-    #[test]
-    fn a_lane_origin_that_does_not_parse_stops_the_orchestrator() {
-        let id = network_id();
-        assert_eq!(lane_origin(None, None).unwrap(), None);
-        assert_eq!(lane_origin(None, Some(" ".into())).unwrap(), None);
-        assert_eq!(
-            lane_origin(None, Some(format!(" {id}\n"))).unwrap(),
-            Some(ActionHashB64::from_str(&id).unwrap())
-        );
-        let truncated = format!("{}...{}", &id[..8], &id[id.len() - 6..]);
-        for typo in ["local-no-live-lane", &truncated, &id[1..]] {
-            let err = lane_origin(None, Some(typo.into())).expect_err(
-                "a value that does not parse would leave the bridge on the global lane",
-            );
-            assert!(
-                format!("{err:#}").contains("Invalid HOLOCHAIN_LANE_ORIGIN"),
-                "{err:#}"
-            );
-        }
     }
 
     #[test]
