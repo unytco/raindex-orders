@@ -156,8 +156,6 @@ pub struct WatchtowerReporterConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let setting = |key: &str| env::var(key).ok();
-        refuse_retired_settings(setting)?;
         let network: Network = env::var("NETWORK")
             .unwrap_or_else(|_| "sepolia".to_string())
             .parse()
@@ -231,7 +229,7 @@ impl Config {
                 .context("HOLOCHAIN_BRIDGING_AGENT_PUBKEY required")?,
         )
         .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
-        let hot_unit_index = hot_unit_index(setting)?;
+        let hot_unit_index = hot_unit_index(|key| env::var(key).ok())?;
         let ham_request_timeout_secs = env::var("HAM_REQUEST_TIMEOUT_SECS")
             .unwrap_or_else(|_| "120".into())
             .parse()
@@ -468,7 +466,8 @@ fn capped_link_tag_bytes(configured: usize) -> usize {
     configured.clamp(LINK_TAG_BYTES_FLOOR, LINK_TAG_BYTES_CEILING)
 }
 
-/// An older deploy that still sets one of these would otherwise run on defaults.
+/// Refused where the unit is read, so an older deploy that still sets one cannot
+/// run on defaults.
 const RETIRED_SETTINGS: [(&str, &str); 2] = [
     (
         "HOLOCHAIN_LANE_DEFINITION",
@@ -477,17 +476,13 @@ const RETIRED_SETTINGS: [(&str, &str); 2] = [
     ("HOLOCHAIN_UNIT_INDEX", "rename it to HOT_UNIT_INDEX"),
 ];
 
-fn refuse_retired_settings(setting: impl Fn(&str) -> Option<String>) -> Result<()> {
-    match RETIRED_SETTINGS
+fn hot_unit_index(setting: impl Fn(&str) -> Option<String>) -> Result<u32> {
+    if let Some((key, replacement)) = RETIRED_SETTINGS
         .iter()
         .find(|(key, _)| setting(key).is_some())
     {
-        Some((key, replacement)) => anyhow::bail!("{key} is retired: {replacement}"),
-        None => Ok(()),
+        anyhow::bail!("{key} is retired: {replacement}");
     }
-}
-
-fn hot_unit_index(setting: impl Fn(&str) -> Option<String>) -> Result<u32> {
     setting("HOT_UNIT_INDEX")
         .as_deref()
         .unwrap_or("1")
@@ -547,9 +542,8 @@ mod tests {
             ("HOLOCHAIN_UNIT_INDEX", "HOT_UNIT_INDEX"),
         ] {
             for value in ["1", ""] {
-                let err =
-                    refuse_retired_settings(settings(&[("HOT_UNIT_INDEX", "1"), (key, value)]))
-                        .expect_err("a retired setting would otherwise be dropped in silence");
+                let err = hot_unit_index(settings(&[("HOT_UNIT_INDEX", "1"), (key, value)]))
+                    .expect_err("a retired setting would otherwise be dropped in silence");
                 let message = format!("{err:#}");
                 assert!(
                     message.starts_with(&format!("{key} is retired")),
@@ -558,7 +552,6 @@ mod tests {
                 assert!(message.contains(replacement), "{message}");
             }
         }
-        refuse_retired_settings(settings(&[("HOT_UNIT_INDEX", "1")])).unwrap();
     }
 
     #[test]
@@ -567,10 +560,6 @@ mod tests {
         assert_eq!(
             hot_unit_index(settings(&[("HOT_UNIT_INDEX", "3")])).unwrap(),
             3
-        );
-        assert_eq!(
-            hot_unit_index(settings(&[("HOLOCHAIN_UNIT_INDEX", "3")])).unwrap(),
-            1
         );
         let err = hot_unit_index(settings(&[("HOT_UNIT_INDEX", "hot")])).unwrap_err();
         assert!(
