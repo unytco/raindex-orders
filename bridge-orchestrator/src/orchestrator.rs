@@ -1510,8 +1510,6 @@ impl BridgeOrchestrator {
         ))
     }
 
-    /// The one lane, of those in force and the global definition's own, on
-    /// which the DNA lets this bridge's agent raise credit in the HOT unit.
     async fn resolve_deposit_context(
         conductor: &impl LaneReads,
         bridging_agent: &AgentPubKeyB64,
@@ -1587,8 +1585,6 @@ impl BridgeOrchestrator {
 
 struct CandidateLane {
     name: String,
-    /// The named lane's definition in force. The global definition's lane has
-    /// none, and a spend on it names no lane.
     version: Option<ActionHash>,
     definition: LaneDefinition,
 }
@@ -3055,19 +3051,31 @@ mod tests {
         versions: HashMap<ActionHash, LaneDefinition>,
     }
 
+    fn basic_properties(origin: u8) -> LaneBasicPropertiesExt {
+        LaneBasicPropertiesExt {
+            id: action_hash(origin).into(),
+            name: format!("lane {origin}"),
+            abbreviation: String::new(),
+            description: String::new(),
+            url: String::new(),
+            theme: String::new(),
+            lane_editors: vec![],
+        }
+    }
+
     impl FakeConductor {
+        fn with_undefined_lane(mut self, origin: u8) -> Self {
+            self.lanes.push(LaneExt {
+                basic_properties: basic_properties(origin),
+                definition: None,
+            });
+            self
+        }
+
         fn with_lane(mut self, origin: u8, versions: &[Version], in_force: Option<u8>) -> Self {
             let &(newest, agent, units) = versions.last().expect("a lane has a definition");
             self.lanes.push(LaneExt {
-                basic_properties: LaneBasicPropertiesExt {
-                    id: action_hash(origin).into(),
-                    name: format!("lane {origin}"),
-                    abbreviation: String::new(),
-                    description: String::new(),
-                    url: String::new(),
-                    theme: String::new(),
-                    lane_editors: vec![],
-                },
+                basic_properties: basic_properties(origin),
                 definition: Some(LaneDefinitionExt::from(
                     action_hash(origin),
                     action_hash(newest),
@@ -3238,6 +3246,7 @@ mod tests {
     async fn a_lane_with_no_version_in_force_is_passed_over() {
         let conductor = FakeConductor::default()
             .with_lane(OTHER_LANE, &[(OTHER_CURRENT, BRIDGE, &[HOT])], None)
+            .with_undefined_lane(THIRD_LANE)
             .with_lane(LANE, &[(CURRENT, BRIDGE, &[HOT])], Some(CURRENT));
 
         let context = resolve(&conductor, &global_definition(), HOT)
@@ -3245,6 +3254,37 @@ mod tests {
             .unwrap();
 
         assert_on_version(&context, CURRENT);
+        assert_eq!(
+            context.lane_definition_count, 2,
+            "a spend naming no lane is measured for every lane with a definition, in force or not"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lane_that_cannot_be_read_fails_the_cycle() {
+        let mut conductor = FakeConductor::default()
+            .with_lane(
+                OTHER_LANE,
+                &[(OTHER_CURRENT, BRIDGE, &[HOT])],
+                Some(OTHER_CURRENT),
+            )
+            .with_lane(LANE, &[(CURRENT, BRIDGE, &[HOT])], Some(CURRENT));
+        conductor.versions.remove(&action_hash(OTHER_CURRENT));
+
+        resolve(&conductor, &global_definition(), HOT)
+            .await
+            .expect_err("a lane that cannot be read may be the second match");
+    }
+
+    #[test]
+    fn a_deposit_is_credited_in_the_hot_unit_index() {
+        let mut orch = test_orchestrator("hot-unit-index");
+        orch.cfg.hot_unit_index = 3;
+        enqueue_lock(&orch, "lock:unit:a", "0xd1");
+
+        let (_, amount) = orch.extract_lock_proof(&pending_rows(&orch)[0]).unwrap();
+
+        assert_eq!(amount.get_unit_indexes(), vec!["3".to_string()]);
     }
 
     #[tokio::test]
@@ -3273,20 +3313,26 @@ mod tests {
 
     #[tokio::test]
     async fn two_lanes_naming_the_agent_and_unit_fail_the_cycle() {
-        let two_lanes = FakeConductor::default()
+        let three_lanes = FakeConductor::default()
             .with_lane(
                 OTHER_LANE,
                 &[(OTHER_CURRENT, BRIDGE, &[HOT])],
                 Some(OTHER_CURRENT),
             )
-            .with_lane(LANE, &[(CURRENT, BRIDGE, &[HOT])], Some(CURRENT));
+            .with_lane(LANE, &[(CURRENT, BRIDGE, &[HOT])], Some(CURRENT))
+            .with_lane(
+                THIRD_LANE,
+                &[(THIRD_CURRENT, BRIDGE, &[HOT])],
+                Some(THIRD_CURRENT),
+            );
 
-        let err = resolve(&two_lanes, &global_definition(), HOT)
+        let err = resolve(&three_lanes, &global_definition(), HOT)
             .await
             .expect_err("the bridge cannot tell which lane its deposits belong to");
         let message = format!("{err:#}");
-        assert!(message.contains(&origin_of(OTHER_LANE)), "{message}");
-        assert!(message.contains(&origin_of(LANE)), "{message}");
+        for lane in [OTHER_LANE, LANE, THIRD_LANE] {
+            assert!(message.contains(&origin_of(lane)), "{message}");
+        }
 
         let one_lane =
             FakeConductor::default().with_lane(LANE, &[(CURRENT, BRIDGE, &[HOT])], Some(CURRENT));

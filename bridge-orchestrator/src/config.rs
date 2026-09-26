@@ -466,22 +466,24 @@ fn capped_link_tag_bytes(configured: usize) -> usize {
     configured.clamp(LINK_TAG_BYTES_FLOOR, LINK_TAG_BYTES_CEILING)
 }
 
-/// Refused where the unit is read, so an older deploy that still sets one cannot
-/// run on defaults.
+/// Refused rather than ignored, so a deploy that still sets one stops instead of
+/// running without it.
 const RETIRED_SETTINGS: [(&str, &str); 2] = [
     (
         "HOLOCHAIN_LANE_DEFINITION",
-        "remove it. The bridge runs on the lane in force whose bridging agent is HOLOCHAIN_BRIDGING_AGENT_PUBKEY and whose service units include HOT_UNIT_INDEX",
+        "remove it. The bridge finds its lane from HOLOCHAIN_BRIDGING_AGENT_PUBKEY and HOT_UNIT_INDEX",
     ),
     ("HOLOCHAIN_UNIT_INDEX", "rename it to HOT_UNIT_INDEX"),
 ];
 
 fn hot_unit_index(setting: impl Fn(&str) -> Option<String>) -> Result<u32> {
-    if let Some((key, replacement)) = RETIRED_SETTINGS
+    let retired: Vec<String> = RETIRED_SETTINGS
         .iter()
-        .find(|(key, _)| setting(key).is_some())
-    {
-        anyhow::bail!("{key} is retired: {replacement}");
+        .filter(|(key, _)| setting(key).is_some())
+        .map(|(key, replacement)| format!("{key} is retired: {replacement}"))
+        .collect();
+    if !retired.is_empty() {
+        anyhow::bail!("{}", retired.join("; "));
     }
     setting("HOT_UNIT_INDEX")
         .as_deref()
@@ -552,6 +554,18 @@ mod tests {
                 assert!(message.contains(replacement), "{message}");
             }
         }
+
+        let err = hot_unit_index(settings(&[
+            ("HOLOCHAIN_LANE_DEFINITION", ""),
+            ("HOLOCHAIN_UNIT_INDEX", "1"),
+        ]))
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("HOLOCHAIN_LANE_DEFINITION is retired")
+                && message.contains("HOLOCHAIN_UNIT_INDEX is retired"),
+            "one restart names every retired setting: {message}"
+        );
     }
 
     #[test]
