@@ -23,7 +23,7 @@ jobs:
       run:
         working-directory: bridge-orchestrator
     steps:
-      # No `submodules:` — the crate needs only crates.io and the `ham` git dep;
+      # No `submodules:`, because the crate's dependencies all come through cargo.
       # `lib/` is the Solidity side's, and rain.orderbook is the broken pin.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -34,9 +34,12 @@ jobs:
       # which would restate the pin here and leave it free to drift.
       - name: toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache: a pull request, a fork's included, can restore this branch's
+      # cache, and the cargo git database holds the private unyt-app history.
+      - uses: ./.github/actions/fetch-crates
         with:
-          workspaces: bridge-orchestrator
+          working-directory: bridge-orchestrator
+          unyt-app-token: ${{ secrets.UNYT_APP_READ_TOKEN }}
       - name: fmt
         run: cargo fmt --check
       - name: clippy

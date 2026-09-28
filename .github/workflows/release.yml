@@ -24,8 +24,8 @@ jobs:
     outputs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      # No `submodules:`, because the crate needs only crates.io and the `ham`
-      # git dep, while a recursive checkout pulls ~1.4 GB of Solidity submodules.
+      # No `submodules:`, because the crate's dependencies all come through cargo,
+      # while a recursive checkout pulls ~1.4 GB of Solidity submodules.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -75,9 +75,12 @@ jobs:
             exit 1
           fi
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # No rust-cache: a tag run also restores the default branch's cache, which
+      # any run on main can write, and this job holds the unyt-app token.
+      - uses: ./.github/actions/fetch-crates
         with:
-          workspaces: bridge-orchestrator
+          working-directory: bridge-orchestrator
+          unyt-app-token: ${{ secrets.UNYT_APP_READ_TOKEN }}
 
       - name: Build
         run: cargo build --release --locked

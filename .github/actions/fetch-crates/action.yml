@@ -1,0 +1,32 @@
+name: Fetch crates
+description: >
+  cargo fetch for one crate, reading the private unytco/unyt-app repository that
+  rave_engine is pinned to. The token is in this step's environment alone, so the
+  build scripts later steps run do not inherit it.
+inputs:
+  working-directory:
+    description: The crate to fetch for.
+    required: true
+  unyt-app-token:
+    description: A token that can read unytco/unyt-app.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        UNYT_APP_TOKEN: ${{ inputs.unyt-app-token }}
+        CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        GIT_CONFIG_COUNT: "2"
+        GIT_CONFIG_KEY_0: url.https://x-access-token:${{ inputs.unyt-app-token }}@github.com/unytco/unyt-app.insteadOf
+        GIT_CONFIG_VALUE_0: https://github.com/unytco/unyt-app
+        # unyt-app names its submodules by SSH URL, and the runner has no SSH key.
+        GIT_CONFIG_KEY_1: url.https://github.com/.insteadOf
+        GIT_CONFIG_VALUE_1: "git@github.com:"
+      run: |
+        if [[ -z "$UNYT_APP_TOKEN" ]]; then
+          echo "::error::This run has no UNYT_APP_READ_TOKEN (unset, or withheld from a fork's pull request), and rave_engine comes from the private unytco/unyt-app."
+          exit 1
+        fi
+        cargo fetch --locked
