@@ -32,7 +32,7 @@ hmac = "0.12"
 holo_hash = { version = "0.7.0", features = ["encoding"] }
 holochain_client = "0.9.0"
 holochain_zome_types = "0.7.0"
-rave_engine = { git = "https://github.com/unytco/unyt-app.git", rev = "237639d82254ac10f5ad911a360fbb616ae8d470" }
+rave_engine = "=0.12.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmp-serde = "1.1"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
