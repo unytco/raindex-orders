@@ -121,8 +121,6 @@ forge test
 cd bridge-orchestrator && cargo build
 ```
 
-The orchestrator's `rave_engine` is pinned to a revision of the private `unytco/unyt-app`, so building it needs read access to that repository. CI reads it with the `UNYT_APP_READ_TOKEN` secret.
-
 ## Security
 
 - Test signer key in repo is for testing only

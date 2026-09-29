@@ -34,12 +34,9 @@ jobs:
       # which would restate the pin here and leave it free to drift.
       - name: toolchain
         run: rustup toolchain install
-      # No rust-cache: a pull request, a fork's included, can restore this branch's
-      # cache, and the cargo git database holds the private unyt-app history.
-      - uses: ./.github/actions/fetch-crates
+      - uses: Swatinem/rust-cache@v2
         with:
-          working-directory: bridge-orchestrator
-          unyt-app-token: ${{ secrets.UNYT_APP_READ_TOKEN }}
+          workspaces: bridge-orchestrator
       - name: fmt
         run: cargo fmt --check
       - name: clippy

@@ -75,12 +75,9 @@ jobs:
             exit 1
           fi
 
-      # No rust-cache: a tag run also restores the default branch's cache, which
-      # any run on main can write, and this job holds the unyt-app token.
-      - uses: ./.github/actions/fetch-crates
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          working-directory: bridge-orchestrator
-          unyt-app-token: ${{ secrets.UNYT_APP_READ_TOKEN }}
+          workspaces: bridge-orchestrator
 
       - name: Build
         run: cargo build --release --locked
