@@ -1,7 +1,7 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use holo_hash::{ActionHashB64, AgentPubKeyB64};
+use holo_hash::AgentPubKeyB64;
 use std::env;
 use std::str::FromStr;
 
@@ -48,8 +48,7 @@ pub struct Config {
     /// fleet path.
     pub lair_passphrase_file: String,
     pub bridging_agent_pubkey: AgentPubKeyB64,
-    pub lane_definition: Option<ActionHashB64>,
-    pub unit_index: u32,
+    pub hot_unit_index: u32,
     /// Per-request timeout applied to the Holochain app websocket. Prevents a
     /// slow or hung zome call from blocking the orchestrator indefinitely.
     pub ham_request_timeout_secs: u64,
@@ -230,13 +229,7 @@ impl Config {
                 .context("HOLOCHAIN_BRIDGING_AGENT_PUBKEY required")?,
         )
         .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
-        let lane_definition = env::var("HOLOCHAIN_LANE_DEFINITION")
-            .ok()
-            .and_then(|v| ActionHashB64::from_str(&v).ok());
-        let unit_index = env::var("HOLOCHAIN_UNIT_INDEX")
-            .unwrap_or_else(|_| "1".into())
-            .parse()
-            .context("Invalid HOLOCHAIN_UNIT_INDEX")?;
+        let hot_unit_index = hot_unit_index(|key| env::var(key).ok())?;
         let ham_request_timeout_secs = env::var("HAM_REQUEST_TIMEOUT_SECS")
             .unwrap_or_else(|_| "120".into())
             .parse()
@@ -310,8 +303,7 @@ impl Config {
             conductor_config,
             lair_passphrase_file,
             bridging_agent_pubkey,
-            lane_definition,
-            unit_index,
+            hot_unit_index,
             ham_request_timeout_secs,
             ham_reconnect_backoff_initial_ms,
             ham_reconnect_backoff_max_ms,
@@ -474,6 +466,32 @@ fn capped_link_tag_bytes(configured: usize) -> usize {
     configured.clamp(LINK_TAG_BYTES_FLOOR, LINK_TAG_BYTES_CEILING)
 }
 
+/// Refused rather than ignored, so a deploy that still sets one stops instead of
+/// running without it.
+const RETIRED_SETTINGS: [(&str, &str); 2] = [
+    (
+        "HOLOCHAIN_LANE_DEFINITION",
+        "remove it. The bridge finds its lane from HOLOCHAIN_BRIDGING_AGENT_PUBKEY and HOT_UNIT_INDEX",
+    ),
+    ("HOLOCHAIN_UNIT_INDEX", "rename it to HOT_UNIT_INDEX"),
+];
+
+fn hot_unit_index(setting: impl Fn(&str) -> Option<String>) -> Result<u32> {
+    let retired: Vec<String> = RETIRED_SETTINGS
+        .iter()
+        .filter(|(key, _)| setting(key).is_some())
+        .map(|(key, replacement)| format!("{key} is retired: {replacement}"))
+        .collect();
+    if !retired.is_empty() {
+        anyhow::bail!("{}", retired.join("; "));
+    }
+    setting("HOT_UNIT_INDEX")
+        .as_deref()
+        .unwrap_or("1")
+        .parse()
+        .context("Invalid HOT_UNIT_INDEX")
+}
+
 /// Strip a single leading `u` multibase prefix (base64url) so the reporter's
 /// stored DNA matches the 52-char form the Holochain observer uses across
 /// the rest of the Watchtower schema. Both forms encode the same hash;
@@ -505,6 +523,62 @@ mod tests {
         assert_eq!(
             capped_link_tag_bytes(LINK_TAG_BYTES_FLOOR - 1),
             LINK_TAG_BYTES_FLOOR
+        );
+    }
+
+    fn settings<'a>(set: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        |key| {
+            set.iter()
+                .find(|(set_key, _)| *set_key == key)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn each_retired_setting_stops_the_orchestrator_naming_its_replacement() {
+        for (key, replacement) in [
+            (
+                "HOLOCHAIN_LANE_DEFINITION",
+                "HOLOCHAIN_BRIDGING_AGENT_PUBKEY",
+            ),
+            ("HOLOCHAIN_UNIT_INDEX", "HOT_UNIT_INDEX"),
+        ] {
+            for value in ["1", ""] {
+                let err = hot_unit_index(settings(&[("HOT_UNIT_INDEX", "1"), (key, value)]))
+                    .expect_err("a retired setting would otherwise be dropped in silence");
+                let message = format!("{err:#}");
+                assert!(
+                    message.starts_with(&format!("{key} is retired")),
+                    "{message}"
+                );
+                assert!(message.contains(replacement), "{message}");
+            }
+        }
+
+        let err = hot_unit_index(settings(&[
+            ("HOLOCHAIN_LANE_DEFINITION", ""),
+            ("HOLOCHAIN_UNIT_INDEX", "1"),
+        ]))
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("HOLOCHAIN_LANE_DEFINITION is retired")
+                && message.contains("HOLOCHAIN_UNIT_INDEX is retired"),
+            "one restart names every retired setting: {message}"
+        );
+    }
+
+    #[test]
+    fn hot_unit_index_parses_and_defaults_to_one() {
+        assert_eq!(hot_unit_index(settings(&[])).unwrap(), 1);
+        assert_eq!(
+            hot_unit_index(settings(&[("HOT_UNIT_INDEX", "3")])).unwrap(),
+            3
+        );
+        let err = hot_unit_index(settings(&[("HOT_UNIT_INDEX", "hot")])).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Invalid HOT_UNIT_INDEX"),
+            "{err:#}"
         );
     }
 
