@@ -3882,6 +3882,7 @@ mod tests {
             .find(|r| r.id == row_id)
             .expect("row must have advanced to cl_link_created");
         assert_eq!(row.cl_link_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(row.cl_ea_id, Some(ea(CL_EA)));
     }
 
     #[tokio::test]
@@ -3988,6 +3989,7 @@ mod tests {
             .find(|r| r.id == row_id)
             .expect("row must have advanced to br_spend_created");
         assert_eq!(row.br_spend_hash.as_deref(), Some(expected.as_str()));
+        assert_eq!(row.br_ea_id, Some(ea(BR_EA)));
     }
 
     #[tokio::test]
