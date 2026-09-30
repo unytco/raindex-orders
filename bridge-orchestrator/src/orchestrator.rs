@@ -1184,8 +1184,8 @@ impl BridgeOrchestrator {
     }
 
     /// Whether the link a row waits on has left the agreement it was parked
-    /// on. A row the conductor cannot answer for stays where it is, so one
-    /// unreadable agreement or link holds up no other row.
+    /// on. A read that fails for this row alone leaves it where it is, holding
+    /// up no other row. A failing conductor ends the cycle.
     async fn link_consumed(
         &self,
         conductor: &impl ConductorReads,
@@ -1198,7 +1198,12 @@ impl BridgeOrchestrator {
         };
         let (agreement, parked) = match parked_on(conductor, live, link, recorded).await {
             Ok(checked) => checked,
-            Err(e) if is_connection_error(&e) => return Err(e),
+            Err(e) if classify_cycle_failure(&e) != CycleFailureAction::UnclassifiedCooldown => {
+                return Err(e.context(format!(
+                    "lock {} at {}: its link {} could not be checked",
+                    row.item_id, row.step, link
+                )));
+            }
             Err(e) => {
                 error!(
                     event = "bridge.reconcile.unresolved",
@@ -3172,7 +3177,7 @@ mod tests {
         parked: HashMap<ActionHash, Vec<Transaction>>,
         parked_on: HashMap<ActionHash, ActionHash>,
         parked_reads: std::cell::RefCell<Vec<ActionHash>>,
-        socket_drops_on: Option<ActionHash>,
+        fails_on: Option<(ActionHash, &'static str)>,
     }
 
     fn basic_properties(origin: u8) -> LaneBasicPropertiesExt {
@@ -3199,6 +3204,15 @@ mod tests {
 
         fn consumed(self, agreement: ActionHash) -> Self {
             self.parking(agreement, &[])
+        }
+
+        fn check_fails_on(&self, hash: &ActionHash) -> Result<()> {
+            match &self.fails_on {
+                Some((failing, failure)) if failing == hash => {
+                    Err(anyhow::anyhow!(*failure).context(format!("failed to read {hash}")))
+                }
+                _ => Ok(()),
+            }
         }
 
         fn with_undefined_lane(mut self, origin: u8) -> Self {
@@ -3269,9 +3283,7 @@ mod tests {
 
         async fn parked_links(&self, agreement: &ActionHash) -> Result<Vec<Transaction>> {
             self.parked_reads.borrow_mut().push(agreement.clone());
-            if self.socket_drops_on.as_ref() == Some(agreement) {
-                anyhow::bail!("Websocket closed");
-            }
+            self.check_fails_on(agreement)?;
             let links = self
                 .parked
                 .get(agreement)
@@ -3280,6 +3292,7 @@ mod tests {
         }
 
         async fn agreement_of(&self, link: ActionHash) -> Result<ActionHash> {
+            self.check_fails_on(&link)?;
             let agreement = self
                 .parked_on
                 .get(&link)
@@ -4503,23 +4516,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_socket_fails_the_cycle_rather_than_one_row() {
-        let orch = test_orchestrator("dropped-socket");
-        let waiting = enqueue_lock(&orch, "lock:dropped-socket", "0xe2");
+    async fn a_conductor_failure_fails_the_cycle_rather_than_one_row() {
+        let orch = test_orchestrator("conductor-failure");
+        let (agreement, link) = (action_hash(0xE2), action_hash(0x53));
+        let waiting = enqueue_lock(&orch, "lock:conductor-failure", "0xe2");
         orch.db
-            .advance_to_cl_link_created(waiting, &action_hash(0x53).to_string(), &ea(0xE2))
+            .advance_to_cl_link_created(waiting, &link.to_string(), &agreement.to_string())
             .unwrap();
-        let conductor = FakeConductor {
-            socket_drops_on: Some(action_hash(0xE2)),
-            ..FakeConductor::default()
-                .consumed(action_hash(CL_EA))
-                .consumed(action_hash(BR_EA))
-        };
+        let behind = enqueue_lock(&orch, "lock:behind-the-failure", "0xe9");
+        orch.db
+            .advance_to_cl_link_created(behind, &action_hash(0x57).to_string(), &ea(CL_EA))
+            .unwrap();
 
-        let e = reconcile_fails(&orch, &conductor).await;
+        for failing in [agreement, link] {
+            for (failure, action) in [
+                ("Websocket closed", CycleFailureAction::Reconnect),
+                ("Websocket error: Timeout", CycleFailureAction::Cooldown),
+                (
+                    "Source chain error: deadline has elapsed",
+                    CycleFailureAction::Cooldown,
+                ),
+            ] {
+                let conductor = FakeConductor {
+                    fails_on: Some((failing.clone(), failure)),
+                    ..FakeConductor::default()
+                        .consumed(action_hash(CL_EA))
+                        .consumed(action_hash(BR_EA))
+                };
 
-        assert!(is_connection_error(&e), "{e:#}");
-        assert_eq!(lock_row(&orch, waiting).step, WorkStep::ClLinkCreated);
+                let e = reconcile_fails(&orch, &conductor).await;
+
+                assert_eq!(classify_cycle_failure(&e), action, "{e:#}");
+                assert!(format!("{e:#}").contains("lock:conductor-failure"), "{e:#}");
+                for id in [waiting, behind] {
+                    assert_eq!(lock_row(&orch, id).step, WorkStep::ClLinkCreated);
+                }
+            }
+            forget_agreements(&orch, &[waiting]);
+        }
     }
 
     #[tokio::test]
