@@ -1127,7 +1127,7 @@ impl BridgeOrchestrator {
         {
             if self
                 .link_consumed(conductor, live, &row, &credit_limit)
-                .await
+                .await?
             {
                 self.db.advance_to_cl_rave_executed(row.id, None)?;
                 counts.s2_advanced += 1;
@@ -1155,7 +1155,7 @@ impl BridgeOrchestrator {
             .db
             .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?
         {
-            if self.link_consumed(conductor, live, &row, &bridging).await {
+            if self.link_consumed(conductor, live, &row, &bridging).await? {
                 self.db.advance_to_br_rave_executed(row.id, None)?;
                 counts.s4_advanced += 1;
             }
@@ -1184,83 +1184,61 @@ impl BridgeOrchestrator {
     }
 
     /// Whether the link a row waits on has left the agreement it was parked
-    /// on. A row this cannot settle stays where it is, so one unreadable
-    /// agreement or link holds up no other row.
+    /// on. A row the conductor cannot answer for stays where it is, so one
+    /// unreadable agreement or link holds up no other row.
     async fn link_consumed(
         &self,
         conductor: &impl ConductorReads,
         live: &mut LiveLinks,
         row: &WorkItem,
         in_force: &ActionHash,
-    ) -> bool {
+    ) -> Result<bool> {
         let Some((link, recorded)) = row.parked_link() else {
-            return false;
+            return Ok(false);
         };
-        match self.parked_on(conductor, live, row, link, recorded).await {
-            Ok((agreement, false)) => {
-                debug!(
-                    "[bridge/reconcile] lock={} at {}: link {} left agreement {}",
-                    row.item_id, row.step, link, agreement
-                );
-                true
-            }
-            Ok((agreement, true)) => {
-                if agreement != *in_force {
-                    error!(
-                        event = "bridge.reconcile.superseded_agreement",
-                        "[bridge/reconcile] lock={} waits on agreement {}, no longer in force: only a RAVE on it can consume link {}",
-                        row.item_id,
-                        agreement,
-                        link
-                    );
-                }
-                false
-            }
+        let (agreement, parked) = match parked_on(conductor, live, link, recorded).await {
+            Ok(checked) => checked,
+            Err(e) if is_connection_error(&e) => return Err(e),
             Err(e) => {
                 error!(
                     event = "bridge.reconcile.unresolved",
-                    "[bridge/reconcile] lock={} stays pending, its link {} could not be checked: {:#}",
+                    "[bridge/reconcile] lock={} at {} stays pending, its link {} could not be checked: {:#}",
                     row.item_id,
+                    row.step,
                     link,
                     e
                 );
-                false
-            }
-        }
-    }
-
-    /// The agreement a row's link was parked on, learned from the link and
-    /// recorded when the row names none, and whether it is still parked there.
-    async fn parked_on(
-        &self,
-        conductor: &impl ConductorReads,
-        live: &mut LiveLinks,
-        row: &WorkItem,
-        link: &str,
-        recorded: Option<&str>,
-    ) -> Result<(ActionHash, bool)> {
-        let agreement = match recorded {
-            Some(agreement) => action_hash_from(agreement)?,
-            None => {
-                let agreement = conductor.agreement_of(action_hash_from(link)?).await?;
-                self.db
-                    .record_parked_agreement(row.id, &agreement.to_string())?;
-                info!(
-                    event = "bridge.reconcile.agreement_recorded",
-                    "[bridge/reconcile] lock={} link {} was parked on agreement {}",
-                    row.item_id,
-                    link,
-                    agreement
-                );
-                agreement
+                return Ok(false);
             }
         };
-        let parked = live
-            .on(conductor, &agreement)
-            .await?
-            .iter()
-            .any(|t| t.id.to_string() == link);
-        Ok((agreement, parked))
+        if recorded.is_none() {
+            self.db
+                .record_parked_agreement(row.id, &agreement.to_string())?;
+            info!(
+                event = "bridge.reconcile.agreement_recorded",
+                "[bridge/reconcile] lock={} link {} was parked on agreement {}",
+                row.item_id,
+                link,
+                agreement
+            );
+        }
+        if !parked {
+            debug!(
+                "[bridge/reconcile] lock={} at {}: link {} left agreement {}",
+                row.item_id, row.step, link, agreement
+            );
+            return Ok(true);
+        }
+        if agreement != *in_force {
+            error!(
+                event = "bridge.reconcile.superseded_agreement",
+                "[bridge/reconcile] lock={} waits on agreement {}, no longer in force: only a RAVE on it can consume link {}",
+                row.item_id,
+                agreement,
+                link
+            );
+        }
+        Ok(false)
     }
 
     /// Extract a single lock row's proof `tx_hash` for reconcile lookups,
@@ -1759,6 +1737,26 @@ fn agreement_parked_on(record: &Record) -> Result<ActionHash> {
             record.action_address()
         )
     })
+}
+
+/// The agreement a link was parked on, learned from the link when `recorded`
+/// names none, and whether the link is still parked there.
+async fn parked_on(
+    conductor: &impl ConductorReads,
+    live: &mut LiveLinks,
+    link: &str,
+    recorded: Option<&str>,
+) -> Result<(ActionHash, bool)> {
+    let agreement = match recorded {
+        Some(agreement) => action_hash_from(agreement)?,
+        None => conductor.agreement_of(action_hash_from(link)?).await?,
+    };
+    let parked = live
+        .on(conductor, &agreement)
+        .await?
+        .iter()
+        .any(|t| t.id.to_string() == link);
+    Ok((agreement, parked))
 }
 
 fn action_hash_from(b64: &str) -> Result<ActionHash> {
@@ -3174,6 +3172,7 @@ mod tests {
         parked: HashMap<ActionHash, Vec<Transaction>>,
         parked_on: HashMap<ActionHash, ActionHash>,
         parked_reads: std::cell::RefCell<Vec<ActionHash>>,
+        socket_drops_on: Option<ActionHash>,
     }
 
     fn basic_properties(origin: u8) -> LaneBasicPropertiesExt {
@@ -3270,6 +3269,9 @@ mod tests {
 
         async fn parked_links(&self, agreement: &ActionHash) -> Result<Vec<Transaction>> {
             self.parked_reads.borrow_mut().push(agreement.clone());
+            if self.socket_drops_on.as_ref() == Some(agreement) {
+                anyhow::bail!("Websocket closed");
+            }
             let links = self
                 .parked
                 .get(agreement)
@@ -3303,14 +3305,17 @@ mod tests {
         credit_limit: u8,
         bridging: u8,
     ) -> ReconcileCounts {
-        let context = DepositContext {
+        reconcile_on(orch, conductor, &in_force(credit_limit, bridging)).await
+    }
+
+    fn in_force(credit_limit: u8, bridging: u8) -> DepositContext {
+        DepositContext {
             lane: "the test lane".to_string(),
             lane_definitions: vec![],
             lane_definition_count: 0,
             credit_limit_adjustment: action_hash(credit_limit).into(),
             bridging_agreement: action_hash(bridging).into(),
-        };
-        reconcile_on(orch, conductor, &context).await
+        }
     }
 
     async fn reconcile_on(
@@ -3321,6 +3326,19 @@ mod tests {
         orch.reconcile_pipeline(conductor, &mut LiveLinks::default(), context)
             .await
             .unwrap()
+    }
+
+    async fn reconcile_fails(
+        orch: &BridgeOrchestrator,
+        conductor: &FakeConductor,
+    ) -> anyhow::Error {
+        orch.reconcile_pipeline(
+            conductor,
+            &mut LiveLinks::default(),
+            &in_force(CL_EA, BR_EA),
+        )
+        .await
+        .expect_err("the reconcile must fail")
     }
 
     fn forget_agreements(orch: &BridgeOrchestrator, ids: &[i64]) {
@@ -4463,6 +4481,74 @@ mod tests {
             1,
             "a failed read is not retried for each row that shares it"
         );
+    }
+
+    #[tokio::test]
+    async fn an_agreement_in_force_that_cannot_be_read_fails_the_cycle() {
+        let orch = test_orchestrator("in-force-unreadable");
+        let spend = enqueue_lock(&orch, "lock:in-force-unreadable", "0xe1");
+        orch.db
+            .advance_to_cl_link_created(spend, &action_hash(0x51).to_string(), &ea(CL_EA))
+            .unwrap();
+        orch.db.advance_to_cl_rave_executed(spend, None).unwrap();
+        orch.db
+            .advance_to_br_spend_created(spend, &action_hash(0x52).to_string(), &ea(BR_EA))
+            .unwrap();
+
+        for readable in [CL_EA, BR_EA] {
+            let conductor = FakeConductor::default().consumed(action_hash(readable));
+            reconcile_fails(&orch, &conductor).await;
+            assert_eq!(lock_row(&orch, spend).step, WorkStep::BrSpendCreated);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_socket_fails_the_cycle_rather_than_one_row() {
+        let orch = test_orchestrator("dropped-socket");
+        let waiting = enqueue_lock(&orch, "lock:dropped-socket", "0xe2");
+        orch.db
+            .advance_to_cl_link_created(waiting, &action_hash(0x53).to_string(), &ea(0xE2))
+            .unwrap();
+        let conductor = FakeConductor {
+            socket_drops_on: Some(action_hash(0xE2)),
+            ..FakeConductor::default()
+                .consumed(action_hash(CL_EA))
+                .consumed(action_hash(BR_EA))
+        };
+
+        let e = reconcile_fails(&orch, &conductor).await;
+
+        assert!(is_connection_error(&e), "{e:#}");
+        assert_eq!(lock_row(&orch, waiting).step, WorkStep::ClLinkCreated);
+    }
+
+    #[tokio::test]
+    async fn an_agreement_the_state_db_refuses_to_record_fails_the_cycle() {
+        let orch = test_orchestrator("refused-record");
+        let link = parked_tx(0x54, "0xe3");
+        let waiting = enqueue_lock(&orch, "lock:refused-record", "0xe3");
+        orch.db
+            .advance_to_cl_link_created(waiting, &link.id.to_string(), &ea(CL_EA))
+            .unwrap();
+        forget_agreements(&orch, &[waiting]);
+        rusqlite::Connection::open(&orch.cfg.db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse BEFORE UPDATE ON work_items
+                 BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;",
+            )
+            .unwrap();
+        let conductor = FakeConductor::default()
+            .parking(action_hash(CL_EA), &[link])
+            .consumed(action_hash(BR_EA));
+
+        let e = reconcile_fails(&orch, &conductor).await;
+
+        assert!(
+            format!("{e:#}").contains("database or disk is full"),
+            "{e:#}"
+        );
+        assert_eq!(lock_row(&orch, waiting).cl_ea_id, None);
     }
 
     #[test]
