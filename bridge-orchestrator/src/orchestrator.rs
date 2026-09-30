@@ -543,9 +543,10 @@ impl BridgeOrchestrator {
     /// live set, so a silently-committed RAVE drops the consumed links out of
     /// the next fetch and the rows behind them advance on their own.
     ///
-    /// 1. Resolve context + fetch live parked links on both EAs.
-    /// 2. Reconcile — promote rows through the pipeline based on what chain
-    ///    truth says is currently live, before any new write.
+    /// 1. Resolve context.
+    /// 2. Reconcile: promote rows through the pipeline based on what is
+    ///    still parked on the agreement each row was parked on, before any
+    ///    new write.
     /// 3. S1: `create_parked_link` (CL EA) packing proofs from rows at
     ///    `step='new'` up to the link-tag cap.
     /// 4. S2: `execute_rave` (CL EA) over the refetched live set; advances
@@ -594,21 +595,11 @@ impl BridgeOrchestrator {
 
         let credit_limit_ea_id: ActionHash = context.credit_limit_adjustment.clone().into();
         let bridging_ea_id: ActionHash = context.bridging_agreement.clone().into();
-        let credit_limit_ea = credit_limit_ea_id.to_string();
-        let bridging_ea = bridging_ea_id.to_string();
         let global_definition_hash: ActionHash = global_definition.id.clone().into();
 
-        // --- Reconcile: advance rows through the pipeline whenever chain
-        // truth already reflects the next step. Covers every
-        // silently-committed-write recovery scenario by inspecting the
-        // live parked-link set against stored per-row hashes.
-        //
-        // Capture the returned counts so the cycle-completion line can
-        // show reconcile activity alongside the stage write totals —
-        // giving operators a single-line picture of the whole cycle.
         let mut live = LiveLinks::default();
         let reconcile = self
-            .reconcile_pipeline(&conductor, &mut live, &credit_limit_ea_id, &bridging_ea_id)
+            .reconcile_pipeline(&conductor, &mut live, &context)
             .await?;
         let cl_parked_live = live.on(&conductor, &credit_limit_ea_id).await?.len();
         let br_parked_live = live.on(&conductor, &bridging_ea_id).await?.len();
@@ -683,8 +674,7 @@ impl BridgeOrchestrator {
             // One ActionHash for the whole batch; every contributing row
             // stores it for future reconcile comparisons.
             for id in &s1_batch.ids {
-                self.db
-                    .advance_to_cl_link_created(*id, &cl_link_hash, &credit_limit_ea)?;
+                self.record_cl_link(*id, &cl_link_hash, &context)?;
             }
             if self.should_eject(s1_elapsed_ms) {
                 self.log_stage_ejected("s1", "create_parked_link", s1_elapsed_ms);
@@ -852,8 +842,7 @@ impl BridgeOrchestrator {
                     total_spend, spend_hash
                 );
                 for id in &s3_batch.ids {
-                    self.db
-                        .advance_to_br_spend_created(*id, &spend_hash_str, &bridging_ea)?;
+                    self.record_br_spend(*id, &spend_hash_str, &context)?;
                 }
                 s3_written = s3_batch.ids.len();
                 if self.should_eject(s3_elapsed_ms) {
@@ -1095,27 +1084,27 @@ impl BridgeOrchestrator {
     /// * `step='new'` and the lock's `tx_hash` is present in a live CL
     ///   parked-link payload → advance to `cl_link_created` with that
     ///   link's ActionHash.
-    /// * `step='cl_link_created'` and `cl_link_hash` is no longer parked on
-    ///   the agreement it was parked on → that agreement's RAVE consumed the
-    ///   link. Advance to `cl_rave_executed` with `cl_rave_hash=NULL` (we
-    ///   can't recover the actual RAVE hash after the fact).
+    /// * `step='cl_link_created'` and `cl_link_hash` has left the agreement
+    ///   it was parked on → that agreement's RAVE consumed the link. Advance
+    ///   to `cl_rave_executed` with `cl_rave_hash=NULL` (we can't recover the
+    ///   actual RAVE hash after the fact).
     /// * `step='cl_rave_executed'` and the lock's `tx_hash` is present in
     ///   a live bridging parked-spend payload → advance to
     ///   `br_spend_created` with that spend's ActionHash.
-    /// * `step='br_spend_created'` and `br_spend_hash` is no longer parked
-    ///   on the agreement it was parked on → that agreement's RAVE consumed
-    ///   the spend. Advance to `br_rave_executed` (simultaneously
+    /// * `step='br_spend_created'` and `br_spend_hash` has left the
+    ///   agreement it was parked on → that agreement's RAVE consumed the
+    ///   spend. Advance to `br_rave_executed` (simultaneously
     ///   `state='succeeded'`).
     async fn reconcile_pipeline(
         &self,
         conductor: &impl ConductorReads,
         live: &mut LiveLinks,
-        credit_limit: &ActionHash,
-        bridging: &ActionHash,
+        context: &DepositContext,
     ) -> Result<ReconcileCounts> {
-        let cl_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, credit_limit).await?);
-        let br_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, bridging).await?);
-        let (credit_limit_ea, bridging_ea) = (credit_limit.to_string(), bridging.to_string());
+        let credit_limit: ActionHash = context.credit_limit_adjustment.clone().into();
+        let bridging: ActionHash = context.bridging_agreement.clone().into();
+        let cl_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, &credit_limit).await?);
+        let br_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, &bridging).await?);
         let mut counts = ReconcileCounts::default();
 
         for row in self.db.list_pending_by_step("lock", WorkStep::New, 5000)? {
@@ -1127,8 +1116,7 @@ impl BridgeOrchestrator {
                     "[bridge/reconcile] lock={} new → cl_link_created (tx_hash matched live CL link {})",
                     row.item_id, link_id
                 );
-                self.db
-                    .advance_to_cl_link_created(row.id, link_id, &credit_limit_ea)?;
+                self.record_cl_link(row.id, link_id, context)?;
                 counts.s1_advanced += 1;
             }
         }
@@ -1138,13 +1126,9 @@ impl BridgeOrchestrator {
             .list_pending_by_step("lock", WorkStep::ClLinkCreated, 5000)?
         {
             if self
-                .link_consumed(conductor, live, &row, credit_limit)
-                .await?
+                .link_consumed(conductor, live, &row, &credit_limit)
+                .await
             {
-                debug!(
-                    "[bridge/reconcile] lock={} cl_link_created → cl_rave_executed",
-                    row.item_id
-                );
                 self.db.advance_to_cl_rave_executed(row.id, None)?;
                 counts.s2_advanced += 1;
             }
@@ -1162,8 +1146,7 @@ impl BridgeOrchestrator {
                     "[bridge/reconcile] lock={} cl_rave_executed → br_spend_created (tx_hash matched live bridging spend {})",
                     row.item_id, spend_id
                 );
-                self.db
-                    .advance_to_br_spend_created(row.id, spend_id, &bridging_ea)?;
+                self.record_br_spend(row.id, spend_id, context)?;
                 counts.s3_advanced += 1;
             }
         }
@@ -1172,20 +1155,12 @@ impl BridgeOrchestrator {
             .db
             .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?
         {
-            if self.link_consumed(conductor, live, &row, bridging).await? {
-                debug!(
-                    "[bridge/reconcile] lock={} br_spend_created → br_rave_executed (lock succeeded)",
-                    row.item_id
-                );
+            if self.link_consumed(conductor, live, &row, &bridging).await {
                 self.db.advance_to_br_rave_executed(row.id, None)?;
                 counts.s4_advanced += 1;
             }
         }
 
-        // One structured summary line per cycle. In production the
-        // per-row `info!`s above can be noisy; this single record is
-        // the canonical signal for "the reconciler did work this
-        // cycle" (i.e. a previous cycle crashed mid-call).
         debug!(
             event = "bridge.reconcile.summary",
             s1 = counts.s1_advanced,
@@ -1198,18 +1173,72 @@ impl BridgeOrchestrator {
         Ok(counts)
     }
 
+    fn record_cl_link(&self, id: i64, link: &str, context: &DepositContext) -> Result<()> {
+        let agreement = context.credit_limit_adjustment.to_string();
+        self.db.advance_to_cl_link_created(id, link, &agreement)
+    }
+
+    fn record_br_spend(&self, id: i64, spend: &str, context: &DepositContext) -> Result<()> {
+        let agreement = context.bridging_agreement.to_string();
+        self.db.advance_to_br_spend_created(id, spend, &agreement)
+    }
+
     /// Whether the link a row waits on has left the agreement it was parked
-    /// on. A row that names no agreement learns it from the link itself.
+    /// on. A row this cannot settle stays where it is, so one unreadable
+    /// agreement or link holds up no other row.
     async fn link_consumed(
         &self,
         conductor: &impl ConductorReads,
         live: &mut LiveLinks,
         row: &WorkItem,
         in_force: &ActionHash,
-    ) -> Result<bool> {
+    ) -> bool {
         let Some((link, recorded)) = row.parked_link() else {
-            return Ok(false);
+            return false;
         };
+        match self.parked_on(conductor, live, row, link, recorded).await {
+            Ok((agreement, false)) => {
+                debug!(
+                    "[bridge/reconcile] lock={} at {}: link {} left agreement {}",
+                    row.item_id, row.step, link, agreement
+                );
+                true
+            }
+            Ok((agreement, true)) => {
+                if agreement != *in_force {
+                    error!(
+                        event = "bridge.reconcile.superseded_agreement",
+                        "[bridge/reconcile] lock={} waits on agreement {}, no longer in force: only a RAVE on it can consume link {}",
+                        row.item_id,
+                        agreement,
+                        link
+                    );
+                }
+                false
+            }
+            Err(e) => {
+                error!(
+                    event = "bridge.reconcile.unresolved",
+                    "[bridge/reconcile] lock={} stays pending, its link {} could not be checked: {:#}",
+                    row.item_id,
+                    link,
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// The agreement a row's link was parked on, learned from the link and
+    /// recorded when the row names none, and whether it is still parked there.
+    async fn parked_on(
+        &self,
+        conductor: &impl ConductorReads,
+        live: &mut LiveLinks,
+        row: &WorkItem,
+        link: &str,
+        recorded: Option<&str>,
+    ) -> Result<(ActionHash, bool)> {
         let agreement = match recorded {
             Some(agreement) => action_hash_from(agreement)?,
             None => {
@@ -1231,16 +1260,7 @@ impl BridgeOrchestrator {
             .await?
             .iter()
             .any(|t| t.id.to_string() == link);
-        if parked && agreement != *in_force {
-            warn!(
-                event = "bridge.reconcile.superseded_agreement",
-                "[bridge/reconcile] lock={} waits on agreement {}, no longer in force: only a RAVE on it can consume link {}",
-                row.item_id,
-                agreement,
-                link
-            );
-        }
-        Ok(!parked)
+        Ok((agreement, parked))
     }
 
     /// Extract a single lock row's proof `tx_hash` for reconcile lookups,
@@ -1631,9 +1651,10 @@ trait ConductorReads {
     async fn agreement_of(&self, link: ActionHash) -> Result<ActionHash>;
 }
 
-/// The links parked on each agreement, read at most once a cycle.
+/// Each agreement's parked links as reconcile first read them, a failed read
+/// included, so rows sharing an agreement cost one read.
 #[derive(Default)]
-struct LiveLinks(HashMap<ActionHash, Vec<Transaction>>);
+struct LiveLinks(HashMap<ActionHash, Result<Vec<Transaction>, String>>);
 
 impl LiveLinks {
     async fn on(
@@ -1642,10 +1663,13 @@ impl LiveLinks {
         agreement: &ActionHash,
     ) -> Result<&[Transaction]> {
         if !self.0.contains_key(agreement) {
-            let links = conductor.parked_links(agreement).await?;
-            self.0.insert(agreement.clone(), links);
+            let read = conductor.parked_links(agreement).await;
+            self.0
+                .insert(agreement.clone(), read.map_err(|e| format!("{e:#}")));
         }
-        Ok(&self.0[agreement])
+        self.0[agreement]
+            .as_deref()
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
@@ -2120,6 +2144,10 @@ mod tests {
     use alloy::primitives::Address;
     use holo_hash::{ActionHash, AgentPubKey, AgentPubKeyB64};
     use holochain_client::ExternIO;
+    use holochain_zome_types::prelude::{
+        Action, ActionHashed, ActionHeader, CreateData, CreateLinkData, Entry, EntryHash,
+        EntryType, LinkTag, RecordEntry, Signature, SignedActionHashed,
+    };
     use holochain_zome_types::timestamp::Timestamp;
     use rave_engine::types::{
         AddressBook, CommonRAVEAgreements, CommonSpecialAgents, LaneBasicPropertiesExt,
@@ -2247,7 +2275,6 @@ mod tests {
         ActionHash::from_raw_32(vec![seed; 32])
     }
 
-    /// The agreements in force in a reconcile test that names none.
     const CL_EA: u8 = 0xEA;
     const BR_EA: u8 = 0xEB;
 
@@ -3171,6 +3198,10 @@ mod tests {
             self
         }
 
+        fn consumed(self, agreement: ActionHash) -> Self {
+            self.parking(agreement, &[])
+        }
+
         fn with_undefined_lane(mut self, origin: u8) -> Self {
             self.lanes.push(LaneExt {
                 basic_properties: basic_properties(origin),
@@ -3239,9 +3270,11 @@ mod tests {
 
         async fn parked_links(&self, agreement: &ActionHash) -> Result<Vec<Transaction>> {
             self.parked_reads.borrow_mut().push(agreement.clone());
-            Ok(off_the_wire(
-                &self.parked.get(agreement).cloned().unwrap_or_default(),
-            ))
+            let links = self
+                .parked
+                .get(agreement)
+                .with_context(|| format!("no agreement {agreement}"))?;
+            Ok(off_the_wire(links))
         }
 
         async fn agreement_of(&self, link: ActionHash) -> Result<ActionHash> {
@@ -3261,26 +3294,46 @@ mod tests {
         let conductor = FakeConductor::default()
             .parking(action_hash(CL_EA), cl_links)
             .parking(action_hash(BR_EA), br_links);
-        reconcile_in_force(orch, &conductor, action_hash(CL_EA), action_hash(BR_EA)).await
+        reconcile_in_force(orch, &conductor, CL_EA, BR_EA).await
     }
 
     async fn reconcile_in_force(
         orch: &BridgeOrchestrator,
         conductor: &FakeConductor,
-        credit_limit: impl Into<ActionHash>,
-        bridging: impl Into<ActionHash>,
+        credit_limit: u8,
+        bridging: u8,
     ) -> ReconcileCounts {
-        orch.reconcile_pipeline(
-            conductor,
-            &mut LiveLinks::default(),
-            &credit_limit.into(),
-            &bridging.into(),
-        )
-        .await
-        .unwrap()
+        let context = DepositContext {
+            lane: "the test lane".to_string(),
+            lane_definitions: vec![],
+            lane_definition_count: 0,
+            credit_limit_adjustment: action_hash(credit_limit).into(),
+            bridging_agreement: action_hash(bridging).into(),
+        };
+        reconcile_on(orch, conductor, &context).await
     }
 
-    /// A lock row, wherever in the pipeline it stands.
+    async fn reconcile_on(
+        orch: &BridgeOrchestrator,
+        conductor: &FakeConductor,
+        context: &DepositContext,
+    ) -> ReconcileCounts {
+        orch.reconcile_pipeline(conductor, &mut LiveLinks::default(), context)
+            .await
+            .unwrap()
+    }
+
+    fn forget_agreements(orch: &BridgeOrchestrator, ids: &[i64]) {
+        let db = rusqlite::Connection::open(&orch.cfg.db_path).unwrap();
+        for id in ids {
+            db.execute(
+                "UPDATE work_items SET cl_ea_id = NULL, br_ea_id = NULL WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        }
+    }
+
     fn lock_row(orch: &BridgeOrchestrator, id: i64) -> WorkItem {
         [
             crate::state::WorkState::Queued,
@@ -3300,12 +3353,7 @@ mod tests {
             .expect("the orchestrator must decode what the conductor answers")
     }
 
-    fn lane_definition_record(version: ActionHash, definition: &LaneDefinition) -> Record {
-        use holochain_zome_types::prelude::{
-            Action, ActionData, ActionHashed, ActionHeader, CreateData, Entry, EntryHash,
-            EntryType, RecordEntry, Signature, SignedActionHashed,
-        };
-
+    fn record(hash: ActionHash, data: ActionData, entry: RecordEntry) -> Record {
         let action = Action {
             header: ActionHeader {
                 author: AgentPubKey::from_raw_32(vec![9u8; 32]),
@@ -3313,46 +3361,38 @@ mod tests {
                 action_seq: 5,
                 prev_action: Some(action_hash(0x01)),
             },
-            data: ActionData::Create(CreateData {
-                entry_type: EntryType::AgentPubKey,
-                entry_hash: EntryHash::from_raw_32(vec![1u8; 32]),
-            }),
+            data,
         };
         Record::new(
             SignedActionHashed::with_presigned(
-                ActionHashed::with_pre_hashed(action, version),
+                ActionHashed::with_pre_hashed(action, hash),
                 Signature([0; 64]),
             ),
+            entry,
+        )
+    }
+
+    fn lane_definition_record(version: ActionHash, definition: &LaneDefinition) -> Record {
+        record(
+            version,
+            ActionData::Create(CreateData {
+                entry_type: EntryType::AgentPubKey,
+                entry_hash: EntryHash::from_raw_32(vec![1u8; 32]),
+            }),
             RecordEntry::Present(Entry::try_from(definition).unwrap()),
         )
     }
 
     fn parked_link_record(link: ActionHash, agreement: ActionHash) -> Record {
-        use holochain_zome_types::prelude::{
-            Action, ActionHashed, ActionHeader, CreateLinkData, LinkTag, RecordEntry, Signature,
-            SignedActionHashed,
-        };
-
-        let action = Action {
-            header: ActionHeader {
-                author: AgentPubKey::from_raw_32(vec![1u8; 32]),
-                timestamp: Timestamp(0),
-                action_seq: 7,
-                prev_action: Some(action_hash(0x01)),
-            },
-            data: ActionData::CreateLink(CreateLinkData {
+        record(
+            link,
+            ActionData::CreateLink(CreateLinkData {
                 base_address: agreement.into(),
                 target_address: AgentPubKey::from_raw_32(vec![1u8; 32]).into(),
                 zome_index: 0.into(),
                 link_type: 0.into(),
                 tag: LinkTag::new(vec![]),
             }),
-        };
-        Record::new(
-            SignedActionHashed::with_presigned(
-                ActionHashed::with_pre_hashed(action, link),
-                Signature([0; 64]),
-            ),
             RecordEntry::NA,
         )
     }
@@ -4234,38 +4274,25 @@ mod tests {
 
         let link = parked_tx(0x31, "0xc1");
         let on_link = enqueue_lock(&orch, "lock:replaced:cl", "0xc1");
-        orch.db
-            .advance_to_cl_link_created(
-                on_link,
-                &link.id.to_string(),
-                &before.credit_limit_adjustment.to_string(),
-            )
+        orch.record_cl_link(on_link, &link.id.to_string(), &before)
             .unwrap();
         let spend = parked_spend_tx(0x32, "0xc2");
         let on_spend = enqueue_lock(&orch, "lock:replaced:br", "0xc2");
-        orch.db
-            .advance_to_cl_link_created(
-                on_spend,
-                &ea(0x33),
-                &before.credit_limit_adjustment.to_string(),
-            )
+        orch.record_cl_link(on_spend, &action_hash(0x33).to_string(), &before)
             .unwrap();
         orch.db.advance_to_cl_rave_executed(on_spend, None).unwrap();
-        orch.db
-            .advance_to_br_spend_created(
-                on_spend,
-                &spend.id.to_string(),
-                &before.bridging_agreement.to_string(),
-            )
+        orch.record_br_spend(on_spend, &spend.id.to_string(), &before)
             .unwrap();
 
-        let mut conductor = lane(PENDING)
-            .parking(before.credit_limit_adjustment.clone().into(), &[link])
-            .parking(before.bridging_agreement.clone().into(), &[spend]);
-        let in_force = (after.credit_limit_adjustment, after.bridging_agreement);
+        let hash = |agreement: &ActionHashB64| ActionHash::from(agreement.clone());
+        let conductor = lane(PENDING)
+            .parking(hash(&before.credit_limit_adjustment), &[link])
+            .parking(hash(&before.bridging_agreement), &[spend])
+            .consumed(hash(&after.credit_limit_adjustment))
+            .consumed(hash(&after.bridging_agreement));
 
         assert_eq!(
-            reconcile_in_force(&orch, &conductor, in_force.0.clone(), in_force.1.clone()).await,
+            reconcile_on(&orch, &conductor, &after).await,
             ReconcileCounts::default()
         );
         assert_eq!(lock_row(&orch, on_link).step, WorkStep::ClLinkCreated);
@@ -4276,9 +4303,11 @@ mod tests {
             "a spend still parked on the replaced bridging agreement never bridged"
         );
 
-        conductor.parked.clear();
+        let conductor = conductor
+            .consumed(hash(&before.credit_limit_adjustment))
+            .consumed(hash(&before.bridging_agreement));
         assert_eq!(
-            reconcile_in_force(&orch, &conductor, in_force.0, in_force.1).await,
+            reconcile_on(&orch, &conductor, &after).await,
             ReconcileCounts {
                 s2_advanced: 1,
                 s4_advanced: 1,
@@ -4302,16 +4331,17 @@ mod tests {
             .unwrap();
         let done = enqueue_lock(&orch, "lock:in-force:br", "0xc5");
         orch.db
-            .advance_to_cl_link_created(done, &ea(0x35), &ea(CL_EA))
+            .advance_to_cl_link_created(done, &action_hash(0x35).to_string(), &ea(CL_EA))
             .unwrap();
         orch.db.advance_to_cl_rave_executed(done, None).unwrap();
         orch.db
-            .advance_to_br_spend_created(done, &ea(0x36), &ea(BR_EA))
+            .advance_to_br_spend_created(done, &action_hash(0x36).to_string(), &ea(BR_EA))
             .unwrap();
-        let conductor = FakeConductor::default().parking(action_hash(CL_EA), &[link]);
+        let conductor = FakeConductor::default()
+            .parking(action_hash(CL_EA), &[link])
+            .consumed(action_hash(BR_EA));
 
-        let counts =
-            reconcile_in_force(&orch, &conductor, action_hash(CL_EA), action_hash(BR_EA)).await;
+        let counts = reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
         assert_eq!(
             counts,
@@ -4320,10 +4350,9 @@ mod tests {
                 ..Default::default()
             }
         );
-        assert_eq!(
-            *conductor.parked_reads.borrow(),
-            vec![action_hash(CL_EA), action_hash(BR_EA)]
-        );
+        let mut reads = conductor.parked_reads.take();
+        reads.sort();
+        assert_eq!(reads, vec![action_hash(CL_EA), action_hash(BR_EA)]);
     }
 
     #[tokio::test]
@@ -4338,23 +4367,20 @@ mod tests {
         let spend = parked_spend_tx(0x38, "0xc8");
         let on_spend = enqueue_lock(&orch, "lock:unnamed:br", "0xc8");
         orch.db
-            .advance_to_cl_link_created(on_spend, &ea(0x39), &ea(CL_EA))
+            .advance_to_cl_link_created(on_spend, &action_hash(0x39).to_string(), &ea(CL_EA))
             .unwrap();
         orch.db.advance_to_cl_rave_executed(on_spend, None).unwrap();
         orch.db
             .advance_to_br_spend_created(on_spend, &spend.id.to_string(), &ea(BR_EA))
             .unwrap();
-        rusqlite::Connection::open(&orch.cfg.db_path)
-            .unwrap()
-            .execute("UPDATE work_items SET cl_ea_id = NULL, br_ea_id = NULL", [])
-            .unwrap();
-        let mut conductor = FakeConductor::default()
+        forget_agreements(&orch, &[on_link, on_spend]);
+        let conductor = FakeConductor::default()
             .parking(action_hash(REPLACED_CL_EA), &[link])
-            .parking(action_hash(BR_EA), &[spend]);
-        conductor.parked.remove(&action_hash(BR_EA));
+            .consumed(action_hash(CL_EA))
+            .parking(action_hash(BR_EA), &[spend])
+            .consumed(action_hash(BR_EA));
 
-        let counts =
-            reconcile_in_force(&orch, &conductor, action_hash(CL_EA), action_hash(BR_EA)).await;
+        let counts = reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
         assert_eq!(
             counts,
@@ -4369,6 +4395,74 @@ mod tests {
         let done = lock_row(&orch, on_spend);
         assert_eq!(done.state, crate::state::WorkState::Succeeded);
         assert_eq!(done.br_ea_id, Some(ea(BR_EA)));
+    }
+
+    #[tokio::test]
+    async fn a_row_that_cannot_be_checked_waits_without_holding_up_the_others() {
+        const UNREADABLE_EA: u8 = 0xE1;
+        let orch = test_orchestrator("unreadable-agreement");
+        let batch = action_hash(0x41).to_string();
+        let on_unreadable: Vec<i64> = ["0xd1", "0xd2"]
+            .into_iter()
+            .map(|tx| {
+                let id = enqueue_lock(&orch, &format!("lock:unreadable:{tx}"), tx);
+                orch.db
+                    .advance_to_cl_link_created(id, &batch, &ea(UNREADABLE_EA))
+                    .unwrap();
+                id
+            })
+            .collect();
+        let at_spend = |tx: &str, spend: u8| {
+            let id = enqueue_lock(&orch, &format!("lock:unreadable:{tx}"), tx);
+            orch.db
+                .advance_to_cl_link_created(id, &action_hash(0x42).to_string(), &ea(CL_EA))
+                .unwrap();
+            orch.db.advance_to_cl_rave_executed(id, None).unwrap();
+            orch.db
+                .advance_to_br_spend_created(id, &action_hash(spend).to_string(), &ea(BR_EA))
+                .unwrap();
+            id
+        };
+        let unknown_link = at_spend("0xd3", 0x43);
+        forget_agreements(&orch, &[unknown_link]);
+        let consumed = at_spend("0xd4", 0x44);
+        let conductor = FakeConductor::default()
+            .consumed(action_hash(CL_EA))
+            .consumed(action_hash(BR_EA));
+
+        let counts = reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+
+        assert_eq!(
+            counts,
+            ReconcileCounts {
+                s4_advanced: 1,
+                ..Default::default()
+            }
+        );
+        for id in on_unreadable {
+            let row = lock_row(&orch, id);
+            assert_eq!(row.step, WorkStep::ClLinkCreated);
+            assert_eq!(row.cl_ea_id, Some(ea(UNREADABLE_EA)));
+        }
+        let waiting = lock_row(&orch, unknown_link);
+        assert_eq!(
+            (waiting.step, waiting.br_ea_id),
+            (WorkStep::BrSpendCreated, None)
+        );
+        assert_eq!(
+            lock_row(&orch, consumed).state,
+            crate::state::WorkState::Succeeded
+        );
+        assert_eq!(
+            conductor
+                .parked_reads
+                .borrow()
+                .iter()
+                .filter(|read| **read == action_hash(UNREADABLE_EA))
+                .count(),
+            1,
+            "a failed read is not retried for each row that shares it"
+        );
     }
 
     #[test]

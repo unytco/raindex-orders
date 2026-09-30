@@ -131,16 +131,16 @@ pub struct WorkItem {
     pub cl_rave_hash: Option<String>,
     pub br_spend_hash: Option<String>,
     pub br_rave_hash: Option<String>,
-    /// The agreement `cl_link_hash` was parked on. `None` on a row written
-    /// before rows carried it.
+    /// The agreement `cl_link_hash` was parked on. `None` on a row parked by
+    /// a binary that did not record it.
     pub cl_ea_id: Option<String>,
     /// The agreement `br_spend_hash` was parked on, `None` as for `cl_ea_id`.
     pub br_ea_id: Option<String>,
 }
 
 impl WorkItem {
-    /// The link a row waits on a RAVE to consume, and the agreement it was
-    /// parked on when the row knows it.
+    /// The link a row waits on a RAVE to consume, with the agreement it was
+    /// parked on.
     pub fn parked_link(&self) -> Option<(&str, Option<&str>)> {
         let (link, agreement) = match self.step {
             WorkStep::ClLinkCreated => (&self.cl_link_hash, &self.cl_ea_id),
@@ -753,9 +753,6 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Advance a row to `step='cl_link_created'`, recording the ActionHash
-    /// returned by `create_parked_link` and the agreement it was parked on.
-    /// `state` is reset to `queued` so the row is eligible for the next stage.
     pub fn advance_to_cl_link_created(
         &self,
         id: i64,
@@ -802,8 +799,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Advance a row to `step='br_spend_created'`, recording the ActionHash
-    /// returned by `create_parked_spend` and the agreement it was parked on.
     pub fn advance_to_br_spend_created(
         &self,
         id: i64,
@@ -2086,8 +2081,6 @@ mod tests {
 
     #[test]
     fn a_state_db_whose_rows_name_no_agreement_opens_with_its_parked_rows_intact() {
-        // The schema the previous binary wrote: pipeline steps and hashes,
-        // no agreements.
         let path = test_db_path("agreement-migration");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
