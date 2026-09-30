@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- bridge-orchestrator waits for the agreement a deposit was parked on to consume it, even after its lane names a new one.
 - bridge-orchestrator keeps bridging after its lane's definition is extended or replaced.
 - bridge-orchestrator fails a cycle with an error when no lane, or more than one, names its agent and lists the HOT unit.
 - bridge-orchestrator keeps bridging when another lane sets no credit limit adjustment, and fails a cycle, naming its lane, when its own sets none.

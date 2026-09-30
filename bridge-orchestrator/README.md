@@ -206,15 +206,6 @@ Cycle-level errors still reset affected locks from `in_flight` back to
 retries an individual zome call; reconnects only happen between cycles so a
 dropped socket cannot cause a write to be replayed mid-cycle.
 
-**Known limitation: cycle-level idempotency.** A bridge cycle performs four
-writes on the conductor before marking locks `succeeded`. If a write lands
-on the conductor but the response is lost (ws drop or timeout), the affected
-locks are currently re-queued and will be re-processed on the next cycle.
-This risk exists independently of websocket drops and predates the
-reconnect layer. A reconciliation step (scan existing EA links / action
-hashes before re-committing) is a separate, larger change that is not part
-of the reconnect work.
-
 ### Graceful shutdown
 
 `bridge-orchestrator run` installs handlers for `SIGINT` and `SIGTERM`. On
