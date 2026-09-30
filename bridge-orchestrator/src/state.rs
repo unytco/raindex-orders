@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const SCHEMA_VERSION: i64 = 1;
+/// In the order [`row_to_work_item`] reads them.
+const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id";
 #[cfg(test)]
 const DEFAULT_MAX_ATTEMPTS: i64 = 8;
 
@@ -129,6 +131,24 @@ pub struct WorkItem {
     pub cl_rave_hash: Option<String>,
     pub br_spend_hash: Option<String>,
     pub br_rave_hash: Option<String>,
+    /// The agreement `cl_link_hash` was parked on. `None` on a row written
+    /// before rows carried it.
+    pub cl_ea_id: Option<String>,
+    /// The agreement `br_spend_hash` was parked on, `None` as for `cl_ea_id`.
+    pub br_ea_id: Option<String>,
+}
+
+impl WorkItem {
+    /// The link a row waits on a RAVE to consume, and the agreement it was
+    /// parked on when the row knows it.
+    pub fn parked_link(&self) -> Option<(&str, Option<&str>)> {
+        let (link, agreement) = match self.step {
+            WorkStep::ClLinkCreated => (&self.cl_link_hash, &self.cl_ea_id),
+            WorkStep::BrSpendCreated => (&self.br_spend_hash, &self.br_ea_id),
+            _ => return None,
+        };
+        Some((link.as_deref()?, agreement.as_deref()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -693,13 +713,13 @@ impl StateStore {
         limit: usize,
     ) -> Result<Vec<WorkItem>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORK_ITEM_COLUMNS}
              FROM work_items
              WHERE flow = ?1 AND state = ?2
              ORDER BY created_at ASC, id ASC
-             LIMIT ?3",
-        )?;
+             LIMIT ?3"
+        ))?;
         let rows = stmt.query_map(
             params![flow, state.to_string(), limit as i64],
             row_to_work_item,
@@ -719,13 +739,13 @@ impl StateStore {
         limit: usize,
     ) -> Result<Vec<WorkItem>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORK_ITEM_COLUMNS}
              FROM work_items
              WHERE flow = ?1 AND step = ?2 AND state IN ('queued', 'in_flight')
              ORDER BY created_at ASC, id ASC
-             LIMIT ?3",
-        )?;
+             LIMIT ?3"
+        ))?;
         let rows = stmt.query_map(
             params![flow, step.to_string(), limit as i64],
             row_to_work_item,
@@ -734,14 +754,20 @@ impl StateStore {
     }
 
     /// Advance a row to `step='cl_link_created'`, recording the ActionHash
-    /// returned by `create_parked_link`. `state` is reset to `queued` so the
-    /// row is eligible for the next stage.
-    pub fn advance_to_cl_link_created(&self, id: i64, cl_link_hash: &str) -> Result<()> {
+    /// returned by `create_parked_link` and the agreement it was parked on.
+    /// `state` is reset to `queued` so the row is eligible for the next stage.
+    pub fn advance_to_cl_link_created(
+        &self,
+        id: i64,
+        cl_link_hash: &str,
+        cl_ea_id: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
             "UPDATE work_items
              SET step='cl_link_created',
                  cl_link_hash=?2,
+                 cl_ea_id=?3,
                  state='queued',
                  attempts=0,
                  error_class=NULL,
@@ -749,7 +775,7 @@ impl StateStore {
                  next_retry_at=NULL,
                  updated_at=strftime('%s', 'now')
              WHERE id=?1",
-            params![id, cl_link_hash],
+            params![id, cl_link_hash, cl_ea_id],
         )?;
         Ok(())
     }
@@ -777,13 +803,19 @@ impl StateStore {
     }
 
     /// Advance a row to `step='br_spend_created'`, recording the ActionHash
-    /// returned by `create_parked_spend`.
-    pub fn advance_to_br_spend_created(&self, id: i64, br_spend_hash: &str) -> Result<()> {
+    /// returned by `create_parked_spend` and the agreement it was parked on.
+    pub fn advance_to_br_spend_created(
+        &self,
+        id: i64,
+        br_spend_hash: &str,
+        br_ea_id: &str,
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
             "UPDATE work_items
              SET step='br_spend_created',
                  br_spend_hash=?2,
+                 br_ea_id=?3,
                  state='queued',
                  attempts=0,
                  error_class=NULL,
@@ -791,7 +823,22 @@ impl StateStore {
                  next_retry_at=NULL,
                  updated_at=strftime('%s', 'now')
              WHERE id=?1",
-            params![id, br_spend_hash],
+            params![id, br_spend_hash, br_ea_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record the agreement a row's [`WorkItem::parked_link`] was parked on,
+    /// for a row written before rows carried it.
+    pub fn record_parked_agreement(&self, id: i64, agreement: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE work_items
+             SET cl_ea_id = CASE step WHEN 'cl_link_created' THEN ?2 ELSE cl_ea_id END,
+                 br_ea_id = CASE step WHEN 'br_spend_created' THEN ?2 ELSE br_ea_id END,
+                 updated_at=strftime('%s', 'now')
+             WHERE id=?1",
+            params![id, agreement],
         )?;
         Ok(())
     }
@@ -926,44 +973,25 @@ impl StateStore {
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
         let cols: Vec<String> = rows.collect::<Result<Vec<_>, _>>()?;
 
-        if !cols.iter().any(|c| c == "max_attempts") {
-            conn.execute(
-                "ALTER TABLE work_items ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 8",
-                [],
-            )?;
-        }
-        if !cols.iter().any(|c| c == "next_retry_at") {
-            conn.execute(
-                "ALTER TABLE work_items ADD COLUMN next_retry_at INTEGER",
-                [],
-            )?;
-        }
-        if !cols.iter().any(|c| c == "last_attempt_at") {
-            conn.execute(
-                "ALTER TABLE work_items ADD COLUMN last_attempt_at INTEGER",
-                [],
-            )?;
-        }
-        if !cols.iter().any(|c| c == "error_class") {
-            conn.execute("ALTER TABLE work_items ADD COLUMN error_class TEXT", [])?;
-        }
-        if !cols.iter().any(|c| c == "step") {
-            conn.execute(
-                "ALTER TABLE work_items ADD COLUMN step TEXT NOT NULL DEFAULT 'new'",
-                [],
-            )?;
-        }
-        if !cols.iter().any(|c| c == "cl_link_hash") {
-            conn.execute("ALTER TABLE work_items ADD COLUMN cl_link_hash TEXT", [])?;
-        }
-        if !cols.iter().any(|c| c == "cl_rave_hash") {
-            conn.execute("ALTER TABLE work_items ADD COLUMN cl_rave_hash TEXT", [])?;
-        }
-        if !cols.iter().any(|c| c == "br_spend_hash") {
-            conn.execute("ALTER TABLE work_items ADD COLUMN br_spend_hash TEXT", [])?;
-        }
-        if !cols.iter().any(|c| c == "br_rave_hash") {
-            conn.execute("ALTER TABLE work_items ADD COLUMN br_rave_hash TEXT", [])?;
+        for (column, definition) in [
+            ("max_attempts", "INTEGER NOT NULL DEFAULT 8"),
+            ("next_retry_at", "INTEGER"),
+            ("last_attempt_at", "INTEGER"),
+            ("error_class", "TEXT"),
+            ("step", "TEXT NOT NULL DEFAULT 'new'"),
+            ("cl_link_hash", "TEXT"),
+            ("cl_rave_hash", "TEXT"),
+            ("br_spend_hash", "TEXT"),
+            ("br_rave_hash", "TEXT"),
+            ("cl_ea_id", "TEXT"),
+            ("br_ea_id", "TEXT"),
+        ] {
+            if !cols.iter().any(|c| c == column) {
+                conn.execute(
+                    &format!("ALTER TABLE work_items ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
         }
         Ok(())
     }
@@ -994,6 +1022,8 @@ fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
         cl_rave_hash: row.get(17)?,
         br_spend_hash: row.get(18)?,
         br_rave_hash: row.get(19)?,
+        cl_ea_id: row.get(20)?,
+        br_ea_id: row.get(21)?,
     })
 }
 
@@ -1073,8 +1103,7 @@ impl StateStore {
 
         let item = tx
             .query_row(
-                "SELECT id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash
-                 FROM work_items WHERE id = ?1",
+                &format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE id = ?1"),
                 [id],
                 row_to_work_item,
             )
@@ -1103,6 +1132,9 @@ impl StateStore {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    const CL_EA: &str = "uhCkkCLEA";
+    const BR_EA: &str = "uhCkkBREA";
 
     fn test_db_path(name: &str) -> String {
         let ts = SystemTime::now()
@@ -1737,15 +1769,17 @@ mod tests {
         let id_cl = enqueue_one(&store, "lock:s:cl");
         let id_done = enqueue_one(&store, "lock:s:done");
 
-        store.advance_to_cl_link_created(id_cl, "uhCkkCL").unwrap();
         store
-            .advance_to_cl_link_created(id_done, "uhCkkDONE")
+            .advance_to_cl_link_created(id_cl, "uhCkkCL", CL_EA)
+            .unwrap();
+        store
+            .advance_to_cl_link_created(id_done, "uhCkkDONE", CL_EA)
             .unwrap();
         store
             .advance_to_cl_rave_executed(id_done, Some("uhCkkRAVE1"))
             .unwrap();
         store
-            .advance_to_br_spend_created(id_done, "uhCkkSPEND")
+            .advance_to_br_spend_created(id_done, "uhCkkSPEND", BR_EA)
             .unwrap();
         store
             .advance_to_br_rave_executed(id_done, Some("uhCkkRAVE2"))
@@ -1792,7 +1826,9 @@ mod tests {
         store.mark_in_flight(id).unwrap();
         store.schedule_retry(id, "boom", 0).unwrap();
 
-        store.advance_to_cl_link_created(id, "uhCkkABC123").unwrap();
+        store
+            .advance_to_cl_link_created(id, "uhCkkABC123", CL_EA)
+            .unwrap();
 
         let row = store
             .list_pending_by_step("lock", WorkStep::ClLinkCreated, 10)
@@ -1803,6 +1839,7 @@ mod tests {
         assert_eq!(row.step, WorkStep::ClLinkCreated);
         assert_eq!(row.state, WorkState::Queued);
         assert_eq!(row.cl_link_hash.as_deref(), Some("uhCkkABC123"));
+        assert_eq!(row.parked_link(), Some(("uhCkkABC123", Some(CL_EA))));
         assert!(
             row.last_error.is_none(),
             "error text must be cleared on advance"
@@ -1825,7 +1862,9 @@ mod tests {
         let id_s1 = enqueue_one(&store, "lock:attempts:s1");
         let _ = store.claim_next(Some("lock")).unwrap().unwrap();
         let _ = store.claim_next(Some("lock")).unwrap();
-        store.advance_to_cl_link_created(id_s1, "uhCkkS1").unwrap();
+        store
+            .advance_to_cl_link_created(id_s1, "uhCkkS1", CL_EA)
+            .unwrap();
         let row = store
             .list_pending_by_step("lock", WorkStep::ClLinkCreated, 10)
             .unwrap()
@@ -1839,7 +1878,9 @@ mod tests {
 
         // S2 → cl_rave_executed: seed attempts via mark_in_flight + schedule_retry.
         let id_s2 = enqueue_one(&store, "lock:attempts:s2");
-        store.advance_to_cl_link_created(id_s2, "uhCkkS2A").unwrap();
+        store
+            .advance_to_cl_link_created(id_s2, "uhCkkS2A", CL_EA)
+            .unwrap();
         store.mark_in_flight(id_s2).unwrap();
         store.schedule_retry(id_s2, "boom s2", 0).unwrap();
         store.advance_to_cl_rave_executed(id_s2, None).unwrap();
@@ -1856,12 +1897,14 @@ mod tests {
 
         // S3 → br_spend_created.
         let id_s3 = enqueue_one(&store, "lock:attempts:s3");
-        store.advance_to_cl_link_created(id_s3, "uhCkkS3A").unwrap();
+        store
+            .advance_to_cl_link_created(id_s3, "uhCkkS3A", CL_EA)
+            .unwrap();
         store.advance_to_cl_rave_executed(id_s3, None).unwrap();
         store.mark_in_flight(id_s3).unwrap();
         store.schedule_retry(id_s3, "boom s3", 0).unwrap();
         store
-            .advance_to_br_spend_created(id_s3, "uhCkkS3B")
+            .advance_to_br_spend_created(id_s3, "uhCkkS3B", BR_EA)
             .unwrap();
         let row = store
             .list_pending_by_step("lock", WorkStep::BrSpendCreated, 10)
@@ -1876,10 +1919,12 @@ mod tests {
 
         // S4 → br_rave_executed (terminal).
         let id_s4 = enqueue_one(&store, "lock:attempts:s4");
-        store.advance_to_cl_link_created(id_s4, "uhCkkS4A").unwrap();
+        store
+            .advance_to_cl_link_created(id_s4, "uhCkkS4A", CL_EA)
+            .unwrap();
         store.advance_to_cl_rave_executed(id_s4, None).unwrap();
         store
-            .advance_to_br_spend_created(id_s4, "uhCkkS4B")
+            .advance_to_br_spend_created(id_s4, "uhCkkS4B", BR_EA)
             .unwrap();
         store.mark_in_flight(id_s4).unwrap();
         store.schedule_retry(id_s4, "boom s4", 0).unwrap();
@@ -1910,7 +1955,9 @@ mod tests {
         let id_observed = enqueue_one(&store, "lock:cl-rave:observed");
 
         for id in [id_inferred, id_observed] {
-            store.advance_to_cl_link_created(id, "uhCkkLINK").unwrap();
+            store
+                .advance_to_cl_link_created(id, "uhCkkLINK", CL_EA)
+                .unwrap();
         }
         store
             .advance_to_cl_rave_executed(id_inferred, None)
@@ -1937,11 +1984,15 @@ mod tests {
         let path = test_db_path("advance-br-rave");
         let store = StateStore::open(&path).unwrap();
         let id = enqueue_one(&store, "lock:br-rave:1");
-        store.advance_to_cl_link_created(id, "uhCkkA").unwrap();
+        store
+            .advance_to_cl_link_created(id, "uhCkkA", CL_EA)
+            .unwrap();
         store
             .advance_to_cl_rave_executed(id, Some("uhCkkB"))
             .unwrap();
-        store.advance_to_br_spend_created(id, "uhCkkC").unwrap();
+        store
+            .advance_to_br_spend_created(id, "uhCkkC", BR_EA)
+            .unwrap();
         store
             .advance_to_br_rave_executed(id, Some("uhCkkD"))
             .unwrap();
@@ -1953,6 +2004,9 @@ mod tests {
         assert_eq!(row.step, WorkStep::BrRaveExecuted);
         assert_eq!(row.br_rave_hash.as_deref(), Some("uhCkkD"));
         assert_eq!(row.br_spend_hash.as_deref(), Some("uhCkkC"));
+        assert_eq!(row.cl_ea_id.as_deref(), Some(CL_EA));
+        assert_eq!(row.br_ea_id.as_deref(), Some(BR_EA));
+        assert_eq!(row.parked_link(), None, "a succeeded row waits on nothing");
     }
 
     #[test]
@@ -1967,7 +2021,9 @@ mod tests {
         let id = {
             let store = StateStore::open(&path).unwrap();
             let id = enqueue_one(&store, "lock:reopen:1");
-            store.advance_to_cl_link_created(id, "uhCkkLINK").unwrap();
+            store
+                .advance_to_cl_link_created(id, "uhCkkLINK", CL_EA)
+                .unwrap();
             store
                 .advance_to_cl_rave_executed(id, Some("uhCkkRAVE"))
                 .unwrap();
@@ -2026,6 +2082,76 @@ mod tests {
         assert!(row.cl_rave_hash.is_none());
         assert!(row.br_spend_hash.is_none());
         assert!(row.br_rave_hash.is_none());
+    }
+
+    #[test]
+    fn a_state_db_whose_rows_name_no_agreement_opens_with_its_parked_rows_intact() {
+        // The schema the previous binary wrote: pipeline steps and hashes,
+        // no agreements.
+        let path = test_db_path("agreement-migration");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE schema_meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    version INTEGER NOT NULL
+                );
+                INSERT INTO schema_meta (id, version) VALUES (1, 1);
+                CREATE TABLE work_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    flow TEXT NOT NULL,
+                    task_type TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 8,
+                    next_retry_at INTEGER,
+                    last_attempt_at INTEGER,
+                    error_class TEXT,
+                    last_error TEXT,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    step TEXT NOT NULL DEFAULT 'new',
+                    cl_link_hash TEXT,
+                    cl_rave_hash TEXT,
+                    br_spend_hash TEXT,
+                    br_rave_hash TEXT
+                );
+                INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state, step, cl_link_hash)
+                VALUES ('lock', 'create_parked_link', 'lock:cl', 'lock:cl:key', '{}', 'queued', 'cl_link_created', 'uhCkkLINK');
+                INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state, step, cl_link_hash, br_spend_hash)
+                VALUES ('lock', 'create_parked_link', 'lock:br', 'lock:br:key', '{}', 'queued', 'br_spend_created', 'uhCkkOLD', 'uhCkkSPEND');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = StateStore::open(&path).unwrap();
+        let pending = |step| {
+            let rows = store.list_pending_by_step("lock", step, 10).unwrap();
+            assert_eq!(rows.len(), 1);
+            rows.into_iter().next().unwrap()
+        };
+        let on_link = pending(WorkStep::ClLinkCreated);
+        let on_spend = pending(WorkStep::BrSpendCreated);
+        assert_eq!(on_link.parked_link(), Some(("uhCkkLINK", None)));
+        assert_eq!(on_spend.parked_link(), Some(("uhCkkSPEND", None)));
+
+        store.record_parked_agreement(on_link.id, CL_EA).unwrap();
+        store.record_parked_agreement(on_spend.id, BR_EA).unwrap();
+
+        let on_link = pending(WorkStep::ClLinkCreated);
+        let on_spend = pending(WorkStep::BrSpendCreated);
+        assert_eq!(on_link.parked_link(), Some(("uhCkkLINK", Some(CL_EA))));
+        assert_eq!(on_link.br_ea_id, None);
+        assert_eq!(on_spend.parked_link(), Some(("uhCkkSPEND", Some(BR_EA))));
+        assert_eq!(
+            on_spend.cl_ea_id, None,
+            "the spend's agreement is not its credit limit link's"
+        );
     }
 
     #[test]
