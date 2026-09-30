@@ -1,6 +1,6 @@
 [package]
 name = "bridge-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Single-writer bridge orchestrator for lock-watcher and coupon-signer flows"
 
@@ -33,7 +33,10 @@ holo_hash = { version = "0.7.0", features = ["encoding"] }
 holochain_client = "0.9.0"
 holochain_zome_types = "0.7.0"
 rave_engine = "=0.11.0"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 rmp-serde = "1.1"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 serde = { version = "1", features = ["derive"] }
