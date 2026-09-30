@@ -1568,16 +1568,18 @@ impl BridgeOrchestrator {
                 )
             }
         };
-        let bridging_agreement = lane
-            .definition
-            .rave_agreements
+        let agreements = lane.definition.rave_agreements;
+        let credit_limit_adjustment = agreements
+            .credit_limit_adjustment
+            .with_context(|| format!("{} sets no credit limit adjustment", lane.name))?;
+        let bridging_agreement = agreements
             .bridging_agreement
             .with_context(|| format!("{} sets no bridging agreement", lane.name))?;
         Ok(DepositContext {
             lane: lane.name,
             lane_definitions: lane.version.into_iter().collect(),
             lane_definition_count,
-            credit_limit_adjustment: lane.definition.rave_agreements.credit_limit_adjustment,
+            credit_limit_adjustment,
             bridging_agreement,
         })
     }
@@ -3031,7 +3033,7 @@ mod tests {
                 unit_issuers: Default::default(),
             },
             rave_agreements: CommonRAVEAgreements {
-                credit_limit_adjustment: action_hash(version ^ 0x10).into(),
+                credit_limit_adjustment: Some(action_hash(version ^ 0x10).into()),
                 bridging_agreement: Some(action_hash(version ^ 0x20).into()),
                 proof_of_service: action_hash(version ^ 0x30).into(),
             },
@@ -3092,11 +3094,30 @@ mod tests {
             }
             self
         }
+
+        fn naming_no_adjustment(mut self, version: u8) -> Self {
+            let version = action_hash(version);
+            let listed = self
+                .lanes
+                .iter_mut()
+                .filter_map(|lane| lane.definition.as_mut())
+                .filter(|newest| ActionHash::from(newest.definition_hash.clone()) == version)
+                .map(|newest| &mut newest.rave_agreements);
+            let read = &mut self
+                .versions
+                .get_mut(&version)
+                .expect("a version the conductor serves")
+                .rave_agreements;
+            for agreements in listed.chain([read]) {
+                agreements.credit_limit_adjustment = None;
+            }
+            self
+        }
     }
 
     impl LaneReads for FakeConductor {
         async fn all_lanes(&self) -> Result<Vec<LaneExt>> {
-            Ok(self.lanes.clone())
+            Ok(off_the_wire(&self.lanes))
         }
 
         async fn version_in_force(&self, newest: ActionHash) -> Result<Option<ActionHash>> {
@@ -3104,11 +3125,47 @@ mod tests {
         }
 
         async fn lane_definition(&self, version: ActionHash) -> Result<LaneDefinition> {
-            self.versions
+            let definition = self
+                .versions
                 .get(&version)
-                .cloned()
-                .with_context(|| format!("no lane definition {version}"))
+                .with_context(|| format!("no lane definition {version}"))?;
+            lane_definition_of(&off_the_wire(&lane_definition_record(version, definition)))
         }
+    }
+
+    /// Encoded as a zome returns it, decoded as `ham` reads it.
+    fn off_the_wire<T: serde::de::DeserializeOwned>(
+        answer: &(impl Serialize + std::fmt::Debug),
+    ) -> T {
+        rmp_serde::from_slice(&ExternIO::encode(answer).unwrap().0)
+            .expect("the orchestrator must decode what the conductor answers")
+    }
+
+    fn lane_definition_record(version: ActionHash, definition: &LaneDefinition) -> Record {
+        use holochain_zome_types::prelude::{
+            Action, ActionData, ActionHashed, ActionHeader, CreateData, Entry, EntryHash,
+            EntryType, RecordEntry, Signature, SignedActionHashed,
+        };
+
+        let action = Action {
+            header: ActionHeader {
+                author: AgentPubKey::from_raw_32(vec![9u8; 32]),
+                timestamp: Timestamp(0),
+                action_seq: 5,
+                prev_action: Some(action_hash(0x01)),
+            },
+            data: ActionData::Create(CreateData {
+                entry_type: EntryType::AgentPubKey,
+                entry_hash: EntryHash::from_raw_32(vec![1u8; 32]),
+            }),
+        };
+        Record::new(
+            SignedActionHashed::with_presigned(
+                ActionHashed::with_pre_hashed(action, version),
+                Signature([0; 64]),
+            ),
+            RecordEntry::Present(Entry::try_from(definition).unwrap()),
+        )
     }
 
     fn global_bridged_by(agent: u8, units: &[u32]) -> GlobalDefinitionExt {
@@ -3123,7 +3180,8 @@ mod tests {
         global: &GlobalDefinitionExt,
         unit: u32,
     ) -> Result<DepositContext> {
-        BridgeOrchestrator::resolve_deposit_context(conductor, &agent_key(BRIDGE), unit, global)
+        let global: GlobalDefinitionExt = off_the_wire(global);
+        BridgeOrchestrator::resolve_deposit_context(conductor, &agent_key(BRIDGE), unit, &global)
             .await
     }
 
@@ -3131,7 +3189,7 @@ mod tests {
         let agreements = lane_version(version, BRIDGE, &[]).rave_agreements;
         assert_eq!(context.lane_definitions, vec![action_hash(version)]);
         assert_eq!(
-            context.credit_limit_adjustment,
+            Some(context.credit_limit_adjustment.clone()),
             agreements.credit_limit_adjustment
         );
         assert_eq!(
@@ -3143,7 +3201,7 @@ mod tests {
     fn assert_on_global_lane(context: &DepositContext, global: &GlobalDefinitionExt) {
         assert!(context.lane_definitions.is_empty());
         assert_eq!(
-            context.credit_limit_adjustment,
+            Some(context.credit_limit_adjustment.clone()),
             global.lane_def.rave_agreements.credit_limit_adjustment
         );
         assert_eq!(
@@ -3382,37 +3440,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_bridge_refuses_a_lane_of_its_own_naming_no_adjustment() {
+        let conductor = FakeConductor::default()
+            .with_lane(LANE, &[(CURRENT, BRIDGE, &[HOT])], Some(CURRENT))
+            .naming_no_adjustment(CURRENT);
+
+        let err = resolve(&conductor, &global_definition(), HOT)
+            .await
+            .expect_err("the bridge raises credit through its lane's adjustment");
+        let message = format!("{err:#}");
+        assert!(message.contains(&origin_of(LANE)), "{message}");
+        assert!(
+            message.ends_with("sets no credit limit adjustment"),
+            "{message}"
+        );
+
+        let mut global = global_bridged_by(BRIDGE, &[HOT]);
+        global.lane_def.rave_agreements.credit_limit_adjustment = None;
+        let err = resolve(&FakeConductor::default(), &global, HOT)
+            .await
+            .expect_err("the global lane is refused the same way");
+        assert_eq!(
+            format!("{err:#}"),
+            "the global definition's lane sets no credit limit adjustment"
+        );
+    }
+
+    #[tokio::test]
+    async fn lanes_naming_no_adjustment_leave_the_bridge_on_its_lane() {
+        let conductor = FakeConductor::default()
+            .with_lane(
+                THIRD_LANE,
+                &[(THIRD_CURRENT, STRANGER, &[HOT])],
+                Some(THIRD_CURRENT),
+            )
+            .naming_no_adjustment(THIRD_CURRENT)
+            .with_lane(
+                OTHER_LANE,
+                &[(OTHER_CURRENT, BRIDGE, &[OTHER_UNIT])],
+                Some(OTHER_CURRENT),
+            )
+            .naming_no_adjustment(OTHER_CURRENT)
+            .with_lane(LANE, &[(CURRENT, BRIDGE, &[HOT])], Some(CURRENT));
+        let mut global = global_definition();
+        global.lane_def.rave_agreements.credit_limit_adjustment = None;
+
+        let context = resolve(&conductor, &global, HOT).await.unwrap();
+
+        assert_on_version(&context, CURRENT);
+    }
+
     #[test]
     fn a_lane_definition_record_decodes_off_the_wire() {
-        use holochain_zome_types::prelude::{
-            Action, ActionData, ActionHashed, ActionHeader, CreateData, Entry, EntryHash,
-            EntryType, RecordEntry, Signature, SignedActionHashed,
-        };
-
         let definition = lane_version(CURRENT, BRIDGE, &[HOT]);
-        let action = Action {
-            header: ActionHeader {
-                author: AgentPubKey::from_raw_32(vec![9u8; 32]),
-                timestamp: Timestamp(0),
-                action_seq: 5,
-                prev_action: Some(action_hash(0x01)),
-            },
-            data: ActionData::Create(CreateData {
-                entry_type: EntryType::AgentPubKey,
-                entry_hash: EntryHash::from_raw_32(vec![1u8; 32]),
-            }),
-        };
-        let record = Record::new(
-            SignedActionHashed::with_presigned(
-                ActionHashed::with_pre_hashed(action, action_hash(CURRENT)),
-                Signature([0; 64]),
-            ),
-            RecordEntry::Present(Entry::try_from(&definition).unwrap()),
-        );
-        let wire = ExternIO::encode(&record).unwrap().0;
-        let decoded: Record = rmp_serde::from_slice(&wire).unwrap();
+        let record = lane_definition_record(action_hash(CURRENT), &definition);
 
-        let read = lane_definition_of(&decoded).unwrap();
+        let read = lane_definition_of(&off_the_wire(&record)).unwrap();
 
         assert_eq!(read.rave_agreements, definition.rave_agreements);
         assert_eq!(read.special_agents, definition.special_agents);

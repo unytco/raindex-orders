@@ -23,7 +23,7 @@ jobs:
       run:
         working-directory: bridge-orchestrator
     steps:
-      # No `submodules:` — the crate needs only crates.io and the `ham` git dep;
+      # No `submodules:`, because the crate's dependencies all come through cargo.
       # `lib/` is the Solidity side's, and rain.orderbook is the broken pin.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:

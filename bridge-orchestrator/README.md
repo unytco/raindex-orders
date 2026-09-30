@@ -85,7 +85,7 @@ the env file must be sourced even for `status` and `clear`.
 | `HOLOCHAIN_APP_PORT` | No | `30001` |
 | `HOLOCHAIN_APP_ID` | No | `bridging-app` |
 | `HOLOCHAIN_ROLE_NAME` | No | `alliance` |
-| `HOLOCHAIN_BRIDGING_AGENT_PUBKEY` | **Yes** | -- (each cycle bridges on the one lane that names this key its bridging agent and lists `HOT_UNIT_INDEX` in its service units, counting the global definition's lane and each lane's definition in force. No such lane, or more than one, fails the cycle) |
+| `HOLOCHAIN_BRIDGING_AGENT_PUBKEY` | **Yes** | -- (each cycle bridges on the one lane that names this key its bridging agent and lists `HOT_UNIT_INDEX` in its service units, counting the global definition's lane and each lane's definition in force. No such lane, or more than one, fails the cycle, and so does that lane setting no credit limit adjustment or no bridging agreement) |
 | `HOT_UNIT_INDEX` | No | `1` (`HOLOCHAIN_UNIT_INDEX` or `HOLOCHAIN_LANE_DEFINITION` set at all, even empty, stops the orchestrator at startup) |
 | `HAM_REQUEST_TIMEOUT_SECS` | No | `120` (per-request timeout applied to the Holochain app websocket; prevents a slow/hung zome call from blocking the orchestrator indefinitely) |
 | `HAM_RECONNECT_BACKOFF_INITIAL_MS` | No | `1000` (initial reconnect delay after a dropped Holochain websocket) |
