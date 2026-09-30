@@ -1634,10 +1634,13 @@ trait ConductorReads {
     async fn agreement_of(&self, link: ActionHash) -> Result<ActionHash>;
 }
 
-/// Each agreement's parked links as reconcile first read them, a failed read
-/// included, so rows sharing an agreement cost one read.
+/// Each agreement's parked links, and each link's agreement, as reconcile
+/// first read them, a failed read included, so rows sharing one cost one read.
 #[derive(Default)]
-struct LiveLinks(HashMap<ActionHash, Result<Vec<Transaction>, String>>);
+struct LiveLinks {
+    parked: HashMap<ActionHash, Result<Vec<Transaction>, String>>,
+    agreements: HashMap<ActionHash, Result<ActionHash, String>>,
+}
 
 impl LiveLinks {
     async fn on(
@@ -1645,15 +1648,32 @@ impl LiveLinks {
         conductor: &impl ConductorReads,
         agreement: &ActionHash,
     ) -> Result<&[Transaction]> {
-        if !self.0.contains_key(agreement) {
-            let read = conductor.parked_links(agreement).await;
-            self.0
-                .insert(agreement.clone(), read.map_err(|e| format!("{e:#}")));
-        }
-        self.0[agreement]
-            .as_deref()
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        let read = conductor.parked_links(agreement);
+        read_once(&mut self.parked, agreement, read)
+            .await
+            .map(Vec::as_slice)
     }
+
+    async fn agreement_of(
+        &mut self,
+        conductor: &impl ConductorReads,
+        link: ActionHash,
+    ) -> Result<ActionHash> {
+        let read = conductor.agreement_of(link.clone());
+        read_once(&mut self.agreements, &link, read).await.cloned()
+    }
+}
+
+async fn read_once<'a, T>(
+    reads: &'a mut HashMap<ActionHash, Result<T, String>>,
+    hash: &ActionHash,
+    read: impl std::future::Future<Output = Result<T>>,
+) -> Result<&'a T> {
+    if !reads.contains_key(hash) {
+        let read = read.await.map_err(|e| format!("{e:#}"));
+        reads.insert(hash.clone(), read);
+    }
+    reads[hash].as_ref().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 struct Conductor<'a> {
@@ -1754,7 +1774,10 @@ async fn parked_on(
 ) -> Result<(ActionHash, bool)> {
     let agreement = match recorded {
         Some(agreement) => action_hash_from(agreement)?,
-        None => conductor.agreement_of(action_hash_from(link)?).await?,
+        None => {
+            live.agreement_of(conductor, action_hash_from(link)?)
+                .await?
+        }
     };
     let parked = live
         .on(conductor, &agreement)
@@ -3177,6 +3200,7 @@ mod tests {
         parked: HashMap<ActionHash, Vec<Transaction>>,
         parked_on: HashMap<ActionHash, ActionHash>,
         parked_reads: std::cell::RefCell<Vec<ActionHash>>,
+        link_reads: std::cell::RefCell<Vec<ActionHash>>,
         fails_on: Option<(ActionHash, &'static str)>,
     }
 
@@ -3292,6 +3316,7 @@ mod tests {
         }
 
         async fn agreement_of(&self, link: ActionHash) -> Result<ActionHash> {
+            self.link_reads.borrow_mut().push(link.clone());
             self.check_fails_on(&link)?;
             let agreement = self
                 .parked_on
@@ -4553,6 +4578,44 @@ mod tests {
                 }
             }
             forget_agreements(&orch, &[waiting]);
+        }
+    }
+
+    #[tokio::test]
+    async fn rows_sharing_a_link_read_its_agreement_once() {
+        const REPLACED_CL_EA: u8 = 0xE3;
+        let orch = test_orchestrator("shared-link");
+        let known = parked_tx(0x55, "0xe4");
+        let unknown = action_hash(0x56);
+        let batch = |link: &str, txs: &[&str]| -> Vec<i64> {
+            txs.iter()
+                .map(|tx| {
+                    let id = enqueue_lock(&orch, &format!("lock:shared-link:{tx}"), tx);
+                    orch.db
+                        .advance_to_cl_link_created(id, link, &ea(CL_EA))
+                        .unwrap();
+                    id
+                })
+                .collect()
+        };
+        let on_known = batch(&known.id.to_string(), &["0xe4", "0xe5", "0xe6"]);
+        let on_unknown = batch(&unknown.to_string(), &["0xe7", "0xe8"]);
+        forget_agreements(&orch, &[on_known.as_slice(), &on_unknown].concat());
+        let conductor = FakeConductor::default()
+            .parking(action_hash(REPLACED_CL_EA), &[known])
+            .consumed(action_hash(CL_EA))
+            .consumed(action_hash(BR_EA));
+
+        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+
+        let mut reads = conductor.link_reads.take();
+        reads.sort();
+        assert_eq!(reads, vec![action_hash(0x55), unknown]);
+        for id in on_known {
+            assert_eq!(lock_row(&orch, id).cl_ea_id, Some(ea(REPLACED_CL_EA)));
+        }
+        for id in on_unknown {
+            assert_eq!(lock_row(&orch, id).cl_ea_id, None);
         }
     }
 
