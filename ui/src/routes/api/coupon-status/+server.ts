@@ -20,11 +20,16 @@ import { PUBLIC_ORDERBOOK_ADDRESS } from '$env/static/public'
 import { CLAIM_ORDER } from '$lib/orderConfig'
 
 const MAX_COUPONS = 50
+const MAX_BODY_BYTES = 64 * 1024
+// A coupon from bridge-orchestrator/src/signer.rs is under 900 characters.
+const MAX_COUPON_CHARS = 1024
+const UINT256_DIGITS = maxUint256.toString().length
 
 const HEADERS = {
 	'Access-Control-Allow-Origin': '*',
 	'Access-Control-Allow-Methods': 'POST, OPTIONS',
 	'Access-Control-Allow-Headers': 'Content-Type',
+	'Access-Control-Max-Age': '86400',
 	'Cache-Control': 'no-store'
 }
 
@@ -66,7 +71,7 @@ const reply = (body: unknown, status: number) => json(body, { status, headers: H
 export const OPTIONS: RequestHandler = () => new Response(null, { status: 204, headers: HEADERS })
 
 export const POST: RequestHandler = async ({ request }) => {
-	const coupons = readBody(await request.text())
+	const coupons = await readCoupons(request)
 	if ('error' in coupons) return reply(coupons, 400)
 
 	const parsed = coupons.map(parseCoupon)
@@ -103,7 +108,9 @@ export const POST: RequestHandler = async ({ request }) => {
 	return reply({ chainId: chain.chainId, block: chain.block.toString(), results }, 200)
 }
 
-function readBody(text: string): string[] | { error: string } {
+async function readCoupons(request: Request): Promise<string[] | { error: string }> {
+	const text = await readText(request)
+	if (text === null) return { error: `body must be at most ${MAX_BODY_BYTES} bytes` }
 	let body: unknown
 	try {
 		body = JSON.parse(text)
@@ -131,16 +138,36 @@ function readBody(text: string): string[] | { error: string } {
 	return coupons
 }
 
+/** The body as text, or null as soon as it is longer than MAX_BODY_BYTES. */
+async function readText(request: Request): Promise<string | null> {
+	if (Number(request.headers.get('Content-Length')) > MAX_BODY_BYTES) return null
+	if (!request.body) return ''
+	const reader = request.body.getReader()
+	const decoder = new TextDecoder()
+	let text = ''
+	let size = 0
+	for (let read = await reader.read(); !read.done; read = await reader.read()) {
+		size += read.value.byteLength
+		if (size > MAX_BODY_BYTES) {
+			await reader.cancel()
+			return null
+		}
+		text += decoder.decode(read.value, { stream: true })
+	}
+	return text + decoder.decode()
+}
+
 /**
  * A coupon is `signer,signature,c0..c8` (bridge-orchestrator/src/signer.rs). Null
  * unless it parses and names the claim order, so no other namespace is ever read.
  */
 function parseCoupon(coupon: string): Coupon | null {
+	if (coupon.length > MAX_COUPON_CHARS) return null
 	const [signer, signature, ...fields] = coupon.split(',')
 	if (fields.length !== 9) return null
 	if (!isAddress(signer, { strict: false })) return null
 	if (!isHex(signature) || signature.length === 2 || signature.length % 2 !== 0) return null
-	if (!fields.every(field => /^\d+$/.test(field))) return null
+	if (!fields.every(field => field.length <= UINT256_DIGITS && /^\d+$/.test(field))) return null
 
 	const context = fields.map(BigInt)
 	if (context.some(value => value > maxUint256)) return null
@@ -170,7 +197,10 @@ async function readChain(rpcUrl: string, coupons: Coupon[]): Promise<ChainRead> 
 			args: [namespace, nonceKey(nonce)] as const
 		}))
 	]
-	const client = createPublicClient({ chain: sepolia, transport: http(rpcUrl) })
+	// One attempt of at most 5 s. A retry would wait as long as the RPC's Retry-After
+	// asks, and the caller polls anyway.
+	const transport = http(rpcUrl, { retryCount: 0, timeout: 5_000 })
+	const client = createPublicClient({ chain: sepolia, transport })
 	const [chainId, block, timestamp, ...flags] = await client.multicall({
 		contracts,
 		allowFailure: false,

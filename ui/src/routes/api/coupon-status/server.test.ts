@@ -105,19 +105,61 @@ const redeemedChain = (): Chain => ({
 })
 
 async function post(body: unknown) {
-	const request = new Request('http://localhost/api/coupon-status', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: typeof body === 'string' ? body : JSON.stringify(body)
-	})
+	return send(
+		new Request('http://localhost/api/coupon-status', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: typeof body === 'string' ? body : JSON.stringify(body)
+		})
+	)
+}
+
+async function send(request: Request) {
 	const response = await POST({ request } as Parameters<typeof POST>[0])
 	return { response, body: await response.json() }
+}
+
+/** `text` as a body that states no Content-Length, as a chunked upload does. */
+function streamed(text: string): Request {
+	const bytes = new TextEncoder().encode(text)
+	const body = new ReadableStream({
+		start(controller) {
+			for (let i = 0; i < bytes.length; i += 4096) controller.enqueue(bytes.slice(i, i + 4096))
+			controller.close()
+		}
+	})
+	return new Request('http://localhost/api/coupon-status', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body,
+		duplex: 'half'
+	} as RequestInit)
+}
+
+/** A JSON body of one coupon, padded with trailing whitespace to `bytes`. */
+function bodyOf(bytes: number): string {
+	const json = JSON.stringify({ coupons: [REDEEMED_A] })
+	return json + ' '.repeat(bytes - json.length)
+}
+
+/** REDEEMED_A lengthened to `chars` with zeros: whole bytes on its signature, one leading zero on its amount. */
+function couponOf(chars: number): string {
+	const [signer, signature, recipient, amount, ...rest] = REDEEMED_A.split(',')
+	const extra = chars - REDEEMED_A.length
+	return [
+		signer,
+		signature + '00'.repeat(Math.floor(extra / 2)),
+		recipient,
+		'0'.repeat(extra % 2) + amount,
+		...rest
+	].join(',')
 }
 
 function expectCorsHeaders(response: Response) {
 	expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*')
 	expect(response.headers.get('Access-Control-Allow-Methods')).toBe('POST, OPTIONS')
 	expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Content-Type')
+	expect(response.headers.get('Access-Control-Max-Age')).toBe('86400')
 	expect(response.headers.get('Access-Control-Allow-Credentials')).toBeNull()
 	expect(response.headers.get('Cache-Control')).toBe('no-store')
 }
@@ -128,6 +170,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+	vi.useRealTimers()
 	vi.unstubAllGlobals()
 	vi.restoreAllMocks()
 })
@@ -185,6 +228,36 @@ describe('POST /api/coupon-status', () => {
 		expect(rpc.storeReads).toHaveLength(50)
 	})
 
+	it('reads a coupon of exactly 1 KB whose nonce has 78 digits', async () => {
+		const rpc = fakeRpc(redeemedChain())
+		const nonce = '1775867941'.padStart(78, '0')
+		const longest = couponOf(1024 - 68).replace(/,1775867941$/, `,${nonce}`)
+		expect(longest).toHaveLength(1024)
+
+		const { body } = await post({ coupons: [longest] })
+
+		expect(body.results).toEqual([{ status: 'redeemed', nonce: '1775867941', expiry: 1776472741 }])
+		expect(rpc.storeReads).toEqual([KEY_A])
+	})
+
+	it('still reads the block for a batch with no valid coupon', async () => {
+		const rpc = fakeRpc(redeemedChain())
+
+		const { response, body } = await post({ coupons: ['not a coupon', coupon({ 3: '1' })] })
+
+		expect(response.status).toBe(200)
+		expect(body).toEqual({
+			chainId: 11155111,
+			block: '10883600',
+			results: [
+				{ status: 'invalid', nonce: null, expiry: null },
+				{ status: 'invalid', nonce: null, expiry: null }
+			]
+		})
+		expect(rpc.requests).toHaveLength(1)
+		expect(rpc.storeReads).toEqual([])
+	})
+
 	const claim = REDEEMED_A.split(',')
 	it.each([
 		['too few fields', claim.slice(0, 10).join(',')],
@@ -196,6 +269,8 @@ describe('POST /api/coupon-status', () => {
 		['a negative context field', coupon({ 8: '-1' })],
 		['an empty context field', coupon({ 8: '' })],
 		['a context field above uint256', coupon({ 8: (maxUint256 + 1n).toString() })],
+		['a context field of 79 digits', coupon({ 8: '0'.repeat(79) })],
+		['a coupon over 1 KB', couponOf(1025)],
 		['an expiry past what a JSON number holds exactly', coupon({ 2: '9007199254740992' })],
 		['another order hash', coupon({ 3: '1' })],
 		['another order owner', coupon({ 4: '1' })],
@@ -228,6 +303,81 @@ describe('POST /api/coupon-status', () => {
 		expectCorsHeaders(response)
 		expect(answer).toEqual({ error: expect.any(String) })
 		expect(rpc.fetch).not.toHaveBeenCalled()
+	})
+
+	it('answers 400 to a body over 64 KB by its Content-Length, unread', async () => {
+		const rpc = fakeRpc(redeemedChain())
+		const request = new Request('http://localhost/api/coupon-status', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', 'Content-Length': '65537' },
+			body: bodyOf(64 * 1024)
+		})
+
+		const { response, body } = await send(request)
+
+		expect(response.status).toBe(400)
+		expectCorsHeaders(response)
+		expect(body).toEqual({ error: expect.any(String) })
+		expect(request.bodyUsed).toBe(false)
+		expect(rpc.fetch).not.toHaveBeenCalled()
+	})
+
+	it('answers 400 to a body that states no length once it passes 64 KB', async () => {
+		const rpc = fakeRpc(redeemedChain())
+
+		const { response, body } = await send(streamed(bodyOf(64 * 1024 + 1)))
+
+		expect(response.status).toBe(400)
+		expect(body).toEqual({ error: expect.any(String) })
+		expect(rpc.fetch).not.toHaveBeenCalled()
+	})
+
+	it('reads a body of exactly 64 KB, with or without a stated length', async () => {
+		fakeRpc(redeemedChain())
+
+		const stated = await post(bodyOf(64 * 1024))
+		const unstated = await send(streamed(bodyOf(64 * 1024)))
+
+		expect(stated.response.status).toBe(200)
+		expect(unstated.response.status).toBe(200)
+		expect(unstated.body.results).toEqual([
+			{ status: 'redeemed', nonce: '1775867941', expiry: 1776472741 }
+		])
+	})
+
+	it('asks a rate-limited RPC once and answers 502', async () => {
+		const fetch = vi.fn(
+			async () => new Response('rate limited', { status: 429, headers: { 'Retry-After': '1' } })
+		)
+		vi.stubGlobal('fetch', fetch)
+
+		const { response } = await post({ coupons: [REDEEMED_A] })
+
+		expect(response.status).toBe(502)
+		expect(fetch).toHaveBeenCalledTimes(1)
+	})
+
+	it('answers 502 when the RPC has not answered in 5 s', async () => {
+		vi.useFakeTimers()
+		const fetch = vi.fn(
+			(_url: string, init: RequestInit) =>
+				new Promise<Response>((_, reject) =>
+					init.signal?.addEventListener('abort', () =>
+						reject(new DOMException('aborted', 'AbortError'))
+					)
+				)
+		)
+		vi.stubGlobal('fetch', fetch)
+		let answered = false
+		const answer = post({ coupons: [REDEEMED_A] }).finally(() => (answered = true))
+
+		await vi.advanceTimersByTimeAsync(4_999)
+		expect(answered).toBe(false)
+		await vi.advanceTimersByTimeAsync(1)
+		const { response } = await answer
+
+		expect(response.status).toBe(502)
+		expect(fetch).toHaveBeenCalledTimes(1)
 	})
 
 	it('answers 502 without the RPC URL when the RPC cannot be reached', async () => {

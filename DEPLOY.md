@@ -166,6 +166,9 @@ SvelteKit web interface:
 - `/lock` - Lock HOT to receive bridged HOT
 - `/claim` - Claim HOT with coupon
 - `/claim?c=<coupon>` - Direct claim via URL parameter
+- `POST /api/coupon-status` - Status of up to 50 claim coupons, read from Sepolia through `SEPOLIA_RPC_URL`
+
+Every well-formed `/api/coupon-status` request makes one `eth_call` to `SEPOLIA_RPC_URL`, even when no coupon in it is valid. The route checks no coupon signature, so anyone can build a coupon it will read, and skipping the read for an invalid batch would not reduce abuse. Add a Cloudflare rate limiting rule on `/api/*` for the Worker's route to cap the RPC traffic callers can cause.
 
 ## Coupon Format
 
