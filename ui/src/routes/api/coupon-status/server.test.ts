@@ -104,18 +104,38 @@ const redeemedChain = (): Chain => ({
 	])
 })
 
-async function post(body: unknown) {
+/** A Workers rate limiter allowing `limit` calls per key, counting what it was asked. */
+function fakeLimiter(limit = Infinity) {
+	const calls = new Map<string, number>()
+	const limiter: RateLimiter = {
+		limit: vi.fn(async ({ key }: { key: string }) => {
+			calls.set(key, (calls.get(key) ?? 0) + 1)
+			return { success: calls.get(key)! <= limit }
+		})
+	}
+	return { limiter, calls }
+}
+
+type Platform = NonNullable<App.Platform['env']>
+let platformEnv: Platform | undefined
+let clientAddress: string
+
+async function post(body: unknown, headers: Record<string, string> = {}) {
 	return send(
 		new Request('http://localhost/api/coupon-status', {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: { 'Content-Type': 'application/json', ...headers },
 			body: typeof body === 'string' ? body : JSON.stringify(body)
 		})
 	)
 }
 
 async function send(request: Request) {
-	const response = await POST({ request } as Parameters<typeof POST>[0])
+	const response = await POST({
+		request,
+		platform: platformEnv && { env: platformEnv },
+		getClientAddress: () => clientAddress
+	} as unknown as Parameters<typeof POST>[0])
 	return { response, body: await response.json() }
 }
 
@@ -166,6 +186,11 @@ function expectCorsHeaders(response: Response) {
 
 beforeEach(() => {
 	env.SEPOLIA_RPC_URL = 'https://rpc.test/secret-key'
+	platformEnv = {
+		COUPON_STATUS_PER_IP_LIMITER: fakeLimiter().limiter,
+		COUPON_STATUS_TOTAL_LIMITER: fakeLimiter().limiter
+	}
+	clientAddress = '198.51.100.1'
 	vi.spyOn(console, 'error').mockImplementation(() => {})
 })
 
@@ -431,6 +456,127 @@ describe('POST /api/coupon-status', () => {
 		expect(response.status).toBe(502)
 		expect(body).toEqual({ error: expect.any(String) })
 		expect(rpc.fetch).not.toHaveBeenCalled()
+	})
+})
+
+describe('POST /api/coupon-status rate limits', () => {
+	function limiters(perIpLimit: number, totalLimit: number) {
+		const perIp = fakeLimiter(perIpLimit)
+		const total = fakeLimiter(totalLimit)
+		platformEnv = {
+			COUPON_STATUS_PER_IP_LIMITER: perIp.limiter,
+			COUPON_STATUS_TOTAL_LIMITER: total.limiter
+		}
+		return { perIp, total }
+	}
+
+	async function expectTooManyRequests(answer: Promise<{ response: Response; body: unknown }>) {
+		const { response, body } = await answer
+		expect(response.status).toBe(429)
+		expect(response.headers.get('Retry-After')).toBe('60')
+		expectCorsHeaders(response)
+		expect(body).toEqual({ error: expect.any(String) })
+	}
+
+	it('reads as before under both limits, taking a token from each', async () => {
+		const rpc = fakeRpc(redeemedChain())
+		const { perIp, total } = limiters(10, 60)
+
+		const { response, body } = await post(
+			{ coupons: [REDEEMED_A] },
+			{ 'cf-connecting-ip': '203.0.113.9' }
+		)
+
+		expect(response.status).toBe(200)
+		expect(body.results).toEqual([{ status: 'redeemed', nonce: '1775867941', expiry: 1776472741 }])
+		expect(rpc.requests).toHaveLength(1)
+		// Cloudflare's address for the caller wins over the socket's.
+		expect([...perIp.calls]).toEqual([['203.0.113.9', 1]])
+		expect([...total.calls]).toEqual([['all', 1]])
+	})
+
+	it('answers 429 to a caller over its own limit, with no RPC call, and still serves others', async () => {
+		const rpc = fakeRpc(redeemedChain())
+		limiters(1, 60)
+
+		await post({ coupons: [REDEEMED_A] })
+		await expectTooManyRequests(post({ coupons: [REDEEMED_A] }))
+		expect(rpc.requests).toHaveLength(1)
+
+		clientAddress = '198.51.100.2'
+		const other = await post({ coupons: [REDEEMED_A] })
+		expect(other.response.status).toBe(200)
+		expect(rpc.requests).toHaveLength(2)
+	})
+
+	it('answers 429 to every caller once all callers together pass the total, with no RPC call', async () => {
+		const rpc = fakeRpc(redeemedChain())
+		limiters(10, 2)
+
+		for (const ip of ['198.51.100.1', '198.51.100.2']) {
+			clientAddress = ip
+			expect((await post({ coupons: [REDEEMED_A] })).response.status).toBe(200)
+		}
+		clientAddress = '198.51.100.3'
+		await expectTooManyRequests(post({ coupons: [REDEEMED_A] }))
+		expect(rpc.requests).toHaveLength(2)
+	})
+
+	it('takes no total token for a caller already over its own limit', async () => {
+		fakeRpc(redeemedChain())
+		const { total } = limiters(1, 60)
+
+		await post({ coupons: [REDEEMED_A] })
+		await post({ coupons: [REDEEMED_A] })
+
+		expect(total.calls.get('all')).toBe(1)
+	})
+
+	it.each([
+		['no platform', () => undefined],
+		[
+			'no per-IP limiter',
+			() => ({ COUPON_STATUS_TOTAL_LIMITER: fakeLimiter().limiter }) as Platform
+		],
+		[
+			'no total limiter',
+			() => ({ COUPON_STATUS_PER_IP_LIMITER: fakeLimiter().limiter }) as Platform
+		]
+	])('answers 503 with no RPC call when there is %s', async (_, platform) => {
+		const rpc = fakeRpc(redeemedChain())
+		platformEnv = platform()
+
+		const { response, body } = await post({ coupons: [REDEEMED_A] })
+
+		expect(response.status).toBe(503)
+		expectCorsHeaders(response)
+		expect(body).toEqual({ error: expect.any(String) })
+		expect(rpc.fetch).not.toHaveBeenCalled()
+	})
+
+	it('makes no RPC call when a limiter fails', async () => {
+		const rpc = fakeRpc(redeemedChain())
+		platformEnv = {
+			COUPON_STATUS_PER_IP_LIMITER: fakeLimiter().limiter,
+			COUPON_STATUS_TOTAL_LIMITER: {
+				limit: async () => {
+					throw new Error('limiter unavailable')
+				}
+			}
+		}
+
+		await expect(post({ coupons: [REDEEMED_A] })).rejects.toThrow('limiter unavailable')
+		expect(rpc.fetch).not.toHaveBeenCalled()
+	})
+
+	it('answers 400 to a malformed body without taking a token', async () => {
+		fakeRpc(redeemedChain())
+		const { perIp, total } = limiters(10, 60)
+
+		const { response } = await post({ coupons: [] })
+
+		expect(response.status).toBe(400)
+		expect(perIp.calls.size + total.calls.size).toBe(0)
 	})
 })
 

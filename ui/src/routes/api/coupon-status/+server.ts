@@ -17,6 +17,7 @@ import { sepolia } from 'viem/chains'
 import { env } from '$env/dynamic/private'
 import { PUBLIC_ORDERBOOK_ADDRESS } from '$env/static/public'
 import { CLAIM_ORDER } from '$lib/orderConfig'
+import { RATE_LIMITERS } from '$lib/server/rateLimits.js'
 import { logRpcError } from '$lib/server/rpcError'
 
 const MAX_COUPONS = 50
@@ -66,13 +67,29 @@ type Result = {
 
 type ChainRead = { chainId: number; block: bigint; timestamp: bigint; flags: bigint[] }
 
-const reply = (body: unknown, status: number) => json(body, { status, headers: HEADERS })
+const reply = (body: unknown, status: number, headers: Record<string, string> = {}) =>
+	json(body, { status, headers: { ...HEADERS, ...headers } })
 
 export const OPTIONS: RequestHandler = () => new Response(null, { status: 204, headers: HEADERS })
 
-export const POST: RequestHandler = async ({ request }) => {
+export const POST: RequestHandler = async ({ request, platform, getClientAddress }) => {
 	const coupons = await readCoupons(request)
 	if ('error' in coupons) return reply(coupons, 400)
+
+	// Every request past this point makes one eth_call, so each takes a token first.
+	const perIp = platform?.env?.[RATE_LIMITERS.perIp]
+	const total = platform?.env?.[RATE_LIMITERS.total]
+	if (!perIp || !total) {
+		console.error('coupon-status: a rate limiting binding is missing; refusing to call the RPC')
+		return reply({ error: 'Rate limiting is not configured' }, 503)
+	}
+	// Cloudflare sets cf-connecting-ip on every request it serves. Callers with no
+	// address share one key, so they are limited together rather than not at all.
+	const ip = request.headers.get('cf-connecting-ip') || getClientAddress() || 'unknown'
+	const allowed =
+		(await perIp.limit({ key: ip })).success && (await total.limit({ key: 'all' })).success
+	// 60 s is the longest period a Workers rate limit can have.
+	if (!allowed) return reply({ error: 'Too many requests' }, 429, { 'Retry-After': '60' })
 
 	const parsed = coupons.map(parseCoupon)
 	const valid = parsed.filter((coupon): coupon is Coupon => coupon !== null)

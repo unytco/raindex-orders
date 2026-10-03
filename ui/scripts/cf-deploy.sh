@@ -16,6 +16,10 @@ set -euo pipefail
 : "${FAUCET_PRIVATE_KEY:?set FAUCET_PRIVATE_KEY as a Workers Builds build variable}"
 : "${SEPOLIA_RPC_URL:?set SEPOLIA_RPC_URL as a Workers Builds build variable}"
 
+# POST /api/coupon-status calls the RPC for any caller; never ship it without its
+# rate limiters.
+node scripts/check-rate-limits.js wrangler.jsonc
+
 # Ship the built worker. --keep-vars stops the deploy from dropping bindings not
 # declared in wrangler.jsonc, so any secrets already present survive with no gap.
 npx wrangler deploy --keep-vars

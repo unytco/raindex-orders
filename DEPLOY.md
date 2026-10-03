@@ -168,7 +168,23 @@ SvelteKit web interface:
 - `/claim?c=<coupon>` - Direct claim via URL parameter
 - `POST /api/coupon-status` - Status of up to 50 claim coupons, read from Sepolia through `SEPOLIA_RPC_URL`
 
-Every well-formed `/api/coupon-status` request makes one `eth_call` to `SEPOLIA_RPC_URL`, even when no coupon in it is valid. The route checks no coupon signature, so anyone can build a coupon it will read, and skipping the read for an invalid batch would not reduce abuse. Add a Cloudflare rate limiting rule on `/api/*` for the Worker's route to cap the RPC traffic callers can cause.
+#### Coupon status rate limits
+
+Every well-formed `/api/coupon-status` request makes one `eth_call` to `SEPOLIA_RPC_URL`, even when no coupon in it is valid. The route checks no coupon signature, so anyone can build a coupon it will read. Before that call, the route takes a token from two Workers Rate Limiting bindings declared in `ui/wrangler.jsonc`:
+
+| Binding | Key | Limit |
+|---|---|---|
+| `COUPON_STATUS_PER_IP_LIMITER` | the caller's `cf-connecting-ip` | 10 requests per 60 s |
+| `COUPON_STATUS_TOTAL_LIMITER` | one key for all callers | 60 requests per 60 s |
+
+- Cloudflare counts each limit per Cloudflare location, not globally.
+- An app polls once every 3 minutes, so one address has room for about 30 apps, and one location for about 180.
+- Over a limit, the route answers `429` with `Retry-After: 60` and makes no RPC call.
+- If either binding is missing at runtime, the route answers `503` and makes no RPC call.
+- `ui/scripts/cf-deploy.sh` runs `ui/scripts/check-rate-limits.js` before `wrangler deploy`, and stops the deploy when `wrangler.jsonc` does not declare both bindings.
+- Each `namespace_id` (`1036001`, `1036002`) must not be used by another rate limiter on the Cloudflare account, or the two share counters.
+- The bindings sit under `unsafe.bindings` because the `ratelimits` key needs wrangler 4.36 or later, and `@sveltejs/adapter-cloudflare` 4.9 pins wrangler 3. Wrangler 4 uploads the same binding. Move them to `ratelimits`, and update the check, when the adapter and wrangler are upgraded.
+- `wrangler dev` and `vite dev` run the same limiters locally, from `wrangler.jsonc`.
 
 ## Coupon Format
 
