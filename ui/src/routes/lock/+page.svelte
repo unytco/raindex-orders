@@ -6,7 +6,8 @@
 	import { transactionStore } from '$lib/stores/transactionStore'
 	import { onMount } from 'svelte'
 	import { browser } from '$app/environment'
-	import TransactionModal from '$lib/components/TransactionModal.svelte'
+	import TransactionModal, { LOCK_FINALIZE_LINE } from '$lib/components/TransactionModal.svelte'
+	import TransactionReceipt from '$lib/components/TransactionReceipt.svelte'
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 	import { PUBLIC_LOCK_VAULT_ADDRESS, PUBLIC_TOKEN_ADDRESS } from '$env/static/public'
 	import {
@@ -25,6 +26,8 @@
 	let agentPrefilledFromUrl = false
 	let isLoading = false
 	let error = ''
+	// Replaces the form once a lock confirms, until the page is reloaded.
+	let lockReceipt: { amount: string; hash: string } | undefined
 
 	// Contract data
 	let tokenBalance: bigint = 0n
@@ -224,6 +227,7 @@
 
 			if (receipt) {
 				transactionStore.transactionSuccess(hash)
+				lockReceipt = { amount: `${formatToken(amountWei, tokenDecimals)} ${tokenSymbol}`, hash }
 				await fetchContractData()
 			}
 		} catch (e: any) {
@@ -247,148 +251,159 @@
 </script>
 
 <Card size="xl" class="flex flex-col gap-4">
-	<h1 class="text-2xl font-bold">Lock mock HOT</h1>
-	<p class="text-gray-600">
-		Lock your mock HOT tokens to receive mock HOT on Unyt. Your mock HOT will be credited to the
-		specified agent.
-	</p>
-
-	{#if !isConfigured}
-		<Alert color="yellow">
-			<span class="font-semibold">Contracts not configured.</span> The Lock Vault contract address
-			needs to be set in the environment variables. Please deploy the contracts and update
-			<code>PUBLIC_LOCK_VAULT_ADDRESS</code>
-			in your <code>.env</code> file.
-		</Alert>
-	{:else if !isConnected}
-		<Alert color="blue">Please connect your wallet to continue.</Alert>
-		<Button on:click={handleConnect}>Connect Wallet</Button>
+	{#if lockReceipt}
+		<TransactionReceipt
+			title="Lock almost complete"
+			message={LOCK_FINALIZE_LINE}
+			hash={lockReceipt.hash}
+		>
+			<span class="text-gray-600">Amount:</span>
+			<span class="font-semibold">{lockReceipt.amount}</span>
+		</TransactionReceipt>
 	{:else}
-		<div class="space-y-4">
-			<!-- Balance Info -->
-			<div class="bg-gray-50 p-4 rounded-lg">
-				<p class="text-sm text-gray-600">Your {tokenSymbol} Balance</p>
-				<p class="text-xl font-semibold">
-					{formatToken(tokenBalance, tokenDecimals)}
-					{tokenSymbol}
-				</p>
-			</div>
+		<h1 class="text-2xl font-bold">Lock mock HOT</h1>
+		<p class="text-gray-600">
+			Lock your mock HOT tokens to receive mock HOT on Unyt. Your mock HOT will be credited to the
+			specified agent.
+		</p>
 
-			<!-- Amount Input -->
-			<div>
-				<Label for="amount" class="mb-2">Amount to Lock</Label>
-				{#if amountPrefilledFromUrl}
-					<div
-						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default"
-						style="user-select: none; -webkit-user-select: none;"
-						aria-readonly="true"
-					>
-						{amount}
-					</div>
-				{:else}
-					<Input
-						id="amount"
-						type="number"
-						step="0.000001"
-						placeholder="0.0"
-						bind:value={amount}
-						disabled={isLoading}
-					/>
-				{/if}
-				<Helper class="mt-1">
-					Minimum: {formatToken(minLockAmount, tokenDecimals)}
-					{tokenSymbol}
-				</Helper>
-			</div>
+		{#if !isConfigured}
+			<Alert color="yellow">
+				<span class="font-semibold">Contracts not configured.</span> The Lock Vault contract address
+				needs to be set in the environment variables. Please deploy the contracts and update
+				<code>PUBLIC_LOCK_VAULT_ADDRESS</code>
+				in your <code>.env</code> file.
+			</Alert>
+		{:else if !isConnected}
+			<Alert color="blue">Please connect your wallet to continue.</Alert>
+			<Button on:click={handleConnect}>Connect Wallet</Button>
+		{:else}
+			<div class="space-y-4">
+				<!-- Balance Info -->
+				<div class="bg-gray-50 p-4 rounded-lg">
+					<p class="text-sm text-gray-600">Your {tokenSymbol} Balance</p>
+					<p class="text-xl font-semibold">
+						{formatToken(tokenBalance, tokenDecimals)}
+						{tokenSymbol}
+					</p>
+				</div>
 
-			<!-- Holochain Agent Input -->
-			<div>
-				<Label for="agent" class="mb-2">Unyt Agent Public Key (Holochain key)</Label>
-				{#if agentPrefilledFromUrl}
-					<div
-						class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default break-all"
-						style="user-select: none; -webkit-user-select: none;"
-						aria-readonly="true"
-					>
-						{agentInput}
-					</div>
-				{:else}
-					<Input
-						id="agent"
-						type="text"
-						placeholder="uhCA..."
-						bind:value={agentInput}
-						disabled={isLoading}
-					/>
-				{/if}
-				<Helper class="mt-1">
-					{#if agentPrefilledFromUrl}
-						Agent key from URL (read-only). This is where your mock HOT will be sent.
+				<!-- Amount Input -->
+				<div>
+					<Label for="amount" class="mb-2">Amount to Lock</Label>
+					{#if amountPrefilledFromUrl}
+						<div
+							class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default"
+							style="user-select: none; -webkit-user-select: none;"
+							aria-readonly="true"
+						>
+							{amount}
+						</div>
 					{:else}
-						Paste your Holochain agent key (e.g. uhCA...). This is where your mock HOT will be sent.
-						It is converted to hex for the contract below.
+						<Input
+							id="amount"
+							type="number"
+							step="0.000001"
+							placeholder="0.0"
+							bind:value={amount}
+							disabled={isLoading}
+						/>
 					{/if}
-				</Helper>
-				{#if agentInput && hasValidAgent}
-					<div
-						class="mt-2 space-y-2 rounded-lg border border-gray-200 bg-gray-50 p-3 dark:border-gray-600 dark:bg-gray-700"
-					>
-						<div>
-							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain key</p>
-							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
-								{agentInput}
-							</p>
-						</div>
-						<div>
-							<p class="text-xs font-medium text-gray-500 dark:text-gray-400">
-								Ethereum (hex, used for lock)
-							</p>
-							<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
-								{agentHex}
-							</p>
-						</div>
-					</div>
-				{:else if agentInput}
-					<Helper color="red" class="mt-1">
-						Invalid format. Provide a Holochain agent key (uhCA...).
+					<Helper class="mt-1">
+						Minimum: {formatToken(minLockAmount, tokenDecimals)}
+						{tokenSymbol}
 					</Helper>
-				{/if}
-			</div>
+				</div>
 
-			<!-- Error Display -->
-			{#if error}
-				<Alert color="red">{error}</Alert>
-			{/if}
-
-			<!-- Single action: Lock (approve is done automatically first if needed) -->
-			<div class="flex flex-row gap-2">
-				<Button
-					class="w-fit disabled:!bg-primary-300 disabled:!opacity-100"
-					on:click={handleLock}
-					disabled={isLoading || !amount || !hasValidAgent}
-				>
-					{#if isLoading}
-						<Spinner size="4" class="mr-2" />
+				<!-- Holochain Agent Input -->
+				<div>
+					<Label for="agent" class="mb-2">Unyt Agent Public Key (Holochain key)</Label>
+					{#if agentPrefilledFromUrl}
+						<div
+							class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default break-all"
+							style="user-select: none; -webkit-user-select: none;"
+							aria-readonly="true"
+						>
+							{agentInput}
+						</div>
+					{:else}
+						<Input
+							id="agent"
+							type="text"
+							placeholder="uhCA..."
+							bind:value={agentInput}
+							disabled={isLoading}
+						/>
 					{/if}
-					Lock {tokenSymbol}
-				</Button>
-			</div>
+					<Helper class="mt-1">
+						{#if agentPrefilledFromUrl}
+							Agent key from URL (read-only). This is where your mock HOT will be sent.
+						{:else}
+							Paste your Holochain agent key (e.g. uhCA...). This is where your mock HOT will be
+							sent. It is converted to hex for the contract below.
+						{/if}
+					</Helper>
+					{#if agentInput && hasValidAgent}
+						<div
+							class="mt-2 space-y-2 rounded-lg border border-gray-200 bg-gray-50 p-3 dark:border-gray-600 dark:bg-gray-700"
+						>
+							<div>
+								<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain key</p>
+								<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
+									{agentInput}
+								</p>
+							</div>
+							<div>
+								<p class="text-xs font-medium text-gray-500 dark:text-gray-400">
+									Ethereum (hex, used for lock)
+								</p>
+								<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
+									{agentHex}
+								</p>
+							</div>
+						</div>
+					{:else if agentInput}
+						<Helper color="red" class="mt-1">
+							Invalid format. Provide a Holochain agent key (uhCA...).
+						</Helper>
+					{/if}
+				</div>
 
-			<!-- Vault Info -->
-			<!-- <div class="mt-4 pt-4 border-t">
-				<p class="text-sm text-gray-500">
-					Vault Balance: {formatUnits(vaultBalance, tokenDecimals)}
-					{tokenSymbol}
-				</p>
-				<p class="text-xs text-gray-400 mt-1">
-					Lock Vault: <a
-						href={`https://sepolia.etherscan.io/address/${lockVaultAddress}`}
-						target="_blank"
-						class="hover:underline">{lockVaultAddress.slice(0, 10)}...{lockVaultAddress.slice(-8)}</a
+				<!-- Error Display -->
+				{#if error}
+					<Alert color="red">{error}</Alert>
+				{/if}
+
+				<!-- Single action: Lock (approve is done automatically first if needed) -->
+				<div class="flex flex-row gap-2">
+					<Button
+						class="w-fit disabled:!bg-primary-300 disabled:!opacity-100"
+						on:click={handleLock}
+						disabled={isLoading || !amount || !hasValidAgent}
 					>
-				</p>
-			</div> -->
-		</div>
+						{#if isLoading}
+							<Spinner size="4" class="mr-2" />
+						{/if}
+						Lock {tokenSymbol}
+					</Button>
+				</div>
+
+				<!-- Vault Info -->
+				<!-- <div class="mt-4 pt-4 border-t">
+					<p class="text-sm text-gray-500">
+						Vault Balance: {formatUnits(vaultBalance, tokenDecimals)}
+						{tokenSymbol}
+					</p>
+					<p class="text-xs text-gray-400 mt-1">
+						Lock Vault: <a
+							href={`https://sepolia.etherscan.io/address/${lockVaultAddress}`}
+							target="_blank"
+							class="hover:underline">{lockVaultAddress.slice(0, 10)}...{lockVaultAddress.slice(-8)}</a
+						>
+					</p>
+				</div> -->
+			</div>
+		{/if}
 	{/if}
 </Card>
 
