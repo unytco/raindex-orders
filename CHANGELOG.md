@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- the bridge UI's faucet answers a failed RPC call with a fixed error instead of the RPC error text, which held the full `SEPOLIA_RPC_URL` and any API key in it.
 - bridge-orchestrator gives each withdrawal coupon a nonce derived from its withdrawal's transaction ID, so coupons signed in the same second can all be claimed, and a withdrawal signed again cannot be claimed twice.
 - bridge-orchestrator waits for the agreement a deposit was parked on to consume it, even after its lane names a new one.
 - bridge-orchestrator keeps bridging after its lane's definition is extended or replaced.

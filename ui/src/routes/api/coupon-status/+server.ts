@@ -1,7 +1,6 @@
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import {
-	BaseError,
 	createPublicClient,
 	encodeAbiParameters,
 	encodePacked,
@@ -18,6 +17,7 @@ import { sepolia } from 'viem/chains'
 import { env } from '$env/dynamic/private'
 import { PUBLIC_ORDERBOOK_ADDRESS } from '$env/static/public'
 import { CLAIM_ORDER } from '$lib/orderConfig'
+import { logRpcError } from '$lib/server/rpcError'
 
 const MAX_COUPONS = 50
 const MAX_BODY_BYTES = 64 * 1024
@@ -87,9 +87,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	try {
 		chain = await readChain(rpcUrl, valid)
 	} catch (e) {
-		// viem error messages carry the RPC URL, and with it any API key, so only
-		// the short message is logged and none of it is returned.
-		console.error('coupon-status: RPC read failed:', e instanceof BaseError ? e.shortMessage : e)
+		logRpcError('coupon-status: RPC read failed', e)
 		return reply({ error: 'Sepolia RPC read failed' }, 502)
 	}
 

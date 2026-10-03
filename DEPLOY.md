@@ -206,6 +206,7 @@ What it means depends on when the coupon was signed. Coupons signed before the p
 
 ## Security Notes
 
+- Rotate the `SEPOLIA_RPC_URL` API key once the faucet fix (UNYT-1040) is deployed: until then `/api/faucet` answered a failed RPC call with an error that held the full RPC URL. Change the `SEPOLIA_RPC_URL` Workers Builds build variable, which `ui/scripts/cf-deploy.sh` re-applies as the runtime secret on every deploy.
 - Never commit `.env` files with private keys
 - The test signer key in this repo is for testing only
 - In production, use Fireblocks MPC or similar secure key management
