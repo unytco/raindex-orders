@@ -6,6 +6,8 @@ import type { Hex, Address } from 'viem'
 export interface OrderConfig {
 	orderHash: Hex
 	owner: Address
+	// The only signer whose coupons the order accepts.
+	signer: Address
 	interpreter: Address
 	store: Address
 	expression: Address
@@ -22,6 +24,7 @@ export interface OrderConfig {
 export const CLAIM_ORDER: OrderConfig = {
 	orderHash: '0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9',
 	owner: '0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6', // HoloLockVault
+	signer: '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37', // `valid-signer` in src/holo-claim.rain
 	interpreter: '0x8853d126bc23a45b9f807739b6ea0b38ef569005',
 	store: '0x23f77e7bc935503e437166498d7d72f2ea290e1f',
 	expression: '0x0a1369aee76570cc7404492d55a5d1468d5a9b4b',
