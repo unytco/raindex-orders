@@ -4,27 +4,37 @@ import {
 	createPublicClient,
 	encodeAbiParameters,
 	encodePacked,
+	hexToBigInt,
 	http,
 	isAddress,
+	isAddressEqual,
 	isHex,
 	keccak256,
 	maxUint256,
 	parseAbi,
+	recoverMessageAddress,
 	type Address,
-	type ContractFunctionParameters
+	type ContractFunctionParameters,
+	type Hex
 } from 'viem'
 import { sepolia } from 'viem/chains'
 import { env } from '$env/dynamic/private'
 import { PUBLIC_ORDERBOOK_ADDRESS } from '$env/static/public'
 import { CLAIM_ORDER } from '$lib/orderConfig'
-import { RATE_LIMITERS } from '$lib/server/rateLimits.js'
+import {
+	CouponStatusCache,
+	settledStatus,
+	type CouponCache,
+	type ReadStatus
+} from '$lib/server/couponStatusCache'
 import { logRpcError } from '$lib/server/rpcError'
 
 const MAX_COUPONS = 50
 const MAX_BODY_BYTES = 64 * 1024
-// A coupon from bridge-orchestrator/src/signer.rs is under 900 characters.
-const MAX_COUPON_CHARS = 1024
 const UINT256_DIGITS = maxUint256.toString().length
+// The highest `s` OpenZeppelin's ECDSA.tryRecover accepts, which the orderbook uses to
+// check a coupon's signature. viem would also accept the high-`s` twin.
+const MAX_SIGNATURE_S = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0n
 
 const HEADERS = {
 	'Access-Control-Allow-Origin': '*',
@@ -57,70 +67,80 @@ const readAbi = parseAbi([
 ])
 const multicall3 = sepolia.contracts.multicall3.address
 
-type Coupon = { nonce: bigint; expiry: bigint }
+type Coupon = { text: string; signature: Hex; hash: Hex; nonce: bigint; expiry: bigint }
 
 type Result = {
-	status: 'redeemed' | 'unredeemed' | 'expired' | 'invalid'
+	status: ReadStatus | 'invalid'
 	nonce: string | null
 	expiry: number | null
 }
 
-type ChainRead = { chainId: number; block: bigint; timestamp: bigint; flags: bigint[] }
+type ChainRead = { block: bigint; timestamp: bigint; flags: Map<bigint, bigint> }
 
-const reply = (body: unknown, status: number, headers: Record<string, string> = {}) =>
-	json(body, { status, headers: { ...HEADERS, ...headers } })
+const reply = (body: unknown, status: number) => json(body, { status, headers: HEADERS })
 
 export const OPTIONS: RequestHandler = () => new Response(null, { status: 204, headers: HEADERS })
 
-export const POST: RequestHandler = async ({ request, platform, getClientAddress }) => {
-	const coupons = await readCoupons(request)
-	if ('error' in coupons) return reply(coupons, 400)
+export const POST: RequestHandler = async ({ request, platform }) => {
+	const texts = await readCoupons(request)
+	if ('error' in texts) return reply(texts, 400)
+	if (!platform) throw new Error('coupon-status needs the Cloudflare Workers platform')
+	// The adapter types `caches` with @cloudflare/workers-types, whose Response is not
+	// the DOM Response this app builds; at runtime both are the Workers Response.
+	const store = (await platform.caches.open('coupon-status')) as unknown as CouponCache
+	const cache = new CouponStatusCache(store, new URL(request.url).origin)
 
-	// Every request past this point makes one eth_call, so each takes a token first.
-	const perIp = platform?.env?.[RATE_LIMITERS.perIp]
-	const total = platform?.env?.[RATE_LIMITERS.total]
-	if (!perIp || !total) {
-		console.error('coupon-status: a rate limiting binding is missing; refusing to call the RPC')
-		return reply({ error: 'Rate limiting is not configured' }, 503)
+	// A coupon with no status at the end is invalid.
+	const coupons = texts.map(parseCoupon)
+	const statuses = new Map<Coupon, ReadStatus>()
+	const unread: Coupon[] = []
+	const now = Date.now()
+	await Promise.all(
+		coupons.map(async coupon => {
+			if (!coupon) return
+			const cached = await cache.get(coupon.text)
+			const status = cached && settledStatus(cached, coupon.expiry, now)
+			if (status) statuses.set(coupon, status)
+			// An entry exists only for a coupon whose signature was verified.
+			else if (cached || (await signedByClaimSigner(coupon))) unread.push(coupon)
+		})
+	)
+
+	let chain: ChainRead | undefined
+	if (unread.length > 0) {
+		const rpcUrl = env.SEPOLIA_RPC_URL
+		if (!rpcUrl) {
+			console.error('coupon-status: SEPOLIA_RPC_URL is not set')
+			return reply({ error: 'Sepolia RPC is not configured' }, 502)
+		}
+		try {
+			chain = await readChain(rpcUrl, unread)
+		} catch (e) {
+			logRpcError('coupon-status: RPC read failed', e)
+			return reply({ error: 'Sepolia RPC read failed' }, 502)
+		}
+		const readAt = Date.now()
+		const { flags, timestamp } = chain
+		await Promise.all(
+			unread.map(coupon => {
+				const status =
+					flags.get(coupon.nonce) !== 0n
+						? 'redeemed'
+						: coupon.expiry <= timestamp
+							? 'expired'
+							: 'unredeemed'
+				statuses.set(coupon, status)
+				return cache.put(coupon.text, { status, readAt })
+			})
+		)
 	}
-	// Cloudflare sets cf-connecting-ip on every request it serves. Callers with no
-	// address share one key, so they are limited together rather than not at all.
-	const ip = request.headers.get('cf-connecting-ip') || getClientAddress() || 'unknown'
-	const allowed =
-		(await perIp.limit({ key: ip })).success && (await total.limit({ key: 'all' })).success
-	// 60 s is the longest period a Workers rate limit can have.
-	if (!allowed) return reply({ error: 'Too many requests' }, 429, { 'Retry-After': '60' })
 
-	const parsed = coupons.map(parseCoupon)
-	const valid = parsed.filter((coupon): coupon is Coupon => coupon !== null)
-
-	const rpcUrl = env.SEPOLIA_RPC_URL
-	if (!rpcUrl) {
-		console.error('coupon-status: SEPOLIA_RPC_URL is not set')
-		return reply({ error: 'Sepolia RPC is not configured' }, 502)
-	}
-
-	let chain: ChainRead
-	try {
-		chain = await readChain(rpcUrl, valid)
-	} catch (e) {
-		logRpcError('coupon-status: RPC read failed', e)
-		return reply({ error: 'Sepolia RPC read failed' }, 502)
-	}
-
-	const flags = new Map(valid.map((coupon, i) => [coupon, chain.flags[i]]))
-	const results = parsed.map((coupon): Result => {
-		if (coupon === null) return { status: 'invalid', nonce: null, expiry: null }
-		const status =
-			flags.get(coupon) !== 0n
-				? 'redeemed'
-				: coupon.expiry <= chain.timestamp
-					? 'expired'
-					: 'unredeemed'
+	const results = coupons.map((coupon): Result => {
+		const status = coupon && statuses.get(coupon)
+		if (!status) return { status: 'invalid', nonce: null, expiry: null }
 		return { status, nonce: coupon.nonce.toString(), expiry: Number(coupon.expiry) }
 	})
-
-	return reply({ chainId: chain.chainId, block: chain.block.toString(), results }, 200)
+	return reply({ chainId: sepolia.id, block: chain?.block.toString() ?? null, results }, 200)
 }
 
 async function readCoupons(request: Request): Promise<string[] | { error: string }> {
@@ -174,14 +194,19 @@ async function readText(request: Request): Promise<string | null> {
 
 /**
  * A coupon is `signer,signature,c0..c8` (bridge-orchestrator/src/signer.rs). Null
- * unless it parses and names the claim order, so no other namespace is ever read.
+ * unless it parses, names the claim order and its signer, and carries a signature the
+ * orderbook would accept the form of. Its signature is checked by signedByClaimSigner.
  */
-function parseCoupon(coupon: string): Coupon | null {
-	if (coupon.length > MAX_COUPON_CHARS) return null
-	const [signer, signature, ...fields] = coupon.split(',')
+function parseCoupon(text: string): Coupon | null {
+	const [signer, signature, ...fields] = text.split(',')
 	if (fields.length !== 9) return null
-	if (!isAddress(signer, { strict: false })) return null
-	if (!isHex(signature) || signature.length === 2 || signature.length % 2 !== 0) return null
+	if (!isAddress(signer, { strict: false }) || !isAddressEqual(signer, CLAIM_ORDER.signer)) {
+		return null
+	}
+	// 65 bytes r, s, v, with v 27 or 28 and a low s, as ECDSA.tryRecover requires.
+	if (!isHex(signature) || signature.length !== 132) return null
+	if (!['1b', '1c'].includes(signature.slice(130).toLowerCase())) return null
+	if (hexToBigInt(`0x${signature.slice(66, 130)}`) > MAX_SIGNATURE_S) return null
 	if (!fields.every(field => field.length <= UINT256_DIGITS && /^\d+$/.test(field))) return null
 
 	const context = fields.map(BigInt)
@@ -193,19 +218,34 @@ function parseCoupon(coupon: string): Coupon | null {
 	// The response states expiry as a JSON number of seconds.
 	if (expiry > BigInt(Number.MAX_SAFE_INTEGER)) return null
 
-	return { nonce, expiry }
+	const hash = keccak256(encodePacked(Array<'uint256'>(9).fill('uint256'), context))
+	return { text, signature, hash, nonce, expiry }
 }
 
 /**
- * One aggregate3 eth_call at the `safe` block reads every coupon's flag along with
+ * Whether the coupon's signature recovers to the claim order's signer, over the
+ * EIP-191 message the orderbook checks: keccak256 of the nine context words.
+ */
+async function signedByClaimSigner({ hash, signature }: Coupon): Promise<boolean> {
+	try {
+		const recovered = await recoverMessageAddress({ message: { raw: hash }, signature })
+		return isAddressEqual(recovered, CLAIM_ORDER.signer)
+	} catch {
+		return false
+	}
+}
+
+/**
+ * One aggregate3 eth_call at the `safe` block reads each nonce's flag once, along with
  * the chain, number and timestamp of the block it read them in.
  */
 async function readChain(rpcUrl: string, coupons: Coupon[]): Promise<ChainRead> {
+	const nonces = [...new Set(coupons.map(coupon => coupon.nonce))]
 	const contracts: ContractFunctionParameters<typeof readAbi, 'view'>[] = [
 		{ address: multicall3, abi: readAbi, functionName: 'getChainId' },
 		{ address: multicall3, abi: readAbi, functionName: 'getBlockNumber' },
 		{ address: multicall3, abi: readAbi, functionName: 'getCurrentBlockTimestamp' },
-		...coupons.map(({ nonce }) => ({
+		...nonces.map(nonce => ({
 			address: CLAIM_ORDER.store,
 			abi: readAbi,
 			functionName: 'get' as const,
@@ -226,5 +266,5 @@ async function readChain(rpcUrl: string, coupons: Coupon[]): Promise<ChainRead> 
 	if (chainId !== BigInt(sepolia.id)) {
 		throw new Error(`RPC answered for chain ${chainId}, expected ${sepolia.id}`)
 	}
-	return { chainId: sepolia.id, block, timestamp, flags }
+	return { block, timestamp, flags: new Map(nonces.map((nonce, i) => [nonce, flags[i]])) }
 }

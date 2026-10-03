@@ -168,23 +168,26 @@ SvelteKit web interface:
 - `/claim?c=<coupon>` - Direct claim via URL parameter
 - `POST /api/coupon-status` - Status of up to 50 claim coupons, read from Sepolia through `SEPOLIA_RPC_URL`
 
-#### Coupon status rate limits
+#### What bounds coupon-status RPC use
 
-Every well-formed `/api/coupon-status` request makes one `eth_call` to `SEPOLIA_RPC_URL`, even when no coupon in it is valid. The route checks no coupon signature, so anyone can build a coupon it will read. Before that call, the route takes a token from two Workers Rate Limiting bindings declared in `ui/wrangler.jsonc`:
+- **Signature gate.** A coupon is read only if it names the claim order's signer (`valid-signer` in `src/holo-claim.rain`, `CLAIM_ORDER.signer` in `ui/src/lib/orderConfig.ts`) and its signature recovers to that signer, checked as the orderbook checks it. Any other coupon answers `invalid` and is never read, so only genuine coupons can cause a read.
+- **Cache.** Answers are kept in the Workers Cache, keyed by the coupon text. `redeemed` and `expired` are kept from then on. `unredeemed` is kept for 60 s, and never once the coupon's expiry has passed. The Workers Cache is local to each Cloudflare data centre, so each data centre reads a coupon once for itself.
+- **One read at most.** A request makes at most one `eth_call` to `SEPOLIA_RPC_URL`: one Multicall3 `aggregate3` at the `safe` block, reading each uncached nonce once. A request the cache answers in full, or with no valid coupon, makes none, and its `block` is `null`.
 
-| Binding | Key | Limit |
-|---|---|---|
-| `COUPON_STATUS_PER_IP_LIMITER` | the caller's `cf-connecting-ip` | 10 requests per 60 s |
-| `COUPON_STATUS_TOTAL_LIMITER` | one key for all callers | 60 requests per 60 s |
+A coupon whose expiry has passed, but which the `safe` block still shows unexpired, is read on every request until the `safe` block passes its expiry, about 10 to 15 minutes on Sepolia.
 
-- Cloudflare counts each limit per Cloudflare location, not globally.
-- An app polls once every 3 minutes, so one address has room for about 30 apps, and one location for about 180.
-- Over a limit, the route answers `429` with `Retry-After: 60` and makes no RPC call.
-- If either binding is missing at runtime, the route answers `503` and makes no RPC call.
-- `ui/scripts/cf-deploy.sh` runs `ui/scripts/check-rate-limits.js` before `wrangler deploy`, and stops the deploy when `wrangler.jsonc` does not declare both bindings.
-- Each `namespace_id` (`1036001`, `1036002`) must not be used by another rate limiter on the Cloudflare account, or the two share counters.
-- The bindings sit under `unsafe.bindings` because the `ratelimits` key needs wrangler 4.36 or later, and `@sveltejs/adapter-cloudflare` 4.9 pins wrangler 3. Wrangler 4 uploads the same binding. Move them to `ratelimits`, and update the check, when the adapter and wrangler are upgraded.
-- `wrangler dev` and `vite dev` run the same limiters locally, from `wrangler.jsonc`.
+Checking a signature costs about 1 ms of CPU: 50 took about 50 ms under local `wrangler dev`. A coupon the cache holds is not checked again. Under the Workers Free plan's limit of 10 ms of CPU per request, a request with more than a few coupons the cache has not seen can fail with error 1102; the Paid plan allows 30 s by default.
+
+Optionally, for raw floods, add a Cloudflare WAF rate limiting rule in the dashboard (Security, then WAF, then Rate limiting rules) for the zone that serves `hot-bridge.unyt.dev`:
+
+| Setting | Value |
+|---|---|
+| Match | URI path equals `/api/coupon-status` |
+| Count by | IP |
+| Rate | 20 requests per 10 s |
+| Action | Block for 10 s |
+
+An app sends about one request every 3 minutes, plus one each time Interaction Details is opened, so this sits far above genuine use. These are the Free plan's only period and timeout, and the Free plan cannot match on method. The rule covers the custom domain only, not the Worker's `workers.dev` and version URLs.
 
 ## Coupon Format
 
