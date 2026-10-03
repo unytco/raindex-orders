@@ -166,7 +166,7 @@ SvelteKit web interface:
 - `/lock` - Lock HOT to receive bridged HOT
 - `/claim` - Claim HOT with coupon
 - `/claim?c=<coupon>` - Direct claim via URL parameter
-- `POST /api/coupon-status` - Status of up to 50 claim coupons, read from Sepolia through `SEPOLIA_RPC_URL`
+- `POST /api/coupon-status` - Status of up to 20 claim coupons, read from Sepolia through `SEPOLIA_RPC_URL`
 
 #### What bounds coupon-status RPC use
 
@@ -176,7 +176,11 @@ SvelteKit web interface:
 
 A coupon whose expiry has passed, but which the `safe` block still shows unexpired, is read on every request until the `safe` block passes its expiry, about 10 to 15 minutes on Sepolia.
 
-Checking a signature costs about 1 ms of CPU: 50 took about 50 ms under local `wrangler dev`. A coupon the cache holds is not checked again. Under the Workers Free plan's limit of 10 ms of CPU per request, a request with more than a few coupons the cache has not seen can fail with error 1102; the Paid plan allows 30 s by default.
+#### Why 20 coupons per request
+
+`hot-bridge-ui` runs on the Workers Free plan, which allows 50 subrequests per request, Cache API `match()` and `put()` calls included, and 10 ms of CPU. A request of N coupons the cache has not seen costs N cache matches, one RPC fetch and N cache puts. On a preview build, 6 to 20 new coupons answered `200`, 25 answered `500` (the 25th put), and 44 or 50 answered `502` (the RPC fetch). So a request takes at most 20 coupons: 41 subrequests and 20 signature checks. Checking a signature costs about 1 ms of CPU, and a coupon the cache holds is not checked again. The Workers Paid plan allows 10,000 subrequests per request.
+
+#### Optional WAF rule
 
 Optionally, for raw floods, add a Cloudflare WAF rate limiting rule in the dashboard (Security, then WAF, then Rate limiting rules) for the zone that serves `hot-bridge.unyt.dev`:
 

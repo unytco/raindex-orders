@@ -259,17 +259,18 @@ describe('POST /api/coupon-status', () => {
 		expect(body.results.map((r: { status: string }) => r.status)).toEqual(['expired', 'unredeemed'])
 	})
 
-	it('reads all 50 Sepolia coupons in one eth_call, every signature accepted', async () => {
+	it('reads 20 Sepolia coupons, the most a request takes, in one eth_call', async () => {
 		const rpc = fakeRpc(unclaimed())
 		const coupons = SEPOLIA_REDEEMED.map(({ coupon }) => coupon)
+		expect(coupons).toHaveLength(20)
 
 		const { response, body } = await post({ coupons })
 
 		expect(response.status).toBe(200)
-		expect(body.results).toHaveLength(50)
+		expect(body.results).toHaveLength(20)
 		expect(body.results.every((r: { status: string }) => r.status === 'unredeemed')).toBe(true)
 		expect(rpc.requests).toHaveLength(1)
-		expect(new Set(rpc.storeReads[0]).size).toBe(50)
+		expect(new Set(rpc.storeReads[0]).size).toBe(20)
 	})
 
 	it('reads a nonce once for coupons that share it', async () => {
@@ -386,7 +387,7 @@ describe('POST /api/coupon-status', () => {
 		['a body with another field', { coupons: [A], extra: true }],
 		['coupons that are not an array', { coupons: A }],
 		['no coupons', { coupons: [] }],
-		['51 coupons', { coupons: Array(51).fill(A) }],
+		['21 coupons', { coupons: Array(21).fill(A) }],
 		['a coupon that is not a string', { coupons: [A, 1] }]
 	])('answers 400 for %s', async (_, body) => {
 		const rpc = fakeRpc(sepolia())

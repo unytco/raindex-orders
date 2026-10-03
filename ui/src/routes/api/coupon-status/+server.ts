@@ -29,7 +29,10 @@ import {
 } from '$lib/server/couponStatusCache'
 import { logRpcError } from '$lib/server/rpcError'
 
-const MAX_COUPONS = 50
+// hot-bridge-ui runs on the Workers Free plan: 50 subrequests per request, Cache API
+// calls included, and 10 ms of CPU. N uncached coupons cost N cache matches, one RPC
+// fetch and N cache puts, so 20 costs at most 41 subrequests and 20 signature checks.
+const MAX_COUPONS = 20
 const MAX_BODY_BYTES = 64 * 1024
 const UINT256_DIGITS = maxUint256.toString().length
 // The highest `s` OpenZeppelin's ECDSA.tryRecover accepts, which the orderbook uses to
