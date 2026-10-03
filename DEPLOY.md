@@ -199,7 +199,10 @@ The coupon was signed with a different key than the one configured in the Rainla
 - Ensure `SIGNER_PRIVATE_KEY` in the bridge-orchestrator environment matches
 
 ### "Nonce already used"
-The withdrawal has already been claimed. Every coupon signed for one withdrawal carries the same nonce, so only one of them can be claimed.
+What it means depends on when the coupon was signed. Coupons signed before the per-withdrawal nonce carry the unix second they were signed in, a ten-digit nonce.
+
+- **Ten-digit nonce:** coupons signed in the same second shared that nonce, so the error can mean a sibling coupon was claimed and this withdrawal is still unpaid. `POST /api/coupon-status` reports the coupon as `redeemed` in both cases. Re-issue the withdrawal (UNYT-1041).
+- **Any other nonce:** the withdrawal has been claimed. Every coupon signed for one withdrawal carries the same nonce, so only one of them can be claimed.
 
 ## Security Notes
 
