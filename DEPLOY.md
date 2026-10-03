@@ -180,7 +180,7 @@ The signed coupon contains 9 context values:
 | 5 | orderbook | Orderbook contract address |
 | 6 | outputToken | Token address (MockHOT) |
 | 7 | outputVaultId | Vault ID |
-| 8 | nonce | Unique nonce (prevents replay) |
+| 8 | nonce | keccak256 of the 39 raw bytes of the withdrawal's Holochain transaction ID (prevents replay) |
 
 ## Troubleshooting
 
@@ -196,7 +196,7 @@ The coupon was signed with a different key than the one configured in the Rainla
 - Ensure `SIGNER_PRIVATE_KEY` in the bridge-orchestrator environment matches
 
 ### "Nonce already used"
-Each coupon can only be used once. Generate a new coupon with a fresh nonce.
+The withdrawal has already been claimed. Every coupon signed for one withdrawal carries the same nonce, so only one of them can be claimed.
 
 ## Security Notes
 

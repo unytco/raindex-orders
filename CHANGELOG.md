@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- bridge-orchestrator gives each withdrawal coupon a nonce derived from its withdrawal's transaction ID, so coupons signed in the same second can all be claimed, and a withdrawal signed again cannot be claimed twice.
 - bridge-orchestrator waits for the agreement a deposit was parked on to consume it, even after its lane names a new one.
 - bridge-orchestrator keeps bridging after its lane's definition is extended or replaced.
 - bridge-orchestrator fails a cycle with an error when no lane, or more than one, names its agent and lists the HOT unit.
