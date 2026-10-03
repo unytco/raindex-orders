@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- the bridge UI answers `POST /api/coupon-status` with each claim coupon's status on Sepolia (`redeemed`, `unredeemed`, `expired` or `invalid`), up to 50 coupons and 64 KB per request, read at the `safe` block and open to any origin. It answers `429` past 10 requests a minute from one address or 60 from all callers, per Cloudflare location, and will not deploy or run without those limits.
 - bridge-orchestrator reports its unclassified-error streak (`unclassified_active` / `unclassified_consecutive`) to watchtower alongside the source-chain-pressure pair, so a persistent unknown failure is visible to watchtower instead of only in log events.
 - CI runs the bridge-orchestrator Rust suite (`.github/workflows/rust.yml`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`) on the crate's pinned toolchain.
 - bridge-orchestrator signs zome calls via lair (`CONDUCTOR_CONFIG` + `LAIR_PASSPHRASE_FILE`, defaulting to the fleet paths), committing no capability grant per connect. A node that cannot offer lair stops the orchestrator at startup with the reason instead of writing to the bridging agent's chain.
@@ -28,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- the bridge UI's faucet answers a failed RPC call with a fixed error instead of the RPC error text, which held the full `SEPOLIA_RPC_URL` and any API key in it.
+- bridge-orchestrator gives each withdrawal coupon a nonce derived from its withdrawal's transaction ID, so coupons signed in the same second can all be claimed, and a withdrawal signed again cannot be claimed twice.
 - bridge-orchestrator waits for the agreement a deposit was parked on to consume it, even after its lane names a new one.
 - bridge-orchestrator keeps bridging after its lane's definition is extended or replaced.
 - bridge-orchestrator fails a cycle with an error when no lane, or more than one, names its agent and lists the HOT unit.

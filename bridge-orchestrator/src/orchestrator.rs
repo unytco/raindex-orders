@@ -896,7 +896,8 @@ impl BridgeOrchestrator {
                         .unwrap_or_default();
 
                     let signer_ctx = signer_context_from_env()?;
-                    let coupon = generate_coupon(&amount, withdraw_to, &signer_ctx).await?;
+                    let coupon =
+                        generate_coupon(&amount, withdraw_to, tx.id.as_ref(), &signer_ctx).await?;
                     let key = tx.id.to_string();
 
                     let entry_bytes = serde_json::to_vec(&json!({ &key: &coupon }))

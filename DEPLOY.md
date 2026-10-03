@@ -166,6 +166,25 @@ SvelteKit web interface:
 - `/lock` - Lock HOT to receive bridged HOT
 - `/claim` - Claim HOT with coupon
 - `/claim?c=<coupon>` - Direct claim via URL parameter
+- `POST /api/coupon-status` - Status of up to 50 claim coupons, read from Sepolia through `SEPOLIA_RPC_URL`
+
+#### Coupon status rate limits
+
+Every well-formed `/api/coupon-status` request makes one `eth_call` to `SEPOLIA_RPC_URL`, even when no coupon in it is valid. The route checks no coupon signature, so anyone can build a coupon it will read. Before that call, the route takes a token from two Workers Rate Limiting bindings declared in `ui/wrangler.jsonc`:
+
+| Binding | Key | Limit |
+|---|---|---|
+| `COUPON_STATUS_PER_IP_LIMITER` | the caller's `cf-connecting-ip` | 10 requests per 60 s |
+| `COUPON_STATUS_TOTAL_LIMITER` | one key for all callers | 60 requests per 60 s |
+
+- Cloudflare counts each limit per Cloudflare location, not globally.
+- An app polls once every 3 minutes, so one address has room for about 30 apps, and one location for about 180.
+- Over a limit, the route answers `429` with `Retry-After: 60` and makes no RPC call.
+- If either binding is missing at runtime, the route answers `503` and makes no RPC call.
+- `ui/scripts/cf-deploy.sh` runs `ui/scripts/check-rate-limits.js` before `wrangler deploy`, and stops the deploy when `wrangler.jsonc` does not declare both bindings.
+- Each `namespace_id` (`1036001`, `1036002`) must not be used by another rate limiter on the Cloudflare account, or the two share counters.
+- The bindings sit under `unsafe.bindings` because the `ratelimits` key needs wrangler 4.36 or later, and `@sveltejs/adapter-cloudflare` 4.9 pins wrangler 3. Wrangler 4 uploads the same binding. Move them to `ratelimits`, and update the check, when the adapter and wrangler are upgraded.
+- `wrangler dev` and `vite dev` run the same limiters locally, from `wrangler.jsonc`.
 
 ## Coupon Format
 
@@ -180,7 +199,7 @@ The signed coupon contains 9 context values:
 | 5 | orderbook | Orderbook contract address |
 | 6 | outputToken | Token address (MockHOT) |
 | 7 | outputVaultId | Vault ID |
-| 8 | nonce | Unique nonce (prevents replay) |
+| 8 | nonce | keccak256 of the 39 raw bytes of the withdrawal's Holochain transaction ID (prevents replay) |
 
 ## Troubleshooting
 
@@ -196,10 +215,14 @@ The coupon was signed with a different key than the one configured in the Rainla
 - Ensure `SIGNER_PRIVATE_KEY` in the bridge-orchestrator environment matches
 
 ### "Nonce already used"
-Each coupon can only be used once. Generate a new coupon with a fresh nonce.
+What it means depends on when the coupon was signed. Coupons signed before the per-withdrawal nonce carry the unix second they were signed in, a ten-digit nonce.
+
+- **Ten-digit nonce:** coupons signed in the same second shared that nonce, so the error can mean a sibling coupon was claimed and this withdrawal is still unpaid. `POST /api/coupon-status` reports the coupon as `redeemed` in both cases. Re-issue the withdrawal (UNYT-1041).
+- **Any other nonce:** the withdrawal has been claimed. Every coupon signed for one withdrawal carries the same nonce, so only one of them can be claimed.
 
 ## Security Notes
 
+- Rotate the `SEPOLIA_RPC_URL` API key once the faucet fix (UNYT-1040) is deployed: until then `/api/faucet` answered a failed RPC call with an error that held the full RPC URL. Change the `SEPOLIA_RPC_URL` Workers Builds build variable, which `ui/scripts/cf-deploy.sh` re-applies as the runtime secret on every deploy.
 - Never commit `.env` files with private keys
 - The test signer key in this repo is for testing only
 - In production, use Fireblocks MPC or similar secure key management

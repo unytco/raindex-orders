@@ -26,5 +26,30 @@
 		"PUBLIC_TOKEN_ADDRESS": "0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749",
 		"PUBLIC_LOCK_VAULT_ADDRESS": "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6",
 		"PUBLIC_SUBGRAPH_URL": "https://api.goldsky.com/api/public/project_clv14x04y9kzi01saerx7bxpg/subgraphs/ob-sepolia-0xfca89cD1/0.0.2/gn"
+	},
+	// Workers Rate Limiting for POST /api/coupon-status, which answers 503 without them
+	// and which scripts/cf-deploy.sh refuses to deploy without (scripts/check-rate-limits.js).
+	// Each limit counts per Cloudflare location, per 60 s. An app polls once every 3 min.
+	// Declared under `unsafe` because the top-level `ratelimits` key needs wrangler 4.36+,
+	// and adapter-cloudflare 4.9 pins wrangler 3; wrangler 4 uploads the same binding.
+	// A namespace_id must not be shared with another limiter on the Cloudflare account.
+	"unsafe": {
+		"bindings": [
+			{
+				// 10 requests per caller IP: room for ~30 apps behind one address.
+				"name": "COUPON_STATUS_PER_IP_LIMITER",
+				"type": "ratelimit",
+				"namespace_id": "1036001",
+				"simple": { "limit": 10, "period": 60 }
+			},
+			{
+				// 60 requests across all callers: ~180 apps polling through one location, and
+				// at most 60 eth_calls a minute from it to SEPOLIA_RPC_URL.
+				"name": "COUPON_STATUS_TOTAL_LIMITER",
+				"type": "ratelimit",
+				"namespace_id": "1036002",
+				"simple": { "limit": 60, "period": 60 }
+			}
+		]
 	}
 }

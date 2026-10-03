@@ -7,6 +7,7 @@ import { sepolia } from 'viem/chains'
 // so the key is NOT inlined into the built bundle — unlike $env/static/private (issue #14).
 import { env } from '$env/dynamic/private'
 import { PUBLIC_TOKEN_ADDRESS } from '$env/static/public'
+import { logRpcError } from '$lib/server/rpcError'
 
 // ERC20 ABI for transfer function
 const ERC20_ABI = [
@@ -73,9 +74,9 @@ export const GET: RequestHandler = async () => {
 			balance: formatEther(balance),
 			address: account.address
 		})
-	} catch (error: any) {
-		console.error('Error getting faucet balance:', error)
-		return json({ error: error.message || 'Failed to get balance' }, { status: 500 })
+	} catch (error) {
+		logRpcError('faucet: balance read failed', error)
+		return json({ error: 'Failed to get balance' }, { status: 500 })
 	}
 }
 
@@ -163,14 +164,8 @@ export const POST: RequestHandler = async ({ request }) => {
 		} else {
 			return json({ error: 'Transaction failed' }, { status: 500 })
 		}
-	} catch (error: any) {
-		console.error('Error sending faucet tokens:', error)
-		return json(
-			{
-				error: error.message || 'Failed to send tokens',
-				details: error.shortMessage || error.details
-			},
-			{ status: 500 }
-		)
+	} catch (error) {
+		logRpcError('faucet: token transfer failed', error)
+		return json({ error: 'Failed to send tokens' }, { status: 500 })
 	}
 }
