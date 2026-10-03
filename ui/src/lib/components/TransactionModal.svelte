@@ -1,3 +1,8 @@
+<script context="module" lang="ts">
+	export const LOCK_FINALIZE_LINE =
+		'Go back to your Unyt app now to finalize. You can close this window.'
+</script>
+
 <script lang="ts">
 	import { Button, Modal, Spinner } from 'flowbite-svelte'
 	import { transactionStore, TransactionStatus } from '$lib/stores/transactionStore'
@@ -20,10 +25,10 @@
 
 <Modal
 	on:close={() => {
-		if (!isLockSuccess && !isPending) transactionStore.reset()
+		if (!isPending) transactionStore.reset()
 	}}
 	open={$transactionStore.status !== TransactionStatus.IDLE}
-	dismissable={!isLockSuccess && !isPending}
+	dismissable={!isPending}
 	placement="center"
 >
 	<div class="p-4">
@@ -59,13 +64,8 @@
 					<h1 class="text-2xl">✅</h1>
 				</div>
 				{#if isLockSuccess}
-					<p class="text-lg font-semibold">Lock successful!</p>
-					<p class="text-sm text-gray-600 dark:text-gray-400">
-						Your mock HOT will be credited in your Unyt app within a few minutes.
-					</p>
-					<p class="text-sm text-gray-600 dark:text-gray-400">
-						You can now close this tab and return to your Unyt app to finalize the bridge transfer.
-					</p>
+					<p class="text-lg font-semibold">Lock almost complete</p>
+					<p class="text-sm text-gray-600 dark:text-gray-400">{LOCK_FINALIZE_LINE}</p>
 				{:else}
 					{$transactionStore.status}
 				{/if}
@@ -74,9 +74,6 @@
 					href={`https://sepolia.etherscan.io/tx/${$transactionStore.hash}`}
 					target="_blank">View transaction on Etherscan</a
 				>
-				{#if !isLockSuccess}
-					<Button on:click={() => transactionStore.reset()}>Close</Button>
-				{/if}
 			{/if}
 
 			{#if $transactionStore.status === TransactionStatus.ERROR}

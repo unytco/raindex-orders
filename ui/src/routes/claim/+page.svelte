@@ -4,6 +4,7 @@
 	import { formatUnits, type Hex, isAddress } from 'viem'
 	import { transactionStore } from '$lib/stores/transactionStore'
 	import TransactionModal from '$lib/components/TransactionModal.svelte'
+	import TransactionReceipt from '$lib/components/TransactionReceipt.svelte'
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 	import { PUBLIC_ORDERBOOK_ADDRESS } from '$env/static/public'
 	import { deserializeSignedContext, parseCoupon, type SignedContextV1Struct } from '$lib/coupon'
@@ -187,47 +188,27 @@
 
 <Card size="xl" class="flex flex-col gap-4">
 	{#if success}
-		<div class="flex flex-col items-center justify-center gap-4 py-8">
-			<div
-				class="flex h-20 w-20 items-center justify-center rounded-full bg-green-100 dark:bg-green-900"
-			>
-				<span class="text-4xl">✅</span>
-			</div>
-			<h1 class="text-2xl font-bold">Claim Successful!</h1>
-			<p class="text-center text-gray-600">
-				Your mock HOT tokens have been transferred to your wallet.
-			</p>
-
+		<TransactionReceipt
+			title="Claim Successful!"
+			message="Your mock HOT tokens have been transferred to your wallet."
+			hash={successTxHash}
+		>
 			{#if coupon && orderConfig}
-				<div class="bg-gray-50 p-4 rounded-lg space-y-2 w-full max-w-md">
-					<div class="grid grid-cols-2 gap-2 text-sm">
-						<span class="text-gray-600">Amount:</span>
-						<span class="font-semibold">
-							{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} mock HOT
-						</span>
+				<span class="text-gray-600">Amount:</span>
+				<span class="font-semibold">
+					{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} mock HOT
+				</span>
 
-						<span class="text-gray-600">Recipient:</span>
-						<a
-							class="font-mono hover:underline text-blue-600"
-							href={`https://sepolia.etherscan.io/address/${coupon.recipient}`}
-							target="_blank"
-						>
-							{truncateAddress(coupon.recipient)}
-						</a>
-					</div>
-				</div>
-			{/if}
-
-			{#if successTxHash}
+				<span class="text-gray-600">Recipient:</span>
 				<a
-					class="text-blue-500 hover:underline"
-					href={`https://sepolia.etherscan.io/tx/${successTxHash}`}
+					class="font-mono hover:underline text-blue-600"
+					href={`https://sepolia.etherscan.io/address/${coupon.recipient}`}
 					target="_blank"
 				>
-					View transaction on Etherscan
+					{truncateAddress(coupon.recipient)}
 				</a>
 			{/if}
-		</div>
+		</TransactionReceipt>
 	{:else}
 		<h1 class="text-2xl font-bold">Claim mock HOT</h1>
 		<p class="text-gray-600">
