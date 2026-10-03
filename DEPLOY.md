@@ -171,7 +171,7 @@ SvelteKit web interface:
 #### What bounds coupon-status RPC use
 
 - **Signature gate.** A coupon is read only if it names the claim order's signer (`valid-signer` in `src/holo-claim.rain`, `CLAIM_ORDER.signer` in `ui/src/lib/orderConfig.ts`) and its signature recovers to that signer, checked as the orderbook checks it. Any other coupon answers `invalid` and is never read, so only genuine coupons can cause a read.
-- **Cache.** Answers are kept in the Workers Cache, keyed by the coupon text. `redeemed` and `expired` are kept from then on. `unredeemed` is kept for 60 s, and never once the coupon's expiry has passed. The Workers Cache is local to each Cloudflare data centre, so each data centre reads a coupon once for itself.
+- **Cache.** Answers are kept in the Workers Cache, keyed by the coupon's signer, signature and context values, so a coupon respelled with other hex case or leading zeros shares its entry. `redeemed` and `expired` are kept from then on. `unredeemed` is kept for 60 s, and never once the coupon's expiry has passed. The Workers Cache is local to each Cloudflare data centre, so each data centre reads a coupon once for itself. A cache read or write that fails is logged and costs only a read; it never changes an answer.
 - **One read at most.** A request makes at most one `eth_call` to `SEPOLIA_RPC_URL`: one Multicall3 `aggregate3` at the `safe` block, reading each uncached nonce once. A request the cache answers in full, or with no valid coupon, makes none, and its `block` is `null`.
 
 A coupon whose expiry has passed, but which the `safe` block still shows unexpired, is read on every request until the `safe` block passes its expiry, about 10 to 15 minutes on Sepolia.

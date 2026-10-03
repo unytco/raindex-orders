@@ -608,6 +608,69 @@ describe('POST /api/coupon-status cache', () => {
 		expect(rpc.storeReads[0]).not.toContain(KEY_A)
 	})
 
+	it('answers another spelling of a cached coupon from the cache, with no RPC call', async () => {
+		const rpc = fakeRpc(sepolia())
+		await post({ coupons: [A] })
+		const [signer, signature] = fieldsOf(A)
+		const recased = withFields(A, {
+			0: `0x${signer.slice(2).toUpperCase()}`,
+			1: `0x${signature.slice(2).toUpperCase()}`
+		})
+		const zeroPadded = padded(A, A.length + 9)
+		expect(new Set([A, recased, zeroPadded]).size).toBe(3)
+
+		const { body } = await post({ coupons: [recased, zeroPadded] })
+
+		expect(body).toEqual({
+			chainId: 11155111,
+			block: null,
+			results: [
+				{ status: 'redeemed', nonce: '1775867941', expiry: EXPIRY_A },
+				{ status: 'redeemed', nonce: '1775867941', expiry: EXPIRY_A }
+			]
+		})
+		expect(rpc.requests).toHaveLength(1)
+	})
+
+	it('answers invalid for a cached coupon carrying another signature, with no RPC call', async () => {
+		const rpc = fakeRpc(sepolia())
+		await post({ coupons: [A] })
+		const signature = fieldsOf(A)[1]
+		const forged = withFields(A, { 1: `${signature.slice(0, 64)}00${signature.slice(66)}` })
+
+		const { body } = await post({ coupons: [forged] })
+
+		expect(body.results).toEqual([invalid])
+		expect(rpc.requests).toHaveLength(1)
+	})
+
+	it('answers with what it read when the cache cannot store it', async () => {
+		const rpc = fakeRpc(sepolia())
+		cache.store.put.mockRejectedValue(new Error('cache unavailable'))
+
+		const { response, body } = await post({ coupons: [A, C] })
+
+		expect(response.status).toBe(200)
+		expect(body.block).toBe('10883600')
+		expect(body.results.map((r: { status: string }) => r.status)).toEqual([
+			'redeemed',
+			'unredeemed'
+		])
+		expect(rpc.requests).toHaveLength(1)
+	})
+
+	it('reads the chain when the cache cannot be read', async () => {
+		const rpc = fakeRpc(sepolia())
+		await post({ coupons: [A] })
+		cache.store.match.mockRejectedValue(new Error('cache unavailable'))
+
+		const { response, body } = await post({ coupons: [A] })
+
+		expect(response.status).toBe(200)
+		expect(body.results).toEqual([{ status: 'redeemed', nonce: '1775867941', expiry: EXPIRY_A }])
+		expect(rpc.requests).toHaveLength(2)
+	})
+
 	it('stores nothing for an invalid coupon, and nothing when the read fails', async () => {
 		vi.stubGlobal(
 			'fetch',

@@ -13,6 +13,7 @@ import {
 	maxUint256,
 	parseAbi,
 	recoverMessageAddress,
+	stringToHex,
 	type Address,
 	type ContractFunctionParameters,
 	type Hex
@@ -70,7 +71,7 @@ const readAbi = parseAbi([
 ])
 const multicall3 = sepolia.contracts.multicall3.address
 
-type Coupon = { text: string; signature: Hex; hash: Hex; nonce: bigint; expiry: bigint }
+type Coupon = { id: Hex; signature: Hex; hash: Hex; nonce: bigint; expiry: bigint }
 
 type Result = {
 	status: ReadStatus | 'invalid'
@@ -101,7 +102,7 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 	await Promise.all(
 		coupons.map(async coupon => {
 			if (!coupon) return
-			const cached = await cache.get(coupon.text)
+			const cached = await cache.get(coupon.id)
 			const status = cached && settledStatus(cached, coupon.expiry, now)
 			if (status) statuses.set(coupon, status)
 			// An entry exists only for a coupon whose signature was verified.
@@ -133,7 +134,7 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 							? 'expired'
 							: 'unredeemed'
 				statuses.set(coupon, status)
-				return cache.put(coupon.text, { status, readAt })
+				return cache.put(coupon.id, { status, readAt })
 			})
 		)
 	}
@@ -222,7 +223,17 @@ function parseCoupon(text: string): Coupon | null {
 	if (expiry > BigInt(Number.MAX_SAFE_INTEGER)) return null
 
 	const hash = keccak256(encodePacked(Array<'uint256'>(9).fill('uint256'), context))
-	return { text, signature, hash, nonce, expiry }
+	return { id: couponId(signer, signature, context), signature, hash, nonce, expiry }
+}
+
+/**
+ * One coupon's identity, whatever its spelling: hex case and leading zeros change the
+ * text but not what the orderbook checks. Its context includes the expiry, so a coupon
+ * re-issued for the same withdrawal has an identity of its own.
+ */
+function couponId(signer: string, signature: Hex, context: bigint[]): Hex {
+	const canonical = [signer.toLowerCase(), signature.toLowerCase(), ...context.map(String)]
+	return keccak256(stringToHex(canonical.join(',')))
 }
 
 /**
