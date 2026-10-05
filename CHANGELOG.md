@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `POST /api/coupon-status` reads its own network's chain through that network's RPC secret.
 - `compose-rainlang.mjs` takes the network, the subparser and the coupon signer as inputs, and refuses the test signer on mainnet.
 - `deploy-sepolia.sh` signs with `--account` or `--ledger`, and refuses a private key in `.env` or on the command line.
-- bridge-orchestrator runs on the network `NETWORK` names, mainnet or sepolia, with that network's RPC URL and vault, and refuses to start when its chain, vault, claim order or signer do not match it.
+- bridge-orchestrator runs on the network `NETWORK` names, mainnet or sepolia, and refuses to start when its chain, vault or claim order do not match it, or it is given the test signer on mainnet.
 - bridge-orchestrator bridges on the one lane that names its agent and lists the unit in `HOT_UNIT_INDEX`, and will not start while `HOLOCHAIN_LANE_DEFINITION` or `HOLOCHAIN_UNIT_INDEX` is set.
 - the lair requirement is `ham`'s decision, supplied with the orchestrator's two paths, rather than restated here. A refusal names the fault before the reason the node could not offer lair.
 - the Rainix/Solidity workflow (`.github/workflows/test.yml`) is now manual-only (`on: workflow_dispatch`) — it has failed for years on a dead nixpkgs pin in `lib/rain.orderbook`.

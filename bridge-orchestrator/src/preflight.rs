@@ -6,6 +6,7 @@ use alloy::sol;
 use alloy::transports::{RpcError, TransportError, TransportErrorKind};
 use anyhow::{anyhow, bail, Result};
 use std::error::Error;
+use std::time::Duration;
 
 sol! {
     #[sol(rpc)]
@@ -21,10 +22,38 @@ sol! {
     }
 }
 
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Refuses to run the bridge unless the RPC answers for `network`, and the vault
 /// and claim order the configuration names are the ones deployed there. Every
 /// mismatch names its variable.
 pub async fn check(
+    network: Network,
+    rpc_url: &str,
+    vault: Address,
+    order: &ClaimOrder,
+) -> Result<()> {
+    check_within(RPC_TIMEOUT, network, rpc_url, vault, order).await
+}
+
+async fn check_within(
+    timeout: Duration,
+    network: Network,
+    rpc_url: &str,
+    vault: Address,
+    order: &ClaimOrder,
+) -> Result<()> {
+    tokio::time::timeout(timeout, read_and_compare(network, rpc_url, vault, order))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "{} did not answer within {timeout:?}",
+                network.rpc_url_var()
+            )
+        })?
+}
+
+async fn read_and_compare(
     network: Network,
     rpc_url: &str,
     vault: Address,
@@ -422,6 +451,34 @@ mod tests {
         for variable in ["TOKEN_ADDRESS", "ORDER_OWNER", "ORDER_HASH"] {
             assert!(message.contains(variable), "{message}");
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_an_rpc_that_never_answers() {
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", silent.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = silent.accept().await {
+                open.push(socket);
+            }
+        });
+
+        let err = check_within(
+            Duration::from_millis(200),
+            Network::Sepolia,
+            &url,
+            VAULT,
+            &order(),
+        )
+        .await
+        .expect_err("a silent RPC passed the check");
+        held.abort();
+
+        assert_eq!(
+            format!("{err:#}"),
+            "SEPOLIA_RPC_URL did not answer within 200ms"
+        );
     }
 
     #[tokio::test]

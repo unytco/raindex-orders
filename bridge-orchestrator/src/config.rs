@@ -74,8 +74,6 @@ struct NetworkSettings {
     lock_vault_address: Address,
 }
 
-/// `NETWORK` and its RPC URL and vault, refusing every variable of the other
-/// network. Each fault is named, so one restart reports all of them.
 fn network_settings(setting: impl Fn(&str) -> Option<String>) -> Result<NetworkSettings> {
     let network = match setting("NETWORK") {
         None => anyhow::bail!("NETWORK is required: sepolia or mainnet"),
@@ -162,9 +160,7 @@ pub struct Config {
     /// Per-request timeout applied to the Holochain app websocket. Prevents a
     /// slow or hung zome call from blocking the orchestrator indefinitely.
     pub ham_request_timeout_secs: u64,
-    /// Initial backoff delay used by the reconnect loop (milliseconds).
     pub ham_reconnect_backoff_initial_ms: u64,
-    /// Cap on the reconnect backoff delay (milliseconds).
     pub ham_reconnect_backoff_max_ms: u64,
     /// Number of consecutive failed reconnect attempts before the log level
     /// escalates from `warn` to `error`. The loop keeps retrying forever.
@@ -593,6 +589,19 @@ fn normalize_dna_b64(raw: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn test_settings(set: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    let set: Vec<(String, String)> = set
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    move |key| {
+        set.iter()
+            .find(|(set_key, _)| set_key == key)
+            .map(|(_, value)| value.clone())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -617,14 +626,6 @@ mod tests {
         );
     }
 
-    fn settings<'a>(set: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        |key| {
-            set.iter()
-                .find(|(set_key, _)| *set_key == key)
-                .map(|(_, value)| value.to_string())
-        }
-    }
-
     #[test]
     fn each_retired_setting_stops_the_orchestrator_naming_its_replacement() {
         for (key, replacement) in [
@@ -635,7 +636,7 @@ mod tests {
             ("HOLOCHAIN_UNIT_INDEX", "HOT_UNIT_INDEX"),
         ] {
             for value in ["1", ""] {
-                let err = hot_unit_index(settings(&[("HOT_UNIT_INDEX", "1"), (key, value)]))
+                let err = hot_unit_index(test_settings(&[("HOT_UNIT_INDEX", "1"), (key, value)]))
                     .expect_err("a retired setting would otherwise be dropped in silence");
                 let message = format!("{err:#}");
                 assert!(
@@ -646,7 +647,7 @@ mod tests {
             }
         }
 
-        let err = hot_unit_index(settings(&[
+        let err = hot_unit_index(test_settings(&[
             ("HOLOCHAIN_LANE_DEFINITION", ""),
             ("HOLOCHAIN_UNIT_INDEX", "1"),
         ]))
@@ -661,12 +662,12 @@ mod tests {
 
     #[test]
     fn hot_unit_index_parses_and_defaults_to_one() {
-        assert_eq!(hot_unit_index(settings(&[])).unwrap(), 1);
+        assert_eq!(hot_unit_index(test_settings(&[])).unwrap(), 1);
         assert_eq!(
-            hot_unit_index(settings(&[("HOT_UNIT_INDEX", "3")])).unwrap(),
+            hot_unit_index(test_settings(&[("HOT_UNIT_INDEX", "3")])).unwrap(),
             3
         );
-        let err = hot_unit_index(settings(&[("HOT_UNIT_INDEX", "hot")])).unwrap_err();
+        let err = hot_unit_index(test_settings(&[("HOT_UNIT_INDEX", "hot")])).unwrap_err();
         assert!(
             format!("{err:#}").contains("Invalid HOT_UNIT_INDEX"),
             "{err:#}"
@@ -676,12 +677,12 @@ mod tests {
     const VAULT: &str = "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6";
 
     fn network_refusal(set: &[(&str, &str)]) -> String {
-        format!("{:#}", network_settings(settings(set)).unwrap_err())
+        format!("{:#}", network_settings(test_settings(set)).unwrap_err())
     }
 
     #[test]
     fn each_network_reads_its_own_rpc_url_and_vault() {
-        let sepolia = network_settings(settings(&[
+        let sepolia = network_settings(test_settings(&[
             ("NETWORK", "sepolia"),
             ("SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
             ("SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
@@ -697,7 +698,7 @@ mod tests {
         );
         assert_eq!(sepolia.network.confirmations(), 5);
 
-        let mainnet = network_settings(settings(&[
+        let mainnet = network_settings(test_settings(&[
             ("NETWORK", "mainnet"),
             ("ETH_RPC_URL", "https://eth.rpc.test"),
             ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),

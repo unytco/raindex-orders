@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use holo_hash::ActionHash;
 use std::env;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,9 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The coupon signer whose private key is committed in `src/Constants.sol`.
 pub const TEST_SIGNER: Address = address!("8E72b7568738da52ca3DCd9b24E178127A4E7d37");
 
-const DEFAULT_EXPIRY_SECONDS: u64 = 604_800;
+const DEFAULT_EXPIRY_SECONDS: NonZeroU64 = match NonZeroU64::new(604_800) {
+    Some(seconds) => seconds,
+    None => unreachable!(),
+};
 
-/// The claim order every coupon names, and the vault it pays out of.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaimOrder {
     pub order_hash: B256,
@@ -27,11 +30,9 @@ pub struct ClaimOrder {
 
 pub type Signing<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 
-/// Signs a coupon for the claim order's `valid-signer`. The orderbook checks the
-/// signature with OpenZeppelin's `SignatureChecker` over `digest`, the EIP-191
-/// digest of the coupon's context: a key answers with its own 65-byte signature,
-/// a contract signer such as a Safe with what its EIP-1271 `isValidSignature`
-/// accepts.
+/// The claim order's `valid-signer`. The orderbook checks its signature of
+/// `digest` with OpenZeppelin's `SignatureChecker`: a key's 65-byte signature, or
+/// what a contract's EIP-1271 `isValidSignature` accepts.
 pub trait CouponKey: Send + Sync {
     fn address(&self) -> Address;
     fn sign<'a>(&'a self, digest: &'a B256) -> Signing<'a>;
@@ -57,12 +58,10 @@ impl CouponKey for PrivateKeySigner {
 pub struct CouponSigner {
     key: Box<dyn CouponKey>,
     order: ClaimOrder,
-    expiry_seconds: u64,
+    expiry_seconds: NonZeroU64,
 }
 
 impl CouponSigner {
-    /// Parsed at startup, naming every variable that is unset or malformed. On
-    /// mainnet the test signer is refused, as its key is public.
     pub fn from_env(network: Network) -> Result<Self> {
         Self::from_settings(network, |key| env::var(key).ok())
     }
@@ -79,7 +78,7 @@ impl CouponSigner {
             Some(_) => parsed(
                 &setting,
                 "EXPIRY_SECONDS",
-                "a number of seconds",
+                "a number of seconds above 0",
                 &mut faults,
             ),
         };
@@ -163,7 +162,7 @@ impl CouponSigner {
         let context: Vec<U256> = vec![
             pad_address(recipient),
             parse_amount(amount)?,
-            U256::from(now + self.expiry_seconds),
+            U256::from(now) + U256::from(self.expiry_seconds.get()),
             U256::from_be_bytes(order.order_hash.0),
             pad_address(order.order_owner),
             pad_address(order.orderbook),
@@ -185,7 +184,6 @@ impl CouponSigner {
 
 #[cfg(test)]
 impl CouponSigner {
-    /// A signer for the Sepolia claim order.
     pub fn with_key(key: impl CouponKey + 'static) -> Self {
         Self {
             key: Box::new(key),
@@ -205,8 +203,6 @@ impl CouponSigner {
     }
 }
 
-/// What the orderbook passes to `SignatureChecker`: keccak256 of the packed
-/// context words, under the EIP-191 personal-message prefix.
 fn context_digest(context: &[U256]) -> B256 {
     let packed: Vec<u8> = context.iter().flat_map(|v| v.to_be_bytes::<32>()).collect();
     keccak256(
@@ -279,6 +275,7 @@ fn parse_amount(amount_str: &str) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_settings;
     use holo_hash::ActionHashB64;
 
     const NOW: u64 = 1_750_000_000;
@@ -287,10 +284,6 @@ mod tests {
 
     fn sepolia_order() -> ClaimOrder {
         CouponSigner::with_key(PrivateKeySigner::random()).order
-    }
-
-    fn signer_with(key: impl CouponKey + 'static) -> CouponSigner {
-        CouponSigner::with_key(key)
     }
 
     async fn coupon(signer: &CouponSigner, withdrawal: &ActionHash, now: u64) -> String {
@@ -310,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn withdrawals_signed_in_the_same_second_get_different_nonces() {
-        let signer = signer_with(PrivateKeySigner::random());
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let first = coupon(&signer, &ActionHash::from_raw_32(vec![1; 32]), NOW).await;
         let second = coupon(&signer, &ActionHash::from_raw_32(vec![2; 32]), NOW).await;
 
@@ -319,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_withdrawal_signed_again_keeps_its_nonce() {
-        let signer = signer_with(PrivateKeySigner::random());
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let withdrawal: ActionHash =
             ActionHashB64::from_b64_str("uhCkkWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlrx-wQB")
                 .unwrap()
@@ -344,7 +337,7 @@ mod tests {
             "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
                 .parse()
                 .unwrap();
-        let signer = signer_with(key);
+        let signer = CouponSigner::with_key(key);
 
         let coupon = coupon(&signer, &ActionHash::from_raw_32(vec![7; 32]), NOW).await;
 
@@ -353,8 +346,6 @@ mod tests {
 
     const GOLDEN_COUPON: &str = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc,0x5700e22974b0b133fd972f920b36e055e35ab5e83c08db389845451c5532232846d64b38b077e85d8c9e311fd7d22b15af7a78f58b5cb11089b9b07b429bade11c,97433442488726861213578988847752201310395502865,1500000000000000000,1750604800,42941365433660945573526868378572896801276519612010928011051331832534249141753,1300945060633283894583661816534861012306758682838,1442425860134574572653119565674449928420894127102,1340384803335777240622375245841800624658726815561,108043606565222972236900316128309391016550688326814185311821020602083120460619,8496889498503184870230947373316602526857109467185425766089433217409414560631";
 
-    /// A contract signer, as a Safe would be: its own address, and a signature
-    /// of any length that its `isValidSignature` accepts.
     struct ContractSigner;
 
     impl CouponKey for ContractSigner {
@@ -369,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_contract_signer_names_itself_and_signs_the_same_digest() {
-        let signer = signer_with(ContractSigner);
+        let signer = CouponSigner::with_key(ContractSigner);
         let withdrawal = ActionHash::from_raw_32(vec![7; 32]);
 
         let coupon = coupon(&signer, &withdrawal, NOW).await;
@@ -408,14 +399,6 @@ mod tests {
         ("SIGNER_PRIVATE_KEY", TEST_SIGNER_KEY),
     ];
 
-    fn settings(set: Vec<(&'static str, String)>) -> impl Fn(&str) -> Option<String> {
-        move |key| {
-            set.iter()
-                .find(|(set_key, _)| *set_key == key)
-                .map(|(_, value)| value.clone())
-        }
-    }
-
     fn sepolia_settings_with(
         changes: &[(&'static str, Option<&str>)],
     ) -> impl Fn(&str) -> Option<String> {
@@ -429,7 +412,11 @@ mod tests {
                 set.push((key, value.to_string()));
             }
         }
-        settings(set)
+        let set: Vec<(&str, &str)> = set
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        test_settings(&set)
     }
 
     fn refusal(network: Network, setting: impl Fn(&str) -> Option<String>) -> String {
@@ -471,7 +458,18 @@ mod tests {
             Network::Sepolia,
             sepolia_settings_with(&[("EXPIRY_SECONDS", Some("a week"))]),
         );
-        assert_eq!(message, "EXPIRY_SECONDS=a week is not a number of seconds");
+        assert_eq!(
+            message,
+            "EXPIRY_SECONDS=a week is not a number of seconds above 0"
+        );
+        let message = refusal(
+            Network::Sepolia,
+            sepolia_settings_with(&[("EXPIRY_SECONDS", Some("0"))]),
+        );
+        assert_eq!(
+            message,
+            "EXPIRY_SECONDS=0 is not a number of seconds above 0"
+        );
     }
 
     #[test]
@@ -527,6 +525,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(signer.expiry_seconds, 3600);
+        assert_eq!(signer.expiry_seconds.get(), 3600);
     }
 }

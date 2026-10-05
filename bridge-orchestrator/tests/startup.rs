@@ -112,3 +112,25 @@ fn run_stops_on_an_unreachable_rpc_before_it_writes_anything() {
     );
     assert!(!db(dir.path()).exists());
 }
+
+#[test]
+fn run_on_mainnet_refuses_the_test_signer_before_it_writes_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = node(dir.path());
+    env.extend(signer());
+    env.retain(|(key, _)| *key != "SIGNER_PRIVATE_KEY");
+    env.push((
+        "SIGNER_PRIVATE_KEY",
+        "0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd".to_string(),
+    ));
+
+    let output = orchestrator(dir.path(), &env, &["run"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("SIGNER_PRIVATE_KEY is the test signer"),
+        "{stderr}"
+    );
+    assert!(!db(dir.path()).exists());
+}
