@@ -6,11 +6,9 @@ import {HoloLockVault} from "src/HoloLockVault.sol";
 import {MAINNET_HOT, MAINNET_ORDERBOOK, HOLO_VAULT_ID, MIN_LOCK_AMOUNT} from "src/Constants.sol";
 import {ClaimOrderScript, ClaimNetwork} from "./ClaimOrderScript.sol";
 
-/// @title DeployMainnet
-/// @notice Deploys the HOT bridge on Ethereum mainnet against the existing
-/// OrderBookV3: HoloLockVault, then the claim order through it, then hands the
-/// vault to ADMIN_ADDRESS. Run it through deploy-mainnet.sh, which also reads
-/// back what landed and prints the deploy record.
+/// Deploys the HOT bridge on Ethereum mainnet against the existing OrderBookV3:
+/// HoloLockVault, then the claim order through it, then hands the vault to
+/// ADMIN_ADDRESS. deploy-mainnet.sh runs it, then `record`.
 contract DeployMainnet is ClaimOrderScript {
     function run() external {
         ClaimNetwork memory net = claimNetwork("mainnet");
@@ -34,8 +32,8 @@ contract DeployMainnet is ClaimOrderScript {
         vm.stopBroadcast();
     }
 
-    /// Reads back, from the chain, the vault deployed at `fromBlock` and its claim
-    /// order, and prints the deploy record.
+    /// Prints the deploy record of `vault`, read from the chain, and of the claim
+    /// order it added from `fromBlock` on.
     function record(HoloLockVault vault, uint256 fromBlock) external {
         ClaimNetwork memory net = claimNetwork("mainnet");
         requireChain(net);
@@ -43,7 +41,8 @@ contract DeployMainnet is ClaimOrderScript {
         require(address(vault.orderbook()) == address(MAINNET_ORDERBOOK), "the vault's orderbook is not OrderBookV3");
         require(vault.vaultId() == HOLO_VAULT_ID, "the vault's vault ID is not HOLO_VAULT_ID");
         require(vault.admin() == vm.envAddress("ADMIN_ADDRESS"), "the vault's admin is not ADMIN_ADDRESS");
-        (OrderV2 memory order, bytes32 orderHash) = findClaimOrder(net, vault, fromBlock);
-        printRecord(net, vault, vm.envAddress("VALID_SIGNER"), order, orderHash);
+        address signer = vm.envAddress("VALID_SIGNER");
+        (OrderV2 memory order, bytes32 orderHash) = findClaimOrder(net, vault, signer, fromBlock);
+        printRecord(net, vault, signer, order, orderHash);
     }
 }

@@ -5,20 +5,10 @@ import {Script, console2} from "forge-std/Script.sol";
 import {HoloLockVault} from "src/HoloLockVault.sol";
 import {SEPOLIA_ORDERBOOK, SEPOLIA_TROT, HOLO_VAULT_ID, MIN_LOCK_AMOUNT} from "src/Constants.sol";
 
-/// @title DeployHoloLockVault
-/// @notice Deploys the HoloLockVault contract to Sepolia. Mainnet deploys through
-/// deploy-mainnet.sh.
-/// @dev Run with:
-///   # Sepolia (dry-run):
-///   forge script script/DeployHoloLockVault.s.sol:DeploySepoliaHoloLockVault --rpc-url $SEPOLIA_RPC_URL
-///
-///   # Sepolia (broadcast):
-///   forge script script/DeployHoloLockVault.s.sol:DeploySepoliaHoloLockVault --rpc-url $SEPOLIA_RPC_URL --broadcast --verify
+/// Deploys HoloLockVault on Sepolia. Mainnet deploys through deploy-mainnet.sh.
 contract DeploySepoliaHoloLockVault is Script {
     function run() external {
-        // Read token address from environment, fallback to SEPOLIA_TROT
         address token = vm.envOr("TOKEN_ADDRESS", address(SEPOLIA_TROT));
-        // Read admin address from environment or use deployer
         address admin = vm.envOr("ADMIN_ADDRESS", msg.sender);
 
         console2.log("Deploying HoloLockVault to Sepolia...");

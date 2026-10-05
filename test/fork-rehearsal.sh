@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Rehearses the mainnet deploy, then the move of the vault admin and the coupon
-# signer to Safe multisigs, on anvil forks of Ethereum mainnet:
+# signer to Safe multisigs, on an anvil fork of Ethereum mainnet:
 #   nix develop -c test/fork-rehearsal.sh
-# FORK_URL is the mainnet RPC anvil forks from. Every transaction goes to an
-# anvil this script starts on 127.0.0.1, never to FORK_URL.
+# FORK_URL is the mainnet RPC anvil forks. Every transaction goes to an anvil
+# this script starts on 127.0.0.1, never to FORK_URL.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -34,12 +34,15 @@ fail() {
 }
 
 start_anvil() {
-	local url=$1
+	local url=$1 pid
 	shift
+	cast chain-id --rpc-url "$url" >/dev/null 2>&1 && fail "something already answers on $url"
 	anvil --host 127.0.0.1 --port "${url##*:}" --silent "$@" &
-	anvils+=($!)
+	pid=$!
+	anvils+=("$pid")
 	for _ in $(seq 120); do
-		cast chain-id --rpc-url "$url" >/dev/null 2>&1 && return
+		kill -0 "$pid" 2>/dev/null || fail "anvil on $url exited"
+		[[ $(cast rpc web3_clientVersion --rpc-url "$url" 2>/dev/null) == '"anvil/'* ]] && return
 		sleep 0.5
 	done
 	fail "anvil on $url did not start"
@@ -70,7 +73,7 @@ cast wallet import deployer --private-key "$deployer_key" --keystore-dir "$work/
 	--unsafe-password rehearsal >/dev/null
 wallet=(--keystore "$work/keys/deployer" --password rehearsal)
 
-record_value() { grep -oE "$1=0x[0-9a-fA-F]+" "$2" | tail -1 | cut -d= -f2; }
+record_value() { grep -oE "$1=0x[0-9a-fA-F]+" "$2" | tail -1 | cut -d= -f2 || true; }
 nonce() { cast nonce "$deployer" --rpc-url "$1"; }
 
 # Runs deploy-mainnet.sh against `url`, which must refuse, naming `reason`, and
@@ -104,6 +107,10 @@ expect_refusal "$fork" "VALID_SIGNER is the test signer" \
 	env ADMIN_ADDRESS="$admin" VALID_SIGNER="$test_signer" ./deploy-mainnet.sh "${wallet[@]}"
 expect_refusal "$fork" "ADMIN_ADDRESS is required" \
 	env -u ADMIN_ADDRESS VALID_SIGNER="$signer" ./deploy-mainnet.sh "${wallet[@]}"
+expect_refusal "$fork" "VALID_SIGNER is required" \
+	env -u VALID_SIGNER ADMIN_ADDRESS="$admin" ./deploy-mainnet.sh "${wallet[@]}"
+expect_refusal "$fork" "ADMIN_ADDRESS is the deployer" \
+	env ADMIN_ADDRESS="$deployer" VALID_SIGNER="$signer" ./deploy-mainnet.sh "${wallet[@]}"
 expect_refusal "$fork" "pass the signer as a forge wallet option" \
 	env "${inputs[@]}" ./deploy-mainnet.sh
 expect_refusal "$fork" "--private-key takes a raw key" \
@@ -133,7 +140,6 @@ safe() {
 	forge script test/rehearsal/RehearsalSafe.s.sol:RehearsalSafe --rpc-url "$fork" --broadcast \
 		--private-key "$deployer_key" "$@"
 }
-# A Safe of the accounts whose keys follow the salt.
 create_safe() {
 	local salt=$1 owners=() key
 	shift
@@ -161,9 +167,14 @@ REHEARSAL_OWNER_KEYS="${admin_owner_keys[0]},${admin_owner_keys[1]}" safe \
 echo "minLockAmount is $min_lock_amount, set by the admin Safe"
 
 step "Rotating the coupon signer to the signer Safe through rotate-claim-signer.sh"
-rotation=(NETWORK=mainnet ETH_RPC_URL="$fork" LOCK_VAULT_ADDRESS="$vault" ORDER_HASH="$order_hash"
-	CLAIM_INTERPRETER="$interpreter" CLAIM_STORE="$store" CLAIM_EXPRESSION="$expression"
+rotation=(NETWORK=mainnet ETH_RPC_URL="$fork" MAINNET_LOCK_VAULT_ADDRESS="$vault" ORDER_HASH="$order_hash"
+	PUBLIC_CLAIM_INTERPRETER="$interpreter" PUBLIC_CLAIM_STORE="$store" PUBLIC_CLAIM_EXPRESSION="$expression"
 	VALID_SIGNER="$signer_safe")
+if env "${rotation[@]}" VALID_SIGNER="$test_signer" ./rotate-claim-signer.sh >"$work/refusal.log" 2>&1; then
+	fail "rotate-claim-signer.sh took the test signer on mainnet"
+fi
+grep -qF "VALID_SIGNER is the test signer" "$work/refusal.log" || fail "rotate-claim-signer.sh refused without naming the test signer"
+echo "refused: the test signer as the new coupon signer"
 env "${rotation[@]}" ./rotate-claim-signer.sh | tee "$work/rotate.log"
 mapfile -t calls < <(grep -oE '[0-9]+\. to 0x[0-9a-fA-F]{40}, value 0, data 0x[0-9a-fA-F]+' "$work/rotate.log")
 [[ ${#calls[@]} == 2 ]] || fail "rotate-claim-signer.sh did not print the 2 Safe calls"
@@ -174,6 +185,12 @@ for call in "${calls[@]}"; do
 	REHEARSAL_OWNER_KEYS="${admin_owner_keys[0]},${admin_owner_keys[2]}" safe \
 		--sig 'exec(address,address,bytes)' "$admin_safe" "$to" "$data" >/dev/null
 done
+if env "${rotation[@]}" VALID_SIGNER="$signer" ./rotate-claim-signer.sh record "$from_block" >"$work/refusal.log" 2>&1; then
+	fail "the record named a signer the new claim order does not accept"
+fi
+grep -qF "is not the claim expression for VALID_SIGNER" "$work/refusal.log" ||
+	fail "the record refused another signer without naming the expression"
+echo "refused: a record naming a signer the claim order does not accept"
 env "${rotation[@]}" ./rotate-claim-signer.sh record "$from_block" | tee "$work/rotated.log"
 new_order_hash=$(record_value ORDER_HASH "$work/rotated.log")
 [[ $(record_value PUBLIC_CLAIM_SIGNER "$work/rotated.log") == "$signer_safe" ]] ||

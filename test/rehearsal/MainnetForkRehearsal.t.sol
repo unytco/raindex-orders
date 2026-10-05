@@ -68,7 +68,8 @@ abstract contract ForkRehearsal is Test, SignContext {
     }
 
     /// The nine context words the orchestrator signs for a withdrawal of `amount`
-    /// to `claimer`, its nonce the keccak of the withdrawal's 39-byte action hash.
+    /// to `claimer`. The nonce is the keccak of a 39-byte action hash, as the
+    /// orchestrator's is, though its last 4 bytes are not a real DHT location.
     function context(uint256 amount, uint256 expiry, uint256 withdrawal) internal view returns (uint256[] memory c) {
         c = new uint256[](9);
         c[0] = uint256(uint160(claimer));

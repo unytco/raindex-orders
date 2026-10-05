@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Composes the claim expression for one network:
 //   node compose-rainlang.mjs --network mainnet --subparser 0x... --signer 0x... [src/holo-claim.rain]
-// The file's front matter is never read: its scenarios bind the test signer.
+// The inputs replace the file's scenario bindings, whose mainnet one names the test signer.
 import pkg from '@rainlanguage/dotrain'
 import { readFileSync } from 'node:fs'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 
 const { RainDocument, MetaStore } = pkg
@@ -36,7 +36,9 @@ export function bindings({ network, subparser, signer }) {
 	]
 }
 
-export async function compose({ network, subparser, signer, file = 'src/holo-claim.rain' }) {
+const CLAIM_EXPRESSION = fileURLToPath(new URL('src/holo-claim.rain', import.meta.url))
+
+export async function compose({ network, subparser, signer, file = CLAIM_EXPRESSION }) {
 	const rebinds = bindings({ network, subparser, signer })
 	return RainDocument.composeText(
 		readFileSync(file, 'utf8'),

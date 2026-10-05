@@ -15,14 +15,16 @@
 #   ./deploy-sepolia.sh [step] --ledger
 #
 # Steps:
-#   1 or token          - Deploy MockHOT token
-#   2 or vault          - Deploy HoloLockVault
-#   3 or mint           - Mint test tokens to your wallet (MINT_AMOUNT, in wei)
-#   5 or order-via-vault - Deploy claim order via vault
-#   all                 - Run all steps
-#   status              - Show current deployment status
+#   1 or token           Deploy MockHOT token
+#   2 or vault           Deploy HoloLockVault
+#   3 or mint            Mint test tokens to your wallet (MINT_AMOUNT, in wei)
+#   5 or order-via-vault Deploy claim order via vault
+#   all                  Run all steps
+#   status               Show current deployment status
 
 set -e
+cd "$(dirname "$0")"
+source script/forge-broadcast.sh
 
 # Colors for output
 RED='\033[0;31m'
@@ -52,24 +54,23 @@ fi
 STEP="${1:-status}"
 shift || true
 WALLET=("$@")
-for arg in "${WALLET[@]}"; do
-    case "$arg" in
-        --private-key*|--mnemonic|--mnemonic=*|-i|--interactive)
-            echo -e "${RED}Error: $arg takes a raw key. Pass --account <keystore> or --ledger instead.${NC}"
-            exit 1
-            ;;
-    esac
-done
-
-if [ ${#WALLET[@]} -gt 0 ]; then
+if [ ${#WALLET[@]} -gt 0 ] || [ "$STEP" != "status" ]; then
+    require_wallet "${WALLET[@]}"
     WALLET_ADDRESS=$(cast wallet address "${WALLET[@]}")
     # Scripts that default to msg.sender see the wallet only through --sender.
     WALLET+=(--sender "$WALLET_ADDRESS")
     echo -e "${BLUE}Wallet: $WALLET_ADDRESS${NC}"
-elif [ "$STEP" != "status" ]; then
-    echo -e "${RED}Error: pass the deployer wallet: --account <keystore> or --ledger${NC}"
-    exit 1
 fi
+
+# Runs a forge script that broadcasts, leaving its output in OUTPUT. A failed
+# run stops the deploy, so no later step reads an earlier run's results.
+broadcast() {
+    if ! OUTPUT=$(forge script "$@" --rpc-url "$SEPOLIA_RPC_URL" "${WALLET[@]}" --broadcast -vvv 2>&1); then
+        echo "$OUTPUT"
+        die "forge script $1 failed"
+    fi
+    echo "$OUTPUT"
+}
 
 if [ -n "$WALLET_ADDRESS" ]; then
     BALANCE=$(cast balance "$WALLET_ADDRESS" --rpc-url "$SEPOLIA_RPC_URL" 2>/dev/null || echo "0")
@@ -80,14 +81,7 @@ echo ""
 deploy_token() {
     echo -e "${YELLOW}=== Step 1: Deploying MockHOT Token ===${NC}"
 
-    # Run forge script
-    OUTPUT=$(forge script script/DeployTestHOT.s.sol:DeployTestHOT \
-        --rpc-url "$SEPOLIA_RPC_URL" \
-        "${WALLET[@]}" \
-        --broadcast \
-        -vvv 2>&1)
-
-    echo "$OUTPUT"
+    broadcast script/DeployTestHOT.s.sol:DeployTestHOT
 
     # Extract deployed address
     TOKEN_ADDR=$(echo "$OUTPUT" | grep -oP "MockHOT deployed at: \K0x[a-fA-F0-9]{40}" || true)
@@ -98,7 +92,7 @@ deploy_token() {
         sed -i "s|^TOKEN_ADDRESS=.*|TOKEN_ADDRESS=$TOKEN_ADDR|" .env
         echo -e "${GREEN}Updated .env with TOKEN_ADDRESS${NC}"
     else
-        echo -e "${RED}Could not extract token address from output${NC}"
+        die "Could not extract token address from output"
     fi
 }
 
@@ -113,14 +107,7 @@ deploy_vault() {
 
     echo "Using token: $TOKEN_ADDRESS"
 
-    # Run forge script
-    OUTPUT=$(forge script script/DeployHoloLockVault.s.sol:DeploySepoliaHoloLockVault \
-        --rpc-url "$SEPOLIA_RPC_URL" \
-        "${WALLET[@]}" \
-        --broadcast \
-        -vvv 2>&1)
-
-    echo "$OUTPUT"
+    broadcast script/DeployHoloLockVault.s.sol:DeploySepoliaHoloLockVault
 
     # Extract deployed address
     VAULT_ADDR=$(echo "$OUTPUT" | grep -oP "HoloLockVault deployed at: \K0x[a-fA-F0-9]{40}" || true)
@@ -132,7 +119,7 @@ deploy_vault() {
         sed -i "s|^ORDER_OWNER=.*|ORDER_OWNER=$WALLET_ADDRESS|" .env
         echo -e "${GREEN}Updated .env with LOCK_VAULT_ADDRESS and ORDER_OWNER${NC}"
     else
-        echo -e "${RED}Could not extract vault address from output${NC}"
+        die "Could not extract vault address from output"
     fi
 }
 
@@ -176,35 +163,15 @@ deploy_order_via_vault() {
     echo "Using vault: $LOCK_VAULT_ADDRESS"
     echo "Valid signer: $VALID_SIGNER"
 
-    # Run forge script, which composes the claim expression for Sepolia
-    echo "Running forge script..."
-    set +e  # Don't exit on error so we can capture output
-    OUTPUT=$(NETWORK=sepolia LOCK_VAULT_ADDRESS="$LOCK_VAULT_ADDRESS" VALID_SIGNER="$VALID_SIGNER" \
-        forge script script/DeployClaimOrderViaVault.s.sol:DeployClaimOrderViaVault \
-        --rpc-url "$SEPOLIA_RPC_URL" \
-        "${WALLET[@]}" \
-        --broadcast \
-        -vvv 2>&1)
-    FORGE_EXIT_CODE=$?
-    set -e
+    BROADCAST_FILE="${FOUNDRY_BROADCAST:-broadcast}/DeployClaimOrderViaVault.s.sol/11155111/run-latest.json"
+    STARTED=$(mktemp)
+    NETWORK=sepolia LOCK_VAULT_ADDRESS="$LOCK_VAULT_ADDRESS" VALID_SIGNER="$VALID_SIGNER" \
+        broadcast script/DeployClaimOrderViaVault.s.sol:DeployClaimOrderViaVault
+    sent_since "$STARTED" "$BROADCAST_FILE" || die "forge sent nothing: is the vault admin a Safe?"
+    rm -f "$STARTED"
 
-    echo "$OUTPUT"
-
-    if [ $FORGE_EXIT_CODE -ne 0 ]; then
-        echo -e "${RED}Forge script failed with exit code $FORGE_EXIT_CODE${NC}"
-    fi
-
-    # Try to extract order hash from broadcast JSON
-    # The AddOrder event is emitted by the orderbook contract
-    # Order hash is at bytes 96-128 (4th 32-byte word) in the data field of the AddOrder event
-    BROADCAST_FILE="broadcast/DeployClaimOrderViaVault.s.sol/11155111/run-latest.json"
-
-    if [ -f "$BROADCAST_FILE" ]; then
-        # Find the AddOrder event from the orderbook (topic 0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf)
-        # Extract the order hash from byte offset 192-256 (after sender, deployer, offset)
-        # Data layout: 0x + sender(64) + deployer(64) + offset(64) + orderHash(64) = chars 195-258
-        ORDER_HASH_VAL=$(jq -r '.receipts[0].logs[] | select(.topics[0] == "0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf") | .data' "$BROADCAST_FILE" 2>/dev/null | cut -c195-258 | sed 's/^/0x/')
-    fi
+    # The order hash is the fourth word of the orderbook's AddOrder event data.
+    ORDER_HASH_VAL=$(jq -r '.receipts[0].logs[] | select(.topics[0] == "0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf") | .data' "$BROADCAST_FILE" | cut -c195-258 | sed 's/^/0x/')
 
     if [ -n "$ORDER_HASH_VAL" ] && [ "$ORDER_HASH_VAL" != "0x" ]; then
         echo -e "${GREEN}Order deployed via vault! Hash: $ORDER_HASH_VAL${NC}"

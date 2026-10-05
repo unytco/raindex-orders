@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { TEST_SIGNER, bindings, compose } from './compose-rainlang.mjs'
 
 const SUBPARSER = {
@@ -8,6 +9,7 @@ const SUBPARSER = {
 	mainnet: '0xFCe5E9F48049f3D8850C2C5fd7AD792F10B36326'
 }
 const SIGNER = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC'
+const COMPOSER = fileURLToPath(new URL('compose-rainlang.mjs', import.meta.url))
 
 for (const network of ['sepolia', 'mainnet']) {
 	test(`${network}: binds the subparser and signer it is given`, async () => {
@@ -55,10 +57,10 @@ test('names every missing or malformed input', () => {
 
 test('the command prints the composed expression, and exits 1 naming a refusal', () => {
 	const args = ['--network', 'mainnet', '--subparser', SUBPARSER.mainnet, '--signer']
-	const out = execFileSync('node', ['compose-rainlang.mjs', ...args, SIGNER], { encoding: 'utf8' })
+	const out = execFileSync('node', [COMPOSER, ...args, SIGNER], { encoding: 'utf8' })
 	assert.match(out, /using-words-from/)
 
-	const refused = spawnSync('node', ['compose-rainlang.mjs', ...args, TEST_SIGNER], {
+	const refused = spawnSync('node', [COMPOSER, ...args, TEST_SIGNER], {
 		encoding: 'utf8'
 	})
 	assert.equal(refused.status, 1)

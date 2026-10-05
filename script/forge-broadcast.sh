@@ -49,7 +49,9 @@ landed() {
 		] | join("  ")' "$1"
 }
 
-# The block, in decimal, of the first transaction forge sent.
+# The block, in decimal, of the first transaction forge sent, or nothing.
 first_block() {
-	printf '%d\n' "$(jq -r '.receipts[0].blockNumber' "$1")"
+	local hex
+	hex=$(jq -r '.receipts[0].blockNumber // empty' "$1")
+	[[ $hex =~ ^0x[0-9a-fA-F]+$ ]] && printf '%d\n' "$hex"
 }

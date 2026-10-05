@@ -28,6 +28,8 @@ sent_since "$started" "$run_file" || die "forge sent nothing."
 
 echo "Sent:"
 landed "$run_file"
-vault_tx=$(jq -r '.transactions[] | select(.transactionType == "CREATE" and .contractName == "HoloLockVault")' "$run_file")
-vault=$(jq -r '.contractAddress' <<<"$vault_tx")
-forge script "$script" --rpc-url "$ETH_RPC_URL" --sig 'record(address,uint256)' "$vault" "$(first_block "$run_file")"
+vault=$(jq -r '[.transactions[] | select(.transactionType == "CREATE" and .contractName == "HoloLockVault")][0].contractAddress // empty' "$run_file")
+block=$(first_block "$run_file")
+[[ $vault =~ ^0x[0-9a-fA-F]{40}$ && $block =~ ^[1-9][0-9]*$ ]] ||
+	die "Read the vault and its block from $run_file, then run: forge script $script --rpc-url \$ETH_RPC_URL --sig 'record(address,uint256)' <vault> <block>"
+forge script "$script" --rpc-url "$ETH_RPC_URL" --sig 'record(address,uint256)' "$vault" "$block"

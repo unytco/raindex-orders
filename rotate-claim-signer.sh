@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Replaces the vault's claim order with one that accepts coupons from
-# VALID_SIGNER, as docs/enable-multisig.md describes:
+# VALID_SIGNER, as docs/enable-multisig.md describes. Source the current deploy
+# record first, then:
 #   ./rotate-claim-signer.sh --ledger      an admin key signs and sends the calls
-#   ./rotate-claim-signer.sh               a Safe admin: prints the calls it executes
+#   ./rotate-claim-signer.sh               a Safe admin: prints the calls for the Safe to execute
 #   ./rotate-claim-signer.sh record BLOCK  prints the new deploy record once they have run
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -48,4 +49,6 @@ fi
 
 echo "Sent:"
 landed "$run_file"
-forge script "$script" --rpc-url "$rpc_url" --sig 'record(uint256)' "$(first_block "$run_file")"
+block=$(first_block "$run_file")
+[[ -n $block ]] || die "Read the first call's block from $run_file, then run: $0 record <block>"
+forge script "$script" --rpc-url "$rpc_url" --sig 'record(uint256)' "$block"
