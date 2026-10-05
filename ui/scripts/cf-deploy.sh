@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
 #
-# Cloudflare Workers Builds "Deploy command" for the bridge website's two Workers:
-# hot-bridge-ui, built with PUBLIC_NETWORK=sepolia, and hot-bridge-ui-mainnet, built
-# with PUBLIC_NETWORK=mainnet and deployed as the wrangler env `mainnet`. Point each
-# project's Deploy command at this (`npm run cf:deploy`); the Build command stays
-# `npm run build`. Runs from the same dir as the build (ui/).
+# Workers Builds "Deploy command" (`npm run cf:deploy`) for hot-bridge-ui, built with
+# PUBLIC_NETWORK=sepolia, and hot-bridge-ui-mainnet, built with PUBLIC_NETWORK=mainnet
+# as the wrangler env `mainnet`. Runs from ui/, after `npm run build`.
 #
-# Why: the server routes read their RPC URL and faucet key at runtime via
-# $env/dynamic/private, i.e. from the Worker's runtime secret bindings, not the build.
-# `wrangler deploy` resets dashboard-set bindings on every push, so runtime values added
-# by hand get wiped. Workers Builds *build variables*, by contrast, persist. So we keep
-# the secrets as build variables and re-apply them as runtime secrets here on every
-# deploy: the wipe heals itself and nothing needs managing in the CF dashboard beyond
-# pointing the Deploy command at this script once.
+# The server routes read their secrets at runtime, and `wrangler deploy` drops bindings
+# set by hand, so the secrets are kept as build variables and set again on each deploy.
 set -euo pipefail
 
 case "${PUBLIC_NETWORK:-}" in

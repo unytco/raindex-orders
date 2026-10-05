@@ -85,6 +85,20 @@ describe('parseBridgeConfig', () => {
 		expect(() => parseBridgeConfig({ ...MAINNET_BUILD, [key]: value })).toThrow(fault)
 	})
 
+	it.each([
+		['sepolia', SEPOLIA_BUILD],
+		['mainnet', MAINNET_BUILD]
+	])('refuses a %s build whose order does not hash to its order hash', (_, build) => {
+		const stale = { ...build, PUBLIC_CLAIM_STORE: '0x1111111111111111111111111111111111111111' }
+
+		expect(() => parseBridgeConfig(stale)).toThrow(
+			'PUBLIC_CLAIM_ORDER_HASH is not the hash of the order'
+		)
+		expect(() =>
+			parseBridgeConfig({ ...build, PUBLIC_LOCK_VAULT_ADDRESS: MAINNET_BUILD.PUBLIC_TOKEN_ADDRESS })
+		).toThrow('PUBLIC_CLAIM_ORDER_HASH is not the hash of the order')
+	})
+
 	it('names every fault in one error', () => {
 		expect(() =>
 			parseBridgeConfig({ ...without(SEPOLIA_BUILD, 'PUBLIC_CLAIM_STORE'), PUBLIC_NETWORK: '' })

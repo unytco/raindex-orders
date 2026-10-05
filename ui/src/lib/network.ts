@@ -1,4 +1,14 @@
-import { isAddress, isAddressEqual, isHex, zeroAddress, type Address, type Hex } from 'viem'
+import {
+	encodeAbiParameters,
+	isAddress,
+	isAddressEqual,
+	isHex,
+	keccak256,
+	parseAbiParameters,
+	zeroAddress,
+	type Address,
+	type Hex
+} from 'viem'
 import { mainnet, sepolia } from 'viem/chains'
 
 /** The coupon signer whose private key is committed in `src/Constants.sol`. */
@@ -32,6 +42,40 @@ export const NETWORKS = {
 } as const
 
 export type NetworkName = keyof typeof NETWORKS
+
+/** `HOLO_VAULT_ID` in src/Constants.sol, on both networks. */
+export const HOLO_VAULT_ID = 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334bn
+
+const ORDER_V2 = parseAbiParameters(
+	'(address owner, bool handleIO, (address interpreter, address store, address expression) evaluable, (address token, uint8 decimals, uint256 vaultId)[] validInputs, (address token, uint8 decimals, uint256 vaultId)[] validOutputs)'
+)
+
+type ClaimValues = {
+	lockVaultAddress: Address
+	tokenAddress: Address
+	claimOrder: { interpreter: Address; store: Address; expression: Address; inputToken: Address }
+}
+
+/**
+ * The OrderV2 the vault added and takeOrders names. Both IOs declare 18 decimals, as
+ * script/ClaimOrderScript.sol adds them.
+ */
+export function claimOrderStruct({ lockVaultAddress, tokenAddress, claimOrder }: ClaimValues) {
+	return {
+		owner: lockVaultAddress,
+		handleIO: true,
+		evaluable: {
+			interpreter: claimOrder.interpreter,
+			store: claimOrder.store,
+			expression: claimOrder.expression
+		},
+		validInputs: [{ token: claimOrder.inputToken, decimals: 18, vaultId: HOLO_VAULT_ID }],
+		validOutputs: [{ token: tokenAddress, decimals: 18, vaultId: HOLO_VAULT_ID }]
+	}
+}
+
+export const orderHashOf = (values: ClaimValues): Hex =>
+	keccak256(encodeAbiParameters(ORDER_V2, [claimOrderStruct(values)]))
 
 export type BridgeConfig = (typeof NETWORKS)[NetworkName] & {
 	network: NetworkName
@@ -103,7 +147,7 @@ export function parseBridgeConfig(env: BuildEnv): BridgeConfig {
 
 	if (faults.length > 0) throw new Error(`Bridge build variables: ${faults.join('; ')}`)
 	const a = addresses as Record<(typeof ADDRESS_VARIABLES)[number], Address>
-	return {
+	const config: BridgeConfig = {
 		...NETWORKS[network as NetworkName],
 		network: network as NetworkName,
 		tokenAddress: a.PUBLIC_TOKEN_ADDRESS,
@@ -118,4 +162,10 @@ export function parseBridgeConfig(env: BuildEnv): BridgeConfig {
 			inputToken: a.PUBLIC_CLAIM_INPUT_TOKEN
 		}
 	}
+	if (orderHashOf(config).toLowerCase() !== config.claimOrder.orderHash.toLowerCase()) {
+		throw new Error(
+			`Bridge build variables: PUBLIC_CLAIM_ORDER_HASH is not the hash of the order that PUBLIC_LOCK_VAULT_ADDRESS, PUBLIC_TOKEN_ADDRESS, PUBLIC_CLAIM_INTERPRETER, PUBLIC_CLAIM_STORE, PUBLIC_CLAIM_EXPRESSION and PUBLIC_CLAIM_INPUT_TOKEN describe`
+		)
+	}
+	return config
 }

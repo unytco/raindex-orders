@@ -9,7 +9,8 @@
 	import WrongNetwork from '$lib/components/WrongNetwork.svelte'
 	import { bridge, explorerAddress } from '$lib/config'
 	import { deserializeSignedContext, parseCoupon, type SignedContextV1Struct } from '$lib/coupon'
-	import { getOrderConfig, buildOrderStruct, type OrderConfig } from '$lib/orderConfig'
+	import { getOrderConfig, type OrderConfig } from '$lib/orderConfig'
+	import { claimOrderStruct } from '$lib/network'
 	import {
 		ethereumStore,
 		onWrongNetwork,
@@ -24,18 +25,15 @@
 
 	$: isConnected = $ethereumStore.isConnected
 
-	// Coupon input (for manual entry)
 	let couponInput = ''
 	let couponPrefilledFromUrl = false
 	let signedContext: SignedContextV1Struct | undefined
 
-	// Order state (from RPC instead of subgraph)
 	let orderConfig: OrderConfig | undefined
 	let orderExists = false
 	let vaultBalance: bigint | undefined
 	let isCheckingOrder = false
 
-	// Get coupon from URL on mount
 	onMount(() => {
 		if (browser) {
 			const urlParam = new URL(window.location.href).searchParams.get('c')
@@ -47,7 +45,6 @@
 		}
 	})
 
-	// Parse coupon when input changes
 	async function parseCouponInput() {
 		if (!couponInput) {
 			signedContext = undefined
@@ -75,7 +72,6 @@
 		await getVaultBalance()
 	}
 
-	// Check if order exists on-chain
 	async function checkOrderExists(orderHash: Hex) {
 		isCheckingOrder = true
 		try {
@@ -94,7 +90,6 @@
 		}
 	}
 
-	// Get vault balance via RPC
 	async function getVaultBalance() {
 		if (!orderConfig) return
 
@@ -112,7 +107,6 @@
 		}
 	}
 
-	// Parse coupon to display
 	$: coupon = signedContext ? parseCoupon(signedContext) : undefined
 
 	let isLoading = false
@@ -130,8 +124,7 @@
 		transactionStore.awaitWalletConfirmation()
 
 		try {
-			// Build order struct from config
-			const order = buildOrderStruct(orderConfig)
+			const order = claimOrderStruct(bridge)
 
 			const takeOrderConfig = {
 				order: order,

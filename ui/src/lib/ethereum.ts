@@ -27,7 +27,6 @@ const initialState: EthereumState = {
 
 export const ethereumStore: Writable<EthereumState> = writable(initialState)
 
-/** A connected wallet on a chain other than this build's network. */
 export const onWrongNetwork: Readable<boolean> = derived(
 	ethereumStore,
 	s => s.isConnected && s.chainId !== bridge.chain.id
@@ -80,7 +79,7 @@ export async function initEthereum(): Promise<boolean> {
 	return true
 }
 
-function handleAccountsChanged(accounts: string[]) {
+async function handleAccountsChanged(accounts: string[]) {
 	if (accounts.length === 0) {
 		ethereumStore.update(s => ({
 			...s,
@@ -93,6 +92,18 @@ function handleAccountsChanged(accounts: string[]) {
 			isConnected: true,
 			account: accounts[0]
 		}))
+		await readWalletChain()
+	}
+}
+
+/** Takes the chain from the wallet, which reports no change for a chain it is already on. */
+async function readWalletChain() {
+	const eth = getEthereum()
+	if (!eth) return
+	try {
+		handleChainChanged((await eth.request({ method: 'eth_chainId' })) as string)
+	} catch (err) {
+		console.error('Error reading the wallet chain:', err)
 	}
 }
 
@@ -144,6 +155,7 @@ export async function switchNetwork(): Promise<boolean> {
 	const chainId = numberToHex(bridge.chain.id)
 	try {
 		await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId }] })
+		await readWalletChain()
 		return true
 	} catch (err) {
 		const unknownChain = (err as { code?: number } | null)?.code === 4902
@@ -153,6 +165,7 @@ export async function switchNetwork(): Promise<boolean> {
 					method: 'wallet_addEthereumChain',
 					params: [{ chainId, ...bridge.addToWallet }]
 				})
+				await readWalletChain()
 				return true
 			} catch (addErr) {
 				console.error(`Failed to add ${bridge.networkName}:`, addErr)
@@ -261,6 +274,7 @@ export async function writeContract(params: {
 		params: [
 			{
 				from: account,
+				chainId: numberToHex(bridge.chain.id),
 				to: params.address,
 				data,
 				value: params.value ? '0x' + params.value.toString(16) : '0x0'

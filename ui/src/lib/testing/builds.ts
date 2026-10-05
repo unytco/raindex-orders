@@ -1,6 +1,6 @@
 import { vi } from 'vitest'
 
-/** The TestNet Worker's build variables, as configuration.md gives them. */
+/** The TestNet Worker's build variables. */
 export const SEPOLIA_BUILD = {
 	PUBLIC_NETWORK: 'sepolia',
 	PUBLIC_TOKEN_ADDRESS: '0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749',

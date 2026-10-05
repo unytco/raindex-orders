@@ -1,6 +1,8 @@
 import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import {
+	BaseError,
+	ContractFunctionZeroDataError,
 	createPublicClient,
 	encodeAbiParameters,
 	encodePacked,
@@ -34,10 +36,13 @@ import { logRpcError } from '$lib/server/rpcError'
 // fetch and N cache puts, so 20 costs at most 41 subrequests and 20 signature checks.
 const MAX_COUPONS = 20
 const KEY_SIGNATURE_BYTES = 65
-// A contract signer's signature is checked on chain by its EIP-1271 isValidSignature.
-// A Safe's signature holds 65 bytes per owner, and the claim signer's Safe needs two or more.
-const MIN_CONTRACT_SIGNATURE_BYTES = 2 * KEY_SIGNATURE_BYTES
-const MAX_CONTRACT_SIGNATURE_BYTES = 20 * KEY_SIGNATURE_BYTES
+// A Safe's signature holds 65 bytes for each owner signature its threshold asks for.
+const MIN_SAFE_SIGNATURES = 2
+const MAX_SAFE_SIGNATURES = 20
+// The `v` of a Safe owner's ECDSA signature: 27 or 28 over the hash, 31 or 32 over
+// its EIP-191 message. 0 would have the Safe call another contract, and 1 read an
+// approval stored on chain, so neither is read.
+const SAFE_OWNER_V = ['1b', '1c', '1f', '20']
 const EIP1271_MAGIC_VALUE = '0x1626ba7e00000000000000000000000000000000000000000000000000000000'
 const MAX_BODY_BYTES = 64 * 1024
 const UINT256_DIGITS = maxUint256.toString().length
@@ -67,8 +72,6 @@ const namespace = BigInt(
 const nonceKey = (nonce: bigint) =>
 	BigInt(keccak256(encodePacked(['uint256', 'uint256'], [orderHash, nonce])))
 
-// The interpreter store's `get`, a contract signer's EIP-1271 check, and Multicall3's
-// reads of the chain and block it runs in.
 const readAbi = parseAbi([
 	'function get(uint256 namespace, uint256 key) view returns (uint256)',
 	'function isValidSignature(bytes32 hash, bytes signature) view returns (bytes32)',
@@ -77,6 +80,10 @@ const readAbi = parseAbi([
 	'function getCurrentBlockTimestamp() view returns (uint256)'
 ])
 const multicall3 = bridge.chain.contracts.multicall3.address
+
+// Set once an isValidSignature call finds no answer, as an address with no code
+// gives: from then on this isolate answers a contract signer's coupon invalid unread.
+let claimSignerAnswers = true
 
 type Coupon = {
 	id: Hex
@@ -127,8 +134,9 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 			if (status) statuses.set(coupon, status)
 			// An entry exists only for a coupon whose signature was verified.
 			else if (cached) unread.push(coupon)
-			else if (coupon.signedBy === 'contract') unverified.push(coupon)
-			else if (await signedByClaimSigner(coupon)) unread.push(coupon)
+			else if (coupon.signedBy === 'contract') {
+				if (claimSignerAnswers) unverified.push(coupon)
+			} else if (await signedByClaimSigner(coupon)) unread.push(coupon)
 		})
 	)
 
@@ -257,8 +265,8 @@ function parseCoupon(text: string): Coupon | null {
 
 /**
  * Who could have made `signature`: a key, as 65 bytes r, s, v with v 27 or 28 and a
- * low s, as ECDSA.tryRecover requires; or a contract signer, as anything of a length
- * a Safe of 2 to 20 owners signs with.
+ * low s, as ECDSA.tryRecover requires; or a Safe, as 2 to 20 of its owners' ECDSA
+ * signatures.
  */
 function signatureForm(signature: string): Coupon['signedBy'] | null {
 	if (!isHex(signature) || signature.length % 2 !== 0) return null
@@ -268,8 +276,16 @@ function signatureForm(signature: string): Coupon['signedBy'] | null {
 		if (hexToBigInt(`0x${signature.slice(66, 130)}`) > MAX_SIGNATURE_S) return null
 		return 'key'
 	}
-	if (bytes >= MIN_CONTRACT_SIGNATURE_BYTES && bytes <= MAX_CONTRACT_SIGNATURE_BYTES) {
-		return 'contract'
+	const signatures = bytes / KEY_SIGNATURE_BYTES
+	if (
+		Number.isInteger(signatures) &&
+		signatures >= MIN_SAFE_SIGNATURES &&
+		signatures <= MAX_SAFE_SIGNATURES
+	) {
+		const vs = Array.from({ length: signatures }, (_, i) =>
+			signature.slice(2 + 130 * i + 128, 2 + 130 * (i + 1)).toLowerCase()
+		)
+		return vs.every(v => SAFE_OWNER_V.includes(v)) ? 'contract' : null
 	}
 	return null
 }
@@ -300,8 +316,8 @@ async function signedByClaimSigner({ hash, signature }: Coupon): Promise<boolean
 /**
  * One aggregate3 eth_call at the `safe` block reads each nonce's flag once, along with
  * the chain, number and timestamp of the block it read them in. In the same call the
- * claim signer's EIP-1271 isValidSignature checks each `unverified` coupon, over the
- * digest the orderbook passes it, as OpenZeppelin's SignatureChecker reads the answer.
+ * claim signer's EIP-1271 isValidSignature checks each `unverified` coupon over the
+ * digest the orderbook passes it, accepting only the magic value, as the orderbook does.
  */
 async function readChain(
 	rpcUrl: string,
@@ -348,6 +364,16 @@ async function readChain(
 		throw new Error(`RPC answered for chain ${chainId}, expected ${bridge.chain.id}`)
 	}
 	const checks = results.slice(3 + nonces.length)
+	if (
+		checks.some(
+			answer =>
+				answer.status === 'failure' &&
+				answer.error instanceof BaseError &&
+				answer.error.walk(e => e instanceof ContractFunctionZeroDataError) !== null
+		)
+	) {
+		claimSignerAnswers = false
+	}
 	return {
 		block: read(1),
 		timestamp: read(2),

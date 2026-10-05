@@ -435,12 +435,13 @@ describe('POST /api/coupon-status', () => {
 		expect(body).toEqual({ error: expect.any(String) })
 	})
 
-	it('answers 502 when the RPC is on another chain', async () => {
+	it('answers 502, and caches nothing, when the RPC is on another chain', async () => {
 		fakeRpc({ ...sepolia(), chainId: 1n })
 
 		const { response } = await post({ coupons: [A] })
 
 		expect(response.status).toBe(502)
+		expect(cache.store.put).not.toHaveBeenCalled()
 	})
 
 	it('answers 502 when a coupon needs a read and no RPC is configured', async () => {

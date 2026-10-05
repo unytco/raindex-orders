@@ -50,3 +50,13 @@ describe('the build', () => {
 		expect(build).toThrow('PUBLIC_CLAIM_SIGNER is the test signer')
 	})
 })
+
+describe('vite.config.ts', () => {
+	it('runs the build check', async () => {
+		const config = (await import('../../../vite.config')).default as { plugins: unknown[] }
+
+		const names = config.plugins.flat(Infinity).map(p => (p as { name?: string } | null)?.name)
+
+		expect(names).toContain('bridge-config')
+	})
+})

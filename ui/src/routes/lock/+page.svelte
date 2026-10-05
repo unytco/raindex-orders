@@ -21,7 +21,6 @@
 	} from '$lib/ethereum'
 	import { isHolochainKey, holochainKeyTo32ByteHex, errorMessage } from '$lib/utils'
 
-	// Form state
 	let amount = ''
 	let agentInput = ''
 	let amountPrefilledFromUrl = false
@@ -31,7 +30,6 @@
 	// Replaces the form once a lock confirms, until the page is reloaded.
 	let lockReceipt: { amount: string; hash: string } | undefined
 
-	// Contract data
 	let tokenBalance: bigint = 0n
 	let tokenAllowance: bigint = 0n
 	let minLockAmount: bigint = 0n
@@ -41,16 +39,13 @@
 	const lockVaultAddress = bridge.lockVaultAddress
 	const tokenAddress = bridge.tokenAddress
 
-	// Reactive account
 	$: isConnected = $ethereumStore.isConnected
 	$: account = $ethereumStore.account
 
-	// Fetch contract data when connected
 	async function fetchContractData() {
 		if (!isConnected || !account || $onWrongNetwork) return
 
 		try {
-			// Fetch token balance
 			tokenBalance = (await readContract({
 				address: tokenAddress,
 				abi: erc20Abi,
@@ -58,7 +53,6 @@
 				args: [account]
 			})) as bigint
 
-			// Fetch token allowance
 			tokenAllowance = (await readContract({
 				address: tokenAddress,
 				abi: erc20Abi,
@@ -66,21 +60,18 @@
 				args: [account, lockVaultAddress]
 			})) as bigint
 
-			// Fetch token symbol
 			tokenSymbol = (await readContract({
 				address: tokenAddress,
 				abi: erc20Abi,
 				functionName: 'symbol'
 			})) as string
 
-			// Fetch token decimals
 			tokenDecimals = (await readContract({
 				address: tokenAddress,
 				abi: erc20Abi,
 				functionName: 'decimals'
 			})) as number
 
-			// Fetch min lock amount
 			minLockAmount = (await readContract({
 				address: lockVaultAddress,
 				abi: holoLockVaultAbi,
@@ -91,12 +82,10 @@
 		}
 	}
 
-	// Reactively fetch data when account or network changes
 	$: if (isConnected && account && !$onWrongNetwork) {
 		fetchContractData()
 	}
 
-	// Derive hex for contract from Holochain key (always convert in UI)
 	function getAgentHex(input: string): string {
 		if (!input || !isHolochainKey(input)) return ''
 		try {
@@ -115,7 +104,6 @@
 		return trimmed ? `${whole}.${trimmed}` : whole
 	}
 
-	// Get parameters from URL on mount
 	onMount(() => {
 		if (browser) {
 			try {
@@ -123,9 +111,7 @@
 				const urlAmount = urlParams.get('amount')
 				const urlAgent = urlParams.get('agent')
 
-				// Validate and set amount if provided
 				if (urlAmount) {
-					// Validate that amount is a valid number
 					const parsedAmount = parseFloat(urlAmount)
 					if (!isNaN(parsedAmount) && parsedAmount > 0) {
 						amount = urlAmount
@@ -135,7 +121,6 @@
 					}
 				}
 
-				// Validate and set agent if provided (Holochain key only)
 				if (urlAgent && isHolochainKey(urlAgent)) {
 					agentInput = urlAgent
 					agentPrefilledFromUrl = true
@@ -155,7 +140,6 @@
 	async function handleLock() {
 		if (!amount || !agentHex) return
 
-		// Validate we have a converted hex (from Holochain key)
 		if (!agentHex) {
 			error = 'Invalid Unyt agent public key. Provide a Holochain agent key (uhCA...).'
 			return
@@ -173,7 +157,6 @@
 		try {
 			const amountWei = parseUnits(amount, tokenDecimals)
 
-			// Check minimum amount
 			if (amountWei < minLockAmount) {
 				error = `Amount must be at least ${formatToken(minLockAmount, tokenDecimals)} ${tokenSymbol}`
 				isLoading = false
@@ -260,7 +243,6 @@
 			<WrongNetwork />
 		{:else}
 			<div class="space-y-4">
-				<!-- Balance Info -->
 				<div class="rounded-lg bg-gray-50 p-4">
 					<p class="text-sm text-gray-600">Your {tokenSymbol} Balance</p>
 					<p class="text-xl font-semibold">
@@ -269,7 +251,6 @@
 					</p>
 				</div>
 
-				<!-- Amount Input -->
 				<div>
 					<Label for="amount" class="mb-2">Amount to Lock</Label>
 					{#if amountPrefilledFromUrl}
@@ -296,7 +277,6 @@
 					</Helper>
 				</div>
 
-				<!-- Holochain Agent Input -->
 				<div>
 					<Label for="agent" class="mb-2">Unyt Agent Public Key (Holochain key)</Label>
 					{#if agentPrefilledFromUrl}
@@ -350,7 +330,6 @@
 					{/if}
 				</div>
 
-				<!-- Error Display -->
 				{#if error}
 					<Alert color="red">{error}</Alert>
 				{/if}

@@ -13,6 +13,7 @@ function wallet(chainId: number, refuseSwitch?: number) {
 	const request = vi.fn(async (args: { method: string; params?: unknown[] }) => {
 		asked.push(args)
 		if (args.method === 'eth_chainId') return numberToHex(chainId)
+		if (args.method === 'eth_accounts') return []
 		if (args.method === 'eth_sendTransaction') return '0xabc'
 		if (args.method === 'wallet_switchEthereumChain' && refuseSwitch) {
 			throw Object.assign(new Error('refused'), { code: refuseSwitch })
@@ -66,22 +67,44 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build', network => {
 		expect(asked.map(a => a.method)).not.toContain('eth_sendTransaction')
 	})
 
-	it("sends on the build's own chain", async () => {
+	it("sends on the build's own chain, naming it to the wallet", async () => {
 		const { ethereum, asked } = await connectedOn(network, CHAIN[network])
 
 		expect(get(ethereum.onWrongNetwork)).toBe(false)
 		await expect(ethereum.writeContract(approve)).resolves.toBe('0xabc')
-		expect(asked.filter(a => a.method === 'eth_sendTransaction')).toHaveLength(1)
+		const sends = asked.filter(a => a.method === 'eth_sendTransaction')
+		expect(sends).toHaveLength(1)
+		expect(sends[0].params).toEqual([
+			expect.objectContaining({ chainId: numberToHex(CHAIN[network]) })
+		])
 	})
 
-	it("asks the wallet to switch to the build's chain", async () => {
-		const asked = wallet(OTHER[network])
+	it('reads the chain from the wallet when an account connects', async () => {
+		wallet(CHAIN[network])
+		const listeners: Record<string, (value: never) => void> = {}
+		;(window as unknown as { ethereum: { on: unknown } }).ethereum.on = (
+			event: string,
+			listener: (value: never) => void
+		) => (listeners[event] = listener)
 		const ethereum = await asBuild(BUILDS[network], () => import('./ethereum'))
+		await ethereum.initEthereum()
+
+		await (listeners.accountsChanged as unknown as (a: string[]) => Promise<void>)([ACCOUNT])
+
+		expect(get(ethereum.ethereumStore).chainId).toBe(CHAIN[network])
+		expect(get(ethereum.onWrongNetwork)).toBe(false)
+	})
+
+	it("asks the wallet to switch to the build's chain, then reads the chain it is on", async () => {
+		const { ethereum, asked } = await connectedOn(network, CHAIN[network])
+		ethereum.ethereumStore.update(s => ({ ...s, chainId: OTHER[network] }))
 
 		expect(await ethereum.switchNetwork()).toBe(true)
 		expect(asked).toEqual([
-			{ method: 'wallet_switchEthereumChain', params: [{ chainId: numberToHex(CHAIN[network]) }] }
+			{ method: 'wallet_switchEthereumChain', params: [{ chainId: numberToHex(CHAIN[network]) }] },
+			{ method: 'eth_chainId' }
 		])
+		expect(get(ethereum.onWrongNetwork)).toBe(false)
 	})
 })
 

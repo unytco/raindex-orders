@@ -69,7 +69,7 @@ async function safeSigned(nonce: bigint, owners: readonly Hex[] = OWNERS) {
 	return coupon(SAFE, `0x${signatures.map(s => s.slice(2)).join('')}`, words)
 }
 
-/** The chain `build` names, where the Safe accepts a signature only from both owners. */
+/** The chain `build` names, where the Safe accepts any signature two owners long. */
 function chain(build: Build, chainId: bigint, flags = new Map<bigint, bigint>()) {
 	const namespace = BigInt(
 		keccak256(
@@ -98,8 +98,15 @@ const nonceKey = (build: Build, nonce: bigint) =>
 		keccak256(encodePacked(['uint256', 'uint256'], [BigInt(build.PUBLIC_CLAIM_ORDER_HASH), nonce]))
 	)
 
+type Post = (typeof import('./+server'))['POST']
+
+const load = async (build: Build) => (await asBuild(build, () => import('./+server'))).POST
+
 async function post(build: Build, coupons: string[]) {
-	const { POST } = await asBuild(build, () => import('./+server'))
+	return postTo(await load(build), coupons)
+}
+
+async function postTo(POST: Post, coupons: string[]) {
 	const response = await POST({
 		request: new Request('http://localhost/api/coupon-status', {
 			method: 'POST',
@@ -144,13 +151,14 @@ describe('a mainnet build', () => {
 		expect(rpc.fetch.mock.calls[0][0]).toBe('https://eth.rpc.test/key')
 	})
 
-	it('refuses the read when the RPC answers for Sepolia', async () => {
+	it('refuses the read, and caches nothing, when the RPC answers for Sepolia', async () => {
 		env.ETH_RPC_URL = 'https://eth.rpc.test/key'
-		chain(MAINNET_BUILD, 11155111n)
+		chain(MAINNET_BUILD, 11155111n, new Map([[nonceKey(MAINNET_BUILD, 1n), 1n]]))
 
 		const { response } = await post(MAINNET_BUILD, [await keySigned(MAINNET_BUILD, KEY_SIGNER, 1n)])
 
 		expect(response.status).toBe(502)
+		expect(cache.store.put).not.toHaveBeenCalled()
 	})
 
 	it('never reads through SEPOLIA_RPC_URL', async () => {
@@ -245,22 +253,43 @@ describe('a Safe as the claim signer', () => {
 	it('checks a signature of 20 owners on chain', async () => {
 		const rpc = chain(SAFE_BUILD, 1n)
 
-		await post(SAFE_BUILD, [coupon(SAFE, `0x${'11'.repeat(20 * 65)}`, context(SAFE_BUILD, 1n))])
+		await post(SAFE_BUILD, [await safeSigned(1n, Array(20).fill(OWNERS[0]))])
 
 		expect(rpc.signatureChecks).toHaveLength(1)
 	})
 
-	it('answers invalid when the claim signer is a key with no code to ask', async () => {
-		const rpc = chain(MAINNET_BUILD, 1n)
-		const words = context(MAINNET_BUILD, 1n)
-		const signer = privateKeyToAccount(KEY_SIGNER)
-		const twice = await signer.signMessage({ message: { raw: contextHash(words) } })
+	it('answers invalid, with no RPC call, for an owner part that would call another contract', async () => {
+		const rpc = chain(SAFE_BUILD, 1n)
+		const signed = await safeSigned(1n)
+		const contractPart = `${signed.split(',')[1].slice(0, -2)}00`
 
-		const { body } = await post(MAINNET_BUILD, [
-			coupon(signer.address, `${twice}${twice.slice(2)}`, words)
+		const { body } = await post(SAFE_BUILD, [
+			coupon(SAFE, contractPart as Hex, context(SAFE_BUILD, 1n))
 		])
 
 		expect(statuses(body)).toEqual(['invalid'])
+		expect(rpc.fetch).not.toHaveBeenCalled()
+	})
+
+	it('stops asking a claim signer with no code once it has found none', async () => {
+		const rpc = chain(MAINNET_BUILD, 1n)
+		const POST = await load(MAINNET_BUILD)
+		const words = (nonce: bigint) => context(MAINNET_BUILD, nonce)
+		const signer = privateKeyToAccount(KEY_SIGNER)
+		const twice = async (nonce: bigint) => {
+			const signature = await signer.signMessage({ message: { raw: contextHash(words(nonce)) } })
+			return coupon(signer.address, `${signature}${signature.slice(2)}`, words(nonce))
+		}
+
+		const first = await postTo(POST, [await twice(1n)])
+		const second = await postTo(POST, [await twice(2n)])
+
+		expect(statuses(first.body)).toEqual(['invalid'])
+		expect(statuses(second.body)).toEqual(['invalid'])
 		expect(rpc.signatureChecks).toEqual([expect.objectContaining({ accepted: false })])
+		expect(rpc.fetch).toHaveBeenCalledTimes(1)
+		expect(
+			statuses((await postTo(POST, [await keySigned(MAINNET_BUILD, KEY_SIGNER, 3n)])).body)
+		).toEqual(['unredeemed'])
 	})
 })

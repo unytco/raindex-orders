@@ -56,7 +56,8 @@ describe('cf-deploy.sh', () => {
 	it('deploys the mainnet env with ETH_RPC_URL, and neither needs nor sets a faucet key', () => {
 		const { status, calls } = deploy({
 			PUBLIC_NETWORK: 'mainnet',
-			ETH_RPC_URL: 'https://eth.rpc.test'
+			ETH_RPC_URL: 'https://eth.rpc.test',
+			FAUCET_PRIVATE_KEY: '0xfaucet'
 		})
 
 		expect(status).toBe(0)

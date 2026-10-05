@@ -51,7 +51,6 @@ async function render(
 				error: null
 			})
 		}
-		// Vitest runs in node, where a .svelte import compiles to Svelte's server renderer.
 		const component = (await PAGES[page]()).default as unknown as Rendered
 		return component.render(props).html
 	})
@@ -105,6 +104,16 @@ describe.each(['sepolia', 'mainnet'] as const)('a %s build', network => {
 		})
 
 		expect(html).toContain(`href="${names.explorer}/tx/0xabc"`)
+	})
+})
+
+describe('a mainnet build', () => {
+	it.each(['home', 'lock', 'claim'] as const)('%s names nothing of TestNet', async page => {
+		const html = text(await render('mainnet', page, CHAIN.mainnet)).toLowerCase()
+
+		for (const testnet of ['sepolia', 'mock', 'faucet', 'testnet']) {
+			expect(html).not.toContain(testnet)
+		}
 	})
 })
 
