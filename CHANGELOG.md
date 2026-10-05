@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- the MainNet bridge website has no faucet: its faucet page and API answer 404, and no faucet link shows.
+- `POST /api/coupon-status` accepts a coupon from a contract signer, such as a Safe, checked on chain through its EIP-1271 `isValidSignature`.
 - `deploy-mainnet.sh` deploys the bridge on Ethereum mainnet from a Ledger or an encrypted keystore: the vault, its claim order and the handover to `ADMIN_ADDRESS`, then prints the deploy record. It refuses another chain, a missing input and the test signer.
 - `rotate-claim-signer.sh` replaces the claim order with one that accepts coupons from a new signer, such as a Safe, and prints the calls to execute when the vault admin is a Safe.
 - `test/fork-rehearsal.sh` rehearses the mainnet deploy, and the move of the vault admin and the coupon signer to Safes, on an anvil fork of mainnet.
@@ -19,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- the bridge website builds for TestNet or MainNet from `PUBLIC_NETWORK` and its build variables, naming its network, token and explorer to match, and a build with a missing or malformed value, or the test signer on MainNet, fails.
+- Lock and Claim show the network switch, and send nothing, while the wallet is on another chain.
+- `POST /api/coupon-status` reads its own network's chain through that network's RPC secret.
 - `compose-rainlang.mjs` takes the network, the subparser and the coupon signer as inputs, and refuses the test signer on mainnet.
 - `deploy-sepolia.sh` signs with `--account` or `--ledger`, and refuses a private key in `.env` or on the command line.
 - bridge-orchestrator runs on the network `NETWORK` names, mainnet or sepolia, with that network's RPC URL and vault, and refuses to start when its chain, vault, claim order or signer do not match it.

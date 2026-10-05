@@ -6,6 +6,7 @@
 <script lang="ts">
 	import { Button, Modal, Spinner } from 'flowbite-svelte'
 	import { transactionStore, TransactionStatus } from '$lib/stores/transactionStore'
+	import { explorerTx } from '$lib/config'
 
 	$: isLockSuccess =
 		$transactionStore.status === TransactionStatus.SUCCESS && $transactionStore.isLockTransaction
@@ -52,7 +53,7 @@
 				</div>
 				<a
 					class="text-blue-500 hover:underline"
-					href={`https://sepolia.etherscan.io/tx/${$transactionStore.hash}`}
+					href={explorerTx($transactionStore.hash)}
 					target="_blank">View pending transaction on Etherscan</a
 				>
 			{/if}
@@ -71,7 +72,7 @@
 				{/if}
 				<a
 					class="text-blue-500 hover:underline"
-					href={`https://sepolia.etherscan.io/tx/${$transactionStore.hash}`}
+					href={explorerTx($transactionStore.hash)}
 					target="_blank">View transaction on Etherscan</a
 				>
 			{/if}

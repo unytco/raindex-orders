@@ -1,5 +1,6 @@
-import { get, writable, type Writable } from 'svelte/store'
-import type { Abi, Hex } from 'viem'
+import { derived, get, writable, type Readable, type Writable } from 'svelte/store'
+import { numberToHex, type Abi, type Hex } from 'viem'
+import { bridge } from './config'
 import { errorMessage } from './utils'
 
 export interface EthereumState {
@@ -25,6 +26,12 @@ const initialState: EthereumState = {
 }
 
 export const ethereumStore: Writable<EthereumState> = writable(initialState)
+
+/** A connected wallet on a chain other than this build's network. */
+export const onWrongNetwork: Readable<boolean> = derived(
+	ethereumStore,
+	s => s.isConnected && s.chainId !== bridge.chain.id
+)
 
 let ethereum: Eip1193Provider | null = null
 
@@ -129,41 +136,26 @@ export async function connectWallet(): Promise<string | null> {
 	}
 }
 
-export async function switchToSepolia(): Promise<boolean> {
+/** Asks the wallet to switch to this build's network, adding Sepolia if it lacks it. */
+export async function switchNetwork(): Promise<boolean> {
 	const eth = getEthereum()
 	if (!eth) return false
 
-	const sepoliaChainId = '0xaa36a7' // 11155111 in hex
-
+	const chainId = numberToHex(bridge.chain.id)
 	try {
-		await eth.request({
-			method: 'wallet_switchEthereumChain',
-			params: [{ chainId: sepoliaChainId }]
-		})
+		await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId }] })
 		return true
 	} catch (err) {
-		// Chain not added, try to add it
-		if ((err as { code?: number } | null)?.code === 4902) {
+		const unknownChain = (err as { code?: number } | null)?.code === 4902
+		if (unknownChain && bridge.addToWallet) {
 			try {
 				await eth.request({
 					method: 'wallet_addEthereumChain',
-					params: [
-						{
-							chainId: sepoliaChainId,
-							chainName: 'Sepolia Testnet',
-							nativeCurrency: {
-								name: 'Sepolia ETH',
-								symbol: 'ETH',
-								decimals: 18
-							},
-							rpcUrls: ['https://rpc.sepolia.org'],
-							blockExplorerUrls: ['https://sepolia.etherscan.io']
-						}
-					]
+					params: [{ chainId, ...bridge.addToWallet }]
 				})
 				return true
 			} catch (addErr) {
-				console.error('Failed to add Sepolia network:', addErr)
+				console.error(`Failed to add ${bridge.networkName}:`, addErr)
 				return false
 			}
 		}
@@ -256,6 +248,10 @@ export async function writeContract(params: {
 
 	const { account } = get(ethereumStore)
 	if (!account) throw new Error('Not connected')
+	const walletChain = parseInt((await eth.request({ method: 'eth_chainId' })) as string, 16)
+	if (walletChain !== bridge.chain.id) {
+		throw new Error(`Switch your wallet to ${bridge.networkName} first`)
+	}
 
 	const txHash = (await eth.request({
 		method: 'eth_sendTransaction',

@@ -1,25 +1,39 @@
-import { afterEach, describe, expect, it } from 'vitest'
-import { transactionStore } from '$lib/stores/transactionStore'
-import TransactionModal from './TransactionModal.svelte'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import type { transactionStore as Store } from '$lib/stores/transactionStore'
+import { asBuild, BUILDS } from '$lib/testing/builds'
 
-// Vitest runs in node, where a .svelte import compiles to Svelte's server renderer.
-const render = () =>
-	(TransactionModal as unknown as { render: () => { html: string } }).render().html
+const EXPLORERS = {
+	sepolia: 'https://sepolia.etherscan.io',
+	mainnet: 'https://etherscan.io'
+}
 
 const HASH = '0x7d3c9b2a51e8f4c6a0b9d2e7f1c3a5b8d6e4f2a0c9b7d5e3f1a8c6b4d2e0f9a7'
-const ETHERSCAN = `href="https://sepolia.etherscan.io/tx/${HASH}"`
 const hasX = (html: string) => html.includes('aria-label="Close modal"')
 const hasCloseButton = (html: string) => />\s*Close\s*<\/button>/.test(html)
 
-function confirm(isLock: boolean) {
-	transactionStore.awaitWalletConfirmation(isLock)
-	transactionStore.awaitTxReceipt(HASH)
-	transactionStore.transactionSuccess(HASH)
-}
+describe.each(['sepolia', 'mainnet'] as const)('TransactionModal on %s', network => {
+	const ETHERSCAN = `href="${EXPLORERS[network]}/tx/${HASH}"`
+	let transactionStore: typeof Store
+	let render: () => string
 
-afterEach(() => transactionStore.reset())
+	beforeEach(async () => {
+		const loaded = await asBuild(BUILDS[network], async () => ({
+			modal: (await import('./TransactionModal.svelte')).default,
+			store: (await import('$lib/stores/transactionStore')).transactionStore
+		}))
+		transactionStore = loaded.store
+		// Vitest runs in node, where a .svelte import compiles to Svelte's server renderer.
+		render = () => (loaded.modal as unknown as { render: () => { html: string } }).render().html
+	})
 
-describe('TransactionModal', () => {
+	function confirm(isLock: boolean) {
+		transactionStore.awaitWalletConfirmation(isLock)
+		transactionStore.awaitTxReceipt(HASH)
+		transactionStore.transactionSuccess(HASH)
+	}
+
+	afterEach(() => transactionStore.reset())
+
 	it('lock success closes with the X and tells the user to finalize in the Unyt app', () => {
 		confirm(true)
 		const html = render()

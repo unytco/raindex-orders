@@ -1,16 +1,18 @@
 <script lang="ts">
 	import { Button, Card, Spinner, Alert, Input, Label } from 'flowbite-svelte'
 	import { orderbookAbi } from '../../generated'
-	import { formatUnits, type Hex, isAddress } from 'viem'
+	import { formatUnits, type Hex } from 'viem'
 	import { transactionStore } from '$lib/stores/transactionStore'
 	import TransactionModal from '$lib/components/TransactionModal.svelte'
 	import TransactionReceipt from '$lib/components/TransactionReceipt.svelte'
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
-	import { PUBLIC_ORDERBOOK_ADDRESS } from '$env/static/public'
+	import WrongNetwork from '$lib/components/WrongNetwork.svelte'
+	import { bridge, explorerAddress } from '$lib/config'
 	import { deserializeSignedContext, parseCoupon, type SignedContextV1Struct } from '$lib/coupon'
 	import { getOrderConfig, buildOrderStruct, type OrderConfig } from '$lib/orderConfig'
 	import {
 		ethereumStore,
+		onWrongNetwork,
 		connectWallet,
 		writeContract,
 		readContract,
@@ -57,15 +59,7 @@
 			signedContext = deserializeSignedContext(couponInput)
 			const couponData = parseCoupon(signedContext)
 
-			// Get order config from our hardcoded config
 			orderConfig = getOrderConfig(couponData.orderHash)
-
-			if (orderConfig) {
-				// Check if order exists on-chain via RPC
-				await checkOrderExists(orderConfig.orderHash)
-				// Get vault balance via RPC
-				await getVaultBalance()
-			}
 		} catch (e) {
 			console.error('Failed to parse coupon:', e)
 			signedContext = undefined
@@ -73,14 +67,20 @@
 		}
 	}
 
+	// The reads go through the wallet, so they run again once it is on this network.
+	$: if (orderConfig && !$onWrongNetwork) loadOrderState(orderConfig)
+
+	async function loadOrderState(config: OrderConfig) {
+		await checkOrderExists(config.orderHash)
+		await getVaultBalance()
+	}
+
 	// Check if order exists on-chain
 	async function checkOrderExists(orderHash: Hex) {
-		if (!isAddress(PUBLIC_ORDERBOOK_ADDRESS)) return
-
 		isCheckingOrder = true
 		try {
 			const exists = await readContract({
-				address: PUBLIC_ORDERBOOK_ADDRESS,
+				address: bridge.orderbookAddress,
 				abi: orderbookAbi,
 				functionName: 'orderExists',
 				args: [orderHash]
@@ -96,11 +96,11 @@
 
 	// Get vault balance via RPC
 	async function getVaultBalance() {
-		if (!orderConfig || !isAddress(PUBLIC_ORDERBOOK_ADDRESS)) return
+		if (!orderConfig) return
 
 		try {
 			const balance = await readContract({
-				address: PUBLIC_ORDERBOOK_ADDRESS,
+				address: bridge.orderbookAddress,
 				abi: orderbookAbi,
 				functionName: 'vaultBalance',
 				args: [orderConfig.owner, orderConfig.outputToken, orderConfig.outputVaultId]
@@ -123,7 +123,6 @@
 	const handleClaim = async () => {
 		if (!signedContext) return
 		if (!orderConfig) return
-		if (!isAddress(PUBLIC_ORDERBOOK_ADDRESS)) return
 
 		error = ''
 		success = false
@@ -150,7 +149,7 @@
 			}
 
 			const hash = await writeContract({
-				address: PUBLIC_ORDERBOOK_ADDRESS,
+				address: bridge.orderbookAddress,
 				abi: orderbookAbi,
 				functionName: 'takeOrders',
 				args: [takeOrdersConfig]
@@ -190,19 +189,20 @@
 	{#if success}
 		<TransactionReceipt
 			title="Claim Successful!"
-			message="Your mock HOT tokens have been transferred to your wallet."
+			message="Your {bridge.tokenName} tokens have been transferred to your wallet."
 			hash={successTxHash}
 		>
 			{#if coupon && orderConfig}
 				<span class="text-gray-600">Amount:</span>
 				<span class="font-semibold">
-					{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} mock HOT
+					{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)}
+					{bridge.tokenName}
 				</span>
 
 				<span class="text-gray-600">Recipient:</span>
 				<a
 					class="font-mono text-blue-600 hover:underline"
-					href={`https://sepolia.etherscan.io/address/${coupon.recipient}`}
+					href={explorerAddress(coupon.recipient)}
 					target="_blank"
 				>
 					{truncateAddress(coupon.recipient)}
@@ -210,14 +210,16 @@
 			{/if}
 		</TransactionReceipt>
 	{:else}
-		<h1 class="text-2xl font-bold">Claim mock HOT</h1>
+		<h1 class="text-2xl font-bold">Claim {bridge.tokenName}</h1>
 		<p class="text-gray-600">
-			Redeem your mock HOT claim coupon to receive mock HOT tokens on Ethereum.
+			Redeem your {bridge.tokenName} claim coupon to receive {bridge.tokenName} tokens on Ethereum.
 		</p>
 
 		{#if !isConnected}
 			<Alert color="blue">Please connect your wallet to continue.</Alert>
 			<Button on:click={handleConnect}>Connect Wallet</Button>
+		{:else if $onWrongNetwork}
+			<WrongNetwork />
 		{:else}
 			<div class="space-y-4">
 				<div>
@@ -254,7 +256,7 @@
 							<span class="text-gray-600">Recipient:</span>
 							<a
 								class="font-mono text-blue-600 hover:underline"
-								href={`https://sepolia.etherscan.io/address/${coupon.recipient}`}
+								href={explorerAddress(coupon.recipient)}
 								target="_blank"
 							>
 								{truncateAddress(coupon.recipient)}
@@ -262,7 +264,8 @@
 
 							<span class="text-gray-600">Amount:</span>
 							<span class="font-semibold">
-								{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)} mock HOT
+								{formatUnits(coupon.withdrawAmount, orderConfig.outputDecimals)}
+								{bridge.tokenName}
 							</span>
 
 							<span class="text-gray-600">Expires:</span>
@@ -276,7 +279,8 @@
 
 					{#if vaultBalance !== undefined}
 						<div class="text-sm text-gray-600">
-							Vault Balance: {formatUnits(vaultBalance, orderConfig.outputDecimals)} mock HOT
+							Vault Balance: {formatUnits(vaultBalance, orderConfig.outputDecimals)}
+							{bridge.tokenName}
 						</div>
 					{/if}
 
@@ -292,7 +296,7 @@
 						{#if isLoading}
 							<Spinner size="4" class="mr-2" />
 						{/if}
-						Claim mock HOT
+						Claim {bridge.tokenName}
 					</Button>
 				{:else if couponInput && !coupon}
 					<Alert color="red">Invalid coupon format. Please check and try again.</Alert>
@@ -302,7 +306,7 @@
 					<Alert color="yellow">Order not found on-chain. The order may have been removed.</Alert>
 				{:else}
 					<Alert color="blue">
-						Enter your claim coupon above. You should have received this after burning mock HOT.
+						Enter your claim coupon above. You should have received this after burning {bridge.tokenName}.
 					</Alert>
 				{/if}
 			</div>

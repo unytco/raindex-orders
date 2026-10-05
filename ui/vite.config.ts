@@ -1,8 +1,9 @@
 import { sveltekit } from '@sveltejs/kit/vite'
 import { defineConfig } from 'vitest/config'
+import { bridgeConfig } from './src/lib/build/bridgeConfig'
 
 export default defineConfig({
-	plugins: [sveltekit()],
+	plugins: [bridgeConfig(), sveltekit()],
 	server: {
 		allowedHosts: ['hot-bridge.unyt.dev', 'hot-bridge.unyt.co'],
 		host: true,
@@ -27,6 +28,6 @@ export default defineConfig({
 		}
 	},
 	test: {
-		include: ['src/**/*.{test,spec}.{js,ts}']
+		include: ['src/**/*.{test,spec}.{js,ts}', 'scripts/**/*.test.ts']
 	}
 })

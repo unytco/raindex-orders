@@ -4,6 +4,7 @@
 	import { ethereumStore } from '$lib/ethereum'
 	import { onMount } from 'svelte'
 	import { errorMessage } from '$lib/utils'
+	import { explorerTx } from '$lib/config'
 
 	let recipient: string = ''
 	let loading = false
@@ -144,7 +145,7 @@
 				<p class="font-medium">✓ Successfully sent 1000 mock HOT!</p>
 				<p class="mt-2 text-sm">Transaction Hash:</p>
 				<a
-					href="https://sepolia.etherscan.io/tx/{txHash}"
+					href={explorerTx(txHash)}
 					target="_blank"
 					rel="noopener noreferrer"
 					class="break-all font-mono text-xs hover:underline"

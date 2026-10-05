@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { explorerTx } from '$lib/config'
+
 	export let title: string
 	export let message: string
 	export let hash: string
@@ -19,11 +21,7 @@
 		</div>
 	</div>
 
-	<a
-		class="text-blue-500 hover:underline"
-		href={`https://sepolia.etherscan.io/tx/${hash}`}
-		target="_blank"
-	>
+	<a class="text-blue-500 hover:underline" href={explorerTx(hash)} target="_blank">
 		View transaction on Etherscan
 	</a>
 </div>

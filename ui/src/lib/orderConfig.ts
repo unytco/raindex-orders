@@ -1,7 +1,5 @@
-// Order configuration - hardcoded from deployment since subgraph may be behind
-// Update these values after redeploying the order
-
 import type { Hex, Address } from 'viem'
+import { bridge } from './config'
 
 export interface OrderConfig {
 	orderHash: Hex
@@ -20,22 +18,18 @@ export interface OrderConfig {
 	handleIO: boolean
 }
 
-// Sepolia claim order deployed via HoloLockVault
+/** `HOLO_VAULT_ID` in src/Constants.sol, on both networks. */
+const HOLO_VAULT_ID = BigInt('0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b')
+
+/** The claim order HoloLockVault added, from this build's variables. */
 export const CLAIM_ORDER: OrderConfig = {
-	orderHash: '0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9',
-	owner: '0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6', // HoloLockVault
-	signer: '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37', // `valid-signer` in src/holo-claim.rain
-	interpreter: '0x8853d126bc23a45b9f807739b6ea0b38ef569005',
-	store: '0x23f77e7bc935503e437166498d7d72f2ea290e1f',
-	expression: '0x0a1369aee76570cc7404492d55a5d1468d5a9b4b',
-	// Input: NOOP token (placeholder for claims)
-	inputToken: '0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028',
+	...bridge.claimOrder,
+	owner: bridge.lockVaultAddress,
 	inputDecimals: 18,
-	inputVaultId: BigInt('0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b'),
-	// Output: MockHOT token
-	outputToken: '0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749',
+	inputVaultId: HOLO_VAULT_ID,
+	outputToken: bridge.tokenAddress,
 	outputDecimals: 18,
-	outputVaultId: BigInt('0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b'),
+	outputVaultId: HOLO_VAULT_ID,
 	handleIO: true
 }
 

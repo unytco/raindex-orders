@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Card } from 'flowbite-svelte'
 	import CopyableUrl from './CopyableUrl.svelte'
+	import { bridge } from '$lib/config'
 </script>
 
 <aside class="w-full lg:w-72">
@@ -18,35 +19,37 @@
 			</div>
 		</Card>
 
-		<a
-			href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia"
-			target="_blank"
-			rel="noopener noreferrer"
-			class="block"
-		>
-			<Card class="h-full transition-colors hover:bg-gray-50 dark:hover:bg-gray-800">
-				<h3 class="text-base font-semibold text-gray-900 dark:text-white">
-					Get Test ETH (Sepolia)
-				</h3>
-				<p class="text-sm text-gray-600 dark:text-gray-400">
-					Use the Sepolia faucet to obtain test ETH for gas on the Sepolia network.
-				</p>
-				<p class="mt-2 text-sm font-medium text-blue-600 dark:text-blue-400">
-					Go to Sepolia Faucet →
-				</p>
-			</Card>
-		</a>
+		{#if bridge.faucet}
+			<a
+				href="https://cloud.google.com/application/web3/faucet/ethereum/sepolia"
+				target="_blank"
+				rel="noopener noreferrer"
+				class="block"
+			>
+				<Card class="h-full transition-colors hover:bg-gray-50 dark:hover:bg-gray-800">
+					<h3 class="text-base font-semibold text-gray-900 dark:text-white">
+						Get Test ETH (Sepolia)
+					</h3>
+					<p class="text-sm text-gray-600 dark:text-gray-400">
+						Use the Sepolia faucet to obtain test ETH for gas on the Sepolia network.
+					</p>
+					<p class="mt-2 text-sm font-medium text-blue-600 dark:text-blue-400">
+						Go to Sepolia Faucet →
+					</p>
+				</Card>
+			</a>
 
-		<a href="/faucet" target="_blank" rel="noopener noreferrer" class="block">
-			<Card class="h-full transition-colors hover:bg-gray-50 dark:hover:bg-gray-800">
-				<h3 class="text-base font-semibold text-gray-900 dark:text-white">Get mock HOT</h3>
-				<p class="text-sm text-gray-600 dark:text-gray-400">
-					Use the HOT faucet to obtain mock HOT tokens for testing the bridge.
-				</p>
-				<p class="mt-2 text-sm font-medium text-blue-600 dark:text-blue-400">
-					Go to mock HOT Faucet →
-				</p>
-			</Card>
-		</a>
+			<a href="/faucet" target="_blank" rel="noopener noreferrer" class="block">
+				<Card class="h-full transition-colors hover:bg-gray-50 dark:hover:bg-gray-800">
+					<h3 class="text-base font-semibold text-gray-900 dark:text-white">Get mock HOT</h3>
+					<p class="text-sm text-gray-600 dark:text-gray-400">
+						Use the HOT faucet to obtain mock HOT tokens for testing the bridge.
+					</p>
+					<p class="mt-2 text-sm font-medium text-blue-600 dark:text-blue-400">
+						Go to mock HOT Faucet →
+					</p>
+				</Card>
+			</a>
+		{/if}
 	</div>
 </aside>

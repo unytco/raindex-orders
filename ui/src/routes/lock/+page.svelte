@@ -9,9 +9,11 @@
 	import TransactionModal, { LOCK_FINALIZE_LINE } from '$lib/components/TransactionModal.svelte'
 	import TransactionReceipt from '$lib/components/TransactionReceipt.svelte'
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
-	import { PUBLIC_LOCK_VAULT_ADDRESS, PUBLIC_TOKEN_ADDRESS } from '$env/static/public'
+	import WrongNetwork from '$lib/components/WrongNetwork.svelte'
+	import { bridge } from '$lib/config'
 	import {
 		ethereumStore,
+		onWrongNetwork,
 		connectWallet,
 		readContract,
 		writeContract,
@@ -36,14 +38,8 @@
 	let tokenSymbol = 'HOT'
 	let tokenDecimals = 18
 
-	// Get addresses from environment
-	const lockVaultAddress = PUBLIC_LOCK_VAULT_ADDRESS
-	const tokenAddress = PUBLIC_TOKEN_ADDRESS
-
-	// Check if contracts are configured
-	const isZeroAddress = (addr: string) =>
-		!addr || addr === '0x0000000000000000000000000000000000000000'
-	const isConfigured = !isZeroAddress(lockVaultAddress) && !isZeroAddress(tokenAddress)
+	const lockVaultAddress = bridge.lockVaultAddress
+	const tokenAddress = bridge.tokenAddress
 
 	// Reactive account
 	$: isConnected = $ethereumStore.isConnected
@@ -51,7 +47,7 @@
 
 	// Fetch contract data when connected
 	async function fetchContractData() {
-		if (!isConnected || !account || !isConfigured) return
+		if (!isConnected || !account || $onWrongNetwork) return
 
 		try {
 			// Fetch token balance
@@ -95,8 +91,8 @@
 		}
 	}
 
-	// Reactively fetch data when account changes
-	$: if (isConnected && account) {
+	// Reactively fetch data when account or network changes
+	$: if (isConnected && account && !$onWrongNetwork) {
 		fetchContractData()
 	}
 
@@ -251,22 +247,17 @@
 			<span class="font-semibold">{lockReceipt.amount}</span>
 		</TransactionReceipt>
 	{:else}
-		<h1 class="text-2xl font-bold">Lock mock HOT</h1>
+		<h1 class="text-2xl font-bold">Lock {bridge.tokenName}</h1>
 		<p class="text-gray-600">
-			Lock your mock HOT tokens to receive mock HOT on Unyt. Your mock HOT will be credited to the
-			specified agent.
+			Lock your {bridge.tokenName} tokens to receive {bridge.tokenName} on Unyt. Your {bridge.tokenName}
+			will be credited to the specified agent.
 		</p>
 
-		{#if !isConfigured}
-			<Alert color="yellow">
-				<span class="font-semibold">Contracts not configured.</span> The Lock Vault contract address
-				needs to be set in the environment variables. Please deploy the contracts and update
-				<code>PUBLIC_LOCK_VAULT_ADDRESS</code>
-				in your <code>.env</code> file.
-			</Alert>
-		{:else if !isConnected}
+		{#if !isConnected}
 			<Alert color="blue">Please connect your wallet to continue.</Alert>
 			<Button on:click={handleConnect}>Connect Wallet</Button>
+		{:else if $onWrongNetwork}
+			<WrongNetwork />
 		{:else}
 			<div class="space-y-4">
 				<!-- Balance Info -->
@@ -327,10 +318,10 @@
 					{/if}
 					<Helper class="mt-1">
 						{#if agentPrefilledFromUrl}
-							Agent key from URL (read-only). This is where your mock HOT will be sent.
+							Agent key from URL (read-only). This is where your {bridge.tokenName} will be sent.
 						{:else}
-							Paste your Holochain agent key (e.g. uhCA...). This is where your mock HOT will be
-							sent. It is converted to hex for the contract below.
+							Paste your Holochain agent key (e.g. uhCA...). This is where your {bridge.tokenName} will
+							be sent. It is converted to hex for the contract below.
 						{/if}
 					</Helper>
 					{#if agentInput && hasValidAgent}

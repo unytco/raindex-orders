@@ -10,9 +10,7 @@ const { RPC_HOST, RPC_KEY, RPC_URL } = vi.hoisted(() => {
 vi.mock('$env/dynamic/private', () => ({
 	env: { FAUCET_PRIVATE_KEY: generatePrivateKey(), SEPOLIA_RPC_URL: RPC_URL }
 }))
-vi.mock('$env/static/public', () => ({
-	PUBLIC_TOKEN_ADDRESS: '0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749'
-}))
+vi.mock('$env/static/public', async () => (await import('$lib/testing/builds')).SEPOLIA_BUILD)
 
 import { GET, POST } from './+server'
 
