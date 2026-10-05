@@ -240,7 +240,7 @@ deploys are safe.
 | `ORDERBOOK_ADDRESS` | Yes | -- |
 | `TOKEN_ADDRESS` | Yes | -- |
 | `VAULT_ID` | Yes | -- |
-| `EXPIRY_SECONDS` | No | `604800` (7 days) |
+| `EXPIRY_SECONDS` | No | `604800` (7 days), from 1 to `31536000` (a year) |
 
 ## Usage on the HOT-2-mHOT bridge server
 

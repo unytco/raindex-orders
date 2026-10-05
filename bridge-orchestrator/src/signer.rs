@@ -14,6 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The coupon signer whose private key is committed in `src/Constants.sol`.
 pub const TEST_SIGNER: Address = address!("8E72b7568738da52ca3DCd9b24E178127A4E7d37");
 
+/// A year. coupon-status reads an expiry only up to JavaScript's largest exact
+/// integer, and refuses a coupon whose expiry is past it.
+const MAX_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60;
+
 const DEFAULT_EXPIRY_SECONDS: NonZeroU64 = match NonZeroU64::new(604_800) {
     Some(seconds) => seconds,
     None => unreachable!(),
@@ -75,12 +79,15 @@ impl CouponSigner {
         let vault_id = parsed(&setting, "VAULT_ID", "a uint256", &mut faults);
         let expiry_seconds = match setting("EXPIRY_SECONDS") {
             None => Some(DEFAULT_EXPIRY_SECONDS),
-            Some(_) => parsed(
-                &setting,
-                "EXPIRY_SECONDS",
-                "a number of seconds above 0",
-                &mut faults,
-            ),
+            Some(raw) => match raw.parse::<NonZeroU64>() {
+                Ok(seconds) if seconds.get() <= MAX_EXPIRY_SECONDS => Some(seconds),
+                _ => {
+                    faults.push(format!(
+                        "EXPIRY_SECONDS={raw} is not a number of seconds from 1 to {MAX_EXPIRY_SECONDS}"
+                    ));
+                    None
+                }
+            },
         };
 
         let key = match setting("SIGNER_PRIVATE_KEY") {
@@ -454,22 +461,16 @@ mod tests {
             assert!(message.starts_with(key), "{message}");
             assert!(!message.contains("is required"), "{message}");
         }
-        let message = refusal(
-            Network::Sepolia,
-            sepolia_settings_with(&[("EXPIRY_SECONDS", Some("a week"))]),
-        );
-        assert_eq!(
-            message,
-            "EXPIRY_SECONDS=a week is not a number of seconds above 0"
-        );
-        let message = refusal(
-            Network::Sepolia,
-            sepolia_settings_with(&[("EXPIRY_SECONDS", Some("0"))]),
-        );
-        assert_eq!(
-            message,
-            "EXPIRY_SECONDS=0 is not a number of seconds above 0"
-        );
+        for value in ["a week", "0", "31536001"] {
+            let message = refusal(
+                Network::Sepolia,
+                sepolia_settings_with(&[("EXPIRY_SECONDS", Some(value))]),
+            );
+            assert_eq!(
+                message,
+                format!("EXPIRY_SECONDS={value} is not a number of seconds from 1 to 31536000")
+            );
+        }
     }
 
     #[test]
