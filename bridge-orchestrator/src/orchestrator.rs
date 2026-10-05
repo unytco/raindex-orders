@@ -1,6 +1,6 @@
 use crate::config::{Config, LINK_TAG_BYTES_CEILING};
 use crate::lock_flow::{format_amount, LockFlow};
-use crate::signer::{generate_coupon, signer_context_from_env};
+use crate::signer::CouponSigner;
 use crate::state::{StateStore, WorkItem, WorkStep};
 use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use anyhow::{Context, Result};
@@ -30,6 +30,7 @@ pub struct BridgeOrchestrator {
     cfg: Config,
     db: StateStore,
     reporter: ReporterState,
+    signer: CouponSigner,
 }
 
 /// Severity bucket for a source-chain-pressure event. Mapped to a
@@ -88,10 +89,15 @@ async fn sleep_or_shutdown(duration_ms: u64, shutdown: &mut ShutdownRx) {
 }
 
 impl BridgeOrchestrator {
-    pub fn new(cfg: Config) -> Result<Self> {
+    pub fn new(cfg: Config, signer: CouponSigner) -> Result<Self> {
         let db = StateStore::open(&cfg.db_path)?;
         let reporter = ReporterState::new();
-        Ok(Self { cfg, db, reporter })
+        Ok(Self {
+            cfg,
+            db,
+            reporter,
+            signer,
+        })
     }
 
     /// Timestamp in milliseconds. Wrapped so we can keep every
@@ -895,9 +901,10 @@ impl BridgeOrchestrator {
                         .map(|v| v.to_string())
                         .unwrap_or_default();
 
-                    let signer_ctx = signer_context_from_env()?;
-                    let coupon =
-                        generate_coupon(&amount, withdraw_to, tx.id.as_ref(), &signer_ctx).await?;
+                    let coupon = self
+                        .signer
+                        .coupon(&amount, withdraw_to, tx.id.as_ref())
+                        .await?;
                     let key = tx.id.to_string();
 
                     let entry_bytes = serde_json::to_vec(&json!({ &key: &coupon }))
@@ -2169,6 +2176,7 @@ mod tests {
 
     use crate::config::{Network, RetentionConfig};
     use alloy::primitives::Address;
+    use alloy::signers::local::PrivateKeySigner;
     use holo_hash::{ActionHash, AgentPubKey, AgentPubKeyB64};
     use holochain_client::ExternIO;
     use holochain_zome_types::prelude::{
@@ -2239,6 +2247,7 @@ mod tests {
             cfg: test_config(path),
             db,
             reporter: ReporterState::new(),
+            signer: CouponSigner::with_key(PrivateKeySigner::random()),
         }
     }
 

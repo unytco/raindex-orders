@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- bridge-orchestrator runs on the network `NETWORK` names, mainnet or sepolia, with that network's RPC URL and vault, and refuses to start when its chain, vault, claim order or signer do not match it.
 - bridge-orchestrator bridges on the one lane that names its agent and lists the unit in `HOT_UNIT_INDEX`, and will not start while `HOLOCHAIN_LANE_DEFINITION` or `HOLOCHAIN_UNIT_INDEX` is set.
 - the lair requirement is `ham`'s decision, supplied with the orchestrator's two paths, rather than restated here. A refusal names the fault before the reason the node could not offer lair.
 - the Rainix/Solidity workflow (`.github/workflows/test.yml`) is now manual-only (`on: workflow_dispatch`) — it has failed for years on a dead nixpkgs pin in `lib/rain.orderbook`.

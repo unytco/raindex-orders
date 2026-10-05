@@ -1,6 +1,7 @@
 mod config;
 mod lock_flow;
 mod orchestrator;
+mod preflight;
 mod retention;
 mod signer;
 mod state;
@@ -10,6 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::Config;
 use orchestrator::BridgeOrchestrator;
+use signer::CouponSigner;
 use state::{StateFilter, WorkState};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -68,7 +70,15 @@ async fn main() -> Result<()> {
     match args.command {
         Command::Run => {
             info!("bridge-orchestrator starting");
-            BridgeOrchestrator::new(config)?.run().await?;
+            let signer = CouponSigner::from_env(config.network)?;
+            preflight::check(
+                config.network,
+                &config.rpc_url,
+                config.lock_vault_address,
+                signer.order(),
+            )
+            .await?;
+            BridgeOrchestrator::new(config, signer)?.run().await?;
         }
         Command::Status {
             flow,

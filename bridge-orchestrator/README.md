@@ -20,7 +20,20 @@ This is the command used by the systemd service.
 bridge-orchestrator run
 ```
 
-No additional flags.
+No additional flags. Before it reads from Holochain or writes anything, `run`
+refuses to start, naming each variable at fault, when:
+
+- a signer variable is unset or malformed
+- the RPC answers for a chain other than `NETWORK`'s (1 for `mainnet`,
+  11155111 for `sepolia`)
+- the vault has no contract, or its `token()`, `orderbook()` or `vaultId()`
+  differs from `TOKEN_ADDRESS`, `ORDERBOOK_ADDRESS` or `VAULT_ID`
+- `ORDER_OWNER` is not the vault
+- `ORDERBOOK_ADDRESS` holds no order `ORDER_HASH`
+- on `mainnet`, `SIGNER_PRIVATE_KEY` is the test signer
+  `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
+
+An RPC it cannot reach also stops it, and its supervisor restarts it.
 
 ### `bridge-orchestrator status`
 
@@ -64,18 +77,19 @@ hygiene.
 
 ## Environment variables
 
-Every subcommand loads the full config from the environment on startup, so
-the env file must be sourced even for `status` and `clear`.
+Every subcommand loads the config below on startup, so the env file must be
+sourced even for `status` and `clear`. Only `run` reads the signer variables
+and the chain.
 
 ### Config (all commands)
 
 | Variable | Required | Default |
 |----------|----------|---------|
-| `NETWORK` | No | `sepolia` (`mainnet` or `sepolia`) |
-| `SEPOLIA_RPC_URL` | No | `https://1rpc.io/sepolia` |
-| `SEPOLIA_LOCK_VAULT_ADDRESS` | **Yes** (sepolia) | -- |
-| `ETH_RPC_URL` | No (mainnet) | `https://eth.llamarpc.com` |
-| `MAINNET_LOCK_VAULT_ADDRESS` | **Yes** (mainnet) | -- |
+| `NETWORK` | **Yes** | -- (`mainnet` or `sepolia`) |
+| `SEPOLIA_RPC_URL` | **Yes** (sepolia), refused on mainnet | -- |
+| `SEPOLIA_LOCK_VAULT_ADDRESS` | **Yes** (sepolia), refused on mainnet | -- |
+| `ETH_RPC_URL` | **Yes** (mainnet), refused on sepolia | -- |
+| `MAINNET_LOCK_VAULT_ADDRESS` | **Yes** (mainnet), refused on sepolia | -- |
 | `DB_PATH` | No | `./data/bridge_orchestrator.db` |
 | `POLL_INTERVAL_MS` | No | `5000` |
 | `BRIDGE_CYCLE_INTERVAL_MS` | No | `180000` (falls back to `COUPON_POLL_INTERVAL_MS`) |
@@ -214,9 +228,9 @@ signal, the currently running bridge cycle is allowed to finish
 then exits cleanly between iterations. systemd `Restart=` and rolling
 deploys are safe.
 
-### Signer (run only, when generating withdrawal coupons)
+### Signer (run only)
 
-These are read lazily during the bridge cycle, not at startup.
+`run` parses these at startup.
 
 | Variable | Required | Default |
 |----------|----------|---------|

@@ -23,6 +23,116 @@ impl FromStr for Network {
     }
 }
 
+impl Network {
+    pub fn name(self) -> &'static str {
+        match self {
+            Network::Mainnet => "mainnet",
+            Network::Sepolia => "sepolia",
+        }
+    }
+
+    pub fn chain_id(self) -> u64 {
+        match self {
+            Network::Mainnet => 1,
+            Network::Sepolia => 11_155_111,
+        }
+    }
+
+    pub fn rpc_url_var(self) -> &'static str {
+        match self {
+            Network::Mainnet => "ETH_RPC_URL",
+            Network::Sepolia => "SEPOLIA_RPC_URL",
+        }
+    }
+
+    pub fn lock_vault_var(self) -> &'static str {
+        match self {
+            Network::Mainnet => "MAINNET_LOCK_VAULT_ADDRESS",
+            Network::Sepolia => "SEPOLIA_LOCK_VAULT_ADDRESS",
+        }
+    }
+
+    fn confirmations(self) -> u64 {
+        match self {
+            Network::Mainnet => 15,
+            Network::Sepolia => 5,
+        }
+    }
+
+    fn other(self) -> Network {
+        match self {
+            Network::Mainnet => Network::Sepolia,
+            Network::Sepolia => Network::Mainnet,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct NetworkSettings {
+    network: Network,
+    rpc_url: String,
+    lock_vault_address: Address,
+}
+
+/// `NETWORK` and its RPC URL and vault, refusing every variable of the other
+/// network. Each fault is named, so one restart reports all of them.
+fn network_settings(setting: impl Fn(&str) -> Option<String>) -> Result<NetworkSettings> {
+    let network = match setting("NETWORK") {
+        None => anyhow::bail!("NETWORK is required: sepolia or mainnet"),
+        Some(raw) => raw
+            .parse::<Network>()
+            .map_err(|_| anyhow::anyhow!("NETWORK={raw} is not sepolia or mainnet"))?,
+    };
+
+    let mut faults = Vec::new();
+    let other = network.other();
+    for key in [other.rpc_url_var(), other.lock_vault_var()] {
+        if setting(key).is_some() {
+            faults.push(format!(
+                "{key} is a {} variable and NETWORK is {}: unset it",
+                other.name(),
+                network.name()
+            ));
+        }
+    }
+
+    let rpc_url = setting(network.rpc_url_var()).filter(|url| !url.is_empty());
+    if rpc_url.is_none() {
+        faults.push(format!(
+            "{} is required for NETWORK={}",
+            network.rpc_url_var(),
+            network.name()
+        ));
+    }
+
+    let vault_key = network.lock_vault_var();
+    let lock_vault_address = match setting(vault_key) {
+        None => {
+            faults.push(format!(
+                "{vault_key} is required for NETWORK={}",
+                network.name()
+            ));
+            None
+        }
+        Some(raw) => match raw.parse::<Address>() {
+            Ok(address) => Some(address),
+            Err(_) => {
+                faults.push(format!("{vault_key}={raw} is not an address"));
+                None
+            }
+        },
+    };
+
+    match (rpc_url, lock_vault_address) {
+        (Some(rpc_url), Some(lock_vault_address)) if faults.is_empty() => Ok(NetworkSettings {
+            network,
+            rpc_url,
+            lock_vault_address,
+        }),
+        _ => anyhow::bail!("{}", faults.join("; ")),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub network: Network,
@@ -156,31 +266,12 @@ pub struct WatchtowerReporterConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let network: Network = env::var("NETWORK")
-            .unwrap_or_else(|_| "sepolia".to_string())
-            .parse()
-            .context("Invalid NETWORK value")?;
-
-        let (rpc_url, lock_vault_address, confirmations) = match network {
-            Network::Mainnet => {
-                let rpc_url =
-                    env::var("ETH_RPC_URL").unwrap_or_else(|_| "https://eth.llamarpc.com".into());
-                let lock_vault_address = env::var("MAINNET_LOCK_VAULT_ADDRESS")
-                    .context("MAINNET_LOCK_VAULT_ADDRESS required")?
-                    .parse()
-                    .context("Invalid MAINNET_LOCK_VAULT_ADDRESS")?;
-                (rpc_url, lock_vault_address, 15)
-            }
-            Network::Sepolia => {
-                let rpc_url = env::var("SEPOLIA_RPC_URL")
-                    .unwrap_or_else(|_| "https://1rpc.io/sepolia".into());
-                let lock_vault_address = env::var("SEPOLIA_LOCK_VAULT_ADDRESS")
-                    .context("SEPOLIA_LOCK_VAULT_ADDRESS required")?
-                    .parse()
-                    .context("Invalid SEPOLIA_LOCK_VAULT_ADDRESS")?;
-                (rpc_url, lock_vault_address, 5)
-            }
-        };
+        let NetworkSettings {
+            network,
+            rpc_url,
+            lock_vault_address,
+        } = network_settings(|key| env::var(key).ok())?;
+        let confirmations = network.confirmations();
 
         let poll_interval_ms = env::var("POLL_INTERVAL_MS")
             .unwrap_or_else(|_| "5000".into())
@@ -580,6 +671,112 @@ mod tests {
             format!("{err:#}").contains("Invalid HOT_UNIT_INDEX"),
             "{err:#}"
         );
+    }
+
+    const VAULT: &str = "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6";
+
+    fn network_refusal(set: &[(&str, &str)]) -> String {
+        format!("{:#}", network_settings(settings(set)).unwrap_err())
+    }
+
+    #[test]
+    fn each_network_reads_its_own_rpc_url_and_vault() {
+        let sepolia = network_settings(settings(&[
+            ("NETWORK", "sepolia"),
+            ("SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
+            ("SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
+        ]))
+        .unwrap();
+        assert_eq!(
+            sepolia,
+            NetworkSettings {
+                network: Network::Sepolia,
+                rpc_url: "https://sepolia.rpc.test".to_string(),
+                lock_vault_address: VAULT.parse().unwrap(),
+            }
+        );
+        assert_eq!(sepolia.network.confirmations(), 5);
+
+        let mainnet = network_settings(settings(&[
+            ("NETWORK", "mainnet"),
+            ("ETH_RPC_URL", "https://eth.rpc.test"),
+            ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
+        ]))
+        .unwrap();
+        assert_eq!(mainnet.network, Network::Mainnet);
+        assert_eq!(mainnet.rpc_url, "https://eth.rpc.test");
+        assert_eq!(mainnet.network.confirmations(), 15);
+    }
+
+    #[test]
+    fn network_is_required_and_has_no_default() {
+        assert_eq!(
+            network_refusal(&[
+                ("SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
+                ("SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
+            ]),
+            "NETWORK is required: sepolia or mainnet"
+        );
+        assert_eq!(
+            network_refusal(&[("NETWORK", "goerli")]),
+            "NETWORK=goerli is not sepolia or mainnet"
+        );
+    }
+
+    #[test]
+    fn a_network_without_its_rpc_url_or_vault_is_refused_with_no_public_fallback() {
+        assert_eq!(
+            network_refusal(&[("NETWORK", "mainnet")]),
+            "ETH_RPC_URL is required for NETWORK=mainnet; MAINNET_LOCK_VAULT_ADDRESS is required for NETWORK=mainnet"
+        );
+        assert_eq!(
+            network_refusal(&[
+                ("NETWORK", "sepolia"),
+                ("SEPOLIA_RPC_URL", ""),
+                ("SEPOLIA_LOCK_VAULT_ADDRESS", "0xE3E0"),
+            ]),
+            "SEPOLIA_RPC_URL is required for NETWORK=sepolia; SEPOLIA_LOCK_VAULT_ADDRESS=0xE3E0 is not an address"
+        );
+    }
+
+    #[test]
+    fn each_variable_of_the_other_network_is_refused() {
+        for (network, own, other) in [
+            (
+                "mainnet",
+                [
+                    ("ETH_RPC_URL", "https://eth.rpc.test"),
+                    ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
+                ],
+                ["SEPOLIA_RPC_URL", "SEPOLIA_LOCK_VAULT_ADDRESS"],
+            ),
+            (
+                "sepolia",
+                [
+                    ("SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
+                    ("SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
+                ],
+                ["ETH_RPC_URL", "MAINNET_LOCK_VAULT_ADDRESS"],
+            ),
+        ] {
+            for key in other {
+                let mut set = vec![("NETWORK", network)];
+                set.extend(own);
+                set.push((key, ""));
+                let message = network_refusal(&set);
+                assert_eq!(
+                    message,
+                    format!(
+                        "{key} is a {} variable and NETWORK is {network}: unset it",
+                        if network == "mainnet" {
+                            "sepolia"
+                        } else {
+                            "mainnet"
+                        }
+                    )
+                );
+            }
+        }
     }
 
     #[test]
