@@ -119,9 +119,10 @@ forge build
 forge test
 
 # Build the bridge orchestrator
-cd bridge-orchestrator && cargo build
+(cd bridge-orchestrator && cargo build)
 
-# Rehearse the mainnet deploy and the move to Safes on an anvil fork
+# Rehearse the mainnet deploy and the move to Safes on an anvil fork,
+# after building the orchestrator above
 nix develop -c test/fork-rehearsal.sh
 ```
 

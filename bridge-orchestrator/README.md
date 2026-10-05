@@ -29,11 +29,21 @@ refuses to start, naming each variable at fault, when:
 - the vault has no contract, or its `token()`, `orderbook()` or `vaultId()`
   differs from `TOKEN_ADDRESS`, `ORDERBOOK_ADDRESS` or `VAULT_ID`
 - `ORDER_OWNER` is not the vault
+- the claim order that `ORDER_OWNER`, `TOKEN_ADDRESS`, `VAULT_ID` and the
+  `CLAIM_*` values describe does not hash to `ORDER_HASH`
 - `ORDERBOOK_ADDRESS` holds no order `ORDER_HASH`
+- `CLAIM_SIGNER` is a contract, such as a Safe: the orchestrator signs only as
+  a key
+- `SIGNER_PRIVATE_KEY` is not the key of `CLAIM_SIGNER`
+- the claim order does not accept a coupon signed with that key. `run`
+  simulates `takeOrders` with a one-wei coupon to itself, and starts only if
+  the order pays it, or answers `MinimumInput` because its vault is empty.
 - on `mainnet`, `SIGNER_PRIVATE_KEY` is the test signer
   `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
 
-An RPC it cannot reach also stops it, and its supervisor restarts it.
+An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
+its supervisor restarts it. Once the checks pass it logs
+`startup checks passed`.
 
 ### `bridge-orchestrator status`
 
@@ -230,7 +240,8 @@ deploys are safe.
 
 ### Signer (run only)
 
-`run` parses these at startup.
+`run` parses these at startup. The deploy record prints every one but the key,
+under these names.
 
 | Variable | Required | Default |
 |----------|----------|---------|
@@ -240,6 +251,11 @@ deploys are safe.
 | `ORDERBOOK_ADDRESS` | Yes | -- |
 | `TOKEN_ADDRESS` | Yes | -- |
 | `VAULT_ID` | Yes | -- |
+| `CLAIM_SIGNER` | Yes | -- (the claim order's `valid-signer`: the key's address) |
+| `CLAIM_INTERPRETER` | Yes | -- |
+| `CLAIM_STORE` | Yes | -- |
+| `CLAIM_EXPRESSION` | Yes | -- |
+| `CLAIM_INPUT_TOKEN` | Yes | -- |
 | `EXPIRY_SECONDS` | No | `604800` (7 days), from 1 to `31536000` (a year) |
 
 ## Usage on the HOT-2-mHOT bridge server

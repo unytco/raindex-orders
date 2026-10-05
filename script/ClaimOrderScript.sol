@@ -278,6 +278,11 @@ abstract contract ClaimOrderScript is Script {
         console2.log(string.concat("VAULT_ID=", vm.toString(bytes32(order.validOutputs[0].vaultId))));
         console2.log(string.concat("ORDER_HASH=", hash));
         console2.log(string.concat("ORDER_OWNER=", vm.toString(order.owner)));
+        console2.log(string.concat("CLAIM_SIGNER=", vm.toString(signer)));
+        console2.log(string.concat("CLAIM_INTERPRETER=", vm.toString(address(order.evaluable.interpreter))));
+        console2.log(string.concat("CLAIM_STORE=", vm.toString(address(order.evaluable.store))));
+        console2.log(string.concat("CLAIM_EXPRESSION=", vm.toString(order.evaluable.expression)));
+        console2.log(string.concat("CLAIM_INPUT_TOKEN=", vm.toString(order.validInputs[0].token)));
         console2.log("website:");
         console2.log(string.concat("PUBLIC_NETWORK=", net.name));
         console2.log(string.concat("PUBLIC_TOKEN_ADDRESS=", token));

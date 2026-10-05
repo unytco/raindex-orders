@@ -44,6 +44,20 @@ fn signer() -> Vec<(&'static str, String)> {
             "SIGNER_PRIVATE_KEY",
             "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
         ),
+        ("CLAIM_SIGNER", "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"),
+        (
+            "CLAIM_INTERPRETER",
+            "0x4C7436641da0505A8012218c1524Db0060Fd7253",
+        ),
+        ("CLAIM_STORE", "0x32a868432101C516647E7Ee217CA641B288953C6"),
+        (
+            "CLAIM_EXPRESSION",
+            "0x1e814F560938B7Ed82Ba00Cc075a822E4789309E",
+        ),
+        (
+            "CLAIM_INPUT_TOKEN",
+            "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        ),
     ]
     .into_iter()
     .map(|(key, value)| (key, value.to_string()))

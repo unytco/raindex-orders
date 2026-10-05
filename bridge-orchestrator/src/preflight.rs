@@ -1,14 +1,58 @@
 use crate::config::Network;
-use crate::signer::ClaimOrder;
-use alloy::primitives::Address;
+use crate::signer::{ClaimOrder, CouponSigner, SignedCoupon};
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
+use alloy::sol_types::{Revert, SolError, SolValue};
 use alloy::transports::{RpcError, TransportError, TransportErrorKind};
 use anyhow::{anyhow, bail, Result};
 use std::error::Error;
 use std::time::Duration;
 
 sol! {
+    struct IO {
+        address token;
+        uint8 decimals;
+        uint256 vaultId;
+    }
+
+    struct EvaluableV2 {
+        address interpreter;
+        address store;
+        address expression;
+    }
+
+    struct OrderV2 {
+        address owner;
+        bool handleIO;
+        EvaluableV2 evaluable;
+        IO[] validInputs;
+        IO[] validOutputs;
+    }
+
+    struct SignedContextV1 {
+        address signer;
+        uint256[] context;
+        bytes signature;
+    }
+
+    struct TakeOrderConfigV2 {
+        OrderV2 order;
+        uint256 inputIOIndex;
+        uint256 outputIOIndex;
+        SignedContextV1[] signedContext;
+    }
+
+    struct TakeOrdersConfigV2 {
+        uint256 minimumInput;
+        uint256 maximumInput;
+        uint256 maximumIORatio;
+        TakeOrderConfigV2[] orders;
+        bytes data;
+    }
+
+    error MinimumInput(uint256 minimumInput, uint256 input);
+
     #[sol(rpc)]
     interface IHoloLockVault {
         function token() external view returns (address);
@@ -19,21 +63,24 @@ sol! {
     #[sol(rpc)]
     interface IOrderBookV3 {
         function orderExists(bytes32 orderHash) external view returns (bool);
+        function takeOrders(TakeOrdersConfigV2 calldata config)
+            external
+            returns (uint256 totalTakerInput, uint256 totalTakerOutput);
     }
 }
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Refuses to run the bridge unless the RPC answers for `network`, and the vault
-/// and claim order the configuration names are the ones deployed there. Every
-/// mismatch names its variable.
+/// Refuses to run the bridge unless the RPC answers for `network`, the vault and
+/// claim order the configuration names are the ones deployed there, and that order
+/// accepts coupons signed with the loaded key. Every mismatch names its variable.
 pub async fn check(
     network: Network,
     rpc_url: &str,
     vault: Address,
-    order: &ClaimOrder,
+    signer: &CouponSigner,
 ) -> Result<()> {
-    check_within(RPC_TIMEOUT, network, rpc_url, vault, order).await
+    check_within(RPC_TIMEOUT, network, rpc_url, vault, signer).await
 }
 
 async fn check_within(
@@ -41,9 +88,9 @@ async fn check_within(
     network: Network,
     rpc_url: &str,
     vault: Address,
-    order: &ClaimOrder,
+    signer: &CouponSigner,
 ) -> Result<()> {
-    tokio::time::timeout(timeout, read_and_compare(network, rpc_url, vault, order))
+    tokio::time::timeout(timeout, read_and_compare(network, rpc_url, vault, signer))
         .await
         .map_err(|_| {
             anyhow!(
@@ -57,8 +104,9 @@ async fn read_and_compare(
     network: Network,
     rpc_url: &str,
     vault: Address,
-    order: &ClaimOrder,
+    signer: &CouponSigner,
 ) -> Result<()> {
+    let order = signer.order();
     let rpc_var = network.rpc_url_var();
     let vault_var = network.lock_vault_var();
     let url = rpc_url
@@ -130,6 +178,12 @@ async fn read_and_compare(
             order.order_owner
         ));
     }
+    if order_hash(&claim_order(order)) != order.order_hash {
+        faults.push(
+            "ORDER_HASH is not the hash of the order that ORDER_OWNER, TOKEN_ADDRESS, VAULT_ID, CLAIM_INTERPRETER, CLAIM_STORE, CLAIM_EXPRESSION and CLAIM_INPUT_TOKEN describe"
+                .to_string(),
+        );
+    }
     if orderbook != order.orderbook {
         faults.push(format!(
             "ORDERBOOK_ADDRESS {} is not the vault's orderbook {orderbook}",
@@ -149,11 +203,117 @@ async fn read_and_compare(
             ));
         }
     }
-
     if !faults.is_empty() {
         bail!("{}", faults.join("; "));
     }
-    Ok(())
+
+    let signer_code = provider
+        .get_code_at(order.signer)
+        .await
+        .map_err(|e| read_failed("eth_getCode(CLAIM_SIGNER)", e))?;
+    if !signer_code.is_empty() && !is_delegated_key(&signer_code) {
+        bail!(
+            "CLAIM_SIGNER {} is a contract, such as a Safe: the orchestrator signs coupons only with SIGNER_PRIVATE_KEY, a key, so it cannot sign for it",
+            order.signer
+        );
+    }
+    if signer.address() != order.signer {
+        bail!(
+            "SIGNER_PRIVATE_KEY is the key of {}, not of CLAIM_SIGNER {}",
+            signer.address(),
+            order.signer
+        );
+    }
+
+    let probe = signer.probe_coupon().await?;
+    let taken = IOrderBookV3::new(order.orderbook, &provider)
+        .takeOrders(take_one(order, probe))
+        .from(order.signer)
+        .call()
+        .await;
+    accepts_signer(order.signer, taken.map(|_| ()), rpc_var)
+}
+
+/// Whether simulating takeOrders with the probe coupon shows the claim order accepts
+/// its signer. Its first check is the signer, so any other outcome comes after it.
+/// Only a claim, or MinimumInput for a vault that cannot pay the one wei, counts.
+fn accepts_signer(
+    signer: Address,
+    taken: std::result::Result<(), alloy::contract::Error>,
+    rpc_var: &str,
+) -> Result<()> {
+    let what = "the claim order probe (takeOrders)";
+    let payload = match taken {
+        Ok(()) => return Ok(()),
+        Err(alloy::contract::Error::TransportError(RpcError::ErrorResp(payload))) => payload,
+        Err(alloy::contract::Error::TransportError(e)) => {
+            return Err(rpc_failure(rpc_var, what, &e))
+        }
+        Err(_) => bail!("{what} answered with data that is not takeOrders' result"),
+    };
+    let Some(revert) = payload.as_revert_data() else {
+        return Err(rpc_failure(rpc_var, what, &RpcError::ErrorResp(payload)));
+    };
+    if MinimumInput::abi_decode(&revert, true).is_ok() {
+        return Ok(());
+    }
+    if Revert::abi_decode(&revert, true).is_ok_and(|r| r.reason == "Wrong signer") {
+        bail!("the claim order ORDER_HASH does not accept coupons from CLAIM_SIGNER {signer}: it answered \"Wrong signer\"");
+    }
+    bail!(
+        "the claim order ORDER_HASH refused a coupon from CLAIM_SIGNER {signer} with error 0x{}",
+        hex::encode(&revert[..revert.len().min(4)])
+    )
+}
+
+/// An EIP-7702 delegation leaves an account a key, which the orderbook checks by its
+/// ECDSA signature before it asks any code.
+fn is_delegated_key(code: &Bytes) -> bool {
+    code.len() == 23 && code.starts_with(&[0xef, 0x01, 0x00])
+}
+
+/// The OrderV2 the vault added, as script/ClaimOrderScript.sol adds it.
+fn claim_order(order: &ClaimOrder) -> OrderV2 {
+    let io = |token| IO {
+        token,
+        decimals: 18,
+        vaultId: order.vault_id,
+    };
+    OrderV2 {
+        owner: order.order_owner,
+        handleIO: true,
+        evaluable: EvaluableV2 {
+            interpreter: order.interpreter,
+            store: order.store,
+            expression: order.expression,
+        },
+        validInputs: vec![io(order.input_token)],
+        validOutputs: vec![io(order.token)],
+    }
+}
+
+fn order_hash(order: &OrderV2) -> B256 {
+    keccak256(order.abi_encode())
+}
+
+fn take_one(order: &ClaimOrder, probe: SignedCoupon) -> TakeOrdersConfigV2 {
+    let amount = probe.context[1];
+    TakeOrdersConfigV2 {
+        minimumInput: amount,
+        maximumInput: amount,
+        maximumIORatio: U256::ZERO,
+        orders: vec![TakeOrderConfigV2 {
+            order: claim_order(order),
+            inputIOIndex: U256::ZERO,
+            outputIOIndex: U256::ZERO,
+            signedContext: vec![SignedContextV1 {
+                signer: probe.signer,
+                context: probe.context,
+                signature: probe.signature.into(),
+            }],
+        }],
+        data: Bytes::new(),
+    }
 }
 
 /// The cause of a failed read, in words of our own: a provider's URL can hold its
@@ -201,8 +361,9 @@ fn causes(err: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{address, b256, B256, U256};
-    use alloy::sol_types::{SolCall, SolValue};
+    use alloy::primitives::{address, PrimitiveSignature};
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol_types::SolCall;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -210,9 +371,8 @@ mod tests {
     const VAULT: Address = address!("E3E064e3C2EEf66cb93dA8D8114F5084E92F48D6");
     const HOT: Address = address!("6c6EE5e31d828De241282B9606C8e98Ea48526E2");
     const ORDERBOOK: Address = address!("f1224A483ad7F1E9aA46A8CE41229F32d7549A74");
-    const ORDER_HASH: B256 =
-        b256!("5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9");
     const OTHER: Address = address!("1111111111111111111111111111111111111111");
+    const KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 
     fn vault_id() -> U256 {
         "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b"
@@ -220,18 +380,35 @@ mod tests {
             .unwrap()
     }
 
+    fn key() -> PrivateKeySigner {
+        KEY.parse().unwrap()
+    }
+
+    /// A claim order whose signer is `key()`, its hash rebuilt from its values.
     fn order() -> ClaimOrder {
-        ClaimOrder {
-            order_hash: ORDER_HASH,
+        let mut order = ClaimOrder {
+            order_hash: B256::ZERO,
             order_owner: VAULT,
             orderbook: ORDERBOOK,
             token: HOT,
             vault_id: vault_id(),
-        }
+            signer: key().address(),
+            interpreter: address!("4C7436641da0505A8012218c1524Db0060Fd7253"),
+            store: address!("32a868432101C516647E7Ee217CA641B288953C6"),
+            expression: address!("1e814F560938B7Ed82Ba00Cc075a822E4789309E"),
+            input_token: address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
+        };
+        order.order_hash = order_hash(&claim_order(&order));
+        order
+    }
+
+    fn signer_for(order: ClaimOrder) -> CouponSigner {
+        CouponSigner::for_order(key(), order)
     }
 
     /// What a JSON-RPC endpoint answers about one chain: the vault deployed with
-    /// `token`, `orderbook` and `vault_id`, and the orders that orderbook holds.
+    /// `token`, `orderbook` and `vault_id`, the orders that orderbook holds, and the
+    /// signer the claim order accepts.
     #[derive(Clone)]
     struct Chain {
         chain_id: u64,
@@ -240,6 +417,17 @@ mod tests {
         orderbook: Address,
         vault_id: U256,
         orders: Vec<B256>,
+        valid_signer: Address,
+        signer_code: &'static str,
+        vault_balance: U256,
+    }
+
+    type Answer = std::result::Result<String, Value>;
+
+    fn reverted(data: Vec<u8>) -> Answer {
+        Err(
+            json!({"code": 3, "message": "execution reverted", "data": format!("0x{}", hex::encode(data))}),
+        )
     }
 
     impl Chain {
@@ -250,16 +438,22 @@ mod tests {
                 token: HOT,
                 orderbook: ORDERBOOK,
                 vault_id: vault_id(),
-                orders: vec![ORDER_HASH],
+                orders: vec![order().order_hash],
+                valid_signer: key().address(),
+                signer_code: "0x",
+                vault_balance: U256::from(10),
             }
         }
 
-        fn answer(&self, method: &str, params: &Value) -> String {
-            let empty = "0x".to_string();
+        fn answer(&self, method: &str, params: &Value) -> Answer {
+            let empty = Ok("0x".to_string());
             match method {
-                "eth_chainId" => format!("{:#x}", self.chain_id),
+                "eth_chainId" => Ok(format!("{:#x}", self.chain_id)),
                 "eth_getCode" if self.vault_deployed && address_at(&params[0]) == VAULT => {
-                    "0x6080".to_string()
+                    Ok("0x6080".to_string())
+                }
+                "eth_getCode" if address_at(&params[0]) != VAULT => {
+                    Ok(self.signer_code.to_string())
                 }
                 "eth_getCode" => empty,
                 "eth_call" => {
@@ -282,13 +476,69 @@ mod tests {
                             .unwrap()
                             .orderHash;
                         self.orders.contains(&asked).abi_encode()
+                    } else if to == self.orderbook
+                        && selector == IOrderBookV3::takeOrdersCall::SELECTOR
+                    {
+                        return self.take_orders(&input);
                     } else {
                         return empty;
                     };
-                    format!("0x{}", hex::encode(encoded))
+                    Ok(format!("0x{}", hex::encode(encoded)))
                 }
                 other => panic!("the check sent {other}"),
             }
+        }
+
+        /// takeOrders as OrderBookV3 runs the claim order: the coupon's signature
+        /// first, then the expression's signer check, then the vault's balance.
+        fn take_orders(&self, input: &[u8]) -> Answer {
+            let config = IOrderBookV3::takeOrdersCall::abi_decode(input, true)
+                .unwrap()
+                .config;
+            let take = &config.orders[0];
+            let coupon = &take.signedContext[0];
+            let packed: Vec<u8> = coupon
+                .context
+                .iter()
+                .flat_map(|v| v.to_be_bytes::<32>())
+                .collect();
+            let digest = keccak256(
+                [
+                    b"\x19Ethereum Signed Message:\n32".as_slice(),
+                    keccak256(&packed).as_slice(),
+                ]
+                .concat(),
+            );
+            let recovered = PrimitiveSignature::try_from(coupon.signature.as_ref())
+                .unwrap()
+                .recover_address_from_prehash(&digest)
+                .unwrap();
+            assert_eq!(recovered, coupon.signer, "the probe's signature");
+            assert!(
+                self.orders.contains(&order_hash(&take.order)),
+                "the probe named an order the orderbook does not hold"
+            );
+            if coupon.signer != self.valid_signer {
+                return reverted(
+                    Revert {
+                        reason: "Wrong signer".to_string(),
+                    }
+                    .abi_encode(),
+                );
+            }
+            if self.vault_balance < config.minimumInput {
+                return reverted(
+                    MinimumInput {
+                        minimumInput: config.minimumInput,
+                        input: U256::ZERO,
+                    }
+                    .abi_encode(),
+                );
+            }
+            Ok(format!(
+                "0x{}",
+                hex::encode((config.minimumInput, U256::ZERO).abi_encode_params())
+            ))
         }
     }
 
@@ -312,11 +562,10 @@ mod tests {
     async fn respond(mut socket: TcpStream, chain: &Chain) {
         let body = read_request(&mut socket).await;
         let call: Value = serde_json::from_slice(&body).unwrap();
-        let reply = json!({
-            "jsonrpc": "2.0",
-            "id": call["id"],
-            "result": chain.answer(call["method"].as_str().unwrap(), &call["params"]),
-        })
+        let reply = match chain.answer(call["method"].as_str().unwrap(), &call["params"]) {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": call["id"], "result": result}),
+            Err(error) => json!({"jsonrpc": "2.0", "id": call["id"], "error": error}),
+        }
         .to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
@@ -390,7 +639,7 @@ mod tests {
         for (status, body, expected) in answers {
             let url = serve_answer(status, body).await;
 
-            let err = check(Network::Mainnet, &url, VAULT, &order())
+            let err = check(Network::Mainnet, &url, VAULT, &signer_for(order()))
                 .await
                 .expect_err("a failed answer passed the check");
 
@@ -400,7 +649,19 @@ mod tests {
 
     async fn check_against(network: Network, chain: Chain, order: &ClaimOrder) -> Result<()> {
         let url = serve(chain).await;
-        check(network, &url, VAULT, order).await
+        check(network, &url, VAULT, &signer_for(order.clone())).await
+    }
+
+    /// `order` changed by `change`, with its hash rebuilt, and a chain that holds it.
+    fn changed(change: impl FnOnce(&mut ClaimOrder)) -> (ClaimOrder, Chain) {
+        let mut order = order();
+        change(&mut order);
+        order.order_hash = order_hash(&claim_order(&order));
+        let chain = Chain {
+            orders: vec![order.order_hash],
+            ..Chain::of(Network::Sepolia)
+        };
+        (order, chain)
     }
 
     async fn refusal(network: Network, chain: Chain, order: &ClaimOrder) -> String {
@@ -478,13 +739,10 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_an_order_owner_that_is_not_the_vault() {
-        let order = ClaimOrder {
-            order_owner: OTHER,
-            ..order()
-        };
+        let (order, chain) = changed(|order| order.order_owner = OTHER);
 
         assert_eq!(
-            refusal(Network::Sepolia, Chain::of(Network::Sepolia), &order).await,
+            refusal(Network::Sepolia, chain, &order).await,
             format!("ORDER_OWNER {OTHER} is not the vault SEPOLIA_LOCK_VAULT_ADDRESS {VAULT}")
         );
     }
@@ -498,7 +756,10 @@ mod tests {
 
         assert_eq!(
             refusal(Network::Mainnet, chain, &order()).await,
-            format!("ORDER_HASH {ORDER_HASH} is not an order on ORDERBOOK_ADDRESS {ORDERBOOK}")
+            format!(
+                "ORDER_HASH {} is not an order on ORDERBOOK_ADDRESS {ORDERBOOK}",
+                order().order_hash
+            )
         );
     }
 
@@ -539,7 +800,7 @@ mod tests {
                 Network::Sepolia,
                 &url,
                 VAULT,
-                &order(),
+                &signer_for(order()),
             ),
         )
         .await
@@ -559,7 +820,7 @@ mod tests {
         let url = format!("http://{}/v3/secret-api-key", closed.local_addr().unwrap());
         drop(closed);
 
-        let err = check(Network::Mainnet, &url, VAULT, &order())
+        let err = check(Network::Mainnet, &url, VAULT, &signer_for(order()))
             .await
             .expect_err("an unreachable RPC passed the check");
         let message = format!("{err:#}");
@@ -569,5 +830,139 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("secret-api-key"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn refuses_order_values_that_do_not_hash_to_order_hash() {
+        let order = ClaimOrder {
+            store: OTHER,
+            ..order()
+        };
+
+        assert_eq!(
+            refusal(Network::Mainnet, Chain::of(Network::Mainnet), &order).await,
+            "ORDER_HASH is not the hash of the order that ORDER_OWNER, TOKEN_ADDRESS, VAULT_ID, CLAIM_INTERPRETER, CLAIM_STORE, CLAIM_EXPRESSION and CLAIM_INPUT_TOKEN describe"
+        );
+    }
+
+    #[test]
+    fn rebuilds_the_hash_of_the_claim_order_on_sepolia() {
+        let sepolia = ClaimOrder::sepolia();
+
+        assert_eq!(order_hash(&claim_order(&sepolia)), sepolia.order_hash);
+    }
+
+    #[tokio::test]
+    async fn refuses_a_key_the_claim_order_does_not_accept() {
+        for network in [Network::Sepolia, Network::Mainnet] {
+            let chain = Chain {
+                valid_signer: OTHER,
+                ..Chain::of(network)
+            };
+
+            assert_eq!(
+                refusal(network, chain, &order()).await,
+                format!(
+                    "the claim order ORDER_HASH does not accept coupons from CLAIM_SIGNER {}: it answered \"Wrong signer\"",
+                    key().address()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn passes_a_claim_order_that_accepts_the_key_while_its_vault_is_empty() {
+        let chain = Chain {
+            vault_balance: U256::ZERO,
+            ..Chain::of(Network::Mainnet)
+        };
+
+        check_against(Network::Mainnet, chain, &order())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_a_claim_signer_that_is_a_contract() {
+        for network in [Network::Sepolia, Network::Mainnet] {
+            let chain = Chain {
+                signer_code: "0x608060405260043610",
+                ..Chain::of(network)
+            };
+
+            assert_eq!(
+                refusal(network, chain, &order()).await,
+                format!(
+                    "CLAIM_SIGNER {} is a contract, such as a Safe: the orchestrator signs coupons only with SIGNER_PRIVATE_KEY, a key, so it cannot sign for it",
+                    key().address()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_a_safe_as_the_claim_signer_whatever_the_key() {
+        let (order, chain) = changed(|order| order.signer = OTHER);
+        let chain = Chain {
+            signer_code: "0x608060405260043610",
+            ..chain
+        };
+
+        assert_eq!(
+            refusal(Network::Sepolia, chain, &order).await,
+            format!(
+                "CLAIM_SIGNER {OTHER} is a contract, such as a Safe: the orchestrator signs coupons only with SIGNER_PRIVATE_KEY, a key, so it cannot sign for it"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_key_that_is_not_the_claim_signer() {
+        let (order, chain) = changed(|order| order.signer = OTHER);
+
+        assert_eq!(
+            refusal(Network::Sepolia, chain, &order).await,
+            format!(
+                "SIGNER_PRIVATE_KEY is the key of {}, not of CLAIM_SIGNER {OTHER}",
+                key().address()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn passes_a_claim_signer_that_is_a_key_with_an_eip_7702_delegation() {
+        let chain = Chain {
+            signer_code: "0xef01001111111111111111111111111111111111111111",
+            ..Chain::of(Network::Mainnet)
+        };
+
+        check_against(Network::Mainnet, chain, &order())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn refuses_any_other_answer_to_the_probe() {
+        let other = |data: Vec<u8>| {
+            let answer = json!({"code": 3, "message": "execution reverted", "data": format!("0x{}", hex::encode(data))});
+            Err(alloy::contract::Error::TransportError(RpcError::ErrorResp(
+                serde_json::from_value(answer).unwrap(),
+            )))
+        };
+        let refused = |taken| {
+            format!(
+                "{:#}",
+                accepts_signer(OTHER, taken, "ETH_RPC_URL").unwrap_err()
+            )
+        };
+
+        assert_eq!(
+            refused(other(Revert { reason: "Order expired".to_string() }.abi_encode())),
+            format!("the claim order ORDER_HASH refused a coupon from CLAIM_SIGNER {OTHER} with error 0x08c379a0")
+        );
+        assert_eq!(
+            refused(other(vec![])),
+            format!("the claim order ORDER_HASH refused a coupon from CLAIM_SIGNER {OTHER} with error 0x")
+        );
     }
 }

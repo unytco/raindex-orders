@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lock and Claim show the network switch, and send nothing, while the wallet is on another chain.
 - `POST /api/coupon-status` reads its own network's chain through that network's RPC secret.
 - `deploy-sepolia.sh` signs with `--account` or `--ledger`, never a private key.
-- bridge-orchestrator runs on the network `NETWORK` names, mainnet or sepolia, and refuses to start when its chain, vault or claim order do not match it, or it is given the test signer on mainnet.
+- bridge-orchestrator runs on the network `NETWORK` names, mainnet or sepolia, and refuses to start when its chain, vault or claim order do not match it, when the claim order does not accept its signing key, when the claim signer is a Safe, or when it is given the test signer on mainnet.
 - bridge-orchestrator bridges on the one lane that names its agent and lists the unit in `HOT_UNIT_INDEX`, and will not start while `HOLOCHAIN_LANE_DEFINITION` or `HOLOCHAIN_UNIT_INDEX` is set.
 - the lair requirement is `ham`'s decision, supplied with the orchestrator's two paths, rather than restated here. A refusal names the fault before the reason the node could not offer lair.
 - the Rainix/Solidity workflow (`.github/workflows/test.yml`) is now manual-only (`on: workflow_dispatch`) — it has failed for years on a dead nixpkgs pin in `lib/rain.orderbook`.

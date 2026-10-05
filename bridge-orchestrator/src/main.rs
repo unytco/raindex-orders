@@ -75,9 +75,15 @@ async fn main() -> Result<()> {
                 config.network,
                 &config.rpc_url,
                 config.lock_vault_address,
-                signer.order(),
+                &signer,
             )
             .await?;
+            info!(
+                event = "startup.checks_passed",
+                order = %signer.order().order_hash,
+                signer = %signer.order().signer,
+                "startup checks passed: the chain, vault and claim order match, and the order accepts the signer"
+            );
             BridgeOrchestrator::new(config, signer)?.run().await?;
         }
         Command::Status {

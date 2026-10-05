@@ -8,6 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 FORK_URL=${FORK_URL:-https://eth.drpc.org}
+ORCHESTRATOR=${ORCHESTRATOR:-bridge-orchestrator/target/debug/bridge-orchestrator}
 PORT=${REHEARSAL_PORT:-18545}
 fork=http://127.0.0.1:$PORT
 plain=http://127.0.0.1:$((PORT + 1))
@@ -94,6 +95,10 @@ expect_refusal() {
 	echo "refused, sending nothing: $reason"
 }
 
+[[ -x $ORCHESTRATOR ]] ||
+	fail "build the orchestrator first: cargo build in bridge-orchestrator, on its pinned toolchain, or set ORCHESTRATOR"
+ORCHESTRATOR=$(realpath "$ORCHESTRATOR")
+
 step "Starting anvil: a fork of mainnet on $fork, and a chain 31337 on $plain"
 start_anvil "$fork" --fork-url "$FORK_URL"
 start_anvil "$plain"
@@ -132,6 +137,37 @@ proofs() {
 		ADMIN_ADDRESS=$admin REHEARSAL_DEPLOYER=$deployer REHEARSAL_SIGNER_KEY=$signer_key \
 		forge test --match-path test/rehearsal/MainnetForkRehearsal.t.sol -vv "$@"
 }
+
+# Starts `bridge-orchestrator run` on the fork with the deploy record in `record`
+# and the key `key`, with no Holochain node: it gets past its startup checks only
+# to stop where it needs the node. Prints what it logged.
+orchestrate() {
+	local record=$1 key=$2 dir
+	dir=$(mktemp -d -p "$work")
+	(
+		cd "$dir"
+		mapfile -t lines < <(sed -n '/bridge-orchestrator:/,/website:/p' "$record" | grep -oE '[A-Z_]+=[^ ]+')
+		env -i PATH="$PATH" "${lines[@]}" ETH_RPC_URL="$fork" SIGNER_PRIVATE_KEY="$key" \
+			HOLOCHAIN_BRIDGING_AGENT_PUBKEY=uhCAkYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj \
+			DB_PATH="$dir/bridge.db" CONDUCTOR_CONFIG="$dir/no-conductor.yaml" "$ORCHESTRATOR" run 2>&1 || true
+	)
+}
+
+step "Starting the orchestrator against the deployed claim order"
+orchestrate "$work/deploy.log" "$signer_key" >"$work/orchestrator.log"
+grep -qF "startup checks passed" "$work/orchestrator.log" || {
+	cat "$work/orchestrator.log"
+	fail "the orchestrator did not pass its startup checks with the deploy record and the coupon signer's key"
+}
+echo "passed its startup checks with the record and the coupon signer's key"
+orchestrate <(sed "s/CLAIM_SIGNER=0x[0-9a-fA-F]*/CLAIM_SIGNER=$(address_of "${keys[3]}")/" "$work/deploy.log") "${keys[3]}" \
+	>"$work/orchestrator.log"
+grep -qF "does not accept coupons from CLAIM_SIGNER $(address_of "${keys[3]}"): it answered \"Wrong signer\"" \
+	"$work/orchestrator.log" || {
+	cat "$work/orchestrator.log"
+	fail "the orchestrator started with a key the claim order does not accept"
+}
+echo "refused: a key the claim order does not accept"
 
 step "Proving the deployed bridge on the fork"
 ORDER_HASH=$order_hash PUBLIC_CLAIM_INTERPRETER=$interpreter PUBLIC_CLAIM_STORE=$store \
@@ -246,6 +282,13 @@ new_expression=$(record_value PUBLIC_CLAIM_EXPRESSION "$work/rotated.log")
 	fail "the rotation printed no complete deploy record"
 [[ $(record_value PUBLIC_CLAIM_SIGNER "$work/rotated.log") == "$signer_safe" ]] ||
 	fail "the new deploy record does not name the signer Safe"
+
+orchestrate "$work/rotated.log" "$signer_key" >"$work/orchestrator.log"
+grep -qF "CLAIM_SIGNER $signer_safe is a contract, such as a Safe" "$work/orchestrator.log" || {
+	cat "$work/orchestrator.log"
+	fail "the orchestrator started for a Safe coupon signer"
+}
+echo "refused: the orchestrator for a claim order whose signer is a Safe"
 
 step "Proving the Safe admin and the Safe coupon signer on the fork"
 ORDER_HASH=$new_order_hash PREVIOUS_ORDER_HASH=$order_hash \

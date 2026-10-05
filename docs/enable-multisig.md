@@ -42,7 +42,7 @@ A coupon signer Safe needs a threshold of 2 to 20, which `rotate-claim-signer.sh
 
    - If the admin is a key, pass its wallet option. The script sends both calls and prints the new deploy record.
    - If the admin is a Safe, pass no wallet option. The script sends nothing and prints the two calls. Propose each from the admin Safe in that order, in the Safe web app's Transaction Builder: the vault as the address, value 0, and the printed data. When both have run, print the new deploy record with `./rotate-claim-signer.sh record <block of the first call>`. It checks only the orders the vault added from that block on, so pass the first call's own block.
-4. Give the orchestrator the new `ORDER_HASH` and a signer for the Safe, then start it. At startup it refuses an `ORDER_HASH` the orderbook does not hold.
+4. Give the orchestrator the new record's `ORDER_HASH`, `CLAIM_SIGNER`, `CLAIM_INTERPRETER`, `CLAIM_STORE`, `CLAIM_EXPRESSION` and `CLAIM_INPUT_TOKEN`, and the new signer's key, then start it. At startup it refuses unless the order on chain accepts coupons signed with that key. Until the parts in the last section exist, it refuses a Safe as `CLAIM_SIGNER`, so a rotation to a Safe leaves the bridge paying no withdrawals.
 5. Give the website the new `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_SIGNER`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE` and `PUBLIC_CLAIM_EXPRESSION` from the new deploy record, then build and deploy it again. The build refuses values that do not hash to the order hash, but it cannot check the signer.
 6. Reissue the coupons that were not claimed. A coupon names its order's hash, so a coupon for the old order fails on the new one.
 
@@ -58,11 +58,11 @@ cast call "$COUPON_ORDER_STORE" 'get(uint256,uint256)(uint256)' "$namespace" "$k
 
 ## Fireblocks as the coupon signer
 
-A Fireblocks MPC wallet is a paid alternative to a Safe. It signs as one Ethereum address, so the claim order needs only that address as `valid-signer`, set with `rotate-claim-signer.sh` as above. The website needs no code change, only the new build variables, as it checks a 65-byte signature as one key's. The orchestrator needs a `CouponKey` in `bridge-orchestrator/src/signer.rs` that has Fireblocks sign the coupon's digest and returns the 65-byte signature.
+A Fireblocks MPC wallet is a paid alternative to a Safe. It signs as one Ethereum address, so the claim order needs only that address as `valid-signer`, set with `rotate-claim-signer.sh` as above. The website needs no code change, only the new build variables, as it checks a 65-byte signature as one key's. The orchestrator needs a `CouponKey` in `bridge-orchestrator/src/signer.rs` that has Fireblocks sign the coupon's digest and returns the 65-byte signature, and its startup check compares `CLAIM_SIGNER` with that key's address.
 
 ## What is not built yet
 
 A Safe as the coupon signer needs two parts that do not exist yet. Until both exist, the coupon signer stays one key.
 
 - **A second signer service.** It watches the same withdrawals on the Unyt network and checks each one itself: that the withdrawal is real, its amount and recipient, and that it has no coupon yet. Then it signs the coupon's SafeMessage hash with its own owner key. Without its own check, a second signature adds no protection.
-- **The orchestrator collecting two signatures.** A `CouponKey` for the Safe in `bridge-orchestrator/src/signer.rs` signs with the orchestrator's owner key and gets the second service's signature. It returns both, sorted by owner address and joined, and names the Safe as the coupon's signer. Coupon building does not change.
+- **The orchestrator collecting two signatures.** A `CouponKey` for the Safe in `bridge-orchestrator/src/signer.rs` signs with the orchestrator's owner key and gets the second service's signature. It returns both, sorted by owner address and joined, and names the Safe as the coupon's signer. Coupon building does not change. The startup check, which now refuses a contract `CLAIM_SIGNER`, then accepts the Safe whose signer this is.
