@@ -1,4 +1,6 @@
-import { writable, type Writable } from 'svelte/store'
+import { get, writable, type Writable } from 'svelte/store'
+import type { Abi, Hex } from 'viem'
+import { errorMessage } from './utils'
 
 export interface EthereumState {
 	isConnected: boolean
@@ -6,6 +8,12 @@ export interface EthereumState {
 	chainId: number | null
 	isLoading: boolean
 	error: string | null
+}
+
+export type Eip1193Provider = {
+	request(args: { method: string; params?: unknown[] }): Promise<unknown>
+	on(event: 'accountsChanged', listener: (accounts: string[]) => void): void
+	on(event: 'chainChanged', listener: (chainId: string) => void): void
 }
 
 const initialState: EthereumState = {
@@ -18,18 +26,23 @@ const initialState: EthereumState = {
 
 export const ethereumStore: Writable<EthereumState> = writable(initialState)
 
-let ethereum: any = null
+let ethereum: Eip1193Provider | null = null
 
-export function getEthereum() {
-	return ethereum || (typeof window !== 'undefined' ? (window as any).ethereum : null)
+function injectedProvider(): Eip1193Provider | null {
+	if (typeof window === 'undefined') return null
+	return (window as { ethereum?: Eip1193Provider }).ethereum ?? null
+}
+
+export function getEthereum(): Eip1193Provider | null {
+	return ethereum || injectedProvider()
 }
 
 export async function initEthereum(): Promise<boolean> {
 	if (typeof window === 'undefined') return false
 
-	const eth = (window as any).ethereum
+	const eth = injectedProvider()
 	if (!eth) {
-		ethereumStore.update((s) => ({ ...s, error: 'Please install MetaMask!' }))
+		ethereumStore.update(s => ({ ...s, error: 'Please install MetaMask!' }))
 		return false
 	}
 
@@ -37,8 +50,8 @@ export async function initEthereum(): Promise<boolean> {
 
 	// Check if already connected
 	try {
-		const accounts = await eth.request({ method: 'eth_accounts' })
-		const chainId = await eth.request({ method: 'eth_chainId' })
+		const accounts = (await eth.request({ method: 'eth_accounts' })) as string[]
+		const chainId = (await eth.request({ method: 'eth_chainId' })) as string
 
 		if (accounts.length > 0) {
 			ethereumStore.set({
@@ -62,13 +75,13 @@ export async function initEthereum(): Promise<boolean> {
 
 function handleAccountsChanged(accounts: string[]) {
 	if (accounts.length === 0) {
-		ethereumStore.update((s) => ({
+		ethereumStore.update(s => ({
 			...s,
 			isConnected: false,
 			account: null
 		}))
 	} else {
-		ethereumStore.update((s) => ({
+		ethereumStore.update(s => ({
 			...s,
 			isConnected: true,
 			account: accounts[0]
@@ -77,7 +90,7 @@ function handleAccountsChanged(accounts: string[]) {
 }
 
 function handleChainChanged(chainId: string) {
-	ethereumStore.update((s) => ({
+	ethereumStore.update(s => ({
 		...s,
 		chainId: parseInt(chainId, 16)
 	}))
@@ -86,15 +99,15 @@ function handleChainChanged(chainId: string) {
 export async function connectWallet(): Promise<string | null> {
 	const eth = getEthereum()
 	if (!eth) {
-		ethereumStore.update((s) => ({ ...s, error: 'Please install MetaMask!' }))
+		ethereumStore.update(s => ({ ...s, error: 'Please install MetaMask!' }))
 		return null
 	}
 
-	ethereumStore.update((s) => ({ ...s, isLoading: true, error: null }))
+	ethereumStore.update(s => ({ ...s, isLoading: true, error: null }))
 
 	try {
-		const accounts = await eth.request({ method: 'eth_requestAccounts' })
-		const chainId = await eth.request({ method: 'eth_chainId' })
+		const accounts = (await eth.request({ method: 'eth_requestAccounts' })) as string[]
+		const chainId = (await eth.request({ method: 'eth_chainId' })) as string
 
 		ethereumStore.set({
 			isConnected: true,
@@ -105,20 +118,13 @@ export async function connectWallet(): Promise<string | null> {
 		})
 
 		return accounts[0]
-	} catch (err: any) {
-		if (err.code === 4001) {
-			ethereumStore.update((s) => ({
-				...s,
-				isLoading: false,
-				error: 'Connection rejected by user'
-			}))
-		} else {
-			ethereumStore.update((s) => ({
-				...s,
-				isLoading: false,
-				error: err.message || 'Failed to connect'
-			}))
-		}
+	} catch (err) {
+		const rejected = (err as { code?: number } | null)?.code === 4001
+		ethereumStore.update(s => ({
+			...s,
+			isLoading: false,
+			error: rejected ? 'Connection rejected by user' : errorMessage(err, 'Failed to connect')
+		}))
 		return null
 	}
 }
@@ -135,9 +141,9 @@ export async function switchToSepolia(): Promise<boolean> {
 			params: [{ chainId: sepoliaChainId }]
 		})
 		return true
-	} catch (err: any) {
+	} catch (err) {
 		// Chain not added, try to add it
-		if (err.code === 4902) {
+		if ((err as { code?: number } | null)?.code === 4902) {
 			try {
 				await eth.request({
 					method: 'wallet_addEthereumChain',
@@ -166,35 +172,7 @@ export async function switchToSepolia(): Promise<boolean> {
 	}
 }
 
-export async function sendTransaction(params: {
-	to: string
-	data: string
-	value?: string
-}): Promise<string> {
-	const eth = getEthereum()
-	if (!eth) throw new Error('No ethereum provider')
-
-	let state: EthereumState
-	ethereumStore.subscribe((s) => (state = s))()
-
-	if (!state!.account) throw new Error('Not connected')
-
-	const txHash = await eth.request({
-		method: 'eth_sendTransaction',
-		params: [
-			{
-				from: state!.account,
-				to: params.to,
-				data: params.data,
-				value: params.value || '0x0'
-			}
-		]
-	})
-
-	return txHash
-}
-
-export async function waitForTransaction(txHash: string): Promise<any> {
+export async function waitForTransaction(txHash: string): Promise<unknown> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
 
@@ -222,10 +200,10 @@ export async function waitForTransaction(txHash: string): Promise<any> {
 // Contract interaction helpers using raw ethereum calls
 export async function readContract(params: {
 	address: string
-	abi: any[]
+	abi: Abi
 	functionName: string
-	args?: any[]
-}): Promise<any> {
+	args?: readonly unknown[]
+}): Promise<unknown> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
 
@@ -237,16 +215,16 @@ export async function readContract(params: {
 		args: params.args || []
 	})
 
-	const result = await eth.request({
+	const result = (await eth.request({
 		method: 'eth_call',
 		params: [{ to: params.address, data }, 'latest']
-	})
+	})) as Hex
 
 	const abiItem = params.abi.find(
-		(item) => item.type === 'function' && item.name === params.functionName
+		item => item.type === 'function' && item.name === params.functionName
 	)
 
-	if (abiItem && abiItem.outputs && abiItem.outputs.length > 0) {
+	if (abiItem && abiItem.type === 'function' && abiItem.outputs.length > 0) {
 		const decoded = decodeFunctionResult({
 			abi: params.abi,
 			functionName: params.functionName,
@@ -260,9 +238,9 @@ export async function readContract(params: {
 
 export async function writeContract(params: {
 	address: string
-	abi: any[]
+	abi: Abi
 	functionName: string
-	args?: any[]
+	args?: readonly unknown[]
 	value?: bigint
 }): Promise<string> {
 	const eth = getEthereum()
@@ -276,22 +254,20 @@ export async function writeContract(params: {
 		args: params.args || []
 	})
 
-	let state: EthereumState
-	ethereumStore.subscribe((s) => (state = s))()
+	const { account } = get(ethereumStore)
+	if (!account) throw new Error('Not connected')
 
-	if (!state!.account) throw new Error('Not connected')
-
-	const txHash = await eth.request({
+	const txHash = (await eth.request({
 		method: 'eth_sendTransaction',
 		params: [
 			{
-				from: state!.account,
+				from: account,
 				to: params.address,
 				data,
 				value: params.value ? '0x' + params.value.toString(16) : '0x0'
 			}
 		]
-	})
+	})) as string
 
 	return txHash
 }

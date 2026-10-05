@@ -1,11 +1,11 @@
-import { defineConfig } from '@wagmi/cli';
-import { etherscan, react } from '@wagmi/cli/plugins';
-import { erc20Abi } from 'viem';
-import { sepolia } from 'wagmi/chains';
+import { defineConfig } from '@wagmi/cli'
+import { etherscan, react } from '@wagmi/cli/plugins'
+import { erc20Abi } from 'viem'
+import { sepolia } from 'wagmi/chains'
 
-const apiKey = process.env.ETHERSCAN_API_KEY;
+const apiKey = process.env.ETHERSCAN_API_KEY
 if (!apiKey) {
-	throw new Error('Set ETHERSCAN_API_KEY to fetch the Orderbook ABI from Etherscan');
+	throw new Error('Set ETHERSCAN_API_KEY to fetch the Orderbook ABI from Etherscan')
 }
 
 export default defineConfig({
@@ -31,4 +31,4 @@ export default defineConfig({
 		}),
 		react()
 	]
-});
+})

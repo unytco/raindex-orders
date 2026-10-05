@@ -14,7 +14,7 @@
 		$transactionStore.status === TransactionStatus.PENDING_WALLET ||
 		$transactionStore.status === TransactionStatus.PENDING_TX
 
-	function unescapeString(str) {
+	function unescapeString(str: string) {
 		return str
 			.replace(/\\n/g, '\n')
 			.replace(/\\'/g, "'")

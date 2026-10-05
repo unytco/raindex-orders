@@ -66,3 +66,8 @@ export function holochainKeyTo32ByteHex(holoKey: string): string {
 
 	return `0x${hexString}`
 }
+
+/** The message a thrown value carries, as wallets throw plain objects as well as Errors. */
+export function errorMessage(error: unknown, fallback: string): string {
+	return (error as { message?: string } | null)?.message || fallback
+}

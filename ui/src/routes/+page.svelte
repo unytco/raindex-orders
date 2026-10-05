@@ -24,7 +24,7 @@
 
 <Card size="xl" class="flex flex-col gap-6">
 	<div class="text-center">
-		<h1 class="text-3xl font-bold mb-2">Bridge Home</h1>
+		<h1 class="mb-2 text-3xl font-bold">Bridge Home</h1>
 		<p class="text-gray-600">Bridge between Blockchain and Mirrored-Units on Unyt</p>
 	</div>
 
@@ -32,13 +32,13 @@
 		<Alert color="blue" class="text-center">Connect your wallet to get started</Alert>
 		<Button class="w-full" on:click={handleConnect}>Connect Wallet</Button>
 	{:else}
-		<div class="bg-gray-50 p-4 rounded-lg text-center">
+		<div class="rounded-lg bg-gray-50 p-4 text-center">
 			<p class="text-sm text-gray-600">Connected</p>
 			<p class="font-mono font-semibold">{truncateAddress(account || '')}</p>
 			{#if isWrongNetwork}
-				<p class="text-sm text-red-500 mt-1">Wrong network - please switch to Sepolia</p>
+				<p class="mt-1 text-sm text-red-500">Wrong network - please switch to Sepolia</p>
 			{:else}
-				<p class="text-sm text-green-600 mt-1">Sepolia Testnet</p>
+				<p class="mt-1 text-sm text-green-600">Sepolia Testnet</p>
 			{/if}
 		</div>
 

@@ -1,8 +1,6 @@
 <script lang="ts">
 	import { Card } from 'flowbite-svelte'
 	import CopyableUrl from './CopyableUrl.svelte'
-	import SepoliaFaucetLink from './SepoliaFaucetLink.svelte'
-	import HotFaucetLink from './HotFaucetLink.svelte'
 </script>
 
 <aside class="w-full lg:w-72">

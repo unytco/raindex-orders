@@ -51,7 +51,7 @@ export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig 
 export const serializeSignedContext = (signedContext: SignedContextV1Struct): string => {
 	// we can't use JSON.stringify because the context is an array of BigInts
 	// but we need to serialize all of it as a string
-	const serialized = signedContext.context.map((n) => n.toString()).join(',')
+	const serialized = signedContext.context.map(n => n.toString()).join(',')
 	return `${signedContext.signer},${signedContext.signature},${serialized}`
 }
 
@@ -60,6 +60,6 @@ export const deserializeSignedContext = (serialized: string): SignedContextV1Str
 	return {
 		signer: signer as Hex,
 		signature: signature as Hex,
-		context: context.map((n) => BigInt(n))
+		context: context.map(n => BigInt(n))
 	}
 }

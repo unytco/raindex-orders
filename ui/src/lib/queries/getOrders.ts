@@ -1,4 +1,4 @@
-import type { Hex } from "viem"
+import type { Hex } from 'viem'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const getOrders = async (orderHash: Hex, subgraphUrl: string): Promise<any> => {

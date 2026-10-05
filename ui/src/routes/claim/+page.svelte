@@ -16,11 +16,11 @@
 		readContract,
 		waitForTransaction
 	} from '$lib/ethereum'
+	import { errorMessage } from '$lib/utils'
 	import { onMount } from 'svelte'
 	import { browser } from '$app/environment'
 
 	$: isConnected = $ethereumStore.isConnected
-	$: account = $ethereumStore.account
 
 	// Coupon input (for manual entry)
 	let couponInput = ''
@@ -81,7 +81,7 @@
 		try {
 			const exists = await readContract({
 				address: PUBLIC_ORDERBOOK_ADDRESS,
-				abi: orderbookAbi as any[],
+				abi: orderbookAbi,
 				functionName: 'orderExists',
 				args: [orderHash]
 			})
@@ -101,7 +101,7 @@
 		try {
 			const balance = await readContract({
 				address: PUBLIC_ORDERBOOK_ADDRESS,
-				abi: orderbookAbi as any[],
+				abi: orderbookAbi,
 				functionName: 'vaultBalance',
 				args: [orderConfig.owner, orderConfig.outputToken, orderConfig.outputVaultId]
 			})
@@ -151,7 +151,7 @@
 
 			const hash = await writeContract({
 				address: PUBLIC_ORDERBOOK_ADDRESS,
-				abi: orderbookAbi as any[],
+				abi: orderbookAbi,
 				functionName: 'takeOrders',
 				args: [takeOrdersConfig]
 			})
@@ -165,8 +165,8 @@
 				successTxHash = hash
 				await getVaultBalance()
 			}
-		} catch (e: any) {
-			error = e?.message || 'Claim failed'
+		} catch (e) {
+			error = errorMessage(e, 'Claim failed')
 			transactionStore.transactionError({ message: error })
 			console.error(e)
 		} finally {
@@ -201,7 +201,7 @@
 
 				<span class="text-gray-600">Recipient:</span>
 				<a
-					class="font-mono hover:underline text-blue-600"
+					class="font-mono text-blue-600 hover:underline"
 					href={`https://sepolia.etherscan.io/address/${coupon.recipient}`}
 					target="_blank"
 				>
@@ -224,7 +224,7 @@
 					<Label for="coupon" class="mb-2">Claim Coupon</Label>
 					{#if couponPrefilledFromUrl}
 						<div
-							class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default break-all"
+							class="block w-full cursor-default select-none break-all rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
 							style="user-select: none; -webkit-user-select: none;"
 							aria-readonly="true"
 						>
@@ -247,13 +247,13 @@
 						<Spinner size="16" />
 					</div>
 				{:else if coupon && orderConfig && orderExists}
-					<div class="bg-gray-50 p-4 rounded-lg space-y-2">
-						<h3 class="font-semibold mb-2">Coupon Details</h3>
+					<div class="space-y-2 rounded-lg bg-gray-50 p-4">
+						<h3 class="mb-2 font-semibold">Coupon Details</h3>
 
 						<div class="grid grid-cols-2 gap-2 text-sm">
 							<span class="text-gray-600">Recipient:</span>
 							<a
-								class="font-mono hover:underline text-blue-600"
+								class="font-mono text-blue-600 hover:underline"
 								href={`https://sepolia.etherscan.io/address/${coupon.recipient}`}
 								target="_blank"
 							>

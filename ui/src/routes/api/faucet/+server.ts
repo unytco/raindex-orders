@@ -42,10 +42,9 @@ const FAUCET_AMOUNT = parseEther('1000') // 1000 HOT
 function requireFaucetEnv(): { privateKey: `0x${string}`; rpcUrl: string } {
 	const privateKey = env.FAUCET_PRIVATE_KEY
 	const rpcUrl = env.SEPOLIA_RPC_URL
-	const missing = [
-		!privateKey && 'FAUCET_PRIVATE_KEY',
-		!rpcUrl && 'SEPOLIA_RPC_URL'
-	].filter(Boolean)
+	const missing = [!privateKey && 'FAUCET_PRIVATE_KEY', !rpcUrl && 'SEPOLIA_RPC_URL'].filter(
+		Boolean
+	)
 	if (missing.length > 0) {
 		throw new Error(`Missing ${missing.join(', ')}`)
 	}

@@ -17,7 +17,7 @@
 		writeContract,
 		waitForTransaction
 	} from '$lib/ethereum'
-	import { isHolochainKey, holochainKeyTo32ByteHex } from '$lib/utils'
+	import { isHolochainKey, holochainKeyTo32ByteHex, errorMessage } from '$lib/utils'
 
 	// Form state
 	let amount = ''
@@ -33,7 +33,6 @@
 	let tokenBalance: bigint = 0n
 	let tokenAllowance: bigint = 0n
 	let minLockAmount: bigint = 0n
-	let vaultBalance: bigint = 0n
 	let tokenSymbol = 'HOT'
 	let tokenDecimals = 18
 
@@ -90,13 +89,6 @@
 				address: lockVaultAddress,
 				abi: holoLockVaultAbi,
 				functionName: 'minLockAmount'
-			})) as bigint
-
-			// Fetch vault balance
-			vaultBalance = (await readContract({
-				address: lockVaultAddress,
-				abi: holoLockVaultAbi,
-				functionName: 'vaultBalance'
 			})) as bigint
 		} catch (e) {
 			console.error('Error fetching contract data:', e)
@@ -230,9 +222,8 @@
 				lockReceipt = { amount: `${formatToken(amountWei, tokenDecimals)} ${tokenSymbol}`, hash }
 				await fetchContractData()
 			}
-		} catch (e: any) {
-			const message = e?.message || 'Transaction failed'
-			error = message
+		} catch (e) {
+			error = errorMessage(e, 'Transaction failed')
 			transactionStore.transactionError({ message: error })
 			console.error(e)
 		} finally {
@@ -240,7 +231,6 @@
 		}
 	}
 
-	$: amountWei = amount ? parseUnits(amount, tokenDecimals) : 0n
 	$: hasValidAgent = !!agentHex
 	let showConnectModal = false
 	async function handleConnect() {
@@ -280,7 +270,7 @@
 		{:else}
 			<div class="space-y-4">
 				<!-- Balance Info -->
-				<div class="bg-gray-50 p-4 rounded-lg">
+				<div class="rounded-lg bg-gray-50 p-4">
 					<p class="text-sm text-gray-600">Your {tokenSymbol} Balance</p>
 					<p class="text-xl font-semibold">
 						{formatToken(tokenBalance, tokenDecimals)}
@@ -293,7 +283,7 @@
 					<Label for="amount" class="mb-2">Amount to Lock</Label>
 					{#if amountPrefilledFromUrl}
 						<div
-							class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default"
+							class="block w-full cursor-default select-none rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
 							style="user-select: none; -webkit-user-select: none;"
 							aria-readonly="true"
 						>
@@ -320,7 +310,7 @@
 					<Label for="agent" class="mb-2">Unyt Agent Public Key (Holochain key)</Label>
 					{#if agentPrefilledFromUrl}
 						<div
-							class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default break-all"
+							class="block w-full cursor-default select-none break-all rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
 							style="user-select: none; -webkit-user-select: none;"
 							aria-readonly="true"
 						>
@@ -349,7 +339,7 @@
 						>
 							<div>
 								<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain key</p>
-								<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
+								<p class="break-all text-base font-semibold text-gray-900 dark:text-white">
 									{agentInput}
 								</p>
 							</div>
@@ -357,7 +347,7 @@
 								<p class="text-xs font-medium text-gray-500 dark:text-gray-400">
 									Ethereum (hex, used for lock)
 								</p>
-								<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
+								<p class="break-all text-base font-semibold text-gray-900 dark:text-white">
 									{agentHex}
 								</p>
 							</div>
@@ -387,21 +377,6 @@
 						Lock {tokenSymbol}
 					</Button>
 				</div>
-
-				<!-- Vault Info -->
-				<!-- <div class="mt-4 pt-4 border-t">
-					<p class="text-sm text-gray-500">
-						Vault Balance: {formatUnits(vaultBalance, tokenDecimals)}
-						{tokenSymbol}
-					</p>
-					<p class="text-xs text-gray-400 mt-1">
-						Lock Vault: <a
-							href={`https://sepolia.etherscan.io/address/${lockVaultAddress}`}
-							target="_blank"
-							class="hover:underline">{lockVaultAddress.slice(0, 10)}...{lockVaultAddress.slice(-8)}</a
-						>
-					</p>
-				</div> -->
 			</div>
 		{/if}
 	{/if}

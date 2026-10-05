@@ -13,7 +13,7 @@
 	<h1 class="text-2xl font-bold">{title}</h1>
 	<p class="text-center text-gray-600">{message}</p>
 
-	<div class="bg-gray-50 p-4 rounded-lg space-y-2 w-full max-w-md">
+	<div class="w-full max-w-md space-y-2 rounded-lg bg-gray-50 p-4">
 		<div class="grid grid-cols-2 gap-2 text-sm">
 			<slot />
 		</div>
