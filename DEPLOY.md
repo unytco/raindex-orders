@@ -42,7 +42,7 @@ The `deploy-sepolia.sh` script handles all deployment steps:
 # Step 3: Mint test tokens to your wallet
 ./deploy-sepolia.sh mint --account deployer
 
-# Step 4: Deploy claim order via HoloLockVault, accepting coupons from
+# Step 5: Deploy claim order via HoloLockVault, accepting coupons from
 # VALID_SIGNER (the test signer unless set)
 ./deploy-sepolia.sh order-via-vault --account deployer
 # Note: Updates .env with ORDER_HASH and ORDER_OWNER automatically
@@ -85,13 +85,13 @@ VALID_SIGNER=<the coupon signer's address> \
 
 ### Rehearse it first
 
-`test/fork-rehearsal.sh` runs `deploy-mainnet.sh` and `rotate-claim-signer.sh`, unchanged, against anvil forks of mainnet. Every transaction goes to the anvil it starts on 127.0.0.1.
+`test/fork-rehearsal.sh` runs `deploy-mainnet.sh` and `rotate-claim-signer.sh`, unchanged, against an anvil fork of mainnet. Every transaction goes to an anvil it starts on 127.0.0.1.
 
 ```bash
-nix develop -c test/fork-rehearsal.sh   # FORK_URL sets the mainnet RPC anvil forks
+nix develop -c test/fork-rehearsal.sh   # FORK_URL sets the mainnet RPC that anvil forks
 ```
 
-It proves on the fork that the deploy refuses another chain, a missing input, a raw key and the test signer while sending nothing. Then it deploys, and proves that a lock lands in the vault, that a coupon signed as the orchestrator signs claims it back, and that nonce reuse, a wrong signer and an expired coupon fail. It proves that the admin is `ADMIN_ADDRESS` and the deployer is locked out. Last, it moves the vault admin and the coupon signer to 2 of 3 Safes, as [docs/enable-multisig.md](./docs/enable-multisig.md) describes, and proves that a coupon with two owner signatures claims and one with a single signature fails.
+It proves that the deploy sends nothing while it refuses a chain other than 1 (a plain anvil on chain 31337), a missing input, a raw key, the deployer as admin and the test signer. Then it deploys on the fork, and proves that a lock lands in the vault, that a coupon signed as the orchestrator signs claims it back, and that nonce reuse, a wrong signer and an expired coupon fail. It proves that the admin is `ADMIN_ADDRESS` and the deployer is locked out. Last, it moves the vault admin and the coupon signer to 2 of 3 Safes, as [docs/enable-multisig.md](./docs/enable-multisig.md) describes, and proves that a coupon with two owner signatures claims and one with a single signature fails. The rotation's record is refused for a signer the new order does not accept.
 
 ### Website
 
@@ -190,11 +190,11 @@ SvelteKit web interface:
 - `/lock` - Lock HOT to receive bridged HOT
 - `/claim` - Claim HOT with coupon
 - `/claim?c=<coupon>` - Direct claim via URL parameter
-- `POST /api/coupon-status` - Status of up to 20 claim coupons, read from the build's network through its RPC secret
+- `POST /api/coupon-status`: the status of up to 20 claim coupons, read from the build's network through its RPC secret
 
 #### What bounds coupon-status RPC use
 
-- **Signature gate.** A coupon is read only if it names the claim order's signer (`valid-signer` in `src/holo-claim.rain`, `PUBLIC_CLAIM_SIGNER` in the build) and carries a signature that signer gives, checked as the orderbook checks it. A 65-byte signature must recover to the signer, and any other coupon of that form answers `invalid` and is never read. A signature of 2 to 20 owners' length is a contract signer's, such as a Safe's: the signer's EIP-1271 `isValidSignature` checks it in the same `eth_call` that reads the nonces, so such a coupon causes a read even when it answers `invalid`. A coupon signer Safe therefore needs a threshold of 2 or more.
+- **Signature gate.** A coupon is read only if it names the claim order's signer (`valid-signer` in `src/holo-claim.rain`, `PUBLIC_CLAIM_SIGNER` in the build) and carries a signature that signer gives, checked as the orderbook checks it. A 65-byte signature must recover to the signer, and any other coupon of that form answers `invalid` and is never read. A signature of 2 to 20 owner parts, each a key's 65-byte signature, is a contract signer's, such as a Safe's: the signer's EIP-1271 `isValidSignature` checks it in the same `eth_call` that reads the nonces. Such a coupon causes a read even when it answers `invalid`, until a check finds that the claim signer has no code; from then on that Worker isolate answers such coupons `invalid` without a read. A coupon signer Safe needs a threshold of 2 or more, as a 65-byte signature is read as a key's.
 - **Cache.** Answers are kept in the Workers Cache, keyed by the coupon's signer, signature and context values, so a coupon respelled with other hex case or leading zeros shares its entry. `redeemed` and `expired` are kept from then on. `unredeemed` is kept for 60 s, and never once the coupon's expiry has passed. The Workers Cache is local to each Cloudflare data centre, so each data centre reads a coupon once for itself. A cache read or write that fails is logged and costs only a read; it never changes an answer.
 - **One read at most.** A request makes at most one `eth_call` to its network's RPC secret, `SEPOLIA_RPC_URL` or `ETH_RPC_URL`: one Multicall3 `aggregate3` at the `safe` block, reading each uncached nonce once. A request the cache answers in full, or with no valid coupon, makes none, and its `block` is `null`. An RPC that answers for another chain is refused.
 

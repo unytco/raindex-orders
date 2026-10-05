@@ -10,22 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - the MainNet bridge website has no faucet: its faucet page and API answer 404, and no faucet link shows.
-- `POST /api/coupon-status` accepts a coupon from a contract signer, such as a Safe, checked on chain through its EIP-1271 `isValidSignature`.
-- `deploy-mainnet.sh` deploys the bridge on Ethereum mainnet from a Ledger or an encrypted keystore: the vault, its claim order and the handover to `ADMIN_ADDRESS`, then prints the deploy record. It refuses another chain, a missing input and the test signer.
-- `rotate-claim-signer.sh` replaces the claim order with one that accepts coupons from a new signer, such as a Safe, and prints the calls to execute when the vault admin is a Safe.
-- `test/fork-rehearsal.sh` rehearses the mainnet deploy, and the move of the vault admin and the coupon signer to Safes, on an anvil fork of mainnet.
-- the bridge UI answers `POST /api/coupon-status` with each claim coupon's status on Sepolia (`redeemed`, `unredeemed`, `expired` or `invalid`), up to 20 coupons and 64 KB per request, open to any origin. Only coupons signed by the claim order's signer are read, at the `safe` block, in at most one RPC call per request. `redeemed` and `expired` answers are kept in the Worker's cache, and `unredeemed` ones for 60 s; `block` is `null` when a request needed no read.
+- `POST /api/coupon-status` accepts a coupon signed by a Safe as the claim signer.
+- `deploy-mainnet.sh` deploys the bridge on Ethereum mainnet from a Ledger or an encrypted keystore, and prints the deploy record.
+- `rotate-claim-signer.sh` moves the claim order to a new coupon signer, such as a Safe.
+- the bridge UI answers `POST /api/coupon-status` with each claim coupon's status on its network (`redeemed`, `unredeemed`, `expired` or `invalid`), up to 20 coupons and 64 KB per request, open to any origin. Coupons are read at the `safe` block, in at most one RPC call per request. `redeemed` and `expired` answers are kept in the Worker's cache, and `unredeemed` ones for 60 s; `block` is `null` when a request needed no read.
 - bridge-orchestrator reports its unclassified-error streak (`unclassified_active` / `unclassified_consecutive`) to watchtower alongside the source-chain-pressure pair, so a persistent unknown failure is visible to watchtower instead of only in log events.
 - CI runs the bridge-orchestrator Rust suite (`.github/workflows/rust.yml`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`) on the crate's pinned toolchain.
 - bridge-orchestrator signs zome calls via lair (`CONDUCTOR_CONFIG` + `LAIR_PASSPHRASE_FILE`, defaulting to the fleet paths), committing no capability grant per connect. A node that cannot offer lair stops the orchestrator at startup with the reason instead of writing to the bridging agent's chain.
 
 ### Changed
 
-- the bridge website builds for TestNet or MainNet from `PUBLIC_NETWORK` and its build variables, naming its network, token and explorer to match, and a build with a missing or malformed value, or the test signer on MainNet, fails.
+- the bridge website builds for TestNet or MainNet from `PUBLIC_NETWORK`, naming its network, token and explorer to match.
 - Lock and Claim show the network switch, and send nothing, while the wallet is on another chain.
 - `POST /api/coupon-status` reads its own network's chain through that network's RPC secret.
-- `compose-rainlang.mjs` takes the network, the subparser and the coupon signer as inputs, and refuses the test signer on mainnet.
-- `deploy-sepolia.sh` signs with `--account` or `--ledger`, and refuses a private key in `.env` or on the command line.
+- `deploy-sepolia.sh` signs with `--account` or `--ledger`, never a private key.
 - bridge-orchestrator runs on the network `NETWORK` names, mainnet or sepolia, and refuses to start when its chain, vault or claim order do not match it, or it is given the test signer on mainnet.
 - bridge-orchestrator bridges on the one lane that names its agent and lists the unit in `HOT_UNIT_INDEX`, and will not start while `HOLOCHAIN_LANE_DEFINITION` or `HOLOCHAIN_UNIT_INDEX` is set.
 - the lair requirement is `ham`'s decision, supplied with the orchestrator's two paths, rather than restated here. A refusal names the fault before the reason the node could not offer lair.
