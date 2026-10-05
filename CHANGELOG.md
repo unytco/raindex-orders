@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- the Lock and Claim pages show an error, not a success screen, for a transaction that reverted.
 - the claim page recognises a coupon whose order hash starts with a zero, and links a recipient address that starts with one.
 - the bridge UI's faucet answers a failed RPC call with a fixed error instead of the RPC error text, which held the full `SEPOLIA_RPC_URL` and any API key in it.
 - bridge-orchestrator gives each withdrawal coupon a nonce derived from its withdrawal's transaction ID, so coupons signed in the same second can all be claimed, and a withdrawal signed again cannot be claimed twice.

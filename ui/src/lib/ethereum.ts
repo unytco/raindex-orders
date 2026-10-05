@@ -164,6 +164,7 @@ export async function switchNetwork(): Promise<boolean> {
 	}
 }
 
+/** The receipt of `txHash` once it is mined, or an error if the transaction reverted. */
 export async function waitForTransaction(txHash: string): Promise<unknown> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
@@ -171,15 +172,17 @@ export async function waitForTransaction(txHash: string): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const checkReceipt = async () => {
 			try {
-				const receipt = await eth.request({
+				const receipt = (await eth.request({
 					method: 'eth_getTransactionReceipt',
 					params: [txHash]
-				})
+				})) as { status?: string } | null
 
-				if (receipt) {
+				if (!receipt) {
+					setTimeout(checkReceipt, 2000)
+				} else if (receipt.status === '0x1') {
 					resolve(receipt)
 				} else {
-					setTimeout(checkReceipt, 2000)
+					reject(new Error(`Transaction ${txHash} reverted`))
 				}
 			} catch (err) {
 				reject(err)
