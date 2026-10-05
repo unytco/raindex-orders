@@ -28,8 +28,10 @@ sent_since "$started" "$run_file" || die "forge sent nothing."
 
 echo "Sent:"
 landed "$run_file"
-vault=$(jq -r '[.transactions[] | select(.transactionType == "CREATE" and .contractName == "HoloLockVault")][0].contractAddress // empty' "$run_file")
+vault=$(jq -r '[.transactions[] | select(.transactionType == "CREATE" and .contractName == "HoloLockVault")][0].contractAddress // empty' "$run_file" 2>/dev/null) || true
 block=$(first_block "$run_file")
+record="forge script $script --rpc-url \$ETH_RPC_URL --sig 'record(address,uint256)'"
 [[ $vault =~ ^0x[0-9a-fA-F]{40}$ && $block =~ ^[1-9][0-9]*$ ]] ||
-	die "Read the vault and its block from $run_file, then run: forge script $script --rpc-url \$ETH_RPC_URL --sig 'record(address,uint256)' <vault> <block>"
-forge script "$script" --rpc-url "$ETH_RPC_URL" --sig 'record(address,uint256)' "$vault" "$block"
+	die "The deploy landed. Do not run this again. Read the vault and its block from $run_file, then run: $record <vault> <block>"
+forge script "$script" --rpc-url "$ETH_RPC_URL" --sig 'record(address,uint256)' "$vault" "$block" ||
+	die "The deploy landed: vault $vault from block $block. Do not run this again. Fix the above, then run: $record $vault $block"

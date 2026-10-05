@@ -52,6 +52,6 @@ landed() {
 # The block, in decimal, of the first transaction forge sent, or nothing.
 first_block() {
 	local hex
-	hex=$(jq -r '.receipts[0].blockNumber // empty' "$1")
-	[[ $hex =~ ^0x[0-9a-fA-F]+$ ]] && printf '%d\n' "$hex"
+	hex=$(jq -r '.receipts[0].blockNumber // empty' "$1" 2>/dev/null) || true
+	if [[ $hex =~ ^0x[0-9a-fA-F]+$ ]]; then printf '%d\n' "$hex"; fi
 }

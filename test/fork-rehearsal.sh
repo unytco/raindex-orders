@@ -124,7 +124,8 @@ order_hash=$(record_value ORDER_HASH "$work/deploy.log")
 interpreter=$(record_value PUBLIC_CLAIM_INTERPRETER "$work/deploy.log")
 store=$(record_value PUBLIC_CLAIM_STORE "$work/deploy.log")
 expression=$(record_value PUBLIC_CLAIM_EXPRESSION "$work/deploy.log")
-[[ -n $vault && -n $order_hash && -n $expression ]] || fail "the deploy printed no deploy record"
+[[ -n $vault && -n $order_hash && -n $interpreter && -n $store && -n $expression ]] ||
+	fail "the deploy printed no complete deploy record"
 
 proofs() {
 	REHEARSAL=true REHEARSAL_RPC_URL=$fork MAINNET_LOCK_VAULT_ADDRESS=$vault \
@@ -141,19 +142,20 @@ safe() {
 		--private-key "$deployer_key" "$@"
 }
 create_safe() {
-	local salt=$1 owners=() key
-	shift
+	local threshold=$1 salt=$2 owners=() key
+	shift 2
 	for key in "$@"; do owners+=("$(address_of "$key")"); done
-	safe --sig 'create(address[],uint256)' "[$(IFS=,; echo "${owners[*]}")]" "$salt" |
-		grep -oE 'SAFE=0x[0-9a-fA-F]{40}' | cut -d= -f2
+	safe --sig 'create(address[],uint256,uint256)' "[$(IFS=,; echo "${owners[*]}")]" "$threshold" "$salt" |
+		grep -oE 'SAFE=0x[0-9a-fA-F]{40}' | cut -d= -f2 || true
 }
 admin_owner_keys=("${keys[4]}" "${keys[5]}" "${keys[6]}")
 signer_owner_keys=("${keys[7]}" "${keys[8]}" "${keys[9]}")
 
-step "Creating two Safes on the fork, each 2 of 3 anvil accounts"
-admin_safe=$(create_safe 1 "${admin_owner_keys[@]}")
-signer_safe=$(create_safe 2 "${signer_owner_keys[@]}")
-[[ -n $admin_safe && -n $signer_safe ]] || fail "a Safe was not created"
+step "Creating Safes of 3 anvil accounts on the fork: two that need 2 signatures, one that needs 1"
+admin_safe=$(create_safe 2 1 "${admin_owner_keys[@]}")
+signer_safe=$(create_safe 2 2 "${signer_owner_keys[@]}")
+single_safe=$(create_safe 1 3 "${signer_owner_keys[@]}")
+[[ -n $admin_safe && -n $signer_safe && -n $single_safe ]] || fail "a Safe was not created"
 echo "admin Safe $admin_safe, signer Safe $signer_safe"
 
 step "Moving the vault admin to the admin Safe, then acting through it with 2 owner signatures"
@@ -175,16 +177,40 @@ if env "${rotation[@]}" VALID_SIGNER="$test_signer" ./rotate-claim-signer.sh >"$
 fi
 grep -qF "VALID_SIGNER is the test signer" "$work/refusal.log" || fail "rotate-claim-signer.sh refused without naming the test signer"
 echo "refused: the test signer as the new coupon signer"
+if env "${rotation[@]}" VALID_SIGNER="$single_safe" ./rotate-claim-signer.sh >"$work/refusal.log" 2>&1; then
+	fail "rotate-claim-signer.sh took a Safe of threshold 1"
+fi
+grep -qF "threshold is not 2 to 20" "$work/refusal.log" || fail "rotate-claim-signer.sh refused a threshold 1 Safe without naming it"
+echo "refused: a Safe of threshold 1 as the new coupon signer"
+safe_calls() { grep -oE '[0-9]+\. to 0x[0-9a-fA-F]{40}, value 0, data 0x[0-9a-fA-F]+' "$1" || true; }
+# Executes each printed call from the admin Safe, signed by two of its owners.
+execute() {
+	local call to data
+	for call in "$@"; do
+		to=$(grep -oE 'to 0x[0-9a-fA-F]{40}' <<<"$call" | cut -d' ' -f2)
+		data=$(grep -oE 'data 0x[0-9a-fA-F]+' <<<"$call" | cut -d' ' -f2)
+		REHEARSAL_OWNER_KEYS="${admin_owner_keys[0]},${admin_owner_keys[2]}" safe \
+			--sig 'exec(address,address,bytes)' "$admin_safe" "$to" "$data" >/dev/null
+	done
+}
 env "${rotation[@]}" ./rotate-claim-signer.sh | tee "$work/rotate.log"
-mapfile -t calls < <(grep -oE '[0-9]+\. to 0x[0-9a-fA-F]{40}, value 0, data 0x[0-9a-fA-F]+' "$work/rotate.log")
+mapfile -t calls < <(safe_calls "$work/rotate.log")
 [[ ${#calls[@]} == 2 ]] || fail "rotate-claim-signer.sh did not print the 2 Safe calls"
+
+env "${rotation[@]}" VALID_SIGNER="$signer" ./rotate-claim-signer.sh >"$work/rogue.log"
+mapfile -t rogue < <(safe_calls "$work/rogue.log")
+snapshot=$(cast rpc evm_snapshot --rpc-url "$fork" | tr -d '"')
 from_block=$(($(cast block-number --rpc-url "$fork") + 1))
-for call in "${calls[@]}"; do
-	to=$(grep -oE 'to 0x[0-9a-fA-F]{40}' <<<"$call" | cut -d' ' -f2)
-	data=$(grep -oE 'data 0x[0-9a-fA-F]+' <<<"$call" | cut -d' ' -f2)
-	REHEARSAL_OWNER_KEYS="${admin_owner_keys[0]},${admin_owner_keys[2]}" safe \
-		--sig 'exec(address,address,bytes)' "$admin_safe" "$to" "$data" >/dev/null
-done
+execute "${rogue[0]}" "${calls[@]}"
+if env "${rotation[@]}" ./rotate-claim-signer.sh record "$from_block" >"$work/refusal.log" 2>&1; then
+	fail "the record passed with a second order of the vault's on the orderbook"
+fi
+grep -qF "the vault holds another order" "$work/refusal.log" || fail "the record refused a second order without naming it"
+echo "refused: a record while a second order the Safe added is on the orderbook"
+[[ $(cast rpc evm_revert "$snapshot" --rpc-url "$fork") == true ]] || fail "the fork did not revert to before the second order"
+
+from_block=$(($(cast block-number --rpc-url "$fork") + 1))
+execute "${calls[@]}"
 if env "${rotation[@]}" VALID_SIGNER="$signer" ./rotate-claim-signer.sh record "$from_block" >"$work/refusal.log" 2>&1; then
 	fail "the record named a signer the new claim order does not accept"
 fi
@@ -193,14 +219,18 @@ grep -qF "is not the claim expression for VALID_SIGNER" "$work/refusal.log" ||
 echo "refused: a record naming a signer the claim order does not accept"
 env "${rotation[@]}" ./rotate-claim-signer.sh record "$from_block" | tee "$work/rotated.log"
 new_order_hash=$(record_value ORDER_HASH "$work/rotated.log")
+new_interpreter=$(record_value PUBLIC_CLAIM_INTERPRETER "$work/rotated.log")
+new_store=$(record_value PUBLIC_CLAIM_STORE "$work/rotated.log")
+new_expression=$(record_value PUBLIC_CLAIM_EXPRESSION "$work/rotated.log")
+[[ -n $new_order_hash && -n $new_interpreter && -n $new_store && -n $new_expression ]] ||
+	fail "the rotation printed no complete deploy record"
 [[ $(record_value PUBLIC_CLAIM_SIGNER "$work/rotated.log") == "$signer_safe" ]] ||
 	fail "the new deploy record does not name the signer Safe"
 
 step "Proving the Safe admin and the Safe coupon signer on the fork"
 ORDER_HASH=$new_order_hash PREVIOUS_ORDER_HASH=$order_hash \
-	PUBLIC_CLAIM_INTERPRETER=$(record_value PUBLIC_CLAIM_INTERPRETER "$work/rotated.log") \
-	PUBLIC_CLAIM_STORE=$(record_value PUBLIC_CLAIM_STORE "$work/rotated.log") \
-	PUBLIC_CLAIM_EXPRESSION=$(record_value PUBLIC_CLAIM_EXPRESSION "$work/rotated.log") \
+	PUBLIC_CLAIM_INTERPRETER=$new_interpreter PUBLIC_CLAIM_STORE=$new_store \
+	PUBLIC_CLAIM_EXPRESSION=$new_expression \
 	ADMIN_SAFE=$admin_safe SIGNER_SAFE=$signer_safe REHEARSAL_MIN_LOCK_AMOUNT=$min_lock_amount \
 	REHEARSAL_SIGNER_OWNER_KEYS="${signer_owner_keys[1]},${signer_owner_keys[2]}" \
 	REHEARSAL_SIGNER_ONE_OWNER_KEY="${signer_owner_keys[0]}" \

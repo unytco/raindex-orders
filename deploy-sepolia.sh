@@ -54,6 +54,11 @@ fi
 STEP="${1:-status}"
 shift || true
 WALLET=("$@")
+if [ "$STEP" != "status" ]; then
+    CHAIN_ID=$(cast chain-id --rpc-url "$SEPOLIA_RPC_URL") || die "SEPOLIA_RPC_URL did not answer"
+    [ "$CHAIN_ID" = 11155111 ] || die "SEPOLIA_RPC_URL answers for chain $CHAIN_ID, not Sepolia"
+fi
+
 if [ ${#WALLET[@]} -gt 0 ] || [ "$STEP" != "status" ]; then
     require_wallet "${WALLET[@]}"
     WALLET_ADDRESS=$(cast wallet address "${WALLET[@]}")
@@ -165,10 +170,10 @@ deploy_order_via_vault() {
 
     BROADCAST_FILE="${FOUNDRY_BROADCAST:-broadcast}/DeployClaimOrderViaVault.s.sol/11155111/run-latest.json"
     STARTED=$(mktemp)
+    trap 'rm -f "$STARTED"' EXIT
     NETWORK=sepolia LOCK_VAULT_ADDRESS="$LOCK_VAULT_ADDRESS" VALID_SIGNER="$VALID_SIGNER" \
         broadcast script/DeployClaimOrderViaVault.s.sol:DeployClaimOrderViaVault
     sent_since "$STARTED" "$BROADCAST_FILE" || die "forge sent nothing: is the vault admin a Safe?"
-    rm -f "$STARTED"
 
     # The order hash is the fourth word of the orderbook's AddOrder event data.
     ORDER_HASH_VAL=$(jq -r '.receipts[0].logs[] | select(.topics[0] == "0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf") | .data' "$BROADCAST_FILE" | cut -c195-258 | sed 's/^/0x/')
@@ -180,9 +185,7 @@ deploy_order_via_vault() {
         sed -i "s|^ORDER_OWNER=.*|ORDER_OWNER=$LOCK_VAULT_ADDRESS|" .env
         echo -e "${GREEN}Updated .env with ORDER_HASH and ORDER_OWNER (vault address)${NC}"
     else
-        echo -e "${YELLOW}Order deployed but could not extract hash from broadcast file${NC}"
-        echo "Check the transaction on Etherscan to get the order hash"
-        echo "Remember: ORDER_OWNER should be set to $LOCK_VAULT_ADDRESS"
+        die "The order was added, but its hash is not in $BROADCAST_FILE. Take ORDER_HASH from the transaction on Etherscan, and set ORDER_OWNER to $LOCK_VAULT_ADDRESS."
     fi
 }
 

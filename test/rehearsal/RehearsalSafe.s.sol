@@ -6,10 +6,10 @@ import {ISafe, LibSafe, SAFE_PROXY_FACTORY, SAFE_SINGLETON} from "./Safe.sol";
 
 /// Safe transactions for test/fork-rehearsal.sh, sent to its anvil fork only.
 contract RehearsalSafe is Script {
-    /// Creates a Safe of `owners` that needs 2 of their signatures.
-    function create(address[] calldata owners, uint256 salt) external {
+    function create(address[] calldata owners, uint256 threshold, uint256 salt) external {
         vm.startBroadcast();
-        address safe = SAFE_PROXY_FACTORY.createProxyWithNonce(SAFE_SINGLETON, LibSafe.setupCall(owners, 2), salt);
+        address safe =
+            SAFE_PROXY_FACTORY.createProxyWithNonce(SAFE_SINGLETON, LibSafe.setupCall(owners, threshold), salt);
         vm.stopBroadcast();
         console2.log(string.concat("SAFE=", vm.toString(safe)));
     }

@@ -50,5 +50,6 @@ fi
 echo "Sent:"
 landed "$run_file"
 block=$(first_block "$run_file")
-[[ -n $block ]] || die "Read the first call's block from $run_file, then run: $0 record <block>"
-forge script "$script" --rpc-url "$rpc_url" --sig 'record(uint256)' "$block"
+[[ -n $block ]] || die "The calls landed. Read the first call's block from $run_file, then run: $0 record <block>"
+forge script "$script" --rpc-url "$rpc_url" --sig 'record(uint256)' "$block" ||
+	die "The calls landed from block $block. Fix the above, then run: $0 record $block"

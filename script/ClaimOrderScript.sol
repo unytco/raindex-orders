@@ -22,8 +22,14 @@ import {
     HOLO_VAULT_ID
 } from "src/Constants.sol";
 
-interface GetParser {
+interface ExpressionDeployerParts {
     function iParser() external view returns (IParserV1);
+    function iInterpreter() external view returns (address);
+    function iStore() external view returns (address);
+}
+
+interface SafeThreshold {
+    function getThreshold() external view returns (uint256);
 }
 
 /// One network's claim order: where it is added, what parses it, and the input
@@ -95,12 +101,22 @@ abstract contract ClaimOrderScript is Script {
         );
     }
 
-    function requireSigner(ClaimNetwork memory net, address signer) internal pure {
+    /// Refuses the test signer on mainnet, and a Safe whose signatures the website
+    /// cannot read: it reads 2 to 20 owner signatures, and 65 bytes as a key's.
+    function requireSigner(ClaimNetwork memory net, address signer) internal view {
         require(signer != address(0), "VALID_SIGNER must be a nonzero address");
         require(
             net.chainId != 1 || signer != TEST_SIGNER_ADDRESS,
             "VALID_SIGNER is the test signer, whose key is public: mainnet refuses it"
         );
+        if (signer.code.length > 0) {
+            (bool isSafe, bytes memory threshold) = signer.staticcall(abi.encodeCall(SafeThreshold.getThreshold, ()));
+            require(
+                !isSafe || threshold.length != 32
+                    || (abi.decode(threshold, (uint256)) >= 2 && abi.decode(threshold, (uint256)) <= 20),
+                "VALID_SIGNER is a Safe whose threshold is not 2 to 20"
+            );
+        }
     }
 
     /// The claim order paying `token` out of HOLO_VAULT_ID, accepting coupons
@@ -143,7 +159,7 @@ abstract contract ClaimOrderScript is Script {
         command[7] = vm.toString(signer);
         Vm.FfiResult memory composed = vm.tryFfi(command);
         require(composed.exitCode == 0, string.concat("compose-rainlang.mjs failed: ", string(composed.stderr)));
-        return GetParser(address(net.deployer)).iParser().parse(composed.stdout);
+        return ExpressionDeployerParts(address(net.deployer)).iParser().parse(composed.stdout);
     }
 
     /// Sends `calls` to the vault as its admin, each of which must change the
@@ -188,9 +204,10 @@ abstract contract ClaimOrderScript is Script {
     }
 
     /// The claim order `vault` added last from `fromBlock` on, read from the chain
-    /// and checked against it: still on the orderbook, paying the vault's token out
-    /// of HOLO_VAULT_ID, and evaluating the claim expression that accepts coupons
-    /// from `signer` and nothing else.
+    /// and checked against it: the only order the vault added since that is still on
+    /// the orderbook, paying the vault's token out of HOLO_VAULT_ID, and evaluating,
+    /// through the network's deployer, the claim expression that accepts coupons from
+    /// `signer` and nothing else.
     function findClaimOrder(ClaimNetwork memory net, HoloLockVault vault, address signer, uint256 fromBlock)
         internal
         returns (OrderV2 memory order, bytes32 orderHash)
@@ -200,14 +217,26 @@ abstract contract ClaimOrderScript is Script {
         topics[0] = ADD_ORDER;
         Vm.EthGetLogs[] memory logs = vm.eth_getLogs(fromBlock, block.number, address(net.orderbook), topics);
         bool found;
+        IExpressionDeployerV3 deployer;
         for (uint256 i = 0; i < logs.length; i++) {
-            (address sender,, OrderV2 memory added, bytes32 addedHash) =
+            (address sender, IExpressionDeployerV3 addedBy, OrderV2 memory added, bytes32 addedHash) =
                 abi.decode(logs[i].data, (address, IExpressionDeployerV3, OrderV2, bytes32));
-            if (sender == address(vault)) {
-                (order, orderHash, found) = (added, addedHash, true);
+            if (sender != address(vault)) continue;
+            if (found) {
+                require(
+                    !net.orderbook.orderExists(orderHash),
+                    string.concat("the vault holds another order added since block ", vm.toString(fromBlock))
+                );
             }
+            (order, orderHash, deployer, found) = (added, addedHash, addedBy, true);
         }
         require(found, string.concat("the vault added no order from block ", vm.toString(fromBlock)));
+        ExpressionDeployerParts parts = ExpressionDeployerParts(address(net.deployer));
+        require(
+            address(deployer) == address(net.deployer) && address(order.evaluable.interpreter) == parts.iInterpreter()
+                && address(order.evaluable.store) == parts.iStore(),
+            "the claim order was not deployed by the network's expression deployer"
+        );
         require(order.hash() == orderHash, "the AddOrder event's order does not hash to its order hash");
         require(net.orderbook.orderExists(orderHash), "the vault's last claim order is no longer on the orderbook");
         require(
