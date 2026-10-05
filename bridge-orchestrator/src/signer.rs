@@ -29,6 +29,13 @@ const CLAIM_ORDER_VARIABLES: [&str; 10] = [
 
 const MAX_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60;
 
+/// Every variable the coupon signer reads.
+pub(crate) fn variables() -> impl Iterator<Item = &'static str> {
+    CLAIM_ORDER_VARIABLES
+        .into_iter()
+        .chain(["SIGNER_PRIVATE_KEY", "EXPIRY_SECONDS"])
+}
+
 const DEFAULT_EXPIRY_SECONDS: NonZeroU64 = match NonZeroU64::new(604_800) {
     Some(seconds) => seconds,
     None => unreachable!(),

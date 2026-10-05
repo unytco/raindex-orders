@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- bridge-orchestrator runs with Ethereum off under `NETWORK=none`: it bridges parked deposits on Holochain, leaves withdrawals parked, and calls no Ethereum RPC.
 - the MainNet bridge website has no faucet: its faucet page and API answer 404, and no faucet link shows.
 - `POST /api/coupon-status` accepts a coupon signed by a Safe as the claim signer.
 - `deploy-mainnet.sh` deploys the bridge on Ethereum mainnet from a Ledger or an encrypted keystore, and prints the deploy record.

@@ -30,7 +30,8 @@ pub struct BridgeOrchestrator {
     cfg: Config,
     db: StateStore,
     reporter: ReporterState,
-    signer: CouponSigner,
+    /// None under NETWORK=none, when no coupon is signed.
+    signer: Option<CouponSigner>,
 }
 
 /// Severity bucket for a source-chain-pressure event. Mapped to a
@@ -88,8 +89,100 @@ async fn sleep_or_shutdown(duration_ms: u64, shutdown: &mut ShutdownRx) {
     }
 }
 
+struct BridgingSelection {
+    deposits: Vec<Transaction>,
+    withdrawals: Vec<Transaction>,
+    coupons: serde_json::Map<String, Value>,
+    coupon_bytes: usize,
+    withdrawals_found: usize,
+}
+
+/// Selects S4's links. Without a signer (NETWORK=none) no coupon can be signed, so
+/// every withdrawal stays parked for a run that can sign it.
+async fn select_bridging_links(
+    signer: Option<&CouponSigner>,
+    bridging_links: &[Transaction],
+    coupons_budget: usize,
+) -> Result<BridgingSelection> {
+    let mut selection = BridgingSelection {
+        deposits: Vec::new(),
+        withdrawals: Vec::new(),
+        coupons: serde_json::Map::new(),
+        coupon_bytes: 0,
+        withdrawals_found: 0,
+    };
+    let mut withdrawal_capped = false;
+
+    for tx in bridging_links {
+        let TransactionDetails::ParkedSpend {
+            attached_payload, ..
+        } = &tx.details
+        else {
+            continue;
+        };
+        if attached_payload.get("proof_of_deposit").is_some() {
+            selection.deposits.push(tx.clone());
+            continue;
+        }
+        let Some(withdraw_to) = attached_payload
+            .get("withdraw_to_address")
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        selection.withdrawals_found += 1;
+        let Some(signer) = signer else {
+            continue;
+        };
+        if withdrawal_capped {
+            continue;
+        }
+
+        let amount = tx
+            .amount
+            .get("1")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let coupon = signer.coupon(&amount, withdraw_to, tx.id.as_ref()).await?;
+        let key = tx.id.to_string();
+
+        let entry_bytes = serde_json::to_vec(&json!({ &key: &coupon }))
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        if selection.coupon_bytes + entry_bytes > coupons_budget
+            && !selection.withdrawals.is_empty()
+        {
+            withdrawal_capped = true;
+            info!(
+                "[bridge/withdrawals] batch: cap reached at {} coupons, coupon_bytes={}",
+                selection.withdrawals.len(),
+                selection.coupon_bytes
+            );
+            continue;
+        }
+
+        selection.coupon_bytes += entry_bytes;
+        selection.coupons.insert(key, Value::String(coupon));
+        selection.withdrawals.push(tx.clone());
+
+        info!(
+            "[bridge/withdrawals] generating coupon tx_id={:?} recipient={} amount={}",
+            tx.id, withdraw_to, amount
+        );
+    }
+
+    if signer.is_none() && selection.withdrawals_found > 0 {
+        info!(
+            "[bridge/withdrawals] {} withdrawal(s) stay parked: NETWORK=none signs no coupon",
+            selection.withdrawals_found
+        );
+    }
+    Ok(selection)
+}
+
 impl BridgeOrchestrator {
-    pub fn new(cfg: Config, signer: CouponSigner) -> Result<Self> {
+    pub fn new(cfg: Config, signer: Option<CouponSigner>) -> Result<Self> {
         let db = StateStore::open(&cfg.db_path)?;
         let reporter = ReporterState::new();
         Ok(Self {
@@ -203,8 +296,13 @@ impl BridgeOrchestrator {
 
     pub async fn run(&self) -> Result<()> {
         info!(
-            "bridge-orchestrator started network={:?} poll={}ms bridge_cycle={}ms",
-            self.cfg.network, self.cfg.poll_interval_ms, self.cfg.bridge_cycle_interval_ms
+            "bridge-orchestrator started network={} poll={}ms bridge_cycle={}ms",
+            self.cfg
+                .ethereum
+                .as_ref()
+                .map_or("none", |ethereum| ethereum.network.name()),
+            self.cfg.poll_interval_ms,
+            self.cfg.bridge_cycle_interval_ms
         );
 
         // Checked before anything is spawned: a node that cannot offer lair is
@@ -214,13 +312,9 @@ impl BridgeOrchestrator {
         // conductor's connection_url is picked up without a restart.
         ham_config(&self.cfg)?;
 
-        // Spawn the watchtower reporter, if configured. The handle is
-        // intentionally dropped: the task runs detached, and any
-        // failure inside it is logged and swallowed.
+        // The reporter runs detached: any failure inside it is logged and
+        // swallowed by the task itself.
         if let Some(wt_cfg) = self.cfg.watchtower.clone() {
-            // The returned JoinHandle is intentionally dropped: the
-            // reporter runs detached, and any failure inside it is
-            // logged and swallowed by the task itself.
             drop(watchtower_reporter::spawn(
                 wt_cfg,
                 self.reporter.clone(),
@@ -254,7 +348,11 @@ impl BridgeOrchestrator {
                     return Ok(());
                 }
             };
-        let lock_flow = LockFlow::new(self.cfg.clone(), self.db.clone());
+        let lock_flow = self
+            .cfg
+            .ethereum
+            .clone()
+            .map(|ethereum| LockFlow::new(ethereum, self.db.clone()));
 
         let mut last_bridge_cycle =
             std::time::Instant::now() - Duration::from_millis(self.cfg.bridge_cycle_interval_ms);
@@ -280,8 +378,10 @@ impl BridgeOrchestrator {
                 return Ok(());
             }
 
-            if let Err(e) = lock_flow.run_cycle().await {
-                error!("[lock-flow] cycle failed: {}", e);
+            if let Some(lock_flow) = &lock_flow {
+                if let Err(e) = lock_flow.run_cycle().await {
+                    error!("[lock-flow] cycle failed: {}", e);
+                }
             }
 
             if *shutdown.borrow() {
@@ -610,10 +710,8 @@ impl BridgeOrchestrator {
         let cl_parked_live = live.on(&conductor, &credit_limit_ea_id).await?.len();
         let br_parked_live = live.on(&conductor, &bridging_ea_id).await?.len();
 
-        let s1_rows = self.db.list_pending_by_step("lock", WorkStep::New, 5000)?;
-        let s3_rows_initial =
-            self.db
-                .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?;
+        let s1_rows = self.lock_rows_needing_vault(WorkStep::New)?;
+        let s3_rows_initial = self.lock_rows_needing_vault(WorkStep::ClRaveExecuted)?;
         let br_spend_pending_initial =
             self.db
                 .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?;
@@ -782,9 +880,7 @@ impl BridgeOrchestrator {
         // Re-list `cl_rave_executed` rows here (not reusing the initial
         // snapshot) because S2 may have just promoted additional rows
         // into this step.
-        let s3_rows = self
-            .db
-            .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?;
+        let s3_rows = self.lock_rows_needing_vault(WorkStep::ClRaveExecuted)?;
         let s3_batch = if s3_rows.is_empty() {
             ProofBatch::default()
         } else {
@@ -868,72 +964,13 @@ impl BridgeOrchestrator {
         // ---------------------------------------------------------------
         let bridging_links = conductor.parked_links(&bridging_ea_id).await?;
 
-        let mut coupons_map = serde_json::Map::new();
-        let mut selected_withdrawal_links: Vec<Transaction> = Vec::new();
-        let mut deposit_rave_links: Vec<Transaction> = Vec::new();
-        let mut coupon_cumulative_bytes: usize = 0;
-        let mut total_withdrawals_found: usize = 0;
-        let mut withdrawal_capped = false;
-
-        for tx in &bridging_links {
-            if let TransactionDetails::ParkedSpend {
-                attached_payload, ..
-            } = &tx.details
-            {
-                if attached_payload.get("proof_of_deposit").is_some() {
-                    deposit_rave_links.push(tx.clone());
-                    continue;
-                }
-
-                if let Some(withdraw_to) = attached_payload
-                    .get("withdraw_to_address")
-                    .and_then(|v| v.as_str())
-                {
-                    total_withdrawals_found += 1;
-
-                    if withdrawal_capped {
-                        continue;
-                    }
-
-                    let amount = tx
-                        .amount
-                        .get("1")
-                        .map(|v| v.to_string())
-                        .unwrap_or_default();
-
-                    let coupon = self
-                        .signer
-                        .coupon(&amount, withdraw_to, tx.id.as_ref())
-                        .await?;
-                    let key = tx.id.to_string();
-
-                    let entry_bytes = serde_json::to_vec(&json!({ &key: &coupon }))
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-
-                    if coupon_cumulative_bytes + entry_bytes > coupons_budget
-                        && !selected_withdrawal_links.is_empty()
-                    {
-                        withdrawal_capped = true;
-                        info!(
-                            "[bridge/withdrawals] batch: cap reached at {} coupons, coupon_bytes={}",
-                            selected_withdrawal_links.len(),
-                            coupon_cumulative_bytes
-                        );
-                        continue;
-                    }
-
-                    coupon_cumulative_bytes += entry_bytes;
-                    coupons_map.insert(key, Value::String(coupon));
-                    selected_withdrawal_links.push(tx.clone());
-
-                    info!(
-                        "[bridge/withdrawals] generating coupon tx_id={:?} recipient={} amount={}",
-                        tx.id, withdraw_to, amount
-                    );
-                }
-            }
-        }
+        let BridgingSelection {
+            deposits: deposit_rave_links,
+            withdrawals: selected_withdrawal_links,
+            coupons: mut coupons_map,
+            coupon_bytes: coupon_cumulative_bytes,
+            withdrawals_found: total_withdrawals_found,
+        } = select_bridging_links(self.signer.as_ref(), &bridging_links, coupons_budget).await?;
 
         // Build the pooled RAVE link Vec (deposits first, then selected
         // withdrawals) before applying the optional per-cycle cap. The
@@ -1115,7 +1152,7 @@ impl BridgeOrchestrator {
         let br_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, &bridging).await?);
         let mut counts = ReconcileCounts::default();
 
-        for row in self.db.list_pending_by_step("lock", WorkStep::New, 5000)? {
+        for row in self.lock_rows_needing_vault(WorkStep::New)? {
             let Some(tx_hash) = self.lock_tx_hash(&row) else {
                 continue;
             };
@@ -1142,10 +1179,7 @@ impl BridgeOrchestrator {
             }
         }
 
-        for row in self
-            .db
-            .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?
-        {
+        for row in self.lock_rows_needing_vault(WorkStep::ClRaveExecuted)? {
             let Some(tx_hash) = self.lock_tx_hash(&row) else {
                 continue;
             };
@@ -1509,9 +1543,24 @@ impl BridgeOrchestrator {
         UnfittableHead::Abandoned
     }
 
+    /// Lock rows at `step` whose next move builds a deposit proof, which names the
+    /// vault. NETWORK=none names no vault, so they wait for a run on a chain.
+    fn lock_rows_needing_vault(&self, step: WorkStep) -> Result<Vec<WorkItem>> {
+        if self.cfg.ethereum.is_none() {
+            return Ok(Vec::new());
+        }
+        self.db.list_pending_by_step("lock", step, 5000)
+    }
+
     fn extract_lock_proof(&self, item: &WorkItem) -> Result<(Value, UnitMap)> {
         let payload = LockPayload::deserialize(item.payload_json.clone())?;
-        let contract_hex = format!("{:x}", self.cfg.lock_vault_address);
+        let vault = self
+            .cfg
+            .ethereum
+            .as_ref()
+            .map(|ethereum| ethereum.lock_vault_address)
+            .context("a lock's deposit proof names the vault, and NETWORK=none names none")?;
+        let contract_hex = format!("{vault:x}");
         let depositor = decode_holochain_agent_as_pubkey_string(&payload.holochain_agent)?;
         let normalized = payload.normalized_amounts()?;
         let amount = normalized.amount_hot.clone();
@@ -2174,7 +2223,7 @@ mod tests {
     // the transition is step-gated) negative test.
     // -----------------------------------------------------------------
 
-    use crate::config::{Network, RetentionConfig};
+    use crate::config::{Ethereum, Network, RetentionConfig};
     use alloy::primitives::Address;
     use alloy::signers::local::PrivateKeySigner;
     use holo_hash::{ActionHash, AgentPubKey, AgentPubKeyB64};
@@ -2205,10 +2254,12 @@ mod tests {
     fn test_config(db_path: String) -> Config {
         let agent_pubkey: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1u8; 32]).into();
         Config {
-            network: Network::Sepolia,
-            rpc_url: "http://localhost:0".to_string(),
-            lock_vault_address: Address::ZERO,
-            confirmations: 5,
+            ethereum: Some(Ethereum {
+                network: Network::Sepolia,
+                rpc_url: "http://localhost:0".to_string(),
+                lock_vault_address: Address::ZERO,
+                confirmations: 5,
+            }),
             poll_interval_ms: 1000,
             bridge_cycle_interval_ms: 1000,
             max_link_tag_bytes: 800,
@@ -2247,7 +2298,7 @@ mod tests {
             cfg: test_config(path),
             db,
             reporter: ReporterState::new(),
-            signer: CouponSigner::with_key(PrivateKeySigner::random()),
+            signer: Some(CouponSigner::with_key(PrivateKeySigner::random())),
         }
     }
 
@@ -5090,5 +5141,131 @@ mod tests {
                 "smart_agreement_title",
             ])
         );
+    }
+
+    fn parked_withdrawal_tx(seed: u8) -> Transaction {
+        let mut tx = parked_spend_tx(seed, "");
+        tx.amount = UnitMap::from(vec![(1, "5")]);
+        if let TransactionDetails::ParkedSpend {
+            attached_payload, ..
+        } = &mut tx.details
+        {
+            *attached_payload =
+                json!({ "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)) });
+        }
+        tx
+    }
+
+    fn ids(links: &[Transaction]) -> Vec<String> {
+        links.iter().map(|tx| tx.id.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn without_a_signer_deposits_go_and_every_withdrawal_stays_parked() {
+        let deposit = parked_spend_tx(0x60, "0xd0");
+        let links = [
+            parked_withdrawal_tx(0x61),
+            deposit.clone(),
+            parked_withdrawal_tx(0x62),
+        ];
+
+        let selection = select_bridging_links(None, &links, usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(ids(&selection.deposits), ids(&[deposit]));
+        assert!(selection.withdrawals.is_empty());
+        assert!(selection.coupons.is_empty());
+        assert_eq!(selection.withdrawals_found, 2);
+    }
+
+    #[tokio::test]
+    async fn with_a_signer_each_withdrawal_goes_with_its_coupon() {
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
+        let deposit = parked_spend_tx(0x60, "0xd0");
+        let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
+        let links = [
+            withdrawals[0].clone(),
+            deposit.clone(),
+            withdrawals[1].clone(),
+        ];
+
+        let selection = select_bridging_links(Some(&signer), &links, usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(ids(&selection.deposits), ids(&[deposit]));
+        assert_eq!(ids(&selection.withdrawals), ids(&withdrawals));
+        assert_eq!(
+            selection.coupons.keys().cloned().collect::<BTreeSet<_>>(),
+            ids(&withdrawals).into_iter().collect()
+        );
+        assert_eq!(selection.withdrawals_found, 2);
+    }
+
+    #[tokio::test]
+    async fn the_coupons_budget_holds_back_withdrawals_past_the_first() {
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
+        let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
+
+        let selection = select_bridging_links(Some(&signer), &withdrawals, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(ids(&selection.withdrawals), ids(&withdrawals[..1]));
+        assert_eq!(selection.coupons.len(), 1);
+        assert_eq!(selection.withdrawals_found, 2);
+    }
+
+    #[tokio::test]
+    async fn with_ethereum_off_reconcile_moves_only_the_rows_needing_no_vault() {
+        let mut orch = test_orchestrator("ethereum-off-reconcile");
+        orch.cfg.ethereum = None;
+        orch.signer = None;
+        let new = enqueue_lock(&orch, "lock:off:1", "0xa1");
+        let rave_executed = enqueue_lock(&orch, "lock:off:2", "0xa2");
+        orch.db
+            .advance_to_cl_link_created(rave_executed, &action_hash(0x70).to_string(), &ea(CL_EA))
+            .unwrap();
+        orch.db
+            .advance_to_cl_rave_executed(rave_executed, None)
+            .unwrap();
+        let link_created = enqueue_lock(&orch, "lock:off:3", "0xa3");
+        orch.db
+            .advance_to_cl_link_created(link_created, &action_hash(0x71).to_string(), &ea(CL_EA))
+            .unwrap();
+
+        let counts = reconcile(
+            &orch,
+            &[parked_tx(0x72, "0xa1")],
+            &[parked_spend_tx(0x73, "0xa2")],
+        )
+        .await;
+
+        assert_eq!(
+            counts,
+            ReconcileCounts {
+                s2_advanced: 1,
+                ..ReconcileCounts::default()
+            }
+        );
+        let at = |step| {
+            orch.db
+                .list_pending_by_step("lock", step, 10)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at(WorkStep::New), vec![new]);
+        assert_eq!(
+            at(WorkStep::ClRaveExecuted),
+            vec![rave_executed, link_created]
+        );
+        assert!(orch
+            .lock_rows_needing_vault(WorkStep::New)
+            .unwrap()
+            .is_empty());
+        assert!(orch.extract_lock_proof(&pending_rows(&orch)[0]).is_err());
     }
 }

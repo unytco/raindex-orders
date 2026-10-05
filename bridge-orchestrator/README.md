@@ -45,6 +45,14 @@ An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
 its supervisor restarts it. Once the checks pass it logs
 `startup checks passed`.
 
+`NETWORK=none` turns Ethereum off, for a node with no chain such as a local
+emulation. `run` then makes no Ethereum call: it skips the checks above,
+watches no lock and signs no coupon. It still does its Holochain work. Deposits
+parked on the bridging agreement go through, and every withdrawal stays parked.
+Lock rows from an earlier run on a chain wait for the next one. It logs once
+that Ethereum is off, and names each chain variable it ignores. Only an
+explicit `none` turns Ethereum off.
+
 ### `bridge-orchestrator status`
 
 Query the SQLite work-item database. Prints one JSON object per line to stdout.
@@ -95,7 +103,7 @@ and the chain. A network variable set to an empty value counts as unset.
 
 | Variable | Required | Default |
 |----------|----------|---------|
-| `NETWORK` | No | `sepolia` (`mainnet` or `sepolia`) |
+| `NETWORK` | No | `sepolia` (`mainnet`, `sepolia` or `none`) |
 | `SEPOLIA_RPC_URL` | No, refused on mainnet | `https://1rpc.io/sepolia` |
 | `SEPOLIA_LOCK_VAULT_ADDRESS` | No, refused on mainnet | `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6` |
 | `ETH_RPC_URL` | **Yes** (mainnet), refused on sepolia | -- |

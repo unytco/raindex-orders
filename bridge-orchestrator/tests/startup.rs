@@ -247,3 +247,48 @@ fn a_run_on_testnet_values_refuses_a_mainnet_rpc() {
     );
     assert!(!db(dir.path()).exists());
 }
+
+#[test]
+fn run_with_ethereum_off_calls_no_rpc_and_names_the_chain_variables_it_ignores() {
+    let dir = tempfile::tempdir().unwrap();
+    let rpc = TcpListener::bind("127.0.0.1:0").unwrap();
+    rpc.set_nonblocking(true).unwrap();
+    let mut env = sepolia_node(dir.path(), format!("http://{}/", rpc.local_addr().unwrap()));
+    env.extend([
+        ("NETWORK", "none".to_string()),
+        (
+            "SEPOLIA_LOCK_VAULT_ADDRESS",
+            format!("{:#x}", alloy::primitives::Address::ZERO),
+        ),
+        (
+            "ORDER_HASH",
+            format!("{:#x}", alloy::primitives::B256::ZERO),
+        ),
+        (
+            "CONDUCTOR_CONFIG",
+            dir.path().join("no-conductor.yaml").display().to_string(),
+        ),
+    ]);
+
+    let output = orchestrator(dir.path(), &env, &["run"]);
+
+    let logged = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(logged.contains("NETWORK=none: Ethereum is off"), "{logged}");
+    assert!(
+        logged.contains("NETWORK=none ignores SEPOLIA_RPC_URL, SEPOLIA_LOCK_VAULT_ADDRESS, ORDER_HASH, SIGNER_PRIVATE_KEY"),
+        "{logged}"
+    );
+    assert!(
+        logged.contains("bridge-orchestrator started network=none"),
+        "{logged}"
+    );
+    assert!(logged.contains("no-conductor.yaml"), "{logged}");
+    assert!(
+        matches!(rpc.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "NETWORK=none connected to the RPC"
+    );
+}

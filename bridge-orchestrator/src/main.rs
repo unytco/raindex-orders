@@ -70,20 +70,40 @@ async fn main() -> Result<()> {
     match args.command {
         Command::Run => {
             info!("bridge-orchestrator starting");
-            let signer = CouponSigner::from_env(config.network)?;
-            preflight::check(
-                config.network,
-                &config.rpc_url,
-                config.lock_vault_address,
-                &signer,
-            )
-            .await?;
-            info!(
-                event = "startup.checks_passed",
-                order = %signer.order().order_hash,
-                signer = %signer.order().signer,
-                "startup checks passed: the chain, vault and claim order match, and the order accepts the signer"
-            );
+            let signer = match &config.ethereum {
+                Some(ethereum) => {
+                    let signer = CouponSigner::from_env(ethereum.network)?;
+                    preflight::check(
+                        ethereum.network,
+                        &ethereum.rpc_url,
+                        ethereum.lock_vault_address,
+                        &signer,
+                    )
+                    .await?;
+                    info!(
+                        event = "startup.checks_passed",
+                        order = %signer.order().order_hash,
+                        signer = %signer.order().signer,
+                        "startup checks passed: the chain, vault and claim order match, and the order accepts the signer"
+                    );
+                    Some(signer)
+                }
+                None => {
+                    info!(
+                        event = "startup.ethereum_off",
+                        "NETWORK=none: Ethereum is off. No chain is checked, no lock is watched and no coupon is signed, so withdrawals stay parked"
+                    );
+                    let ignored = config::ignored_without_ethereum(|key| std::env::var(key).ok());
+                    if !ignored.is_empty() {
+                        info!(
+                            event = "startup.ethereum_variables_ignored",
+                            "NETWORK=none ignores {}",
+                            ignored.join(", ")
+                        );
+                    }
+                    None
+                }
+            };
             BridgeOrchestrator::new(config, signer)?.run().await?;
         }
         Command::Status {

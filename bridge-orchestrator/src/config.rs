@@ -155,11 +155,24 @@ pub(crate) fn log_testnet_defaults(
     }
 }
 
-#[derive(Debug, PartialEq)]
-struct NetworkSettings {
-    network: Network,
-    rpc_url: String,
-    lock_vault_address: Address,
+/// The chain the bridge watches and signs for. A run has none under NETWORK=none,
+/// and then makes no Ethereum call at all.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ethereum {
+    pub network: Network,
+    pub rpc_url: String,
+    pub lock_vault_address: Address,
+    pub confirmations: u64,
+}
+
+/// The Ethereum variables `setting` holds a value for, which NETWORK=none ignores.
+pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    [Network::Sepolia, Network::Mainnet]
+        .into_iter()
+        .flat_map(|network| [network.rpc_url_var(), network.lock_vault_var()])
+        .chain(crate::signer::variables())
+        .filter(|key| setting(key).is_some_and(|value| !value.is_empty()))
+        .collect()
 }
 
 /// The network `NETWORK` names, sepolia when it is unset or empty.
@@ -174,11 +187,14 @@ fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<Network> {
         }
         Some(raw) => raw
             .parse::<Network>()
-            .map_err(|_| anyhow::anyhow!("NETWORK={raw} is not sepolia or mainnet")),
+            .map_err(|_| anyhow::anyhow!("NETWORK={raw} is not sepolia, mainnet or none")),
     }
 }
 
-fn network_settings(setting: impl Fn(&str) -> Option<String>) -> Result<NetworkSettings> {
+fn ethereum_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Option<Ethereum>> {
+    if setting("NETWORK").is_some_and(|raw| raw.eq_ignore_ascii_case("none")) {
+        return Ok(None);
+    }
     let network = network_from(&setting)?;
 
     let mut faults = Vec::new();
@@ -225,21 +241,19 @@ fn network_settings(setting: impl Fn(&str) -> Option<String>) -> Result<NetworkS
     };
 
     match (rpc_url, lock_vault_address) {
-        (Some(rpc_url), Some(lock_vault_address)) if faults.is_empty() => Ok(NetworkSettings {
+        (Some(rpc_url), Some(lock_vault_address)) if faults.is_empty() => Ok(Some(Ethereum {
             network,
             rpc_url,
             lock_vault_address,
-        }),
+            confirmations: network.confirmations(),
+        })),
         _ => anyhow::bail!("{}", faults.join("; ")),
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub network: Network,
-    pub rpc_url: String,
-    pub lock_vault_address: Address,
-    pub confirmations: u64,
+    pub ethereum: Option<Ethereum>,
     pub poll_interval_ms: u64,
     pub bridge_cycle_interval_ms: u64,
     pub max_link_tag_bytes: usize,
@@ -365,12 +379,7 @@ pub struct WatchtowerReporterConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let NetworkSettings {
-            network,
-            rpc_url,
-            lock_vault_address,
-        } = network_settings(|key| env::var(key).ok())?;
-        let confirmations = network.confirmations();
+        let ethereum = ethereum_settings(|key| env::var(key).ok())?;
 
         let poll_interval_ms = env::var("POLL_INTERVAL_MS")
             .unwrap_or_else(|_| "5000".into())
@@ -477,10 +486,7 @@ impl Config {
         let retention = RetentionConfig::from_env()?;
 
         Ok(Self {
-            network,
-            rpc_url,
-            lock_vault_address,
-            confirmations,
+            ethereum,
             poll_interval_ms,
             bridge_cycle_interval_ms,
             max_link_tag_bytes,
@@ -780,53 +786,58 @@ mod tests {
     const VAULT: &str = "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6";
 
     fn network_refusal(set: &[(&str, &str)]) -> String {
-        format!("{:#}", network_settings(test_settings(set)).unwrap_err())
+        format!("{:#}", ethereum_settings(test_settings(set)).unwrap_err())
+    }
+
+    fn chain(set: &[(&str, &str)]) -> Ethereum {
+        ethereum_settings(test_settings(set))
+            .unwrap()
+            .expect("the settings name no chain")
     }
 
     #[test]
     fn each_network_reads_its_own_rpc_url_and_vault() {
-        let sepolia = network_settings(test_settings(&[
+        let sepolia = chain(&[
             ("NETWORK", "sepolia"),
             ("SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
             ("SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
-        ]))
-        .unwrap();
+        ]);
         assert_eq!(
             sepolia,
-            NetworkSettings {
+            Ethereum {
                 network: Network::Sepolia,
                 rpc_url: "https://sepolia.rpc.test".to_string(),
                 lock_vault_address: VAULT.parse().unwrap(),
+                confirmations: 5,
             }
         );
-        assert_eq!(sepolia.network.confirmations(), 5);
 
-        let mainnet = network_settings(test_settings(&[
+        let mainnet = chain(&[
             ("NETWORK", "mainnet"),
             ("ETH_RPC_URL", "https://eth.rpc.test"),
             ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
-        ]))
-        .unwrap();
+        ]);
         assert_eq!(mainnet.network, Network::Mainnet);
         assert_eq!(mainnet.rpc_url, "https://eth.rpc.test");
-        assert_eq!(mainnet.network.confirmations(), 15);
+        assert_eq!(mainnet.confirmations, 15);
     }
 
     #[test]
     fn an_unset_network_is_sepolia_with_testnet_values() {
         for unset in [vec![], vec![("NETWORK", "")]] {
             assert_eq!(
-                network_settings(test_settings(&unset)).unwrap(),
-                NetworkSettings {
+                chain(&unset),
+                Ethereum {
                     network: Network::Sepolia,
                     rpc_url: "https://1rpc.io/sepolia".to_string(),
                     lock_vault_address: VAULT.parse().unwrap(),
+                    confirmations: 5,
                 }
             );
         }
         assert_eq!(
             network_refusal(&[("NETWORK", "goerli")]),
-            "NETWORK=goerli is not sepolia or mainnet"
+            "NETWORK=goerli is not sepolia, mainnet or none"
         );
     }
 
@@ -899,24 +910,59 @@ mod tests {
 
     #[test]
     fn an_empty_variable_of_the_other_network_counts_as_unset() {
-        let mainnet = network_settings(test_settings(&[
+        let mainnet = chain(&[
             ("NETWORK", "mainnet"),
             ("ETH_RPC_URL", "https://eth.rpc.test"),
             ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
             ("SEPOLIA_RPC_URL", ""),
             ("SEPOLIA_LOCK_VAULT_ADDRESS", ""),
-        ]))
-        .unwrap();
+        ]);
         assert_eq!(mainnet.network, Network::Mainnet);
         assert_eq!(mainnet.rpc_url, "https://eth.rpc.test");
 
-        let sepolia = network_settings(test_settings(&[
-            ("ETH_RPC_URL", ""),
-            ("MAINNET_LOCK_VAULT_ADDRESS", ""),
-        ]))
-        .unwrap();
+        let sepolia = chain(&[("ETH_RPC_URL", ""), ("MAINNET_LOCK_VAULT_ADDRESS", "")]);
         assert_eq!(sepolia.network, Network::Sepolia);
         assert_eq!(sepolia.rpc_url, "https://1rpc.io/sepolia");
+    }
+
+    #[test]
+    fn network_none_names_no_chain_and_ignores_every_chain_variable() {
+        let set = [
+            ("NETWORK", "none"),
+            ("SEPOLIA_RPC_URL", "http://127.0.0.1:8545"),
+            (
+                "SEPOLIA_LOCK_VAULT_ADDRESS",
+                "0x0000000000000000000000000000000000000000",
+            ),
+            ("ETH_RPC_URL", "https://eth.rpc.test"),
+            ("ORDER_HASH", ""),
+            ("SIGNER_PRIVATE_KEY", "0xabc"),
+        ];
+
+        for network in ["none", "NONE"] {
+            let mut with = set.to_vec();
+            with[0] = ("NETWORK", network);
+            assert_eq!(ethereum_settings(test_settings(&with)).unwrap(), None);
+        }
+        assert_eq!(
+            ignored_without_ethereum(test_settings(&set)),
+            [
+                "SEPOLIA_RPC_URL",
+                "SEPOLIA_LOCK_VAULT_ADDRESS",
+                "ETH_RPC_URL",
+                "SIGNER_PRIVATE_KEY"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_none_turns_ethereum_off() {
+        assert_eq!(chain(&[]).network, Network::Sepolia);
+        assert_eq!(chain(&[("NETWORK", "")]).network, Network::Sepolia);
+        assert_eq!(
+            network_refusal(&[("NETWORK", "off")]),
+            "NETWORK=off is not sepolia, mainnet or none"
+        );
     }
 
     #[test]
