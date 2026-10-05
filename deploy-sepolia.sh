@@ -77,6 +77,7 @@ broadcast() {
     echo "$OUTPUT"
 }
 
+BALANCE=0
 if [ -n "$WALLET_ADDRESS" ]; then
     BALANCE=$(cast balance "$WALLET_ADDRESS" --rpc-url "$SEPOLIA_RPC_URL" 2>/dev/null || echo "0")
     echo -e "${BLUE}Balance: $(cast from-wei "$BALANCE") ETH${NC}"
@@ -192,9 +193,11 @@ deploy_order_via_vault() {
 show_status() {
     echo -e "${BLUE}=== Deployment Status ===${NC}"
     echo ""
-    echo "Wallet:          $WALLET_ADDRESS"
-    echo "Balance:         $(cast from-wei $BALANCE) ETH"
-    echo ""
+    if [ -n "$WALLET_ADDRESS" ]; then
+        echo "Wallet:          $WALLET_ADDRESS"
+        echo "Balance:         $(cast from-wei "$BALANCE") ETH"
+        echo ""
+    fi
     echo "Token Address:   ${TOKEN_ADDRESS:-Not deployed}"
     echo "Vault Address:   ${LOCK_VAULT_ADDRESS:-Not deployed}"
     echo "Order Hash:      ${ORDER_HASH:-Not deployed}"
@@ -204,9 +207,9 @@ show_status() {
     echo "Vault ID:        $VAULT_ID"
     echo ""
 
-    if [ -n "$TOKEN_ADDRESS" ]; then
+    if [ -n "$TOKEN_ADDRESS" ] && [ -n "$WALLET_ADDRESS" ]; then
         TOKEN_BAL=$(cast call "$TOKEN_ADDRESS" "balanceOf(address)(uint256)" "$WALLET_ADDRESS" --rpc-url "$SEPOLIA_RPC_URL" 2>/dev/null || echo "0")
-        echo "Your token balance: $(cast from-wei $TOKEN_BAL)"
+        echo "Your token balance: $(cast from-wei "$TOKEN_BAL")"
     fi
 }
 
