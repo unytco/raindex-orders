@@ -89,7 +89,7 @@ hygiene.
 
 Every subcommand loads the config below on startup, so the env file must be
 sourced even for `status` and `clear`. Only `run` reads the signer variables
-and the chain.
+and the chain. A network variable set to an empty value counts as unset.
 
 ### Config (all commands)
 

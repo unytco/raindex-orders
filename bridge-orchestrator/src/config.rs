@@ -184,7 +184,7 @@ fn network_settings(setting: impl Fn(&str) -> Option<String>) -> Result<NetworkS
     let mut faults = Vec::new();
     let other = network.other();
     for key in [other.rpc_url_var(), other.lock_vault_var()] {
-        if setting(key).is_some() {
+        if setting(key).is_some_and(|value| !value.is_empty()) {
             faults.push(format!(
                 "{key} is a {} variable and NETWORK is {}: unset it",
                 other.name(),
@@ -880,7 +880,7 @@ mod tests {
             for key in other {
                 let mut set = vec![("NETWORK", network)];
                 set.extend(own);
-                set.push((key, ""));
+                set.push((key, "0x1"));
                 let message = network_refusal(&set);
                 assert_eq!(
                     message,
@@ -895,6 +895,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_empty_variable_of_the_other_network_counts_as_unset() {
+        let mainnet = network_settings(test_settings(&[
+            ("NETWORK", "mainnet"),
+            ("ETH_RPC_URL", "https://eth.rpc.test"),
+            ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
+            ("SEPOLIA_RPC_URL", ""),
+            ("SEPOLIA_LOCK_VAULT_ADDRESS", ""),
+        ]))
+        .unwrap();
+        assert_eq!(mainnet.network, Network::Mainnet);
+        assert_eq!(mainnet.rpc_url, "https://eth.rpc.test");
+
+        let sepolia = network_settings(test_settings(&[
+            ("ETH_RPC_URL", ""),
+            ("MAINNET_LOCK_VAULT_ADDRESS", ""),
+        ]))
+        .unwrap();
+        assert_eq!(sepolia.network, Network::Sepolia);
+        assert_eq!(sepolia.rpc_url, "https://1rpc.io/sepolia");
     }
 
     #[test]
