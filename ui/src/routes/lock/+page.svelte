@@ -175,12 +175,7 @@
 					args: [lockVaultAddress, maxUint256]
 				})
 				transactionStore.awaitTxReceipt(approveHash)
-				const approveReceipt = await waitForTransaction(approveHash)
-				if (!approveReceipt) {
-					transactionStore.transactionError({ message: 'Approval failed' })
-					isLoading = false
-					return
-				}
+				await waitForTransaction(approveHash)
 				transactionStore.reset()
 				await fetchContractData()
 			}
@@ -194,13 +189,10 @@
 			})
 
 			transactionStore.awaitTxReceipt(hash)
-			const receipt = await waitForTransaction(hash)
-
-			if (receipt) {
-				transactionStore.transactionSuccess(hash)
-				lockReceipt = { amount: `${formatToken(amountWei, tokenDecimals)} ${tokenSymbol}`, hash }
-				await fetchContractData()
-			}
+			await waitForTransaction(hash)
+			transactionStore.transactionSuccess(hash)
+			lockReceipt = { amount: `${formatToken(amountWei, tokenDecimals)} ${tokenSymbol}`, hash }
+			await fetchContractData()
 		} catch (e) {
 			error = errorMessage(e, 'Transaction failed')
 			transactionStore.transactionError({ message: error })

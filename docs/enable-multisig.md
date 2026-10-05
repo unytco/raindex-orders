@@ -28,7 +28,7 @@ From then on, every admin call is a Safe transaction that two owners approve: `a
 
 ## Move the coupon signer to a Safe
 
-A coupon signer Safe needs a threshold of 2 to 20, and owners that sign with keys. The website's coupon status reads a 65-byte signature as one key's, so with a threshold of 1 every coupon reads as invalid. It reads a longer signature only when each owner's part is a key's signature.
+A coupon signer Safe needs a threshold of 2 to 20, which `rotate-claim-signer.sh` checks, and owners that sign with keys. The website's coupon status reads a 65-byte signature as one key's, so with a threshold of 1 every coupon reads as invalid. It reads a longer signature only when each owner's part is a key's signature.
 
 1. Create the Safe. Its owners are the keys of the signer services, which are not built yet: see the last section.
 2. Stop the orchestrator. Until step 3, any coupon it signs is for an order that is about to be removed.
@@ -43,7 +43,7 @@ A coupon signer Safe needs a threshold of 2 to 20, and owners that sign with key
    - If the admin is a key, pass its wallet option. The script sends both calls and prints the new deploy record.
    - If the admin is a Safe, pass no wallet option. The script sends nothing and prints the two calls. Propose each from the admin Safe in that order, in the Safe web app's Transaction Builder: the vault as the address, value 0, and the printed data. When both have run, print the new deploy record with `./rotate-claim-signer.sh record <block of the first call>`.
 4. Give the orchestrator the new `ORDER_HASH` and a signer for the Safe, then start it. At startup it refuses an `ORDER_HASH` the orderbook does not hold.
-5. Give the website the new `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_SIGNER`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE` and `PUBLIC_CLAIM_EXPRESSION`, then build and deploy it again.
+5. Give the website the new `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_SIGNER`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE` and `PUBLIC_CLAIM_EXPRESSION` from the new deploy record, then build and deploy it again. The build refuses values that do not hash to the order hash, but it cannot check the signer.
 6. Reissue the coupons that were not claimed. A coupon names its order's hash, so a coupon for the old order fails on the new one.
 
 The claim order marks a nonce used under its own order hash. A withdrawal claimed on an old order is not marked on the new one, so a new coupon for it pays it a second time. Reissue a coupon only once its order is removed, and only for a withdrawal none of whose coupons is redeemed. To read whether a coupon is redeemed, ask the store of the order it names, where a nonzero answer means redeemed:

@@ -271,7 +271,7 @@ describe('a Safe as the claim signer', () => {
 		expect(rpc.fetch).not.toHaveBeenCalled()
 	})
 
-	it('stops asking a claim signer with no code once it has found none', async () => {
+	it('stops asking a claim signer with no code for 10 minutes once it has found none', async () => {
 		const rpc = chain(MAINNET_BUILD, 1n)
 		const POST = await load(MAINNET_BUILD)
 		const words = (nonce: bigint) => context(MAINNET_BUILD, nonce)
@@ -288,6 +288,14 @@ describe('a Safe as the claim signer', () => {
 		expect(statuses(second.body)).toEqual(['invalid'])
 		expect(rpc.signatureChecks).toEqual([expect.objectContaining({ accepted: false })])
 		expect(rpc.fetch).toHaveBeenCalledTimes(1)
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining('gave no isValidSignature answer')
+		)
+
+		vi.setSystemTime((NOW + 10 * 60) * 1000)
+		await postTo(POST, [await twice(4n)])
+		expect(rpc.signatureChecks).toHaveLength(2)
+		vi.setSystemTime(NOW * 1000)
 		expect(
 			statuses((await postTo(POST, [await keySigned(MAINNET_BUILD, KEY_SIGNER, 3n)])).body)
 		).toEqual(['unredeemed'])

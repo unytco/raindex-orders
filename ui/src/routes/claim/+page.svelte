@@ -149,14 +149,11 @@
 			})
 
 			transactionStore.awaitTxReceipt(hash)
-			const receipt = await waitForTransaction(hash)
-
-			if (receipt) {
-				transactionStore.transactionSuccess(hash)
-				success = true
-				successTxHash = hash
-				await getVaultBalance()
-			}
+			await waitForTransaction(hash)
+			transactionStore.transactionSuccess(hash)
+			success = true
+			successTxHash = hash
+			await getVaultBalance()
 		} catch (e) {
 			error = errorMessage(e, 'Claim failed')
 			transactionStore.transactionError({ message: error })

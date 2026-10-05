@@ -104,6 +104,7 @@ async function readWalletChain() {
 		handleChainChanged((await eth.request({ method: 'eth_chainId' })) as string)
 	} catch (err) {
 		console.error('Error reading the wallet chain:', err)
+		ethereumStore.update(s => ({ ...s, error: 'Could not read your wallet network' }))
 	}
 }
 

@@ -81,9 +81,11 @@ const readAbi = parseAbi([
 ])
 const multicall3 = bridge.chain.contracts.multicall3.address
 
-// Set once an isValidSignature call finds no answer, as an address with no code
-// gives: from then on this isolate answers a contract signer's coupon invalid unread.
-let claimSignerAnswers = true
+// When an isValidSignature call last found no answer, as an address with no code
+// gives. For SILENT_SIGNER_MS after it, this isolate answers a contract signer's
+// coupon invalid unread, so forged ones cost no read.
+let claimSignerSilentAt: number | undefined
+const SILENT_SIGNER_MS = 10 * 60_000
 
 type Coupon = {
 	id: Hex
@@ -135,7 +137,9 @@ export const POST: RequestHandler = async ({ request, platform }) => {
 			// An entry exists only for a coupon whose signature was verified.
 			else if (cached) unread.push(coupon)
 			else if (coupon.signedBy === 'contract') {
-				if (claimSignerAnswers) unverified.push(coupon)
+				const silent =
+					claimSignerSilentAt !== undefined && now - claimSignerSilentAt < SILENT_SIGNER_MS
+				if (!silent) unverified.push(coupon)
 			} else if (await signedByClaimSigner(coupon)) unread.push(coupon)
 		})
 	)
@@ -372,7 +376,10 @@ async function readChain(
 				answer.error.walk(e => e instanceof ContractFunctionZeroDataError) !== null
 		)
 	) {
-		claimSignerAnswers = false
+		claimSignerSilentAt = Date.now()
+		console.error(
+			`coupon-status: the claim signer ${CLAIM_ORDER.signer} gave no isValidSignature answer; contract signatures read as invalid for ${SILENT_SIGNER_MS / 60_000} min`
+		)
 	}
 	return {
 		block: read(1),
