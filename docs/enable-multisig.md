@@ -1,0 +1,71 @@
+# Moving the bridge to a multisig
+
+The bridge launches with one coupon signer key and the vault admin that `deploy-mainnet.sh` sets. Each of the two can move to a Safe multisig later. Neither move changes a contract or redeploys the vault.
+
+- **The vault admin** can be any address. `setAdmin` hands it to a Safe.
+- **The coupon signer** can be a contract. The orderbook checks a coupon's signature with OpenZeppelin's `SignatureChecker`. For a contract signer, it asks the contract's EIP-1271 `isValidSignature`, so `valid-signer` in `src/holo-claim.rain` can be a Safe with no Rainlang change. A Safe 1.4.1 answers through its `CompatibilityFallbackHandler`. It accepts the signatures of its owners over the SafeMessage hash of the coupon's digest, sorted by owner address and joined.
+
+`test/fork-rehearsal.sh` proves both moves on a fork of mainnet: a 2 of 3 Safe acts as the vault admin, and a coupon with two owner signatures claims while a coupon with one fails.
+
+Each key holder follows [key-holder.md](./key-holder.md).
+
+## Move the vault admin to a Safe
+
+1. In the Safe web app, create a Safe on Ethereum with three owners and a threshold of 2.
+2. From the current admin, hand the vault over:
+
+   ```sh
+   cast send "$MAINNET_LOCK_VAULT_ADDRESS" 'setAdmin(address)' "$SAFE" --ledger --rpc-url "$ETH_RPC_URL"
+   ```
+
+3. Make sure the vault names the Safe:
+
+   ```sh
+   cast call "$MAINNET_LOCK_VAULT_ADDRESS" 'admin()(address)' --rpc-url "$ETH_RPC_URL"
+   ```
+
+From then on, every admin call is a Safe transaction that two owners approve: `adminWithdraw`, `adminRecoverTokens`, `setMinLockAmount`, `addOrder`, `removeOrder` and `setAdmin`. The orchestrator and the website keep their values.
+
+## Move the coupon signer to a Safe
+
+A coupon signer Safe needs a threshold of 2 or more, and at most 20 owners. The website's coupon status reads a 65-byte signature as one key's, and checks only longer signatures with the Safe.
+
+1. Create the Safe. Its owners are the keys of the signer services, which are not built yet: see the last section.
+2. Replace the claim order with one whose `valid-signer` is the Safe. Take the current values from the deploy record:
+
+   ```sh
+   NETWORK=mainnet ETH_RPC_URL=... \
+   LOCK_VAULT_ADDRESS=<MAINNET_LOCK_VAULT_ADDRESS> ORDER_HASH=<ORDER_HASH> \
+   CLAIM_INTERPRETER=<PUBLIC_CLAIM_INTERPRETER> CLAIM_STORE=<PUBLIC_CLAIM_STORE> \
+   CLAIM_EXPRESSION=<PUBLIC_CLAIM_EXPRESSION> VALID_SIGNER=<the Safe> \
+   ./rotate-claim-signer.sh --ledger
+   ```
+
+   The script adds the new order and then removes the old one, through the vault admin.
+
+   - If the admin is a key, pass its wallet option. The script sends both calls and prints the new deploy record.
+   - If the admin is a Safe, pass no wallet option. The script sends nothing and prints the two calls. Propose each from the admin Safe in that order, in the Safe web app's Transaction Builder: the vault as the address, value 0, and the printed data. When both have run, print the new deploy record with `./rotate-claim-signer.sh record <block of the first call>`.
+3. Give the orchestrator the new `ORDER_HASH` and a signer for the Safe, then restart it. At startup it refuses an `ORDER_HASH` the orderbook does not hold.
+4. Give the website the new `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_SIGNER`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE` and `PUBLIC_CLAIM_EXPRESSION`, then build and deploy it again.
+5. Reissue the coupons that were not claimed. A coupon names its order's hash, so a coupon for the old order fails on the new one.
+
+The claim order marks a nonce used under its own order hash. A withdrawal claimed on the old order is not marked on the new one, so a new coupon for it pays it a second time. Reissue a coupon only once the old order is removed, and only for a withdrawal whose old coupon is unredeemed. To read whether an old coupon is redeemed, ask the old order's store, where a nonzero answer means redeemed:
+
+```sh
+namespace=$(cast keccak "$(cast abi-encode 'f(address,address)' "$VAULT" "$ORDERBOOK")")
+key=$(cast keccak "$(cast abi-encode --packed 'f(uint256,uint256)' "$OLD_ORDER_HASH" "$NONCE")")
+cast call "$OLD_CLAIM_STORE" 'get(uint256,uint256)(uint256)' "$namespace" "$key" --rpc-url "$ETH_RPC_URL"
+```
+
+`NONCE` is the coupon's last field.
+
+## Fireblocks as the coupon signer
+
+A Fireblocks MPC wallet is a paid alternative to a Safe. It signs as one Ethereum address, so the claim order needs only that address as `valid-signer`, set with `rotate-claim-signer.sh` as above. The website needs no change, as it checks a 65-byte signature as one key's. The orchestrator needs a `CouponKey` in `bridge-orchestrator/src/signer.rs` that has Fireblocks sign the coupon's digest and returns the 65-byte signature.
+
+## What is not built yet
+
+A Safe as the coupon signer needs two parts that do not exist yet. Until both exist, the coupon signer stays one key.
+
+- **A second signer service.** It watches the same withdrawals on the Unyt network and checks each one itself: that the withdrawal is real, its amount and recipient, and that it has no coupon yet. Then it signs the coupon's SafeMessage hash with its own owner key. Without its own check, a second signature adds no protection.
+- **The orchestrator collecting two signatures.** A `CouponKey` for the Safe in `bridge-orchestrator/src/signer.rs` signs with the orchestrator's owner key and gets the second service's signature. It returns both, sorted by owner address and joined, and names the Safe as the coupon's signer. Coupon building does not change.

@@ -1,6 +1,6 @@
-# Holo Bridge - Sepolia Deployment Guide
+# Holo Bridge deployment guide
 
-This guide covers deploying and testing the complete HOT <> bridged HOT bridge infrastructure on Sepolia testnet.
+This guide covers deploying and testing the complete HOT <> bridged HOT bridge infrastructure on Sepolia testnet, and [deploying it on Ethereum mainnet](#mainnet-deploy).
 
 ## Prerequisites
 
@@ -14,18 +14,14 @@ This guide covers deploying and testing the complete HOT <> bridged HOT bridge i
 ### 1. Set Up Environment
 
 ```bash
-# Copy example env file
+# Copy example env file. It holds addresses, never a private key.
 cp .env.example .env
 
-# Edit .env and add your private key
-nano .env
+# Keep the deployer key in an encrypted keystore, entered at a prompt
+cast wallet import deployer --interactive
 ```
 
-Your `.env` should have:
-```bash
-PRIVATE_KEY=0x<your-private-key-here>
-SEPOLIA_RPC_URL=https://1rpc.io/sepolia
-```
+Every step that sends a transaction takes the deployer as `--account deployer`, or `--ledger` for a Ledger. `deploy-sepolia.sh` refuses a `PRIVATE_KEY` in `.env` and a `--private-key` option.
 
 ### 2. Deploy All Contracts
 
@@ -33,24 +29,22 @@ The `deploy-sepolia.sh` script handles all deployment steps:
 
 ```bash
 # Check your wallet and balance
-./deploy-sepolia.sh status
+./deploy-sepolia.sh status --account deployer
 
 # Step 1: Deploy MockHOT token
-./deploy-sepolia.sh token
+./deploy-sepolia.sh token --account deployer
 # Note: Updates .env with TOKEN_ADDRESS automatically
 
 # Step 2: Deploy HoloLockVault
-./deploy-sepolia.sh vault
+./deploy-sepolia.sh vault --account deployer
 # Note: Updates .env with LOCK_VAULT_ADDRESS automatically
 
 # Step 3: Mint test tokens to your wallet
-./deploy-sepolia.sh mint
+./deploy-sepolia.sh mint --account deployer
 
-# Step 4: Fund the vault (deposit tokens for claims)
-./deploy-sepolia.sh fund
-
-# Step 5: Deploy claim order via HoloLockVault
-./deploy-sepolia.sh order-via-vault
+# Step 4: Deploy claim order via HoloLockVault, accepting coupons from
+# VALID_SIGNER (the test signer unless set)
+./deploy-sepolia.sh order-via-vault --account deployer
 # Note: Updates .env with ORDER_HASH and ORDER_OWNER automatically
 ```
 
@@ -72,6 +66,37 @@ The `deploy-sepolia.sh` script handles all deployment steps:
 | NOOP Token (placeholder) | `0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028` |
 | Test Signer | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` |
 
+## Mainnet deploy
+
+`deploy-mainnet.sh` deploys the bridge on Ethereum mainnet against the existing OrderBookV3. It deploys no orderbook.
+
+```bash
+npm ci   # compose-rainlang.mjs, which composes the claim expression
+ETH_RPC_URL=<an Ethereum RPC> \
+ADMIN_ADDRESS=<the vault's final admin> \
+VALID_SIGNER=<the coupon signer's address> \
+./deploy-mainnet.sh --ledger            # or --account <keystore>
+```
+
+- **Refusals.** Before it sends anything, it refuses a chain other than 1, a missing input, a raw key option such as `--private-key`, an `ADMIN_ADDRESS` equal to the deployer, and a `VALID_SIGNER` equal to the test signer.
+- **What it sends.** `HoloLockVault(HOT, OrderBookV3, HOLO_VAULT_ID, deployer, MIN_LOCK_AMOUNT)`, then the claim order through the vault, then `setAdmin(ADMIN_ADDRESS)`. It sends them one at a time, each after the one before has landed.
+- **The record.** It reads back the vault's token, orderbook, vault ID and admin, and the claim order, from the chain. Then it prints the deploy record under the variable names the orchestrator and the website take.
+- **Failure.** A run cannot be resumed. A run that stops part way prints the transactions it sent. A new run deploys a new vault.
+
+### Rehearse it first
+
+`test/fork-rehearsal.sh` runs `deploy-mainnet.sh` and `rotate-claim-signer.sh`, unchanged, against anvil forks of mainnet. Every transaction goes to the anvil it starts on 127.0.0.1.
+
+```bash
+nix develop -c test/fork-rehearsal.sh   # FORK_URL sets the mainnet RPC anvil forks
+```
+
+It proves on the fork that the deploy refuses another chain, a missing input, a raw key and the test signer while sending nothing. Then it deploys, and proves that a lock lands in the vault, that a coupon signed as the orchestrator signs claims it back, and that nonce reuse, a wrong signer and an expired coupon fail. It proves that the admin is `ADMIN_ADDRESS` and the deployer is locked out. Last, it moves the vault admin and the coupon signer to 2 of 3 Safes, as [docs/enable-multisig.md](./docs/enable-multisig.md) describes, and proves that a coupon with two owner signatures claims and one with a single signature fails.
+
+### Website
+
+One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui` for Sepolia, and `hot-bridge-ui-mainnet`, the wrangler env `mainnet`. Each Workers Builds project sets `PUBLIC_NETWORK` and the `PUBLIC_*` build variables the deploy record prints, and its RPC secret: `SEPOLIA_RPC_URL` and `FAUCET_PRIVATE_KEY`, or `ETH_RPC_URL`. A build with a missing or malformed variable, or the test signer on mainnet, fails. The mainnet website has no faucet.
+
 ## Testing the Complete Flow
 
 ### Lock Flow (HOT -> Bridged HOT)
@@ -79,9 +104,8 @@ The `deploy-sepolia.sh` script handles all deployment steps:
 1. **Start the bridge orchestrator:**
 ```bash
 cd bridge-orchestrator
-cp .env.example .env
-# Edit .env with your Sepolia + Holochain settings
-cargo run
+# Set NETWORK=sepolia and the variables bridge-orchestrator/README.md lists
+cargo run -- run
 ```
 
 2. **Start the UI:**
@@ -150,7 +174,7 @@ Functions:
 Rust service that replaces the legacy `lock-watcher-rs` and `coupon-signer`:
 ```bash
 cd bridge-orchestrator
-cargo run
+cargo run -- run
 ```
 
 Responsibilities:
@@ -166,13 +190,13 @@ SvelteKit web interface:
 - `/lock` - Lock HOT to receive bridged HOT
 - `/claim` - Claim HOT with coupon
 - `/claim?c=<coupon>` - Direct claim via URL parameter
-- `POST /api/coupon-status` - Status of up to 20 claim coupons, read from Sepolia through `SEPOLIA_RPC_URL`
+- `POST /api/coupon-status` - Status of up to 20 claim coupons, read from the build's network through its RPC secret
 
 #### What bounds coupon-status RPC use
 
-- **Signature gate.** A coupon is read only if it names the claim order's signer (`valid-signer` in `src/holo-claim.rain`, `CLAIM_ORDER.signer` in `ui/src/lib/orderConfig.ts`) and its signature recovers to that signer, checked as the orderbook checks it. Any other coupon answers `invalid` and is never read, so only genuine coupons can cause a read.
+- **Signature gate.** A coupon is read only if it names the claim order's signer (`valid-signer` in `src/holo-claim.rain`, `PUBLIC_CLAIM_SIGNER` in the build) and carries a signature that signer gives, checked as the orderbook checks it. A 65-byte signature must recover to the signer, and any other coupon of that form answers `invalid` and is never read. A signature of 2 to 20 owners' length is a contract signer's, such as a Safe's: the signer's EIP-1271 `isValidSignature` checks it in the same `eth_call` that reads the nonces, so such a coupon causes a read even when it answers `invalid`. A coupon signer Safe therefore needs a threshold of 2 or more.
 - **Cache.** Answers are kept in the Workers Cache, keyed by the coupon's signer, signature and context values, so a coupon respelled with other hex case or leading zeros shares its entry. `redeemed` and `expired` are kept from then on. `unredeemed` is kept for 60 s, and never once the coupon's expiry has passed. The Workers Cache is local to each Cloudflare data centre, so each data centre reads a coupon once for itself. A cache read or write that fails is logged and costs only a read; it never changes an answer.
-- **One read at most.** A request makes at most one `eth_call` to `SEPOLIA_RPC_URL`: one Multicall3 `aggregate3` at the `safe` block, reading each uncached nonce once. A request the cache answers in full, or with no valid coupon, makes none, and its `block` is `null`.
+- **One read at most.** A request makes at most one `eth_call` to its network's RPC secret, `SEPOLIA_RPC_URL` or `ETH_RPC_URL`: one Multicall3 `aggregate3` at the `safe` block, reading each uncached nonce once. A request the cache answers in full, or with no valid coupon, makes none, and its `block` is `null`. An RPC that answers for another chain is refused.
 
 A coupon whose expiry has passed, but which the `safe` block still shows unexpired, is read on every request until the `safe` block passes its expiry, about 10 to 15 minutes on Sepolia.
 
@@ -230,7 +254,7 @@ What it means depends on when the coupon was signed. Coupons signed before the p
 ## Security Notes
 
 - Rotate the `SEPOLIA_RPC_URL` API key once the faucet fix (UNYT-1040) is deployed: until then `/api/faucet` answered a failed RPC call with an error that held the full RPC URL. Change the `SEPOLIA_RPC_URL` Workers Builds build variable, which `ui/scripts/cf-deploy.sh` re-applies as the runtime secret on every deploy.
-- Never commit `.env` files with private keys
-- The test signer key in this repo is for testing only
-- In production, use Fireblocks MPC or similar secure key management
-- The admin key controls emergency withdrawals - protect it carefully
+- Keep private keys out of `.env` files and command lines: sign with `--account` or `--ledger`
+- The test signer key in this repo is for testing only, and every mainnet input refuses it
+- The coupon signer is one key at launch. A Safe multisig or a Fireblocks MPC wallet can replace it: [docs/enable-multisig.md](./docs/enable-multisig.md)
+- The admin key controls emergency withdrawals. It can move to a Safe multisig, whose key holders follow [docs/key-holder.md](./docs/key-holder.md)

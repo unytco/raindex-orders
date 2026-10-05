@@ -352,7 +352,7 @@ pub struct ReserveCertificate {
     pub lock_id: u64,                // Lock ID from contract
     pub recipient: AgentPubKey,      // Holochain agent
     pub expiry: Timestamp,           // Certificate expiry
-    pub signature: Signature,        // Fireblocks signature (optional)
+    pub signature: Signature,        // coupon signer's signature (optional)
 }
 ```
 
@@ -361,7 +361,7 @@ pub struct ReserveCertificate {
 The bridge-orchestrator also handles coupon generation for claims:
 
 1. **Current State**: Orchestrator generates signed coupons with the configured signer key
-2. **Next Step**: Integrate with Fireblocks MPC for production signing
+2. **Next Step**: Move the signer to a Safe multisig or a Fireblocks MPC wallet ([docs/enable-multisig.md](./docs/enable-multisig.md))
 3. **Final Step**: Trigger from bridged HOT burn events
 
 **Integration Flow**:
@@ -389,12 +389,12 @@ The bridge-orchestrator also handles coupon generation for claims:
 ### Bridge Security
 - **Finality**: Bridge orchestrator should wait for sufficient confirmations (15+)
 - **Replay Protection**: Track processed lock IDs on both sides
-- **Same Signer**: Use same trusted signer (Fireblocks) for both directions
+- **Same Signer**: Use the same trusted signer for both directions: one key, a Safe multisig or a Fireblocks MPC wallet
 
 ### Key Management
 - **Test Key**: Included in repo for testing only
-- **Production**: Use Fireblocks MPC or similar secure key management
-- **Admin Key**: Protects emergency withdrawal - should be multisig
+- **Coupon signer**: one key at launch, then a Safe multisig or a Fireblocks MPC wallet ([docs/enable-multisig.md](./docs/enable-multisig.md))
+- **Admin Key**: Protects emergency withdrawal. It can move to a Safe multisig: [docs/enable-multisig.md](./docs/enable-multisig.md)
 
 ---
 

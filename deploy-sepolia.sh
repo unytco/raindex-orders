@@ -17,7 +17,7 @@
 # Steps:
 #   1 or token          - Deploy MockHOT token
 #   2 or vault          - Deploy HoloLockVault
-#   3 or mint           - Mint test tokens to your wallet
+#   3 or mint           - Mint test tokens to your wallet (MINT_AMOUNT, in wei)
 #   5 or order-via-vault - Deploy claim order via vault
 #   all                 - Run all steps
 #   status              - Show current deployment status
@@ -40,7 +40,7 @@ else
     exit 1
 fi
 
-if [ -n "$PRIVATE_KEY" ]; then
+if [ -n "$PRIVATE_KEY" ] && [ "$PRIVATE_KEY" != "0x..." ]; then
     echo -e "${RED}Error: remove PRIVATE_KEY from .env. Pass --account <keystore> or --ledger instead.${NC}"
     exit 1
 fi
@@ -249,7 +249,7 @@ case "$STEP" in
         deploy_vault
         ;;
     3|mint)
-        mint_tokens "${2:-1000000000000000000000}"
+        mint_tokens "${MINT_AMOUNT:-1000000000000000000000}"
         ;;
     5|order-via-vault)
         deploy_order_via_vault
