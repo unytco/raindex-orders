@@ -464,14 +464,18 @@ mod tests {
             }
         });
 
-        let err = check_within(
-            Duration::from_millis(200),
-            Network::Sepolia,
-            &url,
-            VAULT,
-            &order(),
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            check_within(
+                Duration::from_millis(200),
+                Network::Sepolia,
+                &url,
+                VAULT,
+                &order(),
+            ),
         )
         .await
+        .expect("the check waited on a silent RPC with no end")
         .expect_err("a silent RPC passed the check");
         held.abort();
 
