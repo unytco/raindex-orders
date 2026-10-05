@@ -156,17 +156,30 @@ async fn read_and_compare(
     Ok(())
 }
 
-/// The cause of a failed read, without the RPC URL: a provider's URL can hold its
-/// API key, and reqwest names the URL in its own message.
+/// The cause of a failed read, in words of our own: a provider's URL can hold its
+/// API key, reqwest names the URL in its message, and the provider's own answer can
+/// echo either. Only reqwest's underlying causes, the HTTP status and the JSON-RPC
+/// error code are kept.
 fn rpc_failure(rpc_var: &str, what: &str, err: &TransportError) -> anyhow::Error {
     let cause = match err {
         RpcError::Transport(TransportErrorKind::Custom(inner)) => {
             match inner.downcast_ref::<reqwest::Error>() {
                 Some(request) => causes(request),
-                None => inner.to_string(),
+                None => "the transport failed".to_string(),
             }
         }
-        other => other.to_string(),
+        RpcError::Transport(TransportErrorKind::HttpError(http)) => {
+            format!("the RPC answered HTTP {}", http.status)
+        }
+        RpcError::Transport(_) => "the transport failed".to_string(),
+        RpcError::ErrorResp(payload) => {
+            format!("the RPC answered with error code {}", payload.code)
+        }
+        RpcError::NullResp => "the RPC answered with no result".to_string(),
+        RpcError::DeserError { .. } => "the RPC's answer could not be read".to_string(),
+        RpcError::SerError(_) | RpcError::LocalUsageError(_) | RpcError::UnsupportedFeature(_) => {
+            "the request could not be made".to_string()
+        }
     };
     anyhow!("{rpc_var}: {what} failed: {cause}")
 }
@@ -297,6 +310,22 @@ mod tests {
     }
 
     async fn respond(mut socket: TcpStream, chain: &Chain) {
+        let body = read_request(&mut socket).await;
+        let call: Value = serde_json::from_slice(&body).unwrap();
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": call["id"],
+            "result": chain.answer(call["method"].as_str().unwrap(), &call["params"]),
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn read_request(socket: &mut TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         let mut chunk = [0u8; 4096];
         let body = loop {
@@ -316,18 +345,57 @@ mod tests {
                 break request[end + 4..end + 4 + length].to_vec();
             }
         };
-        let call: Value = serde_json::from_slice(&body).unwrap();
-        let reply = json!({
-            "jsonrpc": "2.0",
-            "id": call["id"],
-            "result": chain.answer(call["method"].as_str().unwrap(), &call["params"]),
-        })
-        .to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-            reply.len()
-        );
-        socket.write_all(response.as_bytes()).await.unwrap();
+        body
+    }
+
+    /// Answers every request with `status` and `body`, whatever it asks.
+    async fn serve_answer(status: &'static str, body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v3/{SECRET}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                read_request(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        url
+    }
+
+    const SECRET: &str = "secret-api-key";
+
+    #[tokio::test]
+    async fn names_a_failed_answer_in_words_of_its_own() {
+        let leaky = format!("https://rpc.example/v3/{SECRET} refused the body {SECRET}");
+        let answers = [
+            (
+                "200 OK",
+                json!({"jsonrpc": "2.0", "id": 0, "error": {"code": -32000, "message": leaky, "data": leaky}}).to_string(),
+                "ETH_RPC_URL: eth_chainId failed: the RPC answered with error code -32000",
+            ),
+            (
+                "401 Unauthorized",
+                leaky.clone(),
+                "ETH_RPC_URL: eth_chainId failed: the RPC answered HTTP 401",
+            ),
+            (
+                "200 OK",
+                leaky.clone(),
+                "ETH_RPC_URL: eth_chainId failed: the RPC's answer could not be read",
+            ),
+        ];
+        for (status, body, expected) in answers {
+            let url = serve_answer(status, body).await;
+
+            let err = check(Network::Mainnet, &url, VAULT, &order())
+                .await
+                .expect_err("a failed answer passed the check");
+
+            assert_eq!(format!("{err:#}"), expected);
+        }
     }
 
     async fn check_against(network: Network, chain: Chain, order: &ClaimOrder) -> Result<()> {
