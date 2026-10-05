@@ -6,7 +6,6 @@ import {IOrderBookV3ArbOrderTaker} from "rain.orderbook.interface/interface/IOrd
 import {IParserV1} from "rain.interpreter.interface/interface/IParserV1.sol";
 import {IExpressionDeployerV3} from "rain.interpreter.interface/interface/IExpressionDeployerV3.sol";
 import {EvaluableConfigV3, SignedContextV1} from "rain.interpreter.interface/interface/IInterpreterCallerV2.sol";
-import {LibComposeOrders} from "./lib/LibComposeOrder.sol";
 import {
     OrderConfigV2,
     OrderV2,
@@ -16,14 +15,7 @@ import {
 } from "rain.orderbook.interface/interface/IOrderBookV3.sol";
 import {LibOrder} from "rain.orderbook/src/lib/LibOrder.sol";
 import {SignContext} from "./lib/SignContext.sol";
-import {
-    TEST_SIGNER_KEY,
-    TEST_SIGNER_ADDRESS,
-    MAINNET_ORDERBOOK,
-    MAINNET_DEPLOYER,
-    MAINNET_HOT,
-    MAINNET_USDT
-} from "src/Constants.sol";
+import {MAINNET_ORDERBOOK, MAINNET_DEPLOYER, MAINNET_HOT, MAINNET_USDT, MAINNET_SUBPARSER} from "src/Constants.sol";
 
 interface GetParser {
     function iParser() external view returns (IParserV1);
@@ -41,9 +33,17 @@ contract TestClaim is Test, SignContext {
         address orderOwner = makeAddr("owner");
         address taker = makeAddr("taker");
 
-        bytes memory rainlang = LibComposeOrders.getComposedOrder(
-            vm, "src/holo-claim.rain", "mainnet", "./lib/rain.orderbook", "./lib/rain.orderbook/Cargo.toml"
-        );
+        (address signer, uint256 privateKey) = makeAddrAndKey("coupon signer");
+        string[] memory compose = new string[](8);
+        compose[0] = "node";
+        compose[1] = "compose-rainlang.mjs";
+        compose[2] = "--network";
+        compose[3] = "mainnet";
+        compose[4] = "--subparser";
+        compose[5] = vm.toString(MAINNET_SUBPARSER);
+        compose[6] = "--signer";
+        compose[7] = vm.toString(signer);
+        bytes memory rainlang = vm.ffi(compose);
         console2.log(string(rainlang));
 
         IParserV1 parser = GetParser(address(MAINNET_DEPLOYER)).iParser();
@@ -75,8 +75,6 @@ contract TestClaim is Test, SignContext {
             MAINNET_ORDERBOOK.deposit(address(MAINNET_HOT), 1, 100e18);
             assertEq(MAINNET_HOT.balanceOf(address(MAINNET_ORDERBOOK)), 100e18);
         }
-
-        uint256 privateKey = uint256(TEST_SIGNER_KEY);
 
         uint256 amount = 100e18;
 
