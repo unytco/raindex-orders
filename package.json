@@ -1,7 +1,8 @@
 {
   "scripts": {
     "format": "forge fmt",
-    "format:check": "forge fmt --check"
+    "format:check": "forge fmt --check",
+    "test": "node --test compose-rainlang.test.mjs"
   },
   "dependencies": {
     "@rainlanguage/dotrain": "^6.0.1-alpha.24"

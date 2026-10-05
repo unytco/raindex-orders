@@ -3,26 +3,17 @@ pragma solidity =0.8.19;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {HoloLockVault} from "src/HoloLockVault.sol";
-import {
-    MAINNET_ORDERBOOK,
-    MAINNET_HOT,
-    SEPOLIA_ORDERBOOK,
-    SEPOLIA_TROT,
-    HOLO_VAULT_ID,
-    MIN_LOCK_AMOUNT
-} from "src/Constants.sol";
+import {SEPOLIA_ORDERBOOK, SEPOLIA_TROT, HOLO_VAULT_ID, MIN_LOCK_AMOUNT} from "src/Constants.sol";
 
 /// @title DeployHoloLockVault
-/// @notice Deploys the HoloLockVault contract to mainnet or Sepolia
+/// @notice Deploys the HoloLockVault contract to Sepolia. Mainnet deploys through
+/// deploy-mainnet.sh.
 /// @dev Run with:
 ///   # Sepolia (dry-run):
 ///   forge script script/DeployHoloLockVault.s.sol:DeploySepoliaHoloLockVault --rpc-url $SEPOLIA_RPC_URL
 ///
 ///   # Sepolia (broadcast):
 ///   forge script script/DeployHoloLockVault.s.sol:DeploySepoliaHoloLockVault --rpc-url $SEPOLIA_RPC_URL --broadcast --verify
-///
-///   # Mainnet (dry-run):
-///   forge script script/DeployHoloLockVault.s.sol:DeployMainnetHoloLockVault --rpc-url $ETH_RPC_URL
 contract DeploySepoliaHoloLockVault is Script {
     function run() external {
         // Read token address from environment, fallback to SEPOLIA_TROT
@@ -41,29 +32,6 @@ contract DeploySepoliaHoloLockVault is Script {
 
         HoloLockVault lockVault =
             new HoloLockVault(token, address(SEPOLIA_ORDERBOOK), HOLO_VAULT_ID, admin, MIN_LOCK_AMOUNT);
-
-        vm.stopBroadcast();
-
-        console2.log("HoloLockVault deployed at:", address(lockVault));
-    }
-}
-
-contract DeployMainnetHoloLockVault is Script {
-    function run() external {
-        // Read admin address from environment
-        address admin = vm.envAddress("ADMIN_ADDRESS");
-
-        console2.log("Deploying HoloLockVault to Mainnet...");
-        console2.log("Token (HOT):", address(MAINNET_HOT));
-        console2.log("Orderbook:", address(MAINNET_ORDERBOOK));
-        console2.log("Vault ID:", HOLO_VAULT_ID);
-        console2.log("Admin:", admin);
-        console2.log("Min Lock Amount:", MIN_LOCK_AMOUNT);
-
-        vm.startBroadcast();
-
-        HoloLockVault lockVault =
-            new HoloLockVault(address(MAINNET_HOT), address(MAINNET_ORDERBOOK), HOLO_VAULT_ID, admin, MIN_LOCK_AMOUNT);
 
         vm.stopBroadcast();
 

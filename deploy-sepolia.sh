@@ -5,19 +5,20 @@
 # This script deploys all contracts needed for the Holo Bridge on Sepolia
 #
 # Prerequisites:
-# 1. Copy .env.example to .env
-# 2. Add your PRIVATE_KEY to .env
-# 3. Have Sepolia ETH in your wallet
+# 1. Copy .env.example to .env. It holds addresses, never a private key.
+# 2. A deployer wallet forge can sign with: a Ledger, or an encrypted keystore
+#    made with `cast wallet import deployer --interactive`
+# 3. Have Sepolia ETH in that wallet
 #
 # Usage:
-#   ./deploy-sepolia.sh [step]
+#   ./deploy-sepolia.sh [step] --account deployer
+#   ./deploy-sepolia.sh [step] --ledger
 #
 # Steps:
 #   1 or token          - Deploy MockHOT token
 #   2 or vault          - Deploy HoloLockVault
 #   3 or mint           - Mint test tokens to your wallet
-#   4 or order          - Deploy claim order (you as owner)
-#   5 or order-via-vault - Deploy claim order via vault (recommended)
+#   5 or order-via-vault - Deploy claim order via vault
 #   all                 - Run all steps
 #   status              - Show current deployment status
 
@@ -35,13 +36,12 @@ if [ -f .env ]; then
     source .env
 else
     echo -e "${RED}Error: .env file not found${NC}"
-    echo "Please copy .env.example to .env and add your PRIVATE_KEY"
+    echo "Please copy .env.example to .env"
     exit 1
 fi
 
-# Check required variables
-if [ -z "$PRIVATE_KEY" ] || [ "$PRIVATE_KEY" == "0x..." ]; then
-    echo -e "${RED}Error: PRIVATE_KEY not set in .env${NC}"
+if [ -n "$PRIVATE_KEY" ]; then
+    echo -e "${RED}Error: remove PRIVATE_KEY from .env. Pass --account <keystore> or --ledger instead.${NC}"
     exit 1
 fi
 
@@ -49,13 +49,32 @@ if [ -z "$SEPOLIA_RPC_URL" ]; then
     SEPOLIA_RPC_URL="https://1rpc.io/sepolia"
 fi
 
-# Get wallet address from private key
-WALLET_ADDRESS=$(cast wallet address "$PRIVATE_KEY" 2>/dev/null)
-echo -e "${BLUE}Wallet: $WALLET_ADDRESS${NC}"
+STEP="${1:-status}"
+shift || true
+WALLET=("$@")
+for arg in "${WALLET[@]}"; do
+    case "$arg" in
+        --private-key*|--mnemonic|--mnemonic=*|-i|--interactive)
+            echo -e "${RED}Error: $arg takes a raw key. Pass --account <keystore> or --ledger instead.${NC}"
+            exit 1
+            ;;
+    esac
+done
 
-# Check balance
-BALANCE=$(cast balance "$WALLET_ADDRESS" --rpc-url "$SEPOLIA_RPC_URL" 2>/dev/null || echo "0")
-echo -e "${BLUE}Balance: $(cast from-wei $BALANCE) ETH${NC}"
+if [ ${#WALLET[@]} -gt 0 ]; then
+    WALLET_ADDRESS=$(cast wallet address "${WALLET[@]}")
+    # Scripts that default to msg.sender see the wallet only through --sender.
+    WALLET+=(--sender "$WALLET_ADDRESS")
+    echo -e "${BLUE}Wallet: $WALLET_ADDRESS${NC}"
+elif [ "$STEP" != "status" ]; then
+    echo -e "${RED}Error: pass the deployer wallet: --account <keystore> or --ledger${NC}"
+    exit 1
+fi
+
+if [ -n "$WALLET_ADDRESS" ]; then
+    BALANCE=$(cast balance "$WALLET_ADDRESS" --rpc-url "$SEPOLIA_RPC_URL" 2>/dev/null || echo "0")
+    echo -e "${BLUE}Balance: $(cast from-wei "$BALANCE") ETH${NC}"
+fi
 echo ""
 
 deploy_token() {
@@ -64,7 +83,7 @@ deploy_token() {
     # Run forge script
     OUTPUT=$(forge script script/DeployTestHOT.s.sol:DeployTestHOT \
         --rpc-url "$SEPOLIA_RPC_URL" \
-        --private-key "$PRIVATE_KEY" \
+        "${WALLET[@]}" \
         --broadcast \
         -vvv 2>&1)
 
@@ -97,7 +116,7 @@ deploy_vault() {
     # Run forge script
     OUTPUT=$(forge script script/DeployHoloLockVault.s.sol:DeploySepoliaHoloLockVault \
         --rpc-url "$SEPOLIA_RPC_URL" \
-        --private-key "$PRIVATE_KEY" \
+        "${WALLET[@]}" \
         --broadcast \
         -vvv 2>&1)
 
@@ -135,97 +154,16 @@ mint_tokens() {
     AMOUNT="$AMOUNT" \
     forge script script/DeployTestHOT.s.sol:MintTestHOT \
         --rpc-url "$SEPOLIA_RPC_URL" \
-        --private-key "$PRIVATE_KEY" \
+        "${WALLET[@]}" \
         --broadcast \
         -vvv
 
     echo -e "${GREEN}Tokens minted successfully!${NC}"
 }
 
-deploy_order() {
-    echo -e "${YELLOW}=== Step 4: Deploying Claim Order (direct) ===${NC}"
-    echo -e "${YELLOW}NOTE: This deploys with YOUR wallet as owner. Use 'order-via-vault' for production.${NC}"
-
-    if [ -z "$TOKEN_ADDRESS" ]; then
-        echo -e "${RED}Error: TOKEN_ADDRESS not set in .env${NC}"
-        exit 1
-    fi
-
-    # Sepolia addresses
-    ORDERBOOK_SUBPARSER="0xe6A589716d5a72276C08E0e08bc941a28005e55A"
-    VALID_SIGNER="0x8E72b7568738da52ca3DCd9b24E178127A4E7d37"
-
-    echo "Using token: $TOKEN_ADDRESS"
-    echo "Valid signer: $VALID_SIGNER"
-
-    # Use Node.js dotrain package to compose the rainlang
-    echo "Composing rainlang with @rainlanguage/dotrain..."
-    RAINLANG=$(node compose-rainlang.mjs 2>&1)
-
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}dotrain compose failed:${NC}"
-        echo "$RAINLANG"
-        echo ""
-        echo "Make sure @rainlanguage/dotrain is installed: npm install @rainlanguage/dotrain"
-        exit 1
-    fi
-
-    echo "Composed Rainlang:"
-    echo "$RAINLANG"
-    echo ""
-
-    # Write rainlang to temp file (more reliable than env var for multi-line)
-    RAINLANG_FILE=$(mktemp)
-    echo "$RAINLANG" > "$RAINLANG_FILE"
-    echo "Written rainlang to: $RAINLANG_FILE"
-
-    # Run forge script with RAINLANG_FILE env var
-    echo "Running forge script..."
-    set +e  # Don't exit on error so we can capture output
-    OUTPUT=$(RAINLANG_FILE="$RAINLANG_FILE" forge script script/DeployClaimOrder.s.sol:DeployClaimOrder \
-        --rpc-url "$SEPOLIA_RPC_URL" \
-        --private-key "$PRIVATE_KEY" \
-        --broadcast \
-        -vvv 2>&1)
-    FORGE_EXIT_CODE=$?
-    set -e
-
-    # Clean up temp file
-    rm -f "$RAINLANG_FILE"
-
-    echo "$OUTPUT"
-
-    if [ $FORGE_EXIT_CODE -ne 0 ]; then
-        echo -e "${RED}Forge script failed with exit code $FORGE_EXIT_CODE${NC}"
-    fi
-
-    # Try to extract order hash from broadcast JSON
-    BROADCAST_FILE="broadcast/DeployClaimOrder.s.sol/11155111/run-latest.json"
-
-    if [ -f "$BROADCAST_FILE" ]; then
-        # Find the AddOrder event from the orderbook (topic 0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf)
-        # Data layout: 0x + sender(64) + deployer(64) + offset(64) + orderHash(64) = chars 195-258
-        ORDER_HASH_VAL=$(jq -r '.receipts[0].logs[] | select(.topics[0] == "0x6fa57e1a7a1fbbf3623af2b2025fcd9a5e7e4e31a2a6ec7523445f18e9c50ebf") | .data' "$BROADCAST_FILE" 2>/dev/null | cut -c195-258 | sed 's/^/0x/')
-    fi
-
-    if [ -n "$ORDER_HASH_VAL" ] && [ "$ORDER_HASH_VAL" != "0x" ]; then
-        echo -e "${GREEN}Order deployed! Hash: $ORDER_HASH_VAL${NC}"
-        sed -i "s|^ORDER_HASH=.*|ORDER_HASH=$ORDER_HASH_VAL|" .env
-        echo -e "${GREEN}Updated .env with ORDER_HASH${NC}"
-    else
-        echo -e "${YELLOW}Order deployed but could not extract hash from broadcast file${NC}"
-        echo "Check the transaction on Etherscan to get the order hash"
-    fi
-}
-
 deploy_order_via_vault() {
     echo -e "${YELLOW}=== Deploying Claim Order via HoloLockVault ===${NC}"
     echo -e "${GREEN}This makes the vault the order owner, so claims use the same vault as locks.${NC}"
-
-    if [ -z "$TOKEN_ADDRESS" ]; then
-        echo -e "${RED}Error: TOKEN_ADDRESS not set in .env${NC}"
-        exit 1
-    fi
 
     if [ -z "$LOCK_VAULT_ADDRESS" ]; then
         echo -e "${RED}Error: LOCK_VAULT_ADDRESS not set in .env${NC}"
@@ -233,43 +171,22 @@ deploy_order_via_vault() {
         exit 1
     fi
 
-    echo "Using token: $TOKEN_ADDRESS"
+    # TestNet coupons are signed by the test signer, whose key is in src/Constants.sol.
+    VALID_SIGNER="${VALID_SIGNER:-0x8E72b7568738da52ca3DCd9b24E178127A4E7d37}"
     echo "Using vault: $LOCK_VAULT_ADDRESS"
+    echo "Valid signer: $VALID_SIGNER"
 
-    # Use Node.js dotrain package to compose the rainlang
-    echo "Composing rainlang with @rainlanguage/dotrain..."
-    RAINLANG=$(node compose-rainlang.mjs 2>&1)
-
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}dotrain compose failed:${NC}"
-        echo "$RAINLANG"
-        echo ""
-        echo "Make sure @rainlanguage/dotrain is installed: npm install @rainlanguage/dotrain"
-        exit 1
-    fi
-
-    echo "Composed Rainlang:"
-    echo "$RAINLANG"
-    echo ""
-
-    # Write rainlang to temp file (more reliable than env var for multi-line)
-    RAINLANG_FILE=$(mktemp)
-    echo "$RAINLANG" > "$RAINLANG_FILE"
-    echo "Written rainlang to: $RAINLANG_FILE"
-
-    # Run forge script with RAINLANG_FILE env var
+    # Run forge script, which composes the claim expression for Sepolia
     echo "Running forge script..."
     set +e  # Don't exit on error so we can capture output
-    OUTPUT=$(RAINLANG_FILE="$RAINLANG_FILE" forge script script/DeployClaimOrderViaVault.s.sol:DeployClaimOrderViaVault \
+    OUTPUT=$(NETWORK=sepolia LOCK_VAULT_ADDRESS="$LOCK_VAULT_ADDRESS" VALID_SIGNER="$VALID_SIGNER" \
+        forge script script/DeployClaimOrderViaVault.s.sol:DeployClaimOrderViaVault \
         --rpc-url "$SEPOLIA_RPC_URL" \
-        --private-key "$PRIVATE_KEY" \
+        "${WALLET[@]}" \
         --broadcast \
         -vvv 2>&1)
     FORGE_EXIT_CODE=$?
     set -e
-
-    # Clean up temp file
-    rm -f "$RAINLANG_FILE"
 
     echo "$OUTPUT"
 
@@ -324,7 +241,7 @@ show_status() {
 }
 
 # Main
-case "${1:-status}" in
+case "$STEP" in
     1|token)
         deploy_token
         ;;
@@ -333,9 +250,6 @@ case "${1:-status}" in
         ;;
     3|mint)
         mint_tokens "${2:-1000000000000000000000}"
-        ;;
-    4|order)
-        deploy_order
         ;;
     5|order-via-vault)
         deploy_order_via_vault
@@ -356,13 +270,12 @@ case "${1:-status}" in
         show_status
         ;;
     *)
-        echo "Usage: $0 [step]"
+        echo "Usage: $0 [step] --account <keystore> | --ledger"
         echo ""
         echo "Steps:"
         echo "  1 or token          - Deploy MockHOT token"
         echo "  2 or vault          - Deploy HoloLockVault"
         echo "  3 or mint           - Mint test tokens"
-        echo "  4 or order          - Deploy claim order (direct, you as owner)"
         echo "  5 or order-via-vault - Deploy claim order via vault (recommended)"
         echo "  all                 - Run all steps (uses order-via-vault)"
         echo "  status              - Show deployment status"

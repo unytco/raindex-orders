@@ -107,7 +107,7 @@ deployments:
  */ 
 
 #orderbook-subparser !subparser on this network
-#valid-signer !the trusted signer of the claims coupon - this would be the Fireblocks wallet
+#valid-signer !the coupon signer: a single key, a Safe multisig or a Fireblocks MPC wallet (docs/enable-multisig.md)
 
 #calculate-io
 using-words-from orderbook-subparser
