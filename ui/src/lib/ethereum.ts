@@ -104,14 +104,17 @@ async function readWalletChain() {
 		handleChainChanged((await eth.request({ method: 'eth_chainId' })) as string)
 	} catch (err) {
 		console.error('Error reading the wallet chain:', err)
-		ethereumStore.update(s => ({ ...s, error: 'Could not read your wallet network' }))
+		ethereumStore.update(s => ({ ...s, error: CHAIN_READ_FAILED }))
 	}
 }
+
+const CHAIN_READ_FAILED = 'Could not read your wallet network'
 
 function handleChainChanged(chainId: string) {
 	ethereumStore.update(s => ({
 		...s,
-		chainId: parseInt(chainId, 16)
+		chainId: parseInt(chainId, 16),
+		error: s.error === CHAIN_READ_FAILED ? null : s.error
 	}))
 }
 

@@ -180,7 +180,7 @@ echo "refused: the test signer as the new coupon signer"
 if env "${rotation[@]}" VALID_SIGNER="$single_safe" ./rotate-claim-signer.sh >"$work/refusal.log" 2>&1; then
 	fail "rotate-claim-signer.sh took a Safe of threshold 1"
 fi
-grep -qF "threshold is not 2 to 20" "$work/refusal.log" || fail "rotate-claim-signer.sh refused a threshold 1 Safe without naming it"
+grep -qF "not a Safe whose threshold is 2 to 20" "$work/refusal.log" || fail "rotate-claim-signer.sh refused a threshold 1 Safe without naming it"
 echo "refused: a Safe of threshold 1 as the new coupon signer"
 safe_calls() { grep -oE '[0-9]+\. to 0x[0-9a-fA-F]{40}, value 0, data 0x[0-9a-fA-F]+' "$1" || true; }
 # Executes each printed call from the admin Safe, signed by two of its owners.
@@ -197,17 +197,37 @@ env "${rotation[@]}" ./rotate-claim-signer.sh | tee "$work/rotate.log"
 mapfile -t calls < <(safe_calls "$work/rotate.log")
 [[ ${#calls[@]} == 2 ]] || fail "rotate-claim-signer.sh did not print the 2 Safe calls"
 
-env "${rotation[@]}" VALID_SIGNER="$signer" ./rotate-claim-signer.sh >"$work/rogue.log"
+# Runs the printed calls on a snapshot of the fork, expects record to refuse
+# naming `reason`, then reverts the fork.
+expect_record_refusal() {
+	local reason=$1 snapshot from_block
+	shift
+	snapshot=$(cast rpc evm_snapshot --rpc-url "$fork" | tr -d '"')
+	from_block=$(($(cast block-number --rpc-url "$fork") + 1))
+	execute "$@"
+	if env "${rotation[@]}" ./rotate-claim-signer.sh record "$from_block" >"$work/refusal.log" 2>&1; then
+		fail "the record passed: $reason"
+	fi
+	grep -qF "$reason" "$work/refusal.log" || fail "the record refused without naming: $reason"
+	[[ $(cast rpc evm_revert "$snapshot" --rpc-url "$fork") == true ]] || fail "the fork did not revert"
+	echo "refused: a record when $reason"
+}
+
+env "${rotation[@]}" VALID_SIGNER="$signer" ./rotate-claim-signer.sh >"$work/rogue.log" ||
+	fail "rotate-claim-signer.sh did not print the calls for a second order"
 mapfile -t rogue < <(safe_calls "$work/rogue.log")
-snapshot=$(cast rpc evm_snapshot --rpc-url "$fork" | tr -d '"')
-from_block=$(($(cast block-number --rpc-url "$fork") + 1))
-execute "${rogue[0]}" "${calls[@]}"
-if env "${rotation[@]}" ./rotate-claim-signer.sh record "$from_block" >"$work/refusal.log" 2>&1; then
-	fail "the record passed with a second order of the vault's on the orderbook"
-fi
-grep -qF "the vault holds another order" "$work/refusal.log" || fail "the record refused a second order without naming it"
-echo "refused: a record while a second order the Safe added is on the orderbook"
-[[ $(cast rpc evm_revert "$snapshot" --rpc-url "$fork") == true ]] || fail "the fork did not revert to before the second order"
+[[ ${#rogue[@]} == 2 ]] || fail "rotate-claim-signer.sh did not print the 2 calls for a second order"
+expect_record_refusal "the vault holds another order" "${rogue[0]}" "${calls[@]}"
+
+real_deployer=0x56Fa1748867fD547F3cc6C064B809ab84bc7e9B9
+forwarder=$(forge create test/rehearsal/ForwardingDeployer.sol:ForwardingDeployer --rpc-url "$fork" \
+	--private-key "$deployer_key" --broadcast --constructor-args "$real_deployer" |
+	grep -oE 'Deployed to: 0x[0-9a-fA-F]{40}' | cut -d' ' -f3 || true)
+[[ -n $forwarder ]] || fail "the forwarding deployer was not deployed"
+padded() { printf '%064s' "$(tr 'A-F' 'a-f' <<<"${1#0x}")" | tr ' ' 0; }
+forwarded=${calls[0]//$(padded "$real_deployer")/$(padded "$forwarder")}
+[[ $forwarded != "${calls[0]}" ]] || fail "the claim order's call names no deployer to replace"
+expect_record_refusal "not deployed by the network's expression deployer" "$forwarded" "${calls[1]}"
 
 from_block=$(($(cast block-number --rpc-url "$fork") + 1))
 execute "${calls[@]}"

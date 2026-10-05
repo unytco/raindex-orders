@@ -14,8 +14,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The coupon signer whose private key is committed in `src/Constants.sol`.
 pub const TEST_SIGNER: Address = address!("8E72b7568738da52ca3DCd9b24E178127A4E7d37");
 
-/// A year. coupon-status reads an expiry only up to JavaScript's largest exact
-/// integer, and refuses a coupon whose expiry is past it.
 const MAX_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 const DEFAULT_EXPIRY_SECONDS: NonZeroU64 = match NonZeroU64::new(604_800) {

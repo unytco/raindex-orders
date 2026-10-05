@@ -34,8 +34,8 @@ sent_since() {
 # One line per transaction forge sent: what it called, its hash and its outcome.
 landed() {
 	jq -r '
-		.receipts as $receipts
-		| .transactions[]
+		(.receipts // []) as $receipts
+		| (.transactions // [])[]
 		| . as $tx
 		| ([$receipts[] | select(.transactionHash == $tx.hash)][0]) as $receipt
 		| [

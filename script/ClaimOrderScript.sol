@@ -101,20 +101,23 @@ abstract contract ClaimOrderScript is Script {
         );
     }
 
-    /// Refuses the test signer on mainnet, and a Safe whose signatures the website
-    /// cannot read: it reads 2 to 20 owner signatures, and 65 bytes as a key's.
+    /// Refuses the test signer on mainnet, and a contract signer whose signatures the
+    /// website cannot read: it reads a Safe's 2 to 20 owner signatures, and 65 bytes
+    /// as a key's. An EIP-7702 delegation leaves a key a key.
     function requireSigner(ClaimNetwork memory net, address signer) internal view {
         require(signer != address(0), "VALID_SIGNER must be a nonzero address");
         require(
             net.chainId != 1 || signer != TEST_SIGNER_ADDRESS,
             "VALID_SIGNER is the test signer, whose key is public: mainnet refuses it"
         );
-        if (signer.code.length > 0) {
-            (bool isSafe, bytes memory threshold) = signer.staticcall(abi.encodeCall(SafeThreshold.getThreshold, ()));
+        bytes memory code = signer.code;
+        bool delegatedKey = code.length == 23 && code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00;
+        if (code.length > 0 && !delegatedKey) {
+            (bool answered, bytes memory threshold) = signer.staticcall(abi.encodeCall(SafeThreshold.getThreshold, ()));
             require(
-                !isSafe || threshold.length != 32
-                    || (abi.decode(threshold, (uint256)) >= 2 && abi.decode(threshold, (uint256)) <= 20),
-                "VALID_SIGNER is a Safe whose threshold is not 2 to 20"
+                answered && threshold.length == 32 && abi.decode(threshold, (uint256)) >= 2
+                    && abi.decode(threshold, (uint256)) <= 20,
+                "VALID_SIGNER is a contract but not a Safe whose threshold is 2 to 20"
             );
         }
     }

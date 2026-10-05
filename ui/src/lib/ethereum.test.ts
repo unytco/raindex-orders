@@ -108,6 +108,29 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build', network => {
 	})
 })
 
+describe('a failed read of the wallet chain', () => {
+	it('shows, and clears once the chain is read', async () => {
+		vi.spyOn(console, 'error').mockImplementation(() => {})
+		let fail = true
+		const request = vi.fn(async (args: { method: string }) => {
+			if (args.method === 'eth_chainId') {
+				if (fail) throw new Error('wallet locked')
+				return numberToHex(1)
+			}
+			return null
+		})
+		vi.stubGlobal('window', { ethereum: { request, on: vi.fn() } })
+		const ethereum = await asBuild(BUILDS.mainnet, () => import('./ethereum'))
+
+		await ethereum.switchNetwork()
+		expect(get(ethereum.ethereumStore).error).toBe('Could not read your wallet network')
+
+		fail = false
+		await ethereum.switchNetwork()
+		expect(get(ethereum.ethereumStore).error).toBeNull()
+	})
+})
+
 describe('a wallet without the chain', () => {
 	it('is asked to add Sepolia', async () => {
 		const asked = wallet(1, 4902)
