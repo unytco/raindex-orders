@@ -82,9 +82,27 @@ abstract contract ClaimOrderScript is Script {
         revert(string.concat("NETWORK must be sepolia or mainnet, not ", name));
     }
 
+    /// NETWORK's claim order, sepolia when NETWORK is unset.
     function networkFromEnv() internal view returns (ClaimNetwork memory net) {
-        net = claimNetwork(vm.envString("NETWORK"));
+        net = claimNetwork(vm.envOr("NETWORK", string("sepolia")));
         requireChain(net);
+    }
+
+    /// `name`, or on sepolia TestNet's value when it is unset. Mainnet has none.
+    function envOrTestnet(ClaimNetwork memory net, string memory name, address testnet)
+        internal
+        view
+        returns (address)
+    {
+        return net.chainId == 11155111 ? vm.envOr(name, testnet) : vm.envAddress(name);
+    }
+
+    function envOrTestnet(ClaimNetwork memory net, string memory name, bytes32 testnet)
+        internal
+        view
+        returns (bytes32)
+    {
+        return net.chainId == 11155111 ? vm.envOr(name, testnet) : vm.envBytes32(name);
     }
 
     function requireChain(ClaimNetwork memory net) internal view {

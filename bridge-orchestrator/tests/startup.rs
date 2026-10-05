@@ -1,4 +1,5 @@
 use holo_hash::{AgentPubKey, AgentPubKeyB64};
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -144,6 +145,104 @@ fn run_on_mainnet_refuses_the_test_signer_before_it_writes_anything() {
     assert!(!output.status.success());
     assert!(
         stderr.contains("SIGNER_PRIVATE_KEY is the test signer"),
+        "{stderr}"
+    );
+    assert!(!db(dir.path()).exists());
+}
+
+/// An RPC that answers every call with chain 1, as an Ethereum mainnet RPC does.
+fn mainnet_rpc() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut socket in listener.incoming().flatten() {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(read) = socket.read(&mut chunk) {
+                request.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if read == 0 || text.ends_with('}') {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&request);
+            let id = text
+                .split("\"id\":")
+                .nth(1)
+                .and_then(|rest| rest.split([',', '}']).next())
+                .unwrap_or("0")
+                .to_string();
+            let body = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":\"0x1\"}}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+        }
+    });
+    url
+}
+
+/// A sepolia node told only its agent, its key and where its RPC is.
+fn sepolia_node(dir: &Path, rpc: String) -> Vec<(&'static str, String)> {
+    let agent: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1; 32]).into();
+    vec![
+        ("SEPOLIA_RPC_URL", rpc),
+        ("HOLOCHAIN_BRIDGING_AGENT_PUBKEY", agent.to_string()),
+        ("DB_PATH", db(dir).display().to_string()),
+        (
+            "SIGNER_PRIVATE_KEY",
+            "0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd".to_string(),
+        ),
+    ]
+}
+
+#[test]
+fn run_with_nothing_set_but_its_key_takes_testnet_values_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let rpc = format!("http://{}/", closed.local_addr().unwrap());
+    drop(closed);
+
+    let output = orchestrator(dir.path(), &sepolia_node(dir.path(), rpc), &["run"]);
+
+    let logged = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success());
+    assert!(logged.contains("NETWORK is unset: sepolia"), "{logged}");
+    assert!(
+        logged.contains("using TestNet's values for SEPOLIA_LOCK_VAULT_ADDRESS"),
+        "{logged}"
+    );
+    assert!(
+        logged.contains("using TestNet's values for ORDER_HASH, ORDER_OWNER, ORDERBOOK_ADDRESS, TOKEN_ADDRESS, VAULT_ID, CLAIM_SIGNER, CLAIM_INTERPRETER, CLAIM_STORE, CLAIM_EXPRESSION, CLAIM_INPUT_TOKEN"),
+        "{logged}"
+    );
+    assert!(
+        logged.contains("SEPOLIA_RPC_URL: eth_chainId failed"),
+        "{logged}"
+    );
+    assert!(!db(dir.path()).exists());
+}
+
+#[test]
+fn a_run_on_testnet_values_refuses_a_mainnet_rpc() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = orchestrator(
+        dir.path(),
+        &sepolia_node(dir.path(), mainnet_rpc()),
+        &["run"],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr
+            .contains("SEPOLIA_RPC_URL answers for chain 1, and NETWORK=sepolia is chain 11155111"),
         "{stderr}"
     );
     assert!(!db(dir.path()).exists());

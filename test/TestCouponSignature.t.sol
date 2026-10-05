@@ -9,7 +9,7 @@ import {SignContext} from "./lib/SignContext.sol";
 /// The rehearsals sign coupons with SignContext. This pins it to the coupon
 /// bridge-orchestrator signs in signer.rs `a_key_signs_the_coupon_the_claim_order_checks`.
 contract TestCouponSignature is Test, SignContext {
-    function testSignContextSignsTheCouponTheOrchestratorSigns() external {
+    function testSignContextSignsTheCouponTheOrchestratorSigns() external pure {
         uint256[] memory context = new uint256[](9);
         context[0] = uint256(uint160(0x1111111111111111111111111111111111111111));
         context[1] = 1.5e18;

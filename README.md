@@ -69,7 +69,7 @@ npm run dev
 
 ```bash
 cd bridge-orchestrator
-# Set NETWORK=sepolia and the variables bridge-orchestrator/README.md lists
+# Set SIGNER_PRIVATE_KEY: TestNet values are the defaults (bridge-orchestrator/README.md)
 cargo run -- run
 ```
 

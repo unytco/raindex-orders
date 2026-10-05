@@ -31,6 +31,21 @@ test('sepolia takes the test signer', async () => {
 	assert.match(rainlang, new RegExp(TEST_SIGNER))
 })
 
+test('composes for TestNet when given nothing', async () => {
+	const rainlang = await compose({})
+
+	assert.match(rainlang, new RegExp(`using-words-from ${SUBPARSER.sepolia}`))
+	assert.match(rainlang, new RegExp(TEST_SIGNER))
+	assert.equal(execFileSync('node', [COMPOSER], { encoding: 'utf8' }).trim(), rainlang.trim())
+})
+
+test('mainnet has no default binding', () => {
+	assert.throws(() => bindings({ network: 'mainnet' }), {
+		message:
+			'--subparser must be a nonzero address, not unset; --signer must be a nonzero address, not unset'
+	})
+})
+
 test('mainnet refuses the test signer, in any case', () => {
 	for (const signer of [TEST_SIGNER, TEST_SIGNER.toLowerCase()]) {
 		assert.throws(

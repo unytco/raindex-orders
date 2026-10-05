@@ -53,6 +53,16 @@ describe('cf-deploy.sh', () => {
 		})
 	})
 
+	it('deploys hot-bridge-ui when PUBLIC_NETWORK is unset', () => {
+		const { status, calls } = deploy({
+			SEPOLIA_RPC_URL: 'https://sepolia.rpc.test',
+			FAUCET_PRIVATE_KEY: '0xfaucet'
+		})
+
+		expect(status).toBe(0)
+		expect(calls[0]).toBe('wrangler deploy --keep-vars ')
+	})
+
 	it('deploys the mainnet env with ETH_RPC_URL, and neither needs nor sets a faucet key', () => {
 		const { status, calls } = deploy({
 			PUBLIC_NETWORK: 'mainnet',
@@ -75,7 +85,8 @@ describe('cf-deploy.sh', () => {
 		],
 		[{ PUBLIC_NETWORK: 'sepolia', FAUCET_PRIVATE_KEY: '0xfaucet' }, 'SEPOLIA_RPC_URL'],
 		[{ PUBLIC_NETWORK: 'mainnet', SEPOLIA_RPC_URL: 'https://sepolia.rpc.test' }, 'ETH_RPC_URL'],
-		[{ ETH_RPC_URL: 'https://eth.rpc.test' }, 'PUBLIC_NETWORK']
+		[{ PUBLIC_NETWORK: 'goerli', ETH_RPC_URL: 'https://eth.rpc.test' }, 'PUBLIC_NETWORK'],
+		[{ ETH_RPC_URL: 'https://eth.rpc.test' }, 'SEPOLIA_RPC_URL']
 	])('fails, deploying nothing, without %o', (env, missing) => {
 		const { status, stderr, calls } = deploy(env)
 

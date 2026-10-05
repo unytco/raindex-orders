@@ -1,4 +1,4 @@
-use crate::config::Network;
+use crate::config::{log_testnet_defaults, with_network_defaults, Network};
 use alloy::primitives::{address, keccak256, Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
@@ -13,6 +13,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The coupon signer whose private key is committed in `src/Constants.sol`.
 pub const TEST_SIGNER: Address = address!("8E72b7568738da52ca3DCd9b24E178127A4E7d37");
+
+const CLAIM_ORDER_VARIABLES: [&str; 10] = [
+    "ORDER_HASH",
+    "ORDER_OWNER",
+    "ORDERBOOK_ADDRESS",
+    "TOKEN_ADDRESS",
+    "VAULT_ID",
+    "CLAIM_SIGNER",
+    "CLAIM_INTERPRETER",
+    "CLAIM_STORE",
+    "CLAIM_EXPRESSION",
+    "CLAIM_INPUT_TOKEN",
+];
 
 const MAX_EXPIRY_SECONDS: u64 = 365 * 24 * 60 * 60;
 
@@ -83,6 +96,8 @@ impl CouponSigner {
     }
 
     fn from_settings(network: Network, setting: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        log_testnet_defaults(network, &setting, &CLAIM_ORDER_VARIABLES);
+        let setting = with_network_defaults(network, setting);
         let mut faults = Vec::new();
         let order_hash = parsed(&setting, "ORDER_HASH", "a 32-byte hash", &mut faults);
         let order_owner = parsed(&setting, "ORDER_OWNER", "an address", &mut faults);
@@ -256,23 +271,21 @@ impl CouponSigner {
 
 #[cfg(test)]
 impl ClaimOrder {
-    /// The claim order on Sepolia, whose signer is the test signer.
+    /// The claim order on Sepolia, from TestNet's defaults.
     pub fn sepolia() -> Self {
+        let value = with_network_defaults(Network::Sepolia, |_| None);
+        let address = |key: &str| value(key).unwrap().parse::<Address>().unwrap();
         Self {
-            order_hash: "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9"
-                .parse()
-                .unwrap(),
-            order_owner: address!("E3E064e3C2EEf66cb93dA8D8114F5084E92F48D6"),
-            orderbook: address!("fca89cD12Ba1346b1ac570ed988AB43b812733fe"),
-            token: address!("eaC8eEEE9f84F3E3F592e9D8604100eA1b788749"),
-            vault_id: "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b"
-                .parse()
-                .unwrap(),
-            signer: TEST_SIGNER,
-            interpreter: address!("8853d126bc23a45b9f807739b6ea0b38ef569005"),
-            store: address!("23f77e7bc935503e437166498d7d72f2ea290e1f"),
-            expression: address!("0a1369aee76570cc7404492d55a5d1468d5a9b4b"),
-            input_token: address!("555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028"),
+            order_hash: value("ORDER_HASH").unwrap().parse().unwrap(),
+            order_owner: address("ORDER_OWNER"),
+            orderbook: address("ORDERBOOK_ADDRESS"),
+            token: address("TOKEN_ADDRESS"),
+            vault_id: value("VAULT_ID").unwrap().parse().unwrap(),
+            signer: address("CLAIM_SIGNER"),
+            interpreter: address("CLAIM_INTERPRETER"),
+            store: address("CLAIM_STORE"),
+            expression: address("CLAIM_EXPRESSION"),
+            input_token: address("CLAIM_INPUT_TOKEN"),
         }
     }
 }
@@ -539,12 +552,42 @@ mod tests {
         assert_eq!(signer.expiry_seconds, DEFAULT_EXPIRY_SECONDS);
     }
 
+    const MAINNET_KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+
+    /// The Sepolia settings with a key mainnet takes, then `changes`.
+    fn mainnet_settings_with(
+        changes: &[(&'static str, Option<&str>)],
+    ) -> impl Fn(&str) -> Option<String> {
+        let mut all = vec![("SIGNER_PRIVATE_KEY", Some(MAINNET_KEY))];
+        all.extend_from_slice(changes);
+        sepolia_settings_with(&all)
+    }
+
     #[test]
-    fn each_unset_signer_variable_is_named() {
+    fn mainnet_names_each_unset_signer_variable() {
         for (key, _) in SEPOLIA_SIGNER_SETTINGS {
-            let message = refusal(Network::Sepolia, sepolia_settings_with(&[(key, None)]));
+            let message = refusal(Network::Mainnet, mainnet_settings_with(&[(key, None)]));
             assert_eq!(message, format!("{key} is required"));
         }
+    }
+
+    #[test]
+    fn sepolia_takes_testnet_values_for_all_but_the_key() {
+        let key = test_settings(&[("SIGNER_PRIVATE_KEY", TEST_SIGNER_KEY)]);
+        let signer = CouponSigner::from_settings(Network::Sepolia, key).unwrap();
+
+        assert_eq!(signer.order(), &ClaimOrder::sepolia());
+        assert_eq!(
+            refusal(Network::Sepolia, test_settings(&[])),
+            "SIGNER_PRIVATE_KEY is required"
+        );
+        let empty = test_settings(&[("SIGNER_PRIVATE_KEY", TEST_SIGNER_KEY), ("ORDER_HASH", "")]);
+        assert_eq!(
+            CouponSigner::from_settings(Network::Sepolia, empty)
+                .unwrap()
+                .order(),
+            &ClaimOrder::sepolia()
+        );
     }
 
     #[test]
@@ -572,8 +615,8 @@ mod tests {
     #[test]
     fn every_fault_is_named_in_one_refusal() {
         let message = refusal(
-            Network::Sepolia,
-            sepolia_settings_with(&[
+            Network::Mainnet,
+            mainnet_settings_with(&[
                 ("ORDER_HASH", None),
                 ("TOKEN_ADDRESS", Some("hot")),
                 ("SIGNER_PRIVATE_KEY", None),

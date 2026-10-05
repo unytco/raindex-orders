@@ -95,9 +95,9 @@ and the chain.
 
 | Variable | Required | Default |
 |----------|----------|---------|
-| `NETWORK` | **Yes** | -- (`mainnet` or `sepolia`) |
-| `SEPOLIA_RPC_URL` | **Yes** (sepolia), refused on mainnet | -- |
-| `SEPOLIA_LOCK_VAULT_ADDRESS` | **Yes** (sepolia), refused on mainnet | -- |
+| `NETWORK` | No | `sepolia` (`mainnet` or `sepolia`) |
+| `SEPOLIA_RPC_URL` | No, refused on mainnet | `https://1rpc.io/sepolia` |
+| `SEPOLIA_LOCK_VAULT_ADDRESS` | No, refused on mainnet | `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6` |
 | `ETH_RPC_URL` | **Yes** (mainnet), refused on sepolia | -- |
 | `MAINNET_LOCK_VAULT_ADDRESS` | **Yes** (mainnet), refused on sepolia | -- |
 | `DB_PATH` | No | `./data/bridge_orchestrator.db` |
@@ -241,21 +241,23 @@ deploys are safe.
 ### Signer (run only)
 
 `run` parses these at startup. The deploy record prints every one but the key,
-under these names.
+under these names. On `sepolia` each one but the key defaults to TestNet's
+value, the Sepolia claim order, and startup logs which ones it took. On
+`mainnet` every one is required.
 
-| Variable | Required | Default |
-|----------|----------|---------|
+| Variable | Required | Sepolia default |
+|----------|----------|-----------------|
 | `SIGNER_PRIVATE_KEY` | Yes | -- |
-| `ORDER_HASH` | Yes | -- |
-| `ORDER_OWNER` | Yes | -- |
-| `ORDERBOOK_ADDRESS` | Yes | -- |
-| `TOKEN_ADDRESS` | Yes | -- |
-| `VAULT_ID` | Yes | -- |
-| `CLAIM_SIGNER` | Yes | -- (the claim order's `valid-signer`: the key's address) |
-| `CLAIM_INTERPRETER` | Yes | -- |
-| `CLAIM_STORE` | Yes | -- |
-| `CLAIM_EXPRESSION` | Yes | -- |
-| `CLAIM_INPUT_TOKEN` | Yes | -- |
+| `ORDER_HASH` | mainnet | `0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9` |
+| `ORDER_OWNER` | mainnet | `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6` |
+| `ORDERBOOK_ADDRESS` | mainnet | `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe` |
+| `TOKEN_ADDRESS` | mainnet | `0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749` |
+| `VAULT_ID` | mainnet | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
+| `CLAIM_SIGNER` | mainnet | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` (the claim order's `valid-signer`: the key's address) |
+| `CLAIM_INTERPRETER` | mainnet | `0x8853d126bc23a45b9f807739b6ea0b38ef569005` |
+| `CLAIM_STORE` | mainnet | `0x23f77e7bc935503e437166498d7d72f2ea290e1f` |
+| `CLAIM_EXPRESSION` | mainnet | `0x0a1369aee76570cc7404492d55a5d1468d5a9b4b` |
+| `CLAIM_INPUT_TOKEN` | mainnet | `0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028` |
 | `EXPIRY_SECONDS` | No | `604800` (7 days), from 1 to `31536000` (a year) |
 
 ## Usage on the HOT-2-mHOT bridge server

@@ -97,7 +97,7 @@ The rehearsal runs the orchestrator binary, so build it first: `cargo build` in 
 
 ### Website
 
-One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui` for Sepolia, and `hot-bridge-ui-mainnet`, the wrangler env `mainnet`. Each Workers Builds project sets `PUBLIC_NETWORK` and the `PUBLIC_*` build variables the deploy record prints, and its RPC secret: `SEPOLIA_RPC_URL` and `FAUCET_PRIVATE_KEY`, or `ETH_RPC_URL`. A build fails when a variable is missing or malformed, when the claim order they describe does not hash to `PUBLIC_CLAIM_ORDER_HASH`, or on mainnet when the signer is the test signer. The build cannot check that `PUBLIC_CLAIM_SIGNER` is the order's signer, so take it from the deploy record. The mainnet website has no faucet.
+One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui` for Sepolia, and `hot-bridge-ui-mainnet`, the wrangler env `mainnet`. Each Workers Builds project sets `PUBLIC_NETWORK` and the `PUBLIC_*` build variables the deploy record prints, and its RPC secret: `SEPOLIA_RPC_URL` and `FAUCET_PRIVATE_KEY`, or `ETH_RPC_URL`. `PUBLIC_NETWORK` defaults to `sepolia`, and a sepolia build takes TestNet's value, in `ui/src/lib/network.ts`, for any variable it is not given, and logs which. A mainnet build takes none: it fails when a variable is missing or malformed. Either fails when the claim order the variables describe does not hash to `PUBLIC_CLAIM_ORDER_HASH`, and a mainnet build when the signer is the test signer. The MainNet Workers Builds project must set `PUBLIC_NETWORK=mainnet`. The build cannot check that `PUBLIC_CLAIM_SIGNER` is the order's signer, so take it from the deploy record. The mainnet website has no faucet.
 
 ## Testing the Complete Flow
 
@@ -106,7 +106,7 @@ One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui`
 1. **Start the bridge orchestrator:**
 ```bash
 cd bridge-orchestrator
-# Set NETWORK=sepolia and the variables bridge-orchestrator/README.md lists
+# Set SIGNER_PRIVATE_KEY: TestNet values are the defaults (bridge-orchestrator/README.md)
 cargo run -- run
 ```
 

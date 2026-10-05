@@ -8,7 +8,7 @@
 # set by hand, so the secrets are kept as build variables and set again on each deploy.
 set -euo pipefail
 
-case "${PUBLIC_NETWORK:-}" in
+case "${PUBLIC_NETWORK:-sepolia}" in
 sepolia)
 	wrangler_env=()
 	secrets=(SEPOLIA_RPC_URL FAUCET_PRIVATE_KEY)
@@ -18,7 +18,7 @@ mainnet)
 	secrets=(ETH_RPC_URL)
 	;;
 *)
-	echo "set PUBLIC_NETWORK to sepolia or mainnet as a Workers Builds build variable" >&2
+	echo "PUBLIC_NETWORK must be sepolia or mainnet, as a Workers Builds build variable" >&2
 	exit 1
 	;;
 esac

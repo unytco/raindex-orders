@@ -36,6 +36,16 @@ describe('the build', () => {
 		expect(build).not.toThrow()
 	})
 
+	it('passes with nothing set, naming the TestNet values it took', () => {
+		const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+
+		expect(build).not.toThrow()
+		expect(info).toHaveBeenCalledWith(
+			expect.stringContaining("bridge build: TestNet's values for PUBLIC_NETWORK")
+		)
+		info.mockRestore()
+	})
+
 	it('fails with a variable missing, naming it', () => {
 		for (const [key, value] of Object.entries(MAINNET_BUILD)) vi.stubEnv(key, value)
 		vi.stubEnv('PUBLIC_CLAIM_EXPRESSION', '')

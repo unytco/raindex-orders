@@ -112,15 +112,54 @@ export const BUILD_VARIABLES = [
 
 type BuildEnv = Partial<Record<string, string>>
 
+/** TestNet's values: a sepolia build takes each one it is not given. Mainnet has none. */
+export const SEPOLIA_DEFAULTS: Record<
+	Exclude<(typeof BUILD_VARIABLES)[number], 'PUBLIC_NETWORK'>,
+	string
+> = {
+	PUBLIC_TOKEN_ADDRESS: '0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749',
+	PUBLIC_LOCK_VAULT_ADDRESS: '0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6',
+	PUBLIC_ORDERBOOK_ADDRESS: '0xfca89cD12Ba1346b1ac570ed988AB43b812733fe',
+	PUBLIC_CLAIM_ORDER_HASH: '0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9',
+	PUBLIC_CLAIM_SIGNER: '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37',
+	PUBLIC_CLAIM_INTERPRETER: '0x8853d126bc23a45b9f807739b6ea0b38ef569005',
+	PUBLIC_CLAIM_STORE: '0x23f77e7bc935503e437166498d7d72f2ea290e1f',
+	PUBLIC_CLAIM_EXPRESSION: '0x0a1369aee76570cc7404492d55a5d1468d5a9b4b',
+	PUBLIC_CLAIM_INPUT_TOKEN: '0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028'
+}
+
+/**
+ * `env` with TestNet's values for the network values a sepolia build is not given,
+ * PUBLIC_NETWORK itself sepolia when unset. An empty value counts as not given.
+ * Returns the names it filled.
+ */
+export function withTestnetDefaults(env: BuildEnv): { env: BuildEnv; defaulted: string[] } {
+	const given = (key: string) => (env[key] ? env[key] : undefined)
+	const network = given('PUBLIC_NETWORK') ?? 'sepolia'
+	const filled: BuildEnv = { ...env, PUBLIC_NETWORK: network }
+	const defaulted = given('PUBLIC_NETWORK') ? [] : ['PUBLIC_NETWORK']
+	if (network === 'sepolia') {
+		for (const [key, value] of Object.entries(SEPOLIA_DEFAULTS)) {
+			if (!given(key)) {
+				filled[key] = value
+				defaulted.push(key)
+			}
+		}
+	}
+	return { env: filled, defaulted }
+}
+
 /**
  * The website's network values, or an error naming every build variable that is
- * missing or malformed, and the test signer on mainnet.
+ * missing or malformed, and the test signer on mainnet. A sepolia build takes
+ * TestNet's value for any it is not given.
  */
-export function parseBridgeConfig(env: BuildEnv): BridgeConfig {
+export function parseBridgeConfig(given: BuildEnv): BridgeConfig {
+	const { env } = withTestnetDefaults(given)
 	const faults: string[] = []
 	const network = env.PUBLIC_NETWORK
 	if (network !== 'sepolia' && network !== 'mainnet') {
-		faults.push(`PUBLIC_NETWORK must be sepolia or mainnet, not ${network ?? 'unset'}`)
+		faults.push(`PUBLIC_NETWORK must be sepolia or mainnet, not ${network}`)
 	}
 
 	const addresses: Partial<Record<(typeof ADDRESS_VARIABLES)[number], Address>> = {}

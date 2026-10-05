@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Replaces the vault's claim order with one that accepts coupons from
 # VALID_SIGNER, as docs/enable-multisig.md describes. Source the current deploy
-# record first, then:
+# record first; a sepolia run takes TestNet's values for any it lacks. Then:
 #   ./rotate-claim-signer.sh --ledger      an admin key signs and sends the calls
 #   ./rotate-claim-signer.sh               a Safe admin: prints the calls for the Safe to execute
 #   ./rotate-claim-signer.sh record BLOCK  prints the new deploy record once they have run
@@ -9,12 +9,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 source script/forge-broadcast.sh
 
-case "${NETWORK:-}" in
-mainnet) rpc_var=ETH_RPC_URL chain_id=1 ;;
-sepolia) rpc_var=SEPOLIA_RPC_URL chain_id=11155111 ;;
+case "${NETWORK:-sepolia}" in
+mainnet) rpc_var=ETH_RPC_URL chain_id=1 rpc_url=${ETH_RPC_URL:-} ;;
+sepolia) rpc_var=SEPOLIA_RPC_URL chain_id=11155111 rpc_url=${SEPOLIA_RPC_URL:-https://1rpc.io/sepolia} ;;
 *) die "NETWORK must be sepolia or mainnet" ;;
 esac
-rpc_url=${!rpc_var:-}
 [[ -n $rpc_url ]] || die "$rpc_var is required for NETWORK=$NETWORK"
 
 script=script/RotateClaimSigner.s.sol:RotateClaimSigner
