@@ -1,6 +1,6 @@
 # Moving the bridge to a multisig
 
-The bridge launches with one coupon signer key and the vault admin that `deploy-mainnet.sh` sets. Each of the two can move to a Safe multisig later. Neither move changes a contract or redeploys the vault.
+The bridge launches with one coupon signer key and the vault admin that `deploy-mainnet.sh` sets. Each of the two can move to a Safe multisig later, and the coupon signer can move to a [Fireblocks MPC wallet](#fireblocks-as-the-coupon-signer) instead. No move changes a contract or redeploys the vault.
 
 - **The vault admin** can be any address. `setAdmin` hands it to a Safe.
 - **The coupon signer** can be a contract. The orderbook checks a coupon's signature with OpenZeppelin's `SignatureChecker`. For a contract signer, it asks the contract's EIP-1271 `isValidSignature`, so `valid-signer` in `src/holo-claim.rain` can be a Safe with no Rainlang change. A Safe 1.4.1 answers through its `CompatibilityFallbackHandler`. It accepts the signatures of its owners over the SafeMessage hash of the coupon's digest, sorted by owner address and joined.

@@ -202,23 +202,22 @@ avoids duplicating log-lifecycle logic inside the service.
 
 ### Deployment via automation
 
-For the `hot-2-mhot` bridge server the orchestrator is fully provisioned
-by the `automation/` repo. From its root, one command builds the binary,
-auto-derives the DNA hash from the latest Holochain deploy result,
-reuses/creates a local HMAC secret for the watchtower reporter,
-registers it with the worker, writes `bridge-orchestrator.env` (including
-`WATCHTOWER_*` and any `BRIDGE_RETENTION_*` overrides from
-`config/hot-2-mhot-bridge/services.json`), SCPs the binary, and restarts
+The `automation/` repo provisions the orchestrator on the blockchain bridging
+node. From its root, one command builds the binary, derives the DNA hash from
+the latest Holochain deploy result, reuses or creates the watchtower reporter's
+HMAC secret and registers it with the worker, writes `bridge-orchestrator.env`
+from `config/blockchain-bridging/services.json` (including `WATCHTOWER_*` and
+any `BRIDGE_RETENTION_*` overrides), copies the binary over, and restarts
 systemd:
 
 ```bash
-cd automation && make hot-2-mhot-bridge-services
+cd automation && make blockchain-bridging-services
 ```
 
-Manual editing of `bridge-orchestrator.env` is only needed for local/dev
-setups or ad-hoc secret rotation. See `automation/scripts/setup-blockchain-bridge-services.sh`
-and the `watchtower_reporter` / `retention` blocks in `services.json`
-for the knobs available to operators.
+Edit `bridge-orchestrator.env` by hand only for local setups or a secret
+rotation. `automation/scripts/setup-blockchain-bridge-services.sh` and the
+`watchtower_reporter` / `retention` blocks in `services.json` hold the knobs
+available to operators.
 
 ### Holochain websocket resilience
 
@@ -255,7 +254,7 @@ value, the Sepolia claim order, and startup logs which ones it took. On
 
 | Variable | Required | Sepolia default |
 |----------|----------|-----------------|
-| `SIGNER_PRIVATE_KEY` | Yes | -- |
+| `SIGNER_PRIVATE_KEY` | Yes | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`) |
 | `ORDER_HASH` | mainnet | `0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9` |
 | `ORDER_OWNER` | mainnet | `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6` |
 | `ORDERBOOK_ADDRESS` | mainnet | `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe` |

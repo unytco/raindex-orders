@@ -4,7 +4,7 @@ This guide covers deploying and testing the complete HOT <> bridged HOT bridge i
 
 ## Prerequisites
 
-1. MetaMask wallet with Sepolia ETH (get from [Sepolia Faucet](https://sepoliafaucet.com/))
+1. A deployer wallet with Sepolia ETH (get from [Sepolia Faucet](https://sepoliafaucet.com/)): a Ledger, or an encrypted keystore as below
 2. Foundry installed (`forge`, `cast` commands available)
 3. Rust toolchain (for bridge-orchestrator)
 4. Node.js 20+ (for UI)
@@ -37,12 +37,12 @@ The `deploy-sepolia.sh` script handles all deployment steps:
 
 # Step 2: Deploy HoloLockVault
 ./deploy-sepolia.sh vault --account deployer
-# Note: Updates .env with LOCK_VAULT_ADDRESS automatically
+# Note: Updates .env with SEPOLIA_LOCK_VAULT_ADDRESS automatically
 
 # Step 3: Mint test tokens to your wallet
 ./deploy-sepolia.sh mint --account deployer
 
-# Step 5: Deploy claim order via HoloLockVault, accepting coupons from
+# Step 4: Deploy claim order via HoloLockVault, accepting coupons from
 # VALID_SIGNER (the test signer unless set)
 ./deploy-sepolia.sh order-via-vault --account deployer
 # Note: Updates .env with ORDER_HASH and ORDER_OWNER automatically
@@ -106,7 +106,8 @@ One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui`
 1. **Start the bridge orchestrator:**
 ```bash
 cd bridge-orchestrator
-# Set SIGNER_PRIVATE_KEY: TestNet values are the defaults (bridge-orchestrator/README.md)
+# Set HOLOCHAIN_BRIDGING_AGENT_PUBKEY and SIGNER_PRIVATE_KEY. TestNet values are the
+# defaults for the rest (bridge-orchestrator/README.md)
 cargo run -- run
 ```
 
@@ -181,14 +182,14 @@ cargo run -- run
 
 Responsibilities:
 - Polls the orderbook for new Lock events and drives the Holochain bridge
-- Processes withdrawal requests from Holochain and generates signed claim coupons (see `src/signer.rs::generate_coupon`)
+- Processes withdrawal requests from Holochain and generates signed claim coupons (see `CouponSigner::coupon` in `src/signer.rs`)
 - Emits batched bridging RAVE transactions with explicit links and a coupons map
 - Produces the same URL-safe coupon format consumed by the UI: `signer,signature,ctx0,ctx1,...,ctx8`
 
 ### UI (`ui/`)
 
 SvelteKit web interface:
-- `/` - Home page with lock/claim selector
+- `/` - Connect a wallet and see its network
 - `/lock` - Lock HOT to receive bridged HOT
 - `/claim` - Claim HOT with coupon
 - `/claim?c=<coupon>` - Direct claim via URL parameter
@@ -196,7 +197,7 @@ SvelteKit web interface:
 
 #### What bounds coupon-status RPC use
 
-- **Signature gate.** A coupon is read only if it names the claim order's signer (`valid-signer` in `src/holo-claim.rain`, `PUBLIC_CLAIM_SIGNER` in the build) and carries a signature that signer gives, checked as the orderbook checks it. A 65-byte signature must recover to the signer, and any other coupon of that form answers `invalid` and is never read. A signature of 2 to 20 owner parts, each a key's 65-byte signature, is a contract signer's, such as a Safe's: the signer's EIP-1271 `isValidSignature` checks it in the same `eth_call` that reads the nonces. Such a coupon causes a read even when it answers `invalid`, until a check finds that the claim signer has no code; for the next 10 minutes that Worker isolate answers such coupons `invalid` without a read, and logs that it does. A coupon signer Safe needs a threshold of 2 or more, as a 65-byte signature is read as a key's.
+- **Signature gate.** A coupon is read only if it names the claim order's signer (the order's `valid-signer`, `PUBLIC_CLAIM_SIGNER` in the build) and carries a signature that signer gives, checked as the orderbook checks it. A 65-byte signature must recover to the signer, and any other coupon of that form answers `invalid` and is never read. A signature of 2 to 20 owner parts, each a key's 65-byte signature, is a contract signer's, such as a Safe's: the signer's EIP-1271 `isValidSignature` checks it in the same `eth_call` that reads the nonces. Such a coupon causes a read even when it answers `invalid`, until a check finds that the claim signer has no code; for the next 10 minutes that Worker isolate answers such coupons `invalid` without a read, and logs that it does. A coupon signer Safe needs a threshold of 2 or more, as a 65-byte signature is read as a key's.
 - **Cache.** Answers are kept in the Workers Cache, keyed by the coupon's signer, signature and context values, so a coupon respelled with other hex case or leading zeros shares its entry. `redeemed` and `expired` are kept from then on. `unredeemed` is kept for 60 s, and never once the coupon's expiry has passed. The Workers Cache is local to each Cloudflare data centre, so each data centre reads a coupon once for itself. A cache read or write that fails is logged and costs only a read; it never changes an answer.
 - **One read at most.** A request makes at most one `eth_call` to its network's RPC secret, `SEPOLIA_RPC_URL` or `ETH_RPC_URL`: one Multicall3 `aggregate3` at the `safe` block, reading each uncached nonce once. A request the cache answers in full, or with no valid coupon, makes none, and its `block` is `null`. An RPC that answers for another chain is refused.
 
@@ -240,12 +241,10 @@ The signed coupon contains 9 context values:
 The UI reads order status directly from the blockchain via RPC. If you see this error:
 1. Verify the order was deployed: `./deploy-sepolia.sh status`
 2. Check ORDER_HASH in `.env` matches the deployed order
-3. Ensure `ui/src/lib/orderConfig.ts` has the correct order configuration
+3. Check the website's `PUBLIC_*` build variables against the deploy record
 
 ### Transaction fails with "Wrong signer"
-The coupon was signed with a different key than the one configured in the Rainlang order.
-- Check `valid-signer` in `src/holo-claim.rain`
-- Ensure `SIGNER_PRIVATE_KEY` in the bridge-orchestrator environment matches
+The claim order does not accept the coupon's signer, as for a coupon signed before `rotate-claim-signer.sh` moved the order to a new signer. The orchestrator signs only with a key the order accepts: it refuses to start otherwise.
 
 ### "Nonce already used"
 What it means depends on when the coupon was signed. Coupons signed before the per-withdrawal nonce carry the unix second they were signed in, a ten-digit nonce.
@@ -258,5 +257,5 @@ What it means depends on when the coupon was signed. Coupons signed before the p
 - Rotate the `SEPOLIA_RPC_URL` API key once the faucet fix (UNYT-1040) is deployed: until then `/api/faucet` answered a failed RPC call with an error that held the full RPC URL. Change the `SEPOLIA_RPC_URL` Workers Builds build variable, which `ui/scripts/cf-deploy.sh` re-applies as the runtime secret on every deploy.
 - Keep private keys out of `.env` files and command lines: sign with `--account` or `--ledger`
 - The test signer key in this repo is for testing only, and every mainnet input refuses it
-- The coupon signer is one key at launch. A Safe multisig or a Fireblocks MPC wallet can replace it: [docs/enable-multisig.md](./docs/enable-multisig.md)
+- Who holds the coupon signer and the vault admin, and how each moves to a multisig: [docs/enable-multisig.md](./docs/enable-multisig.md)
 - The admin key controls emergency withdrawals. It can move to a Safe multisig, whose key holders follow [docs/key-holder.md](./docs/key-holder.md)

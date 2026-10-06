@@ -23,9 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - the bridge website builds for TestNet or MainNet from `PUBLIC_NETWORK`, naming its network, token and explorer to match. A TestNet build needs no variables.
 - Lock and Claim show the network switch, and send nothing, while the wallet is on another chain.
-- `POST /api/coupon-status` reads its own network's chain through that network's RPC secret.
-- `deploy-sepolia.sh` signs with `--account` or `--ledger`, never a private key.
-- bridge-orchestrator runs on the network `NETWORK` names, sepolia unless it says mainnet, takes TestNet's values for any a sepolia run is not given, and refuses to start when its chain, vault or claim order do not match it, when the claim order does not accept its signing key, when the claim signer is a Safe, or when it is given the test signer on mainnet.
+- `deploy-sepolia.sh` signs with `--account` or `--ledger`, never a private key, and keeps the vault in `.env` as `SEPOLIA_LOCK_VAULT_ADDRESS`.
+- bridge-orchestrator runs on the network `NETWORK` names, TestNet by default, and refuses to start when its chain, vault, claim order or signing key do not match.
 - bridge-orchestrator bridges on the one lane that names its agent and lists the unit in `HOT_UNIT_INDEX`, and will not start while `HOLOCHAIN_LANE_DEFINITION` or `HOLOCHAIN_UNIT_INDEX` is set.
 - the lair requirement is `ham`'s decision, supplied with the orchestrator's two paths, rather than restated here. A refusal names the fault before the reason the node could not offer lair.
 - the Rainix/Solidity workflow (`.github/workflows/test.yml`) is now manual-only (`on: workflow_dispatch`) — it has failed for years on a dead nixpkgs pin in `lib/rain.orderbook`.
@@ -46,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bridge-orchestrator waits for the agreement a deposit was parked on to consume it, even after its lane names a new one.
 - bridge-orchestrator keeps bridging after its lane's definition is extended or replaced.
 - bridge-orchestrator fails a cycle with an error when no lane, or more than one, names its agent and lists the HOT unit.
+- `deploy-sepolia.sh all` mints `MINT_AMOUNT`.
 - a withdrawal coupon pays the withdrawal's amount in the unit `HOT_UNIT_INDEX` names, not always unit 1. A withdrawal no coupon can pay stays parked, and an error names it.
 - bridge-orchestrator keeps bridging when another lane sets no credit limit adjustment, and fails a cycle, naming its lane, when its own sets none.
 - bridge-orchestrator sends `execute_rave` the transaction fields the alliance DNA reads, so a bridge cycle runs past stage 2 instead of failing every link on a node running the fee-charging DNA.

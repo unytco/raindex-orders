@@ -281,7 +281,7 @@ cargo run
 **Responsibilities**:
 - Polls Ethereum RPC for Lock events and hands them off to the Holochain side
 - Scans bridging entries on Holochain and emits unified bridging RAVE transactions
-- Generates signed withdrawal coupons (`src/signer.rs::generate_coupon`) in the URL-safe `signer,signature,ctx0..ctx8` format consumed by the UI claim page
+- Generates signed withdrawal coupons (`CouponSigner::coupon` in `src/signer.rs`) in the URL-safe `signer,signature,ctx0..ctx8` format consumed by the UI claim page
 - Tracks state required to batch coupons up to a configurable size cap
 
 **Configuration** (via `.env`):
@@ -294,7 +294,7 @@ cargo run
 **Purpose**: SvelteKit web interface for locking and claiming.
 
 **Routes**:
-- `/` - Home page with lock/claim selector
+- `/` - Connect a wallet and see its network
 - `/lock` - Lock HOT to receive bridged HOT
 - `/claim` - Claim HOT with coupon
 - `/claim?c=<coupon>` - Direct claim via URL parameter
@@ -302,15 +302,10 @@ cargo run
 **Key Features**:
 - Direct MetaMask integration (no WalletConnect dependency)
 - Reads order status directly from blockchain via RPC
-- Hardcoded order configuration (no subgraph dependency)
+- Order configuration from the build's `PUBLIC_*` variables (no subgraph dependency)
 - Transaction status modal
 
-**Configuration** (`ui/.env`):
-```env
-PUBLIC_ORDERBOOK_ADDRESS=0xfca89cD12Ba1346b1ac570ed988AB43b812733fe
-PUBLIC_LOCK_VAULT_ADDRESS=0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6
-PUBLIC_TOKEN_ADDRESS=0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749
-```
+**Configuration**: `ui/.env.example`.
 
 ---
 
@@ -361,7 +356,7 @@ pub struct ReserveCertificate {
 The bridge-orchestrator also handles coupon generation for claims:
 
 1. **Current State**: Orchestrator generates signed coupons with the configured signer key
-2. **Next Step**: Move the signer to a Safe multisig or a Fireblocks MPC wallet ([docs/enable-multisig.md](./docs/enable-multisig.md))
+2. **Next Step**: Move the signer off a single key ([docs/enable-multisig.md](./docs/enable-multisig.md))
 3. **Final Step**: Trigger from bridged HOT burn events
 
 **Integration Flow**:
@@ -389,11 +384,11 @@ The bridge-orchestrator also handles coupon generation for claims:
 ### Bridge Security
 - **Finality**: Bridge orchestrator should wait for sufficient confirmations (15+)
 - **Replay Protection**: Track processed lock IDs on both sides
-- **Same Signer**: Use the same trusted signer for both directions: one key, a Safe multisig or a Fireblocks MPC wallet
+- **Same Signer**: Use the same trusted signer for both directions ([docs/enable-multisig.md](./docs/enable-multisig.md))
 
 ### Key Management
 - **Test Key**: Included in repo for testing only
-- **Coupon signer**: one key at launch, then a Safe multisig or a Fireblocks MPC wallet ([docs/enable-multisig.md](./docs/enable-multisig.md))
+- **Coupon signer**: [docs/enable-multisig.md](./docs/enable-multisig.md)
 - **Admin Key**: Protects emergency withdrawal. It can move to a Safe multisig: [docs/enable-multisig.md](./docs/enable-multisig.md)
 
 ---
@@ -413,15 +408,14 @@ raindex-orders/
 ├── test/
 │   └── HoloLockVault.t.sol     # Foundry tests
 ├── bridge-orchestrator/        # Rust bridge orchestrator (lock watcher + coupon signer)
-│   ├── src/
-│   └── .env.example
+│   └── src/
 ├── ui/                         # SvelteKit web UI
 │   ├── src/routes/
 │   │   ├── +page.svelte        # Home
 │   │   ├── lock/+page.svelte   # Lock page
 │   │   └── claim/+page.svelte  # Claim page
 │   └── src/lib/
-│       ├── orderConfig.ts      # Hardcoded order config
+│       ├── orderConfig.ts      # The claim order, from the build variables
 │       ├── coupon.ts           # Coupon parsing
 │       └── ethereum.ts         # MetaMask integration
 ├── deploy-sepolia.sh           # Deployment script

@@ -37,7 +37,7 @@ This repository contains the Ethereum-side infrastructure for the HOT <> bridged
 - [Foundry](https://book.getfoundry.sh/getting-started/installation) (forge, cast)
 - [Rust](https://rustup.rs/) (for bridge-orchestrator)
 - [Node.js 20+](https://nodejs.org/) (for UI)
-- MetaMask with Sepolia ETH
+- A Sepolia deployer wallet with Sepolia ETH (a Ledger or an encrypted keystore), and MetaMask for the UI
 
 ### 1. Deploy to Sepolia
 
@@ -69,7 +69,8 @@ npm run dev
 
 ```bash
 cd bridge-orchestrator
-# Set SIGNER_PRIVATE_KEY: TestNet values are the defaults (bridge-orchestrator/README.md)
+# Set HOLOCHAIN_BRIDGING_AGENT_PUBKEY and SIGNER_PRIVATE_KEY. TestNet values are the
+# defaults for the rest (bridge-orchestrator/README.md)
 cargo run -- run
 ```
 
@@ -103,7 +104,7 @@ The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, a
 ### Claim Flow (Bridged HOT -> HOT)
 
 1. User burns bridged HOT on Holochain
-2. The bridge orchestrator signs a coupon with the coupon signer: one key at launch, later a Safe multisig or a Fireblocks MPC wallet ([docs/enable-multisig.md](./docs/enable-multisig.md))
+2. The bridge orchestrator signs a coupon with the coupon signer ([docs/enable-multisig.md](./docs/enable-multisig.md))
 3. User receives coupon (URL or direct)
 4. User visits claim page and submits coupon
 5. Rainlang expression validates coupon (signer, expiry, nonce)
@@ -129,8 +130,7 @@ nix develop -c test/fork-rehearsal.sh
 ## Security
 
 - Test signer key in repo is for testing only, and every mainnet input refuses it
-- The coupon signer is one key at launch. A Safe multisig or a Fireblocks MPC wallet can replace it: [docs/enable-multisig.md](./docs/enable-multisig.md)
-- The vault admin can move to a Safe multisig the same way. Each key holder follows [docs/key-holder.md](./docs/key-holder.md)
+- Who holds the coupon signer and the vault admin, and how each moves to a multisig: [docs/enable-multisig.md](./docs/enable-multisig.md). Each key holder follows [docs/key-holder.md](./docs/key-holder.md)
 - Each coupon has a unique nonce (prevents replay)
 - Coupons have expiry timestamps
 - Admin functions protected by access control
