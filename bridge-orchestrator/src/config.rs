@@ -1,11 +1,10 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
-use clap::ValueEnum;
 use holo_hash::AgentPubKeyB64;
 use std::env;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
     Mainnet,
     Sepolia,
@@ -23,12 +22,239 @@ impl FromStr for Network {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Config {
+impl Network {
+    pub fn name(self) -> &'static str {
+        match self {
+            Network::Mainnet => "mainnet",
+            Network::Sepolia => "sepolia",
+        }
+    }
+
+    pub fn chain_id(self) -> u64 {
+        match self {
+            Network::Mainnet => 1,
+            Network::Sepolia => 11_155_111,
+        }
+    }
+
+    pub fn rpc_url_var(self) -> &'static str {
+        match self {
+            Network::Mainnet => "ETH_RPC_URL",
+            Network::Sepolia => "SEPOLIA_RPC_URL",
+        }
+    }
+
+    pub fn lock_vault_var(self) -> &'static str {
+        match self {
+            Network::Mainnet => "MAINNET_LOCK_VAULT_ADDRESS",
+            Network::Sepolia => "SEPOLIA_LOCK_VAULT_ADDRESS",
+        }
+    }
+
+    fn confirmations(self) -> u64 {
+        match self {
+            Network::Mainnet => 15,
+            Network::Sepolia => 5,
+        }
+    }
+
+    fn other(self) -> Network {
+        match self {
+            Network::Mainnet => Network::Sepolia,
+            Network::Sepolia => Network::Mainnet,
+        }
+    }
+}
+
+/// TestNet's values: a sepolia run takes each one it is not given. Mainnet has none,
+/// so a mainnet run names every value it lacks.
+const SEPOLIA_DEFAULTS: [(&str, &str); 12] = [
+    ("SEPOLIA_RPC_URL", "https://1rpc.io/sepolia"),
+    (
+        "SEPOLIA_LOCK_VAULT_ADDRESS",
+        "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6",
+    ),
+    (
+        "TOKEN_ADDRESS",
+        "0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749",
+    ),
+    (
+        "ORDERBOOK_ADDRESS",
+        "0xfca89cD12Ba1346b1ac570ed988AB43b812733fe",
+    ),
+    (
+        "VAULT_ID",
+        "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
+    ),
+    (
+        "ORDER_HASH",
+        "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9",
+    ),
+    ("ORDER_OWNER", "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6"),
+    ("CLAIM_SIGNER", "0x8E72b7568738da52ca3DCd9b24E178127A4E7d37"),
+    (
+        "CLAIM_INTERPRETER",
+        "0x8853d126bc23a45b9f807739b6ea0b38ef569005",
+    ),
+    ("CLAIM_STORE", "0x23f77e7bc935503e437166498d7d72f2ea290e1f"),
+    (
+        "CLAIM_EXPRESSION",
+        "0x0a1369aee76570cc7404492d55a5d1468d5a9b4b",
+    ),
+    (
+        "CLAIM_INPUT_TOKEN",
+        "0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028",
+    ),
+];
+
+/// `setting`, with TestNet's value for each network value a sepolia run is not
+/// given. An empty value counts as not given.
+pub(crate) fn with_network_defaults(
+    network: Network,
+    setting: impl Fn(&str) -> Option<String>,
+) -> impl Fn(&str) -> Option<String> {
+    move |key| {
+        setting(key)
+            .filter(|value| !value.is_empty())
+            .or_else(|| testnet_default(network, key).map(str::to_string))
+    }
+}
+
+fn testnet_default(network: Network, key: &str) -> Option<&'static str> {
+    match network {
+        Network::Sepolia => SEPOLIA_DEFAULTS
+            .iter()
+            .find(|(default_key, _)| *default_key == key)
+            .map(|(_, value)| *value),
+        Network::Mainnet => None,
+    }
+}
+
+/// Logs which of `keys` a run takes from TestNet's defaults.
+pub(crate) fn log_testnet_defaults(
+    network: Network,
+    setting: impl Fn(&str) -> Option<String>,
+    keys: &[&str],
+) {
+    let defaulted: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|key| {
+            testnet_default(network, key).is_some()
+                && setting(key).filter(|value| !value.is_empty()).is_none()
+        })
+        .collect();
+    if !defaulted.is_empty() {
+        tracing::info!(
+            event = "config.testnet_defaults",
+            defaults = ?defaulted,
+            "using TestNet's values for {}",
+            defaulted.join(", ")
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ethereum {
     pub network: Network,
     pub rpc_url: String,
     pub lock_vault_address: Address,
     pub confirmations: u64,
+}
+
+/// The Ethereum variables `setting` holds a value for, which NETWORK=none ignores.
+pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    [Network::Sepolia, Network::Mainnet]
+        .into_iter()
+        .flat_map(|network| [network.rpc_url_var(), network.lock_vault_var()])
+        .chain(crate::signer::env_variables())
+        .filter(|key| setting(key).is_some_and(|value| !value.is_empty()))
+        .collect()
+}
+
+/// The network `NETWORK` names, sepolia when it is unset or empty.
+fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<Network> {
+    match setting("NETWORK").filter(|raw| !raw.is_empty()) {
+        None => {
+            tracing::info!(
+                event = "config.testnet_defaults",
+                "NETWORK is unset: sepolia"
+            );
+            Ok(Network::Sepolia)
+        }
+        Some(raw) => raw
+            .parse::<Network>()
+            .map_err(|_| anyhow::anyhow!("NETWORK={raw} is not sepolia, mainnet or none")),
+    }
+}
+
+/// `NETWORK`'s chain, read and checked for every command, though only `run` uses it.
+pub fn ethereum_from_env() -> Result<Option<Ethereum>> {
+    ethereum_settings(|key| env::var(key).ok())
+}
+
+fn ethereum_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Option<Ethereum>> {
+    if setting("NETWORK").is_some_and(|raw| raw.eq_ignore_ascii_case("none")) {
+        return Ok(None);
+    }
+    let network = network_from(&setting)?;
+
+    let mut faults = Vec::new();
+    let other = network.other();
+    for key in [other.rpc_url_var(), other.lock_vault_var()] {
+        if setting(key).is_some_and(|value| !value.is_empty()) {
+            faults.push(format!(
+                "{key} is a {} variable and NETWORK is {}: unset it",
+                other.name(),
+                network.name()
+            ));
+        }
+    }
+
+    let own = [network.rpc_url_var(), network.lock_vault_var()];
+    log_testnet_defaults(network, &setting, &own);
+    let setting = with_network_defaults(network, setting);
+
+    let rpc_url = setting(network.rpc_url_var());
+    if rpc_url.is_none() {
+        faults.push(format!(
+            "{} is required for NETWORK={}",
+            network.rpc_url_var(),
+            network.name()
+        ));
+    }
+
+    let vault_key = network.lock_vault_var();
+    let lock_vault_address = match setting(vault_key) {
+        None => {
+            faults.push(format!(
+                "{vault_key} is required for NETWORK={}",
+                network.name()
+            ));
+            None
+        }
+        Some(raw) => match raw.parse::<Address>() {
+            Ok(address) => Some(address),
+            Err(_) => {
+                faults.push(format!("{vault_key}={raw} is not an address"));
+                None
+            }
+        },
+    };
+
+    match (rpc_url, lock_vault_address) {
+        (Some(rpc_url), Some(lock_vault_address)) if faults.is_empty() => Ok(Some(Ethereum {
+            network,
+            rpc_url,
+            lock_vault_address,
+            confirmations: network.confirmations(),
+        })),
+        _ => anyhow::bail!("{}", faults.join("; ")),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
     pub poll_interval_ms: u64,
     pub bridge_cycle_interval_ms: u64,
     pub max_link_tag_bytes: usize,
@@ -52,9 +278,7 @@ pub struct Config {
     /// Per-request timeout applied to the Holochain app websocket. Prevents a
     /// slow or hung zome call from blocking the orchestrator indefinitely.
     pub ham_request_timeout_secs: u64,
-    /// Initial backoff delay used by the reconnect loop (milliseconds).
     pub ham_reconnect_backoff_initial_ms: u64,
-    /// Cap on the reconnect backoff delay (milliseconds).
     pub ham_reconnect_backoff_max_ms: u64,
     /// Number of consecutive failed reconnect attempts before the log level
     /// escalates from `warn` to `error`. The loop keeps retrying forever.
@@ -156,32 +380,6 @@ pub struct WatchtowerReporterConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let network: Network = env::var("NETWORK")
-            .unwrap_or_else(|_| "sepolia".to_string())
-            .parse()
-            .context("Invalid NETWORK value")?;
-
-        let (rpc_url, lock_vault_address, confirmations) = match network {
-            Network::Mainnet => {
-                let rpc_url =
-                    env::var("ETH_RPC_URL").unwrap_or_else(|_| "https://eth.llamarpc.com".into());
-                let lock_vault_address = env::var("MAINNET_LOCK_VAULT_ADDRESS")
-                    .context("MAINNET_LOCK_VAULT_ADDRESS required")?
-                    .parse()
-                    .context("Invalid MAINNET_LOCK_VAULT_ADDRESS")?;
-                (rpc_url, lock_vault_address, 15)
-            }
-            Network::Sepolia => {
-                let rpc_url = env::var("SEPOLIA_RPC_URL")
-                    .unwrap_or_else(|_| "https://1rpc.io/sepolia".into());
-                let lock_vault_address = env::var("SEPOLIA_LOCK_VAULT_ADDRESS")
-                    .context("SEPOLIA_LOCK_VAULT_ADDRESS required")?
-                    .parse()
-                    .context("Invalid SEPOLIA_LOCK_VAULT_ADDRESS")?;
-                (rpc_url, lock_vault_address, 5)
-            }
-        };
-
         let poll_interval_ms = env::var("POLL_INTERVAL_MS")
             .unwrap_or_else(|_| "5000".into())
             .parse()
@@ -287,10 +485,6 @@ impl Config {
         let retention = RetentionConfig::from_env()?;
 
         Ok(Self {
-            network,
-            rpc_url,
-            lock_vault_address,
-            confirmations,
             poll_interval_ms,
             bridge_cycle_interval_ms,
             max_link_tag_bytes,
@@ -502,6 +696,19 @@ fn normalize_dna_b64(raw: &str) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn test_settings(set: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    let set: Vec<(String, String)> = set
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    move |key| {
+        set.iter()
+            .find(|(set_key, _)| set_key == key)
+            .map(|(_, value)| value.clone())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -526,14 +733,6 @@ mod tests {
         );
     }
 
-    fn settings<'a>(set: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        |key| {
-            set.iter()
-                .find(|(set_key, _)| *set_key == key)
-                .map(|(_, value)| value.to_string())
-        }
-    }
-
     #[test]
     fn each_retired_setting_stops_the_orchestrator_naming_its_replacement() {
         for (key, replacement) in [
@@ -544,7 +743,7 @@ mod tests {
             ("HOLOCHAIN_UNIT_INDEX", "HOT_UNIT_INDEX"),
         ] {
             for value in ["1", ""] {
-                let err = hot_unit_index(settings(&[("HOT_UNIT_INDEX", "1"), (key, value)]))
+                let err = hot_unit_index(test_settings(&[("HOT_UNIT_INDEX", "1"), (key, value)]))
                     .expect_err("a retired setting would otherwise be dropped in silence");
                 let message = format!("{err:#}");
                 assert!(
@@ -555,7 +754,7 @@ mod tests {
             }
         }
 
-        let err = hot_unit_index(settings(&[
+        let err = hot_unit_index(test_settings(&[
             ("HOLOCHAIN_LANE_DEFINITION", ""),
             ("HOLOCHAIN_UNIT_INDEX", "1"),
         ]))
@@ -570,15 +769,197 @@ mod tests {
 
     #[test]
     fn hot_unit_index_parses_and_defaults_to_one() {
-        assert_eq!(hot_unit_index(settings(&[])).unwrap(), 1);
+        assert_eq!(hot_unit_index(test_settings(&[])).unwrap(), 1);
         assert_eq!(
-            hot_unit_index(settings(&[("HOT_UNIT_INDEX", "3")])).unwrap(),
+            hot_unit_index(test_settings(&[("HOT_UNIT_INDEX", "3")])).unwrap(),
             3
         );
-        let err = hot_unit_index(settings(&[("HOT_UNIT_INDEX", "hot")])).unwrap_err();
+        let err = hot_unit_index(test_settings(&[("HOT_UNIT_INDEX", "hot")])).unwrap_err();
         assert!(
             format!("{err:#}").contains("Invalid HOT_UNIT_INDEX"),
             "{err:#}"
+        );
+    }
+
+    const VAULT: &str = "0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6";
+
+    fn network_refusal(set: &[(&str, &str)]) -> String {
+        format!("{:#}", ethereum_settings(test_settings(set)).unwrap_err())
+    }
+
+    fn chain(set: &[(&str, &str)]) -> Ethereum {
+        ethereum_settings(test_settings(set))
+            .unwrap()
+            .expect("the settings name no chain")
+    }
+
+    #[test]
+    fn each_network_reads_its_own_rpc_url_and_vault() {
+        let sepolia = chain(&[
+            ("NETWORK", "sepolia"),
+            ("SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
+            ("SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
+        ]);
+        assert_eq!(
+            sepolia,
+            Ethereum {
+                network: Network::Sepolia,
+                rpc_url: "https://sepolia.rpc.test".to_string(),
+                lock_vault_address: VAULT.parse().unwrap(),
+                confirmations: 5,
+            }
+        );
+
+        let mainnet = chain(&[
+            ("NETWORK", "mainnet"),
+            ("ETH_RPC_URL", "https://eth.rpc.test"),
+            ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
+        ]);
+        assert_eq!(mainnet.network, Network::Mainnet);
+        assert_eq!(mainnet.rpc_url, "https://eth.rpc.test");
+        assert_eq!(mainnet.confirmations, 15);
+    }
+
+    #[test]
+    fn an_unset_network_is_sepolia_with_testnet_values() {
+        for unset in [vec![], vec![("NETWORK", "")]] {
+            assert_eq!(
+                chain(&unset),
+                Ethereum {
+                    network: Network::Sepolia,
+                    rpc_url: "https://1rpc.io/sepolia".to_string(),
+                    lock_vault_address: VAULT.parse().unwrap(),
+                    confirmations: 5,
+                }
+            );
+        }
+        assert_eq!(
+            network_refusal(&[("NETWORK", "goerli")]),
+            "NETWORK=goerli is not sepolia, mainnet or none"
+        );
+    }
+
+    #[test]
+    fn a_sepolia_run_still_refuses_mainnet_variables() {
+        assert_eq!(
+            network_refusal(&[("ETH_RPC_URL", "https://eth.rpc.test")]),
+            "ETH_RPC_URL is a mainnet variable and NETWORK is sepolia: unset it"
+        );
+    }
+
+    #[test]
+    fn mainnet_without_its_rpc_url_or_vault_is_refused_with_no_fallback() {
+        assert_eq!(
+            network_refusal(&[("NETWORK", "mainnet")]),
+            "ETH_RPC_URL is required for NETWORK=mainnet; MAINNET_LOCK_VAULT_ADDRESS is required for NETWORK=mainnet"
+        );
+        assert_eq!(
+            network_refusal(&[("NETWORK", "mainnet"), ("ETH_RPC_URL", "")]),
+            "ETH_RPC_URL is required for NETWORK=mainnet; MAINNET_LOCK_VAULT_ADDRESS is required for NETWORK=mainnet"
+        );
+        assert_eq!(
+            network_refusal(&[
+                ("NETWORK", "sepolia"),
+                ("SEPOLIA_LOCK_VAULT_ADDRESS", "0xE3E0"),
+            ]),
+            "SEPOLIA_LOCK_VAULT_ADDRESS=0xE3E0 is not an address"
+        );
+    }
+
+    #[test]
+    fn each_variable_of_the_other_network_is_refused() {
+        for (network, own, other) in [
+            (
+                "mainnet",
+                [
+                    ("ETH_RPC_URL", "https://eth.rpc.test"),
+                    ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
+                ],
+                ["SEPOLIA_RPC_URL", "SEPOLIA_LOCK_VAULT_ADDRESS"],
+            ),
+            (
+                "sepolia",
+                [
+                    ("SEPOLIA_RPC_URL", "https://sepolia.rpc.test"),
+                    ("SEPOLIA_LOCK_VAULT_ADDRESS", VAULT),
+                ],
+                ["ETH_RPC_URL", "MAINNET_LOCK_VAULT_ADDRESS"],
+            ),
+        ] {
+            for key in other {
+                let mut set = vec![("NETWORK", network)];
+                set.extend(own);
+                set.push((key, "0x1"));
+                let message = network_refusal(&set);
+                assert_eq!(
+                    message,
+                    format!(
+                        "{key} is a {} variable and NETWORK is {network}: unset it",
+                        if network == "mainnet" {
+                            "sepolia"
+                        } else {
+                            "mainnet"
+                        }
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_variable_of_the_other_network_counts_as_unset() {
+        let mainnet = chain(&[
+            ("NETWORK", "mainnet"),
+            ("ETH_RPC_URL", "https://eth.rpc.test"),
+            ("MAINNET_LOCK_VAULT_ADDRESS", VAULT),
+            ("SEPOLIA_RPC_URL", ""),
+            ("SEPOLIA_LOCK_VAULT_ADDRESS", ""),
+        ]);
+        assert_eq!(mainnet.network, Network::Mainnet);
+        assert_eq!(mainnet.rpc_url, "https://eth.rpc.test");
+
+        let sepolia = chain(&[("ETH_RPC_URL", ""), ("MAINNET_LOCK_VAULT_ADDRESS", "")]);
+        assert_eq!(sepolia.network, Network::Sepolia);
+        assert_eq!(sepolia.rpc_url, "https://1rpc.io/sepolia");
+    }
+
+    #[test]
+    fn network_none_names_no_chain_and_ignores_every_chain_variable() {
+        let set = [
+            ("NETWORK", "none"),
+            ("SEPOLIA_RPC_URL", "http://127.0.0.1:8545"),
+            (
+                "SEPOLIA_LOCK_VAULT_ADDRESS",
+                "0x0000000000000000000000000000000000000000",
+            ),
+            ("ETH_RPC_URL", "https://eth.rpc.test"),
+            ("ORDER_HASH", ""),
+            ("SIGNER_PRIVATE_KEY", "0xabc"),
+        ];
+
+        for network in ["none", "NONE"] {
+            let mut with = set.to_vec();
+            with[0] = ("NETWORK", network);
+            assert_eq!(ethereum_settings(test_settings(&with)).unwrap(), None);
+        }
+        assert_eq!(
+            ignored_without_ethereum(test_settings(&set)),
+            [
+                "SEPOLIA_RPC_URL",
+                "SEPOLIA_LOCK_VAULT_ADDRESS",
+                "ETH_RPC_URL",
+                "SIGNER_PRIVATE_KEY"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_none_turns_ethereum_off() {
+        assert_eq!(chain(&[]).network, Network::Sepolia);
+        assert_eq!(chain(&[("NETWORK", "")]).network, Network::Sepolia);
+        assert_eq!(
+            network_refusal(&[("NETWORK", "off")]),
+            "NETWORK=off is not sepolia, mainnet or none"
         );
     }
 

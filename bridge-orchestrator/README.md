@@ -20,7 +20,38 @@ This is the command used by the systemd service.
 bridge-orchestrator run
 ```
 
-No additional flags.
+No additional flags. Before it reads from Holochain or writes anything, `run`
+refuses to start, naming each variable at fault, when:
+
+- a signer variable is unset or malformed
+- the RPC answers for a chain other than `NETWORK`'s (1 for `mainnet`,
+  11155111 for `sepolia`)
+- the vault has no contract, or its `token()`, `orderbook()` or `vaultId()`
+  differs from `TOKEN_ADDRESS`, `ORDERBOOK_ADDRESS` or `VAULT_ID`
+- `ORDER_OWNER` is not the vault
+- the claim order that `ORDER_OWNER`, `TOKEN_ADDRESS`, `VAULT_ID` and the
+  `CLAIM_*` values describe does not hash to `ORDER_HASH`
+- `ORDERBOOK_ADDRESS` holds no order `ORDER_HASH`
+- `CLAIM_SIGNER` is a contract, such as a Safe: the orchestrator signs only as
+  a key
+- `SIGNER_PRIVATE_KEY` is not the key of `CLAIM_SIGNER`
+- the claim order does not accept a coupon signed with that key. `run`
+  simulates `takeOrders` with a one-wei coupon to itself, and starts only if
+  the order pays it, or answers `MinimumInput` because its vault is empty.
+- on `mainnet`, `SIGNER_PRIVATE_KEY` is the test signer
+  `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
+
+An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
+its supervisor restarts it. Once the checks pass it logs
+`startup checks passed`.
+
+`NETWORK=none` turns Ethereum off, for a node with no chain such as a local
+emulation. `run` then makes no Ethereum call: it skips the checks above,
+watches no lock and signs no coupon. It still does its Holochain work. Deposits
+parked on the bridging agreement go through, and every withdrawal stays parked.
+A lock row whose next step writes a deposit proof waits for a run on a chain.
+It logs once that Ethereum is off, and names each chain variable it ignores.
+Only an explicit `none` turns Ethereum off.
 
 ### `bridge-orchestrator status`
 
@@ -64,18 +95,19 @@ hygiene.
 
 ## Environment variables
 
-Every subcommand loads the full config from the environment on startup, so
-the env file must be sourced even for `status` and `clear`.
+Every subcommand loads the config below on startup, so the env file must be
+sourced even for `status` and `clear`. Only `run` reads the signer variables
+and the chain. A network variable set to an empty value counts as unset.
 
 ### Config (all commands)
 
 | Variable | Required | Default |
 |----------|----------|---------|
-| `NETWORK` | No | `sepolia` (`mainnet` or `sepolia`) |
-| `SEPOLIA_RPC_URL` | No | `https://1rpc.io/sepolia` |
-| `SEPOLIA_LOCK_VAULT_ADDRESS` | **Yes** (sepolia) | -- |
-| `ETH_RPC_URL` | No (mainnet) | `https://eth.llamarpc.com` |
-| `MAINNET_LOCK_VAULT_ADDRESS` | **Yes** (mainnet) | -- |
+| `NETWORK` | No | `sepolia` (`mainnet`, `sepolia` or `none`) |
+| `SEPOLIA_RPC_URL` | No, refused on mainnet | `https://1rpc.io/sepolia` |
+| `SEPOLIA_LOCK_VAULT_ADDRESS` | No, refused on mainnet | `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6` |
+| `ETH_RPC_URL` | **Yes** (mainnet), refused on sepolia | -- |
+| `MAINNET_LOCK_VAULT_ADDRESS` | **Yes** (mainnet), refused on sepolia | -- |
 | `DB_PATH` | No | `./data/bridge_orchestrator.db` |
 | `POLL_INTERVAL_MS` | No | `5000` |
 | `BRIDGE_CYCLE_INTERVAL_MS` | No | `180000` (falls back to `COUPON_POLL_INTERVAL_MS`) |
@@ -170,23 +202,22 @@ avoids duplicating log-lifecycle logic inside the service.
 
 ### Deployment via automation
 
-For the `hot-2-mhot` bridge server the orchestrator is fully provisioned
-by the `automation/` repo. From its root, one command builds the binary,
-auto-derives the DNA hash from the latest Holochain deploy result,
-reuses/creates a local HMAC secret for the watchtower reporter,
-registers it with the worker, writes `bridge-orchestrator.env` (including
-`WATCHTOWER_*` and any `BRIDGE_RETENTION_*` overrides from
-`config/hot-2-mhot-bridge/services.json`), SCPs the binary, and restarts
+The `automation/` repo provisions the orchestrator on the blockchain bridging
+node. From its root, one command builds the binary, derives the DNA hash from
+the latest Holochain deploy result, reuses or creates the watchtower reporter's
+HMAC secret and registers it with the worker, writes `bridge-orchestrator.env`
+from `config/blockchain-bridging/services.json` (including `WATCHTOWER_*` and
+any `BRIDGE_RETENTION_*` overrides), copies the binary over, and restarts
 systemd:
 
 ```bash
-cd automation && make hot-2-mhot-bridge-services
+cd automation && make blockchain-bridging-services
 ```
 
-Manual editing of `bridge-orchestrator.env` is only needed for local/dev
-setups or ad-hoc secret rotation. See `automation/scripts/setup-blockchain-bridge-services.sh`
-and the `watchtower_reporter` / `retention` blocks in `services.json`
-for the knobs available to operators.
+Edit `bridge-orchestrator.env` by hand only for local setups or a secret
+rotation. `automation/scripts/setup-blockchain-bridge-services.sh` and the
+`watchtower_reporter` / `retention` blocks in `services.json` hold the knobs
+available to operators.
 
 ### Holochain websocket resilience
 
@@ -214,19 +245,27 @@ signal, the currently running bridge cycle is allowed to finish
 then exits cleanly between iterations. systemd `Restart=` and rolling
 deploys are safe.
 
-### Signer (run only, when generating withdrawal coupons)
+### Signer (run only)
 
-These are read lazily during the bridge cycle, not at startup.
+`run` parses these at startup. The deploy record prints every one but the key,
+under these names. On `sepolia` each one but the key defaults to TestNet's
+value, the Sepolia claim order, and startup logs which ones it took. On
+`mainnet` every one is required.
 
-| Variable | Required | Default |
-|----------|----------|---------|
-| `SIGNER_PRIVATE_KEY` | Yes | -- |
-| `ORDER_HASH` | Yes | -- |
-| `ORDER_OWNER` | Yes | -- |
-| `ORDERBOOK_ADDRESS` | Yes | -- |
-| `TOKEN_ADDRESS` | Yes | -- |
-| `VAULT_ID` | Yes | -- |
-| `EXPIRY_SECONDS` | No | `604800` (7 days) |
+| Variable | Required | Sepolia default |
+|----------|----------|-----------------|
+| `SIGNER_PRIVATE_KEY` | Yes | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`) |
+| `ORDER_HASH` | mainnet | `0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9` |
+| `ORDER_OWNER` | mainnet | `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6` |
+| `ORDERBOOK_ADDRESS` | mainnet | `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe` |
+| `TOKEN_ADDRESS` | mainnet | `0xeaC8eEEE9f84F3E3F592e9D8604100eA1b788749` |
+| `VAULT_ID` | mainnet | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
+| `CLAIM_SIGNER` | mainnet | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` (the claim order's `valid-signer`: the key's address) |
+| `CLAIM_INTERPRETER` | mainnet | `0x8853d126bc23a45b9f807739b6ea0b38ef569005` |
+| `CLAIM_STORE` | mainnet | `0x23f77e7bc935503e437166498d7d72f2ea290e1f` |
+| `CLAIM_EXPRESSION` | mainnet | `0x0a1369aee76570cc7404492d55a5d1468d5a9b4b` |
+| `CLAIM_INPUT_TOKEN` | mainnet | `0x555FA2F68dD9B7dB6c8cA1F03bFc317ce61e9028` |
+| `EXPIRY_SECONDS` | No | `604800` (7 days), from 1 to `31536000` (a year) |
 
 ## Usage on the HOT-2-mHOT bridge server
 

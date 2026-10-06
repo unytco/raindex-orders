@@ -1,6 +1,7 @@
 mod config;
 mod lock_flow;
 mod orchestrator;
+mod preflight;
 mod retention;
 mod signer;
 mod state;
@@ -9,7 +10,8 @@ mod watchtower_reporter;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::Config;
-use orchestrator::BridgeOrchestrator;
+use orchestrator::{BridgeOrchestrator, EthereumSide};
+use signer::CouponSigner;
 use state::{StateFilter, WorkState};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -64,11 +66,46 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let config = Config::from_env()?;
+    let ethereum = config::ethereum_from_env()?;
 
     match args.command {
         Command::Run => {
             info!("bridge-orchestrator starting");
-            BridgeOrchestrator::new(config)?.run().await?;
+            let ethereum = match ethereum {
+                Some(chain) => {
+                    let signer = CouponSigner::from_env(chain.network)?;
+                    preflight::check(
+                        chain.network,
+                        &chain.rpc_url,
+                        chain.lock_vault_address,
+                        &signer,
+                    )
+                    .await?;
+                    info!(
+                        event = "startup.checks_passed",
+                        order = %signer.order().order_hash,
+                        signer = %signer.order().signer,
+                        "startup checks passed: the chain, vault and claim order match, and the order accepts the signer"
+                    );
+                    Some(EthereumSide { chain, signer })
+                }
+                None => {
+                    info!(
+                        event = "startup.ethereum_off",
+                        "NETWORK=none: Ethereum is off. No chain is checked, no lock is watched and no coupon is signed, so withdrawals stay parked"
+                    );
+                    let ignored = config::ignored_without_ethereum(|key| std::env::var(key).ok());
+                    if !ignored.is_empty() {
+                        info!(
+                            event = "startup.ethereum_variables_ignored",
+                            "NETWORK=none ignores {}",
+                            ignored.join(", ")
+                        );
+                    }
+                    None
+                }
+            };
+            BridgeOrchestrator::new(config, ethereum)?.run().await?;
         }
         Command::Status {
             flow,

@@ -20,7 +20,7 @@
 </script>
 
 <QueryClientProvider client={queryClient}>
-	<main class="m-12 flex flex-col lg:flex-row lg:items-start lg:justify-center gap-8">
+	<main class="m-12 flex flex-col gap-8 lg:flex-row lg:items-start lg:justify-center">
 		<div class="flex flex-col items-center">
 			<slot />
 		</div>

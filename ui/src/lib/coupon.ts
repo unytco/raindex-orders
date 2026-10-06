@@ -2,7 +2,7 @@
 // Coupon SIGNING is done server-side only (the bridge orchestrator, see
 // bridge-orchestrator/src/signer.rs). No signing key lives in this module or any
 // client-bundled code (issue #14).
-import { type Hex, type Address } from 'viem'
+import { numberToHex, type Hex, type Address } from 'viem'
 
 export type CouponConfig = {
 	recipient: Address
@@ -35,15 +35,16 @@ export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig 
 		nonce
 	] = signedContext.context
 
+	const address = (word: bigint) => numberToHex(word, { size: 20 })
 	return {
-		recipient: `0x${recipient.toString(16)}`,
+		recipient: address(recipient),
 		withdrawAmount,
 		expiryTimestamp: Number(expiryTimestamp),
-		orderHash: `0x${orderHash.toString(16)}`,
-		orderOwner: `0x${orderOwner.toString(16)}`,
-		orderbookAddress: `0x${orderbookAddress.toString(16)}`,
-		claimTokenAddress: `0x${claimTokenAddress.toString(16)}`,
-		outputVaultId: `0x${outputVaultId.toString(16)}`,
+		orderHash: numberToHex(orderHash, { size: 32 }),
+		orderOwner: address(orderOwner),
+		orderbookAddress: address(orderbookAddress),
+		claimTokenAddress: address(claimTokenAddress),
+		outputVaultId: numberToHex(outputVaultId, { size: 32 }),
 		nonce
 	}
 }
@@ -51,7 +52,7 @@ export const parseCoupon = (signedContext: SignedContextV1Struct): CouponConfig 
 export const serializeSignedContext = (signedContext: SignedContextV1Struct): string => {
 	// we can't use JSON.stringify because the context is an array of BigInts
 	// but we need to serialize all of it as a string
-	const serialized = signedContext.context.map((n) => n.toString()).join(',')
+	const serialized = signedContext.context.map(n => n.toString()).join(',')
 	return `${signedContext.signer},${signedContext.signature},${serialized}`
 }
 
@@ -60,6 +61,6 @@ export const deserializeSignedContext = (serialized: string): SignedContextV1Str
 	return {
 		signer: signer as Hex,
 		signature: signature as Hex,
-		context: context.map((n) => BigInt(n))
+		context: context.map(n => BigInt(n))
 	}
 }

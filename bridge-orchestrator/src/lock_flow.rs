@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::Ethereum;
 use crate::state::StateStore;
 use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
@@ -24,12 +24,12 @@ const MAX_BLOCK_RANGE: u64 = 10;
 const LOCK_CHECKPOINT_KEY: &str = "lock.last_processed_block";
 
 pub struct LockFlow {
-    cfg: Config,
+    cfg: Ethereum,
     db: StateStore,
 }
 
 impl LockFlow {
-    pub fn new(cfg: Config, db: StateStore) -> Self {
+    pub fn new(cfg: Ethereum, db: StateStore) -> Self {
         Self { cfg, db }
     }
 

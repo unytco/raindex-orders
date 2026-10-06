@@ -3,6 +3,8 @@
 	import { isAddress } from 'viem'
 	import { ethereumStore } from '$lib/ethereum'
 	import { onMount } from 'svelte'
+	import { errorMessage } from '$lib/utils'
+	import { explorerTx } from '$lib/config'
 
 	let recipient: string = ''
 	let loading = false
@@ -72,8 +74,8 @@
 
 			// Reload balance after successful request
 			await loadFaucetBalance()
-		} catch (e: any) {
-			error = e.message || 'Failed to request tokens'
+		} catch (e) {
+			error = errorMessage(e, 'Failed to request tokens')
 			console.error('Faucet request error:', e)
 		} finally {
 			loading = false
@@ -89,7 +91,6 @@
 </script>
 
 <div class="container mx-auto max-w-2xl p-4">
-
 	<h1 class="mb-6 text-3xl font-bold">Mock HOT Faucet</h1>
 
 	<Card size="xl" class="mb-4">
@@ -133,7 +134,8 @@
 
 	{#if error}
 		<Alert color="red" class="mb-4">
-			<span class="font-medium">Error:</span> {error}
+			<span class="font-medium">Error:</span>
+			{error}
 		</Alert>
 	{/if}
 
@@ -143,7 +145,7 @@
 				<p class="font-medium">✓ Successfully sent 1000 mock HOT!</p>
 				<p class="mt-2 text-sm">Transaction Hash:</p>
 				<a
-					href="https://sepolia.etherscan.io/tx/{txHash}"
+					href={explorerTx(txHash)}
 					target="_blank"
 					rel="noopener noreferrer"
 					class="break-all font-mono text-xs hover:underline"

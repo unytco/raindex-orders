@@ -2,11 +2,10 @@ import { json } from '@sveltejs/kit'
 import type { RequestHandler } from './$types'
 import { createWalletClient, createPublicClient, http, parseEther, formatEther } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
-import { sepolia } from 'viem/chains'
 // $env/dynamic/private reads from the runtime env (Cloudflare Pages secret bindings),
 // so the key is NOT inlined into the built bundle — unlike $env/static/private (issue #14).
 import { env } from '$env/dynamic/private'
-import { PUBLIC_TOKEN_ADDRESS } from '$env/static/public'
+import { bridge } from '$lib/config'
 import { logRpcError } from '$lib/server/rpcError'
 
 // ERC20 ABI for transfer function
@@ -38,14 +37,11 @@ const FAUCET_AMOUNT = parseEther('1000') // 1000 HOT
 
 // Fail fast with a clear, named error if a required runtime secret binding is
 // missing. Without this, a missing FAUCET_PRIVATE_KEY surfaces as an opaque viem
-// error and a missing SEPOLIA_RPC_URL silently falls back to the public RPC.
+// error and a missing RPC URL silently falls back to the public RPC.
 function requireFaucetEnv(): { privateKey: `0x${string}`; rpcUrl: string } {
 	const privateKey = env.FAUCET_PRIVATE_KEY
-	const rpcUrl = env.SEPOLIA_RPC_URL
-	const missing = [
-		!privateKey && 'FAUCET_PRIVATE_KEY',
-		!rpcUrl && 'SEPOLIA_RPC_URL'
-	].filter(Boolean)
+	const rpcUrl = env[bridge.rpcSecret]
+	const missing = [!privateKey && 'FAUCET_PRIVATE_KEY', !rpcUrl && bridge.rpcSecret].filter(Boolean)
 	if (missing.length > 0) {
 		throw new Error(`Missing ${missing.join(', ')}`)
 	}
@@ -59,12 +55,12 @@ export const GET: RequestHandler = async () => {
 		const account = privateKeyToAccount(privateKey)
 
 		const publicClient = createPublicClient({
-			chain: sepolia,
+			chain: bridge.chain,
 			transport: http(rpcUrl)
 		})
 
 		const balance = await publicClient.readContract({
-			address: PUBLIC_TOKEN_ADDRESS as `0x${string}`,
+			address: bridge.tokenAddress,
 			abi: ERC20_ABI,
 			functionName: 'balanceOf',
 			args: [account.address]
@@ -113,18 +109,18 @@ export const POST: RequestHandler = async ({ request }) => {
 		const account = privateKeyToAccount(privateKey)
 		const walletClient = createWalletClient({
 			account,
-			chain: sepolia,
+			chain: bridge.chain,
 			transport: http(rpcUrl)
 		})
 
 		const publicClient = createPublicClient({
-			chain: sepolia,
+			chain: bridge.chain,
 			transport: http(rpcUrl)
 		})
 
 		// Check faucet balance
 		const faucetBalance = await publicClient.readContract({
-			address: PUBLIC_TOKEN_ADDRESS as `0x${string}`,
+			address: bridge.tokenAddress,
 			abi: ERC20_ABI,
 			functionName: 'balanceOf',
 			args: [account.address]
@@ -142,7 +138,7 @@ export const POST: RequestHandler = async ({ request }) => {
 
 		// Send tokens
 		const hash = await walletClient.writeContract({
-			address: PUBLIC_TOKEN_ADDRESS as `0x${string}`,
+			address: bridge.tokenAddress,
 			abi: ERC20_ABI,
 			functionName: 'transfer',
 			args: [recipient as `0x${string}`, FAUCET_AMOUNT]

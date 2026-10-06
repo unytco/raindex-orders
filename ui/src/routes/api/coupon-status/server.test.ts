@@ -1,28 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-	decodeFunctionData,
-	encodeFunctionResult,
-	encodePacked,
-	keccak256,
-	maxUint256,
-	multicall3Abi,
-	parseAbi,
-	type Hex
-} from 'viem'
+import { encodePacked, keccak256, maxUint256, type Hex } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { SEPOLIA_REDEEMED } from './fixtures'
+import { fakeCache, fakeRpc as fakeChainRpc } from './fakeRpc'
 
 const env = vi.hoisted(() => ({
 	SEPOLIA_RPC_URL: 'https://rpc.test/secret-key' as string | undefined
 }))
 vi.mock('$env/dynamic/private', () => ({ env }))
-vi.mock('$env/static/public', () => ({
-	PUBLIC_ORDERBOOK_ADDRESS: '0xfca89cD12Ba1346b1ac570ed988AB43b812733fe'
-}))
+vi.mock('$env/static/public', async () => (await import('$lib/testing/builds')).SEPOLIA_BUILD)
 
 import { OPTIONS, POST } from './+server'
 
-const MULTICALL3 = '0xca11bde05977b3631167028862be2a173976ca11'
 const STORE = '0x23f77e7bc935503e437166498d7d72f2ea290e1f'
 const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n
 
@@ -38,13 +27,6 @@ const EXPIRY_C = 1_776_472_922
 
 const BLOCK = 10_883_600n
 const BEFORE_ALL = 1_776_400_000
-
-const readAbi = parseAbi([
-	'function get(uint256 namespace, uint256 key) view returns (uint256)',
-	'function getChainId() view returns (uint256)',
-	'function getBlockNumber() view returns (uint256)',
-	'function getCurrentBlockTimestamp() view returns (uint256)'
-])
 
 /** The fields of a coupon: signer, signature, then context 0 to 8. */
 const fieldsOf = (coupon: string) => coupon.split(',')
@@ -78,53 +60,10 @@ async function resigned(coupon: string, key: Hex, signer = fieldsOf(coupon)[0]) 
 }
 
 type Chain = { chainId: bigint; timestamp: number; flags: Map<bigint, bigint> }
-type RpcRequest = { method: string; params: [{ to: string; data: Hex }, string] }
 
 /** A Sepolia JSON-RPC endpoint answering Multicall3 aggregate3 calls from `chain`. */
-function fakeRpc(chain: Chain) {
-	const requests: RpcRequest[] = []
-	const storeReads: bigint[][] = []
-	const fetch = vi.fn(async (_url: string, init: RequestInit) => {
-		const request = JSON.parse(String(init.body))
-		requests.push(request)
-		const reads: bigint[] = []
-		storeReads.push(reads)
-		const [{ to, data }] = request.params
-		if (request.method !== 'eth_call' || to.toLowerCase() !== MULTICALL3) {
-			throw new Error(`unexpected ${request.method} to ${to}`)
-		}
-		const { args } = decodeFunctionData({ abi: multicall3Abi, data })
-		const results = (args[0] as readonly { target: string; callData: Hex }[]).map(call => {
-			const { functionName, args } = decodeFunctionData({ abi: readAbi, data: call.callData })
-			const target = call.target.toLowerCase()
-			let value: bigint
-			if (target === STORE && functionName === 'get') {
-				const [namespace, key] = args
-				if (namespace !== CLAIM_NAMESPACE) throw new Error(`read namespace ${namespace}`)
-				reads.push(key)
-				value = chain.flags.get(key) ?? 0n
-			} else if (target === MULTICALL3 && functionName === 'getChainId') {
-				value = chain.chainId
-			} else if (target === MULTICALL3 && functionName === 'getBlockNumber') {
-				value = BLOCK
-			} else if (target === MULTICALL3 && functionName === 'getCurrentBlockTimestamp') {
-				value = BigInt(chain.timestamp)
-			} else {
-				throw new Error(`unexpected ${functionName} on ${target}`)
-			}
-			const returnData = encodeFunctionResult({ abi: readAbi, functionName, result: value })
-			return { success: true, returnData }
-		})
-		const result = encodeFunctionResult({
-			abi: multicall3Abi,
-			functionName: 'aggregate3',
-			result: results
-		})
-		return Response.json({ jsonrpc: '2.0', id: request.id, result })
-	})
-	vi.stubGlobal('fetch', fetch)
-	return { fetch, requests, storeReads }
-}
+const fakeRpc = (chain: Chain) =>
+	fakeChainRpc({ ...chain, block: BLOCK, store: STORE, namespace: CLAIM_NAMESPACE })
 
 /** Sepolia with A and B redeemed, at a safe block timestamped `timestamp`. */
 const sepolia = (timestamp = BEFORE_ALL): Chain => ({
@@ -138,20 +77,6 @@ const sepolia = (timestamp = BEFORE_ALL): Chain => ({
 /** Sepolia with nothing redeemed. */
 const unclaimed = (timestamp = BEFORE_ALL): Chain => ({ ...sepolia(timestamp), flags: new Map() })
 
-/** A Workers cache held in memory, one per test, as one data centre's would be. */
-function fakeCache() {
-	const entries = new Map<string, string>()
-	const store = {
-		match: vi.fn(async (key: string) => {
-			const body = entries.get(key)
-			return body === undefined ? undefined : new Response(body)
-		}),
-		put: vi.fn(async (key: string, response: Response) => {
-			entries.set(key, await response.text())
-		})
-	}
-	return { entries, store, open: vi.fn(async () => store) }
-}
 let cache: ReturnType<typeof fakeCache>
 
 async function post(body: unknown) {
@@ -510,12 +435,13 @@ describe('POST /api/coupon-status', () => {
 		expect(body).toEqual({ error: expect.any(String) })
 	})
 
-	it('answers 502 when the RPC is on another chain', async () => {
+	it('answers 502, and caches nothing, when the RPC is on another chain', async () => {
 		fakeRpc({ ...sepolia(), chainId: 1n })
 
 		const { response } = await post({ coupons: [A] })
 
 		expect(response.status).toBe(502)
+		expect(cache.store.put).not.toHaveBeenCalled()
 	})
 
 	it('answers 502 when a coupon needs a read and no RPC is configured', async () => {

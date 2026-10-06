@@ -1,28 +1,79 @@
 #!/usr/bin/env node
-// Compose rainlang from .rain file using @rainlanguage/dotrain
-import pkg from '@rainlanguage/dotrain';
-const { RainDocument, MetaStore } = pkg;
-import { readFileSync } from 'fs';
+// Composes the claim expression for one network:
+//   node compose-rainlang.mjs --network mainnet --subparser 0x... --signer 0x... [src/holo-claim.rain]
+//   node compose-rainlang.mjs     TestNet's network and bindings
+import pkg from '@rainlanguage/dotrain'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { parseArgs } from 'node:util'
 
-const rainFile = process.argv[2] || 'src/holo-claim.rain';
+const { RainDocument, MetaStore } = pkg
 
-const content = readFileSync(rainFile, 'utf8');
+export const TEST_SIGNER = '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37'
+const NETWORKS = ['sepolia', 'mainnet']
+const ZERO_ADDRESS = `0x${'0'.repeat(40)}`
+/** TestNet's bindings: a sepolia composition takes each one it is not given. */
+const SEPOLIA_DEFAULTS = {
+	subparser: '0xe6A589716d5a72276C08E0e08bc941a28005e55A',
+	signer: TEST_SIGNER
+}
 
-// Create MetaStore
-const metaStore = new MetaStore();
+const isAddress = value => /^0x[0-9a-fA-F]{40}$/.test(value ?? '') && value !== ZERO_ADDRESS
 
-// Sepolia bindings from the .rain file
-const rebinds = [
-  ["orderbook-subparser", "0xe6A589716d5a72276C08E0e08bc941a28005e55A"],
-  ["valid-signer", "0x8E72b7568738da52ca3DCd9b24E178127A4E7d37"]
-];
+/**
+ * The expression's two network bindings, or an error naming every input at fault.
+ * The network is sepolia when unset, and sepolia takes TestNet's bindings for any
+ * it is not given. Mainnet has none.
+ */
+export function bindings({ network = 'sepolia', subparser, signer }) {
+	if (network === 'sepolia') {
+		subparser ||= SEPOLIA_DEFAULTS.subparser
+		signer ||= SEPOLIA_DEFAULTS.signer
+	}
+	const faults = []
+	if (!NETWORKS.includes(network)) {
+		faults.push(`--network must be sepolia or mainnet, not ${network ?? 'unset'}`)
+	}
+	if (!isAddress(subparser)) {
+		faults.push(`--subparser must be a nonzero address, not ${subparser ?? 'unset'}`)
+	}
+	if (!isAddress(signer)) {
+		faults.push(`--signer must be a nonzero address, not ${signer ?? 'unset'}`)
+	} else if (network === 'mainnet' && signer.toLowerCase() === TEST_SIGNER.toLowerCase()) {
+		faults.push(`--signer ${signer} is the test signer, whose key is public: mainnet refuses it`)
+	}
+	if (faults.length > 0) throw new Error(faults.join('; '))
+	return [
+		['orderbook-subparser', subparser],
+		['valid-signer', signer]
+	]
+}
 
-// Compose with rebindings
-const rainlang = await RainDocument.composeText(
-  content,
-  ["calculate-io", "handle-io"],
-  metaStore,
-  rebinds
-);
+const CLAIM_EXPRESSION = fileURLToPath(new URL('src/holo-claim.rain', import.meta.url))
 
-console.log(rainlang);
+export async function compose({ network, subparser, signer, file = CLAIM_EXPRESSION }) {
+	const rebinds = bindings({ network, subparser, signer })
+	return RainDocument.composeText(
+		readFileSync(file, 'utf8'),
+		['calculate-io', 'handle-io'],
+		new MetaStore(),
+		rebinds
+	)
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+	const { values, positionals } = parseArgs({
+		options: {
+			network: { type: 'string' },
+			subparser: { type: 'string' },
+			signer: { type: 'string' }
+		},
+		allowPositionals: true
+	})
+	try {
+		console.log(await compose({ ...values, file: positionals[0] }))
+	} catch (error) {
+		console.error(error.message)
+		process.exit(1)
+	}
+}

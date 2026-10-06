@@ -37,22 +37,24 @@ This repository contains the Ethereum-side infrastructure for the HOT <> bridged
 - [Foundry](https://book.getfoundry.sh/getting-started/installation) (forge, cast)
 - [Rust](https://rustup.rs/) (for bridge-orchestrator)
 - [Node.js 20+](https://nodejs.org/) (for UI)
-- MetaMask with Sepolia ETH
+- A Sepolia deployer wallet with Sepolia ETH (a Ledger or an encrypted keystore), and MetaMask for the UI
 
 ### 1. Deploy to Sepolia
 
 ```bash
-# Set up environment
+# Set up environment: addresses only, never a private key
 cp .env.example .env
-# Edit .env with your private key
+# Keep the deployer key in an encrypted keystore, entered at a prompt
+cast wallet import deployer --interactive
 
 # Deploy all contracts
-./deploy-sepolia.sh token       # Deploy MockHOT token
-./deploy-sepolia.sh vault       # Deploy HoloLockVault
-./deploy-sepolia.sh mint        # Mint test tokens
-./deploy-sepolia.sh fund        # Fund the vault
-./deploy-sepolia.sh order-via-vault  # Deploy claim order
+./deploy-sepolia.sh token --account deployer            # Deploy MockHOT token
+./deploy-sepolia.sh vault --account deployer            # Deploy HoloLockVault
+./deploy-sepolia.sh mint --account deployer             # Mint test tokens
+./deploy-sepolia.sh order-via-vault --account deployer  # Deploy claim order
 ```
+
+Mainnet deploys with `deploy-mainnet.sh`, rehearsed first on a fork: [DEPLOY.md](./DEPLOY.md#mainnet-deploy).
 
 ### 2. Run the UI
 
@@ -67,9 +69,9 @@ npm run dev
 
 ```bash
 cd bridge-orchestrator
-cp .env.example .env
-# Edit with your Sepolia + Holochain settings
-cargo run
+# Set HOLOCHAIN_BRIDGING_AGENT_PUBKEY and SIGNER_PRIVATE_KEY. TestNet values are the
+# defaults for the rest (bridge-orchestrator/README.md)
+cargo run -- run
 ```
 
 The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, and generates signed withdrawal coupons for claim flows.
@@ -102,7 +104,7 @@ The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, a
 ### Claim Flow (Bridged HOT -> HOT)
 
 1. User burns bridged HOT on Holochain
-2. Holo backend generates signed coupon via Fireblocks
+2. The bridge orchestrator signs a coupon with the coupon signer ([docs/enable-multisig.md](./docs/enable-multisig.md))
 3. User receives coupon (URL or direct)
 4. User visits claim page and submits coupon
 5. Rainlang expression validates coupon (signer, expiry, nonce)
@@ -118,13 +120,17 @@ forge build
 forge test
 
 # Build the bridge orchestrator
-cd bridge-orchestrator && cargo build
+(cd bridge-orchestrator && cargo build)
+
+# Rehearse the mainnet deploy and the move to Safes on an anvil fork,
+# after building the orchestrator above
+nix develop -c test/fork-rehearsal.sh
 ```
 
 ## Security
 
-- Test signer key in repo is for testing only
-- Production uses Fireblocks MPC for signing
+- Test signer key in repo is for testing only, and every mainnet input refuses it
+- Who holds the coupon signer and the vault admin, and how each moves to a multisig: [docs/enable-multisig.md](./docs/enable-multisig.md). Each key holder follows [docs/key-holder.md](./docs/key-holder.md)
 - Each coupon has a unique nonce (prevents replay)
 - Coupons have expiry timestamps
 - Admin functions protected by access control

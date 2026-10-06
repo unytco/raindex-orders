@@ -9,17 +9,18 @@
 	import TransactionModal, { LOCK_FINALIZE_LINE } from '$lib/components/TransactionModal.svelte'
 	import TransactionReceipt from '$lib/components/TransactionReceipt.svelte'
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
-	import { PUBLIC_LOCK_VAULT_ADDRESS, PUBLIC_TOKEN_ADDRESS } from '$env/static/public'
+	import WrongNetwork from '$lib/components/WrongNetwork.svelte'
+	import { bridge } from '$lib/config'
 	import {
 		ethereumStore,
+		onWrongNetwork,
 		connectWallet,
 		readContract,
 		writeContract,
 		waitForTransaction
 	} from '$lib/ethereum'
-	import { isHolochainKey, holochainKeyTo32ByteHex } from '$lib/utils'
+	import { isHolochainKey, holochainKeyTo32ByteHex, errorMessage } from '$lib/utils'
 
-	// Form state
 	let amount = ''
 	let agentInput = ''
 	let amountPrefilledFromUrl = false
@@ -29,33 +30,22 @@
 	// Replaces the form once a lock confirms, until the page is reloaded.
 	let lockReceipt: { amount: string; hash: string } | undefined
 
-	// Contract data
 	let tokenBalance: bigint = 0n
 	let tokenAllowance: bigint = 0n
 	let minLockAmount: bigint = 0n
-	let vaultBalance: bigint = 0n
 	let tokenSymbol = 'HOT'
 	let tokenDecimals = 18
 
-	// Get addresses from environment
-	const lockVaultAddress = PUBLIC_LOCK_VAULT_ADDRESS
-	const tokenAddress = PUBLIC_TOKEN_ADDRESS
+	const lockVaultAddress = bridge.lockVaultAddress
+	const tokenAddress = bridge.tokenAddress
 
-	// Check if contracts are configured
-	const isZeroAddress = (addr: string) =>
-		!addr || addr === '0x0000000000000000000000000000000000000000'
-	const isConfigured = !isZeroAddress(lockVaultAddress) && !isZeroAddress(tokenAddress)
-
-	// Reactive account
 	$: isConnected = $ethereumStore.isConnected
 	$: account = $ethereumStore.account
 
-	// Fetch contract data when connected
 	async function fetchContractData() {
-		if (!isConnected || !account || !isConfigured) return
+		if (!isConnected || !account || $onWrongNetwork) return
 
 		try {
-			// Fetch token balance
 			tokenBalance = (await readContract({
 				address: tokenAddress,
 				abi: erc20Abi,
@@ -63,7 +53,6 @@
 				args: [account]
 			})) as bigint
 
-			// Fetch token allowance
 			tokenAllowance = (await readContract({
 				address: tokenAddress,
 				abi: erc20Abi,
@@ -71,44 +60,32 @@
 				args: [account, lockVaultAddress]
 			})) as bigint
 
-			// Fetch token symbol
 			tokenSymbol = (await readContract({
 				address: tokenAddress,
 				abi: erc20Abi,
 				functionName: 'symbol'
 			})) as string
 
-			// Fetch token decimals
 			tokenDecimals = (await readContract({
 				address: tokenAddress,
 				abi: erc20Abi,
 				functionName: 'decimals'
 			})) as number
 
-			// Fetch min lock amount
 			minLockAmount = (await readContract({
 				address: lockVaultAddress,
 				abi: holoLockVaultAbi,
 				functionName: 'minLockAmount'
-			})) as bigint
-
-			// Fetch vault balance
-			vaultBalance = (await readContract({
-				address: lockVaultAddress,
-				abi: holoLockVaultAbi,
-				functionName: 'vaultBalance'
 			})) as bigint
 		} catch (e) {
 			console.error('Error fetching contract data:', e)
 		}
 	}
 
-	// Reactively fetch data when account changes
-	$: if (isConnected && account) {
+	$: if (isConnected && account && !$onWrongNetwork) {
 		fetchContractData()
 	}
 
-	// Derive hex for contract from Holochain key (always convert in UI)
 	function getAgentHex(input: string): string {
 		if (!input || !isHolochainKey(input)) return ''
 		try {
@@ -127,7 +104,6 @@
 		return trimmed ? `${whole}.${trimmed}` : whole
 	}
 
-	// Get parameters from URL on mount
 	onMount(() => {
 		if (browser) {
 			try {
@@ -135,9 +111,7 @@
 				const urlAmount = urlParams.get('amount')
 				const urlAgent = urlParams.get('agent')
 
-				// Validate and set amount if provided
 				if (urlAmount) {
-					// Validate that amount is a valid number
 					const parsedAmount = parseFloat(urlAmount)
 					if (!isNaN(parsedAmount) && parsedAmount > 0) {
 						amount = urlAmount
@@ -147,7 +121,6 @@
 					}
 				}
 
-				// Validate and set agent if provided (Holochain key only)
 				if (urlAgent && isHolochainKey(urlAgent)) {
 					agentInput = urlAgent
 					agentPrefilledFromUrl = true
@@ -167,12 +140,6 @@
 	async function handleLock() {
 		if (!amount || !agentHex) return
 
-		// Validate we have a converted hex (from Holochain key)
-		if (!agentHex) {
-			error = 'Invalid Unyt agent public key. Provide a Holochain agent key (uhCA...).'
-			return
-		}
-
 		const parts = amount.split('.')
 		if (parts.length === 2 && parts[1].length > MAX_DECIMAL_PLACES) {
 			error = `Amount can have at most ${MAX_DECIMAL_PLACES} decimal places.`
@@ -185,7 +152,6 @@
 		try {
 			const amountWei = parseUnits(amount, tokenDecimals)
 
-			// Check minimum amount
 			if (amountWei < minLockAmount) {
 				error = `Amount must be at least ${formatToken(minLockAmount, tokenDecimals)} ${tokenSymbol}`
 				isLoading = false
@@ -204,12 +170,7 @@
 					args: [lockVaultAddress, maxUint256]
 				})
 				transactionStore.awaitTxReceipt(approveHash)
-				const approveReceipt = await waitForTransaction(approveHash)
-				if (!approveReceipt) {
-					transactionStore.transactionError({ message: 'Approval failed' })
-					isLoading = false
-					return
-				}
+				await waitForTransaction(approveHash)
 				transactionStore.reset()
 				await fetchContractData()
 			}
@@ -223,16 +184,12 @@
 			})
 
 			transactionStore.awaitTxReceipt(hash)
-			const receipt = await waitForTransaction(hash)
-
-			if (receipt) {
-				transactionStore.transactionSuccess(hash)
-				lockReceipt = { amount: `${formatToken(amountWei, tokenDecimals)} ${tokenSymbol}`, hash }
-				await fetchContractData()
-			}
-		} catch (e: any) {
-			const message = e?.message || 'Transaction failed'
-			error = message
+			await waitForTransaction(hash)
+			transactionStore.transactionSuccess(hash)
+			lockReceipt = { amount: `${formatToken(amountWei, tokenDecimals)} ${tokenSymbol}`, hash }
+			await fetchContractData()
+		} catch (e) {
+			error = errorMessage(e, 'Transaction failed')
 			transactionStore.transactionError({ message: error })
 			console.error(e)
 		} finally {
@@ -240,7 +197,6 @@
 		}
 	}
 
-	$: amountWei = amount ? parseUnits(amount, tokenDecimals) : 0n
 	$: hasValidAgent = !!agentHex
 	let showConnectModal = false
 	async function handleConnect() {
@@ -261,26 +217,20 @@
 			<span class="font-semibold">{lockReceipt.amount}</span>
 		</TransactionReceipt>
 	{:else}
-		<h1 class="text-2xl font-bold">Lock mock HOT</h1>
+		<h1 class="text-2xl font-bold">Lock {bridge.tokenName}</h1>
 		<p class="text-gray-600">
-			Lock your mock HOT tokens to receive mock HOT on Unyt. Your mock HOT will be credited to the
-			specified agent.
+			Lock your {bridge.tokenName} tokens to receive {bridge.tokenName} on Unyt. Your {bridge.tokenName}
+			will be credited to the specified agent.
 		</p>
 
-		{#if !isConfigured}
-			<Alert color="yellow">
-				<span class="font-semibold">Contracts not configured.</span> The Lock Vault contract address
-				needs to be set in the environment variables. Please deploy the contracts and update
-				<code>PUBLIC_LOCK_VAULT_ADDRESS</code>
-				in your <code>.env</code> file.
-			</Alert>
-		{:else if !isConnected}
+		{#if !isConnected}
 			<Alert color="blue">Please connect your wallet to continue.</Alert>
 			<Button on:click={handleConnect}>Connect Wallet</Button>
+		{:else if $onWrongNetwork}
+			<WrongNetwork />
 		{:else}
 			<div class="space-y-4">
-				<!-- Balance Info -->
-				<div class="bg-gray-50 p-4 rounded-lg">
+				<div class="rounded-lg bg-gray-50 p-4">
 					<p class="text-sm text-gray-600">Your {tokenSymbol} Balance</p>
 					<p class="text-xl font-semibold">
 						{formatToken(tokenBalance, tokenDecimals)}
@@ -288,12 +238,11 @@
 					</p>
 				</div>
 
-				<!-- Amount Input -->
 				<div>
 					<Label for="amount" class="mb-2">Amount to Lock</Label>
 					{#if amountPrefilledFromUrl}
 						<div
-							class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default"
+							class="block w-full cursor-default select-none rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
 							style="user-select: none; -webkit-user-select: none;"
 							aria-readonly="true"
 						>
@@ -315,12 +264,11 @@
 					</Helper>
 				</div>
 
-				<!-- Holochain Agent Input -->
 				<div>
 					<Label for="agent" class="mb-2">Unyt Agent Public Key (Holochain key)</Label>
 					{#if agentPrefilledFromUrl}
 						<div
-							class="block w-full rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white select-none cursor-default break-all"
+							class="block w-full cursor-default select-none break-all rounded-lg border border-gray-300 bg-gray-50 p-2.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white"
 							style="user-select: none; -webkit-user-select: none;"
 							aria-readonly="true"
 						>
@@ -337,10 +285,10 @@
 					{/if}
 					<Helper class="mt-1">
 						{#if agentPrefilledFromUrl}
-							Agent key from URL (read-only). This is where your mock HOT will be sent.
+							Agent key from URL (read-only). This is where your {bridge.tokenName} will be sent.
 						{:else}
-							Paste your Holochain agent key (e.g. uhCA...). This is where your mock HOT will be
-							sent. It is converted to hex for the contract below.
+							Paste your Holochain agent key (e.g. uhCA...). This is where your {bridge.tokenName} will
+							be sent. It is converted to hex for the contract below.
 						{/if}
 					</Helper>
 					{#if agentInput && hasValidAgent}
@@ -349,7 +297,7 @@
 						>
 							<div>
 								<p class="text-xs font-medium text-gray-500 dark:text-gray-400">Holochain key</p>
-								<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
+								<p class="break-all text-base font-semibold text-gray-900 dark:text-white">
 									{agentInput}
 								</p>
 							</div>
@@ -357,7 +305,7 @@
 								<p class="text-xs font-medium text-gray-500 dark:text-gray-400">
 									Ethereum (hex, used for lock)
 								</p>
-								<p class="text-base font-semibold text-gray-900 dark:text-white break-all">
+								<p class="break-all text-base font-semibold text-gray-900 dark:text-white">
 									{agentHex}
 								</p>
 							</div>
@@ -369,7 +317,6 @@
 					{/if}
 				</div>
 
-				<!-- Error Display -->
 				{#if error}
 					<Alert color="red">{error}</Alert>
 				{/if}
@@ -387,21 +334,6 @@
 						Lock {tokenSymbol}
 					</Button>
 				</div>
-
-				<!-- Vault Info -->
-				<!-- <div class="mt-4 pt-4 border-t">
-					<p class="text-sm text-gray-500">
-						Vault Balance: {formatUnits(vaultBalance, tokenDecimals)}
-						{tokenSymbol}
-					</p>
-					<p class="text-xs text-gray-400 mt-1">
-						Lock Vault: <a
-							href={`https://sepolia.etherscan.io/address/${lockVaultAddress}`}
-							target="_blank"
-							class="hover:underline">{lockVaultAddress.slice(0, 10)}...{lockVaultAddress.slice(-8)}</a
-						>
-					</p>
-				</div> -->
 			</div>
 		{/if}
 	{/if}

@@ -22,8 +22,8 @@
 <div class="flex flex-wrap items-center gap-2">
 	<code
 		class="max-w-[min(100%,20rem)] truncate rounded bg-gray-100 px-2 py-1 text-sm text-gray-700 dark:bg-gray-700 dark:text-gray-300"
-		title={currentUrl}
-	>{currentUrl}</code>
+		title={currentUrl}>{currentUrl}</code
+	>
 	<Button size="xs" color="light" on:click={copyUrl}>
 		{copied ? 'Copied!' : 'Copy URL'}
 	</Button>

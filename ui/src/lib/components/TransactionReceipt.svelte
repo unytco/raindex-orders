@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { explorerTx } from '$lib/config'
+
 	export let title: string
 	export let message: string
 	export let hash: string
@@ -13,17 +15,13 @@
 	<h1 class="text-2xl font-bold">{title}</h1>
 	<p class="text-center text-gray-600">{message}</p>
 
-	<div class="bg-gray-50 p-4 rounded-lg space-y-2 w-full max-w-md">
+	<div class="w-full max-w-md space-y-2 rounded-lg bg-gray-50 p-4">
 		<div class="grid grid-cols-2 gap-2 text-sm">
 			<slot />
 		</div>
 	</div>
 
-	<a
-		class="text-blue-500 hover:underline"
-		href={`https://sepolia.etherscan.io/tx/${hash}`}
-		target="_blank"
-	>
+	<a class="text-blue-500 hover:underline" href={explorerTx(hash)} target="_blank">
 		View transaction on Etherscan
 	</a>
 </div>
