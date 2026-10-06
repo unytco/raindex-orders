@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bridge-orchestrator keeps bridging after its lane's definition is extended or replaced.
 - bridge-orchestrator fails a cycle with an error when no lane, or more than one, names its agent and lists the HOT unit.
 - `deploy-sepolia.sh all` mints `MINT_AMOUNT`.
-- the deploy and rotation scripts send from a vault admin key that has an EIP-7702 delegation, such as a MetaMask smart account, instead of treating it as a contract and sending nothing.
+- the deploy and rotation scripts send from a vault admin key that has an EIP-7702 delegation, such as a MetaMask smart account.
 - a withdrawal coupon pays the withdrawal's amount in the unit `HOT_UNIT_INDEX` names, not always unit 1. A withdrawal no coupon can pay stays parked, and an error names it.
 - bridge-orchestrator keeps bridging when another lane sets no credit limit adjustment, and fails a cycle, naming its lane, when its own sets none.
 - bridge-orchestrator sends `execute_rave` the transaction fields the alliance DNA reads, so a bridge cycle runs past stage 2 instead of failing every link on a node running the fee-charging DNA.

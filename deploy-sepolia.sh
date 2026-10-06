@@ -88,6 +88,7 @@ set_env() {
     if grep -q "^$1=" .env; then
         sed -i "s|^$1=.*|$1=$2|" .env
     else
+        [ -z "$(tail -c1 .env)" ] || echo >> .env
         echo "$1=$2" >> .env
     fi
 }
@@ -256,5 +257,6 @@ case "$STEP" in
         echo "  4 or order-via-vault - Deploy claim order via vault"
         echo "  all                 - Run all steps"
         echo "  status              - Show deployment status"
+        exit 1
         ;;
 esac

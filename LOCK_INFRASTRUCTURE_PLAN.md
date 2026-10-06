@@ -275,7 +275,7 @@ io-ratio: 0;
 
 ```bash
 cd bridge-orchestrator
-cargo run
+cargo run -- run
 ```
 
 **Responsibilities**:
@@ -399,14 +399,17 @@ The bridge-orchestrator also handles coupon generation for claims:
 raindex-orders/
 ├── src/
 │   ├── HoloLockVault.sol       # Lock vault contract
-│   ├── MockHOT.sol             # Test token
+│   ├── Constants.sol           # Network addresses and the test signer
+│   ├── test/MockHOT.sol        # Test token
 │   └── holo-claim.rain         # Rainlang claim expression
 ├── script/
-│   ├── DeployMockHOT.s.sol     # Token deployment
-│   ├── DeployHoloLockVault.s.sol # Vault deployment
-│   └── DeployClaimOrderViaVault.s.sol # Order deployment
-├── test/
-│   └── HoloLockVault.t.sol     # Foundry tests
+│   ├── ClaimOrderScript.sol    # Shared claim order composition and checks
+│   ├── DeployTestHOT.s.sol     # Test token deployment and minting
+│   ├── DeployHoloLockVault.s.sol # Sepolia vault deployment
+│   ├── DeployClaimOrderViaVault.s.sol # Claim order deployment
+│   ├── DeployMainnet.s.sol     # Mainnet deployment
+│   └── RotateClaimSigner.s.sol # Coupon signer rotation
+├── test/                       # Foundry tests and the mainnet fork rehearsal
 ├── bridge-orchestrator/        # Rust bridge orchestrator (lock watcher + coupon signer)
 │   └── src/
 ├── ui/                         # SvelteKit web UI
@@ -418,7 +421,11 @@ raindex-orders/
 │       ├── orderConfig.ts      # The claim order, from the build variables
 │       ├── coupon.ts           # Coupon parsing
 │       └── ethereum.ts         # MetaMask integration
-├── deploy-sepolia.sh           # Deployment script
+├── deploy-sepolia.sh           # Sepolia deployment
+├── deploy-mainnet.sh           # Mainnet deployment
+├── rotate-claim-signer.sh      # Coupon signer rotation
+├── compose-rainlang.mjs        # Composes the claim expression for a network
+├── docs/                       # Multisig and key holder guides
 ├── DEPLOY.md                   # Deployment guide
 └── README.md                   # Project overview
 ```

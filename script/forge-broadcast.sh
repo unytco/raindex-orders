@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sourced by deploy-mainnet.sh and rotate-claim-signer.sh.
+# Sourced by deploy-mainnet.sh, deploy-sepolia.sh and rotate-claim-signer.sh.
 
 die() {
 	echo "$*" >&2
