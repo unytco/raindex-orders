@@ -106,6 +106,7 @@ async fn select_bridging_links(
     signer: Option<&CouponSigner>,
     bridging_links: &[Transaction],
     coupons_budget: usize,
+    hot_unit_index: u32,
 ) -> Result<BridgingSelection> {
     let mut selection = BridgingSelection {
         deposits: Vec::new(),
@@ -143,7 +144,7 @@ async fn select_bridging_links(
 
         let amount = tx
             .amount
-            .get("1")
+            .get(&hot_unit_index.to_string())
             .map(|v| v.to_string())
             .unwrap_or_default();
         let coupon = signer.coupon(&amount, withdraw_to, tx.id.as_ref()).await?;
@@ -981,6 +982,7 @@ impl BridgeOrchestrator {
             self.ethereum.as_ref().map(|side| &side.signer),
             &bridging_links,
             coupons_budget,
+            self.cfg.hot_unit_index,
         )
         .await?;
 
@@ -5184,7 +5186,7 @@ mod tests {
             parked_withdrawal_tx(0x62),
         ];
 
-        let selection = select_bridging_links(None, &links, usize::MAX)
+        let selection = select_bridging_links(None, &links, usize::MAX, 1)
             .await
             .unwrap();
 
@@ -5205,7 +5207,7 @@ mod tests {
             withdrawals[1].clone(),
         ];
 
-        let selection = select_bridging_links(Some(&signer), &links, usize::MAX)
+        let selection = select_bridging_links(Some(&signer), &links, usize::MAX, 1)
             .await
             .unwrap();
 
@@ -5223,13 +5225,30 @@ mod tests {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
 
-        let selection = select_bridging_links(Some(&signer), &withdrawals, 1)
+        let selection = select_bridging_links(Some(&signer), &withdrawals, 1, 1)
             .await
             .unwrap();
 
         assert_eq!(ids(&selection.withdrawals), ids(&withdrawals[..1]));
         assert_eq!(selection.coupons.len(), 1);
         assert_eq!(selection.withdrawals_found, 2);
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_is_paid_from_the_hot_unit_index() {
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
+        let mut withdrawal = parked_withdrawal_tx(0x61);
+        withdrawal.amount = UnitMap::from(vec![(1, "7"), (3, "5")]);
+
+        let selection = select_bridging_links(Some(&signer), &[withdrawal.clone()], usize::MAX, 3)
+            .await
+            .unwrap();
+
+        let coupon = selection.coupons[&withdrawal.id.to_string()]
+            .as_str()
+            .unwrap();
+        let amount = coupon.split(',').nth(3);
+        assert_eq!(amount, Some("5000000000000000000"), "{coupon}");
     }
 
     #[tokio::test]
