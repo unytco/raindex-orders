@@ -18,7 +18,7 @@
 #   1 or token           Deploy MockHOT token
 #   2 or vault           Deploy HoloLockVault
 #   3 or mint            Mint test tokens to your wallet (MINT_AMOUNT, in wei)
-#   5 or order-via-vault Deploy claim order via vault
+#   4 or order-via-vault Deploy claim order via vault
 #   all                  Run all steps
 #   status               Show current deployment status
 
@@ -42,7 +42,7 @@ else
     exit 1
 fi
 
-if [ -n "$PRIVATE_KEY" ] && [ "$PRIVATE_KEY" != "0x..." ]; then
+if [ -n "$PRIVATE_KEY" ]; then
     echo -e "${RED}Error: remove PRIVATE_KEY from .env. Pass --account <keystore> or --ledger instead.${NC}"
     exit 1
 fi
@@ -84,6 +84,14 @@ if [ -n "$WALLET_ADDRESS" ]; then
 fi
 echo ""
 
+set_env() {
+    if grep -q "^$1=" .env; then
+        sed -i "s|^$1=.*|$1=$2|" .env
+    else
+        echo "$1=$2" >> .env
+    fi
+}
+
 deploy_token() {
     echo -e "${YELLOW}=== Step 1: Deploying MockHOT Token ===${NC}"
 
@@ -94,8 +102,7 @@ deploy_token() {
 
     if [ -n "$TOKEN_ADDR" ]; then
         echo -e "${GREEN}MockHOT deployed at: $TOKEN_ADDR${NC}"
-        # Update .env file
-        sed -i "s|^TOKEN_ADDRESS=.*|TOKEN_ADDRESS=$TOKEN_ADDR|" .env
+        set_env TOKEN_ADDRESS "$TOKEN_ADDR"
         echo -e "${GREEN}Updated .env with TOKEN_ADDRESS${NC}"
     else
         die "Could not extract token address from output"
@@ -120,10 +127,8 @@ deploy_vault() {
 
     if [ -n "$VAULT_ADDR" ]; then
         echo -e "${GREEN}HoloLockVault deployed at: $VAULT_ADDR${NC}"
-        # Update .env file
-        sed -i "s|^LOCK_VAULT_ADDRESS=.*|LOCK_VAULT_ADDRESS=$VAULT_ADDR|" .env
-        sed -i "s|^ORDER_OWNER=.*|ORDER_OWNER=$WALLET_ADDRESS|" .env
-        echo -e "${GREEN}Updated .env with LOCK_VAULT_ADDRESS and ORDER_OWNER${NC}"
+        set_env SEPOLIA_LOCK_VAULT_ADDRESS "$VAULT_ADDR"
+        echo -e "${GREEN}Updated .env with SEPOLIA_LOCK_VAULT_ADDRESS${NC}"
     else
         die "Could not extract vault address from output"
     fi
@@ -137,9 +142,9 @@ mint_tokens() {
         exit 1
     fi
 
-    AMOUNT=${1:-"1000000000000000000000"} # Default 1000 tokens
+    AMOUNT=${MINT_AMOUNT:-1000000000000000000000}
 
-    echo "Minting $(cast from-wei $AMOUNT) tokens to $WALLET_ADDRESS"
+    echo "Minting $(cast from-wei "$AMOUNT") tokens to $WALLET_ADDRESS"
 
     # Run mint script
     TOKEN_ADDRESS="$TOKEN_ADDRESS" \
@@ -158,21 +163,21 @@ deploy_order_via_vault() {
     echo -e "${YELLOW}=== Deploying Claim Order via HoloLockVault ===${NC}"
     echo -e "${GREEN}This makes the vault the order owner, so claims use the same vault as locks.${NC}"
 
-    if [ -z "$LOCK_VAULT_ADDRESS" ]; then
-        echo -e "${RED}Error: LOCK_VAULT_ADDRESS not set in .env${NC}"
+    if [ -z "$SEPOLIA_LOCK_VAULT_ADDRESS" ]; then
+        echo -e "${RED}Error: SEPOLIA_LOCK_VAULT_ADDRESS not set in .env${NC}"
         echo "Deploy the vault first with: ./deploy-sepolia.sh vault"
         exit 1
     fi
 
     # TestNet coupons are signed by the test signer, whose key is in src/Constants.sol.
     VALID_SIGNER="${VALID_SIGNER:-0x8E72b7568738da52ca3DCd9b24E178127A4E7d37}"
-    echo "Using vault: $LOCK_VAULT_ADDRESS"
+    echo "Using vault: $SEPOLIA_LOCK_VAULT_ADDRESS"
     echo "Valid signer: $VALID_SIGNER"
 
     BROADCAST_FILE="${FOUNDRY_BROADCAST:-broadcast}/DeployClaimOrderViaVault.s.sol/11155111/run-latest.json"
     STARTED=$(mktemp)
     trap 'rm -f "$STARTED"' EXIT
-    NETWORK=sepolia LOCK_VAULT_ADDRESS="$LOCK_VAULT_ADDRESS" VALID_SIGNER="$VALID_SIGNER" \
+    NETWORK=sepolia SEPOLIA_LOCK_VAULT_ADDRESS="$SEPOLIA_LOCK_VAULT_ADDRESS" VALID_SIGNER="$VALID_SIGNER" \
         broadcast script/DeployClaimOrderViaVault.s.sol:DeployClaimOrderViaVault
     sent_since "$STARTED" "$BROADCAST_FILE" || die "forge sent nothing: is the vault admin a Safe?"
 
@@ -181,12 +186,11 @@ deploy_order_via_vault() {
 
     if [ -n "$ORDER_HASH_VAL" ] && [ "$ORDER_HASH_VAL" != "0x" ]; then
         echo -e "${GREEN}Order deployed via vault! Hash: $ORDER_HASH_VAL${NC}"
-        sed -i "s|^ORDER_HASH=.*|ORDER_HASH=$ORDER_HASH_VAL|" .env
-        # Set ORDER_OWNER to the vault address
-        sed -i "s|^ORDER_OWNER=.*|ORDER_OWNER=$LOCK_VAULT_ADDRESS|" .env
+        set_env ORDER_HASH "$ORDER_HASH_VAL"
+        set_env ORDER_OWNER "$SEPOLIA_LOCK_VAULT_ADDRESS"
         echo -e "${GREEN}Updated .env with ORDER_HASH and ORDER_OWNER (vault address)${NC}"
     else
-        die "The order was added, but its hash is not in $BROADCAST_FILE. Take ORDER_HASH from the transaction on Etherscan, and set ORDER_OWNER to $LOCK_VAULT_ADDRESS."
+        die "The order was added, but its hash is not in $BROADCAST_FILE. Take ORDER_HASH from the transaction on Etherscan, and set ORDER_OWNER to $SEPOLIA_LOCK_VAULT_ADDRESS."
     fi
 }
 
@@ -199,7 +203,7 @@ show_status() {
         echo ""
     fi
     echo "Token Address:   ${TOKEN_ADDRESS:-Not deployed}"
-    echo "Vault Address:   ${LOCK_VAULT_ADDRESS:-Not deployed}"
+    echo "Vault Address:   ${SEPOLIA_LOCK_VAULT_ADDRESS:-Not deployed}"
     echo "Order Hash:      ${ORDER_HASH:-Not deployed}"
     echo "Order Owner:     ${ORDER_OWNER:-Not set}"
     echo ""
@@ -222,9 +226,9 @@ case "$STEP" in
         deploy_vault
         ;;
     3|mint)
-        mint_tokens "${MINT_AMOUNT:-1000000000000000000000}"
+        mint_tokens
         ;;
-    5|order-via-vault)
+    4|order-via-vault)
         deploy_order_via_vault
         ;;
     all)
@@ -249,8 +253,8 @@ case "$STEP" in
         echo "  1 or token          - Deploy MockHOT token"
         echo "  2 or vault          - Deploy HoloLockVault"
         echo "  3 or mint           - Mint test tokens"
-        echo "  5 or order-via-vault - Deploy claim order via vault (recommended)"
-        echo "  all                 - Run all steps (uses order-via-vault)"
+        echo "  4 or order-via-vault - Deploy claim order via vault"
+        echo "  all                 - Run all steps"
         echo "  status              - Show deployment status"
         ;;
 esac

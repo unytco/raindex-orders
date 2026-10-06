@@ -6,14 +6,14 @@ import {SEPOLIA_LOCK_VAULT, TEST_SIGNER_ADDRESS} from "src/Constants.sol";
 import {ClaimOrderScript, ClaimNetwork} from "./ClaimOrderScript.sol";
 
 /// @title DeployClaimOrderViaVault
-/// @notice Adds the claim order through LOCK_VAULT_ADDRESS on NETWORK, so the
+/// @notice Adds the claim order through NETWORK's lock vault, so the
 /// vault owns it and claims pay out of the vault locks deposit into. Coupons are
 /// accepted from VALID_SIGNER. On sepolia, NETWORK, the vault and the signer default
 /// to TestNet's.
 contract DeployClaimOrderViaVault is ClaimOrderScript {
     function run() external {
         ClaimNetwork memory net = networkFromEnv();
-        HoloLockVault vault = HoloLockVault(envOrTestnet(net, "LOCK_VAULT_ADDRESS", SEPOLIA_LOCK_VAULT));
+        HoloLockVault vault = HoloLockVault(envOrTestnet(net, net.vaultVar, SEPOLIA_LOCK_VAULT));
         address signer = envOrTestnet(net, "VALID_SIGNER", TEST_SIGNER_ADDRESS);
         requireSigner(net, signer);
         require(
