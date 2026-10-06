@@ -1,6 +1,6 @@
 use crate::config::{Config, Ethereum, LINK_TAG_BYTES_CEILING};
 use crate::lock_flow::{format_amount, LockFlow};
-use crate::signer::CouponSigner;
+use crate::signer::{CouponSigner, Payout};
 use crate::state::{StateStore, WorkItem, WorkStep};
 use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use alloy::primitives::Address;
@@ -147,7 +147,18 @@ async fn select_bridging_links(
             .get(&hot_unit_index.to_string())
             .map(|v| v.to_string())
             .unwrap_or_default();
-        let coupon = signer.coupon(&amount, withdraw_to, tx.id.as_ref()).await?;
+        let terms = match Payout::new(withdraw_to, &amount) {
+            Ok(terms) => terms,
+            Err(e) => {
+                error!(
+                    event = "bridge.withdrawal_unpayable",
+                    "[bridge/withdrawals] withdrawal {:?} stays parked, no coupon can pay it in HOT unit {hot_unit_index}: {e:#} (its amount: {:?})",
+                    tx.id, tx.amount
+                );
+                continue;
+            }
+        };
+        let coupon = signer.coupon(terms, tx.id.as_ref()).await?;
         let key = tx.id.to_string();
 
         let entry_bytes = serde_json::to_vec(&json!({ &key: &coupon }))
@@ -5249,6 +5260,42 @@ mod tests {
             .unwrap();
         let amount = coupon.split(',').nth(3);
         assert_eq!(amount, Some("5000000000000000000"), "{coupon}");
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_no_coupon_can_pay_stays_parked_and_the_rest_go() {
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
+        let paid_to = |seed, recipient: &str, amount: &[(u32, &str)]| {
+            let mut tx = parked_withdrawal_tx(seed);
+            tx.amount = UnitMap::from(amount.to_vec());
+            if let TransactionDetails::ParkedSpend {
+                attached_payload, ..
+            } = &mut tx.details
+            {
+                *attached_payload = json!({ "withdraw_to_address": recipient });
+            }
+            tx
+        };
+        let to = "0x1111111111111111111111111111111111111111";
+        let payable = paid_to(0x60, to, &[(1, "5")]);
+        let deposit = parked_spend_tx(0x61, "0xd0");
+        let links = [
+            paid_to(0x62, to, &[(2, "5")]),
+            paid_to(0x63, to, &[(1, "0")]),
+            paid_to(0x64, to, &[(1, "-5")]),
+            paid_to(0x65, "0xdead", &[(1, "5")]),
+            payable.clone(),
+            deposit.clone(),
+        ];
+
+        let selection = select_bridging_links(Some(&signer), &links, usize::MAX, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(ids(&selection.withdrawals), ids(&[payable]));
+        assert_eq!(ids(&selection.deposits), ids(&[deposit]));
+        assert_eq!(selection.coupons.len(), 1);
+        assert_eq!(selection.withdrawals_found, 5);
     }
 
     #[tokio::test]

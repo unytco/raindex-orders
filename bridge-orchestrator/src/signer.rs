@@ -204,28 +204,16 @@ impl CouponSigner {
     }
 
     /// The claim coupon for the withdrawal whose transaction ID is `withdrawal`.
-    pub async fn coupon(
-        &self,
-        amount: &str,
-        recipient: &str,
-        withdrawal: &ActionHash,
-    ) -> Result<String> {
+    pub async fn coupon(&self, terms: Payout, withdrawal: &ActionHash) -> Result<String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        self.coupon_at(amount, recipient, withdrawal, now).await
+        self.coupon_at(terms, withdrawal, now).await
     }
 
-    async fn coupon_at(
-        &self,
-        amount: &str,
-        recipient: &str,
-        withdrawal: &ActionHash,
-        now: u64,
-    ) -> Result<String> {
-        let recipient: Address = recipient.parse().context("Invalid recipient address")?;
+    async fn coupon_at(&self, terms: Payout, withdrawal: &ActionHash, now: u64) -> Result<String> {
         let coupon = self
             .sign(
-                recipient,
-                parse_amount(amount)?,
+                terms.recipient,
+                terms.wei,
                 U256::from(now) + U256::from(self.expiry_seconds.get()),
                 withdrawal_nonce(withdrawal),
             )
@@ -358,26 +346,37 @@ fn pad_address(addr: Address) -> U256 {
     })
 }
 
-fn parse_amount(amount_str: &str) -> Result<U256> {
-    if amount_str.contains('.') {
-        let parts: Vec<&str> = amount_str.split('.').collect();
-        if parts.len() != 2 {
-            anyhow::bail!("Invalid amount format");
-        }
-        let whole: U256 = parts[0].parse().context("Invalid whole number part")?;
-        let decimals_str = parts[1];
-        if decimals_str.len() > 18 {
-            anyhow::bail!("Too many decimal places (max 18)");
-        }
-        let frac: U256 = decimals_str.parse().context("Invalid decimal part")?;
-        let scale = U256::from(10).pow(U256::from(18));
-        let frac_scale = U256::from(10).pow(U256::from(18 - decimals_str.len()));
-        Ok(whole * scale + frac * frac_scale)
-    } else {
-        let value: U256 = amount_str.parse().context("Invalid amount")?;
-        let scale = U256::from(10).pow(U256::from(18));
-        Ok(value * scale)
+#[derive(Debug)]
+pub struct Payout {
+    recipient: Address,
+    wei: U256,
+}
+
+impl Payout {
+    /// `amount` is HOT as a decimal. HOT has 18 decimals on Ethereum.
+    pub fn new(recipient: &str, amount: &str) -> Result<Self> {
+        let recipient = recipient
+            .parse()
+            .with_context(|| format!("the recipient {recipient:?} is not an address"))?;
+        let wei = hot_in_wei(amount)
+            .with_context(|| format!("the amount {amount:?} is not a HOT amount"))?;
+        anyhow::ensure!(!wei.is_zero(), "the amount is zero");
+        Ok(Self { recipient, wei })
     }
+}
+
+fn hot_in_wei(amount: &str) -> Option<U256> {
+    let (whole, fraction) = amount.split_once('.').unwrap_or((amount, "0"));
+    let is_digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    if !is_digits(whole) || !is_digits(fraction) || fraction.len() > 18 {
+        return None;
+    }
+    let ten = U256::from(10);
+    whole
+        .parse::<U256>()
+        .ok()?
+        .checked_mul(ten.pow(U256::from(18)))?
+        .checked_add(fraction.parse::<U256>().ok()? * ten.pow(U256::from(18 - fraction.len())))
 }
 
 #[cfg(test)]
@@ -395,11 +394,8 @@ mod tests {
     }
 
     async fn coupon(signer: &CouponSigner, withdrawal: &ActionHash, now: u64) -> String {
-        let recipient = "0x1111111111111111111111111111111111111111";
-        signer
-            .coupon_at("1.5", recipient, withdrawal, now)
-            .await
-            .unwrap()
+        let terms = Payout::new("0x1111111111111111111111111111111111111111", "1.5").unwrap();
+        signer.coupon_at(terms, withdrawal, now).await.unwrap()
     }
 
     /// Context field 8, after the signer and signature.
@@ -407,6 +403,42 @@ mod tests {
         let fields: Vec<&str> = coupon.split(',').collect();
         assert_eq!(fields.len(), 11, "coupon is signer,signature,c0..c8");
         fields[10]
+    }
+
+    #[test]
+    fn a_payout_is_a_positive_hot_amount_to_an_address() {
+        let to = "0x1111111111111111111111111111111111111111";
+        let wei = |amount| Payout::new(to, amount).map(|payout| payout.wei).ok();
+        assert_eq!(
+            wei("1.5"),
+            Some(U256::from(15) * U256::from(10).pow(U256::from(17)))
+        );
+        assert_eq!(
+            wei("5"),
+            Some(U256::from(5) * U256::from(10).pow(U256::from(18)))
+        );
+        assert_eq!(wei("0.000000000000000001"), Some(U256::from(1)));
+        for refused in [
+            "",
+            ".",
+            "5.",
+            ".5",
+            "0",
+            "0.0",
+            "-5",
+            "0x10",
+            "1.5.0",
+            " 1",
+            "1e18",
+            "0.0000000000000000001",
+            &"9".repeat(60),
+        ] {
+            assert_eq!(wei(refused), None, "{refused:?}");
+        }
+        assert_eq!(
+            format!("{:#}", Payout::new("0xdead", "1").unwrap_err()),
+            "the recipient \"0xdead\" is not an address: invalid string length"
+        );
     }
 
     #[tokio::test]
