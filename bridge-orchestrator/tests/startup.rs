@@ -95,6 +95,24 @@ fn status_and_clear_read_no_chain_and_need_no_signer() {
 }
 
 #[test]
+fn status_and_clear_refuse_an_unknown_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = node(dir.path());
+    env.retain(|(key, _)| *key != "NETWORK");
+    env.push(("NETWORK", "goerli".to_string()));
+
+    for args in [&["status"][..], &["clear", "--all"][..]] {
+        let output = orchestrator(dir.path(), &env, args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            stderr.contains("NETWORK=goerli is not sepolia, mainnet or none"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn run_names_the_unset_signer_variables_before_it_writes_anything() {
     let dir = tempfile::tempdir().unwrap();
 
