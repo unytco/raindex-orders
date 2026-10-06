@@ -155,8 +155,6 @@ pub(crate) fn log_testnet_defaults(
     }
 }
 
-/// The chain the bridge watches and signs for. A run has none under NETWORK=none,
-/// and then makes no Ethereum call at all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ethereum {
     pub network: Network,
@@ -170,7 +168,7 @@ pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec
     [Network::Sepolia, Network::Mainnet]
         .into_iter()
         .flat_map(|network| [network.rpc_url_var(), network.lock_vault_var()])
-        .chain(crate::signer::variables())
+        .chain(crate::signer::env_variables())
         .filter(|key| setting(key).is_some_and(|value| !value.is_empty()))
         .collect()
 }
@@ -189,6 +187,11 @@ fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<Network> {
             .parse::<Network>()
             .map_err(|_| anyhow::anyhow!("NETWORK={raw} is not sepolia, mainnet or none")),
     }
+}
+
+/// `NETWORK`'s chain, read and checked for every command, though only `run` uses it.
+pub fn ethereum_from_env() -> Result<Option<Ethereum>> {
+    ethereum_settings(|key| env::var(key).ok())
 }
 
 fn ethereum_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Option<Ethereum>> {
@@ -253,7 +256,6 @@ fn ethereum_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Option<
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub ethereum: Option<Ethereum>,
     pub poll_interval_ms: u64,
     pub bridge_cycle_interval_ms: u64,
     pub max_link_tag_bytes: usize,
@@ -379,8 +381,6 @@ pub struct WatchtowerReporterConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let ethereum = ethereum_settings(|key| env::var(key).ok())?;
-
         let poll_interval_ms = env::var("POLL_INTERVAL_MS")
             .unwrap_or_else(|_| "5000".into())
             .parse()
@@ -486,7 +486,6 @@ impl Config {
         let retention = RetentionConfig::from_env()?;
 
         Ok(Self {
-            ethereum,
             poll_interval_ms,
             bridge_cycle_interval_ms,
             max_link_tag_bytes,

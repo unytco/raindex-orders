@@ -1,8 +1,9 @@
-use crate::config::{Config, LINK_TAG_BYTES_CEILING};
+use crate::config::{Config, Ethereum, LINK_TAG_BYTES_CEILING};
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::CouponSigner;
 use crate::state::{StateStore, WorkItem, WorkStep};
 use crate::watchtower_reporter::{self, CycleClass, ReporterState};
+use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use ham::{
     connect_with_backoff, install_shutdown_handler, is_connection_error, is_request_timeout,
@@ -30,8 +31,12 @@ pub struct BridgeOrchestrator {
     cfg: Config,
     db: StateStore,
     reporter: ReporterState,
-    /// None under NETWORK=none, when no coupon is signed.
-    signer: Option<CouponSigner>,
+    ethereum: Option<EthereumSide>,
+}
+
+pub struct EthereumSide {
+    pub chain: Ethereum,
+    pub signer: CouponSigner,
 }
 
 /// Severity bucket for a source-chain-pressure event. Mapped to a
@@ -97,8 +102,6 @@ struct BridgingSelection {
     withdrawals_found: usize,
 }
 
-/// Selects S4's links. Without a signer (NETWORK=none) no coupon can be signed, so
-/// every withdrawal stays parked for a run that can sign it.
 async fn select_bridging_links(
     signer: Option<&CouponSigner>,
     bridging_links: &[Transaction],
@@ -172,24 +175,18 @@ async fn select_bridging_links(
         );
     }
 
-    if signer.is_none() && selection.withdrawals_found > 0 {
-        info!(
-            "[bridge/withdrawals] {} withdrawal(s) stay parked: NETWORK=none signs no coupon",
-            selection.withdrawals_found
-        );
-    }
     Ok(selection)
 }
 
 impl BridgeOrchestrator {
-    pub fn new(cfg: Config, signer: Option<CouponSigner>) -> Result<Self> {
+    pub fn new(cfg: Config, ethereum: Option<EthereumSide>) -> Result<Self> {
         let db = StateStore::open(&cfg.db_path)?;
         let reporter = ReporterState::new();
         Ok(Self {
             cfg,
             db,
             reporter,
-            signer,
+            ethereum,
         })
     }
 
@@ -297,10 +294,9 @@ impl BridgeOrchestrator {
     pub async fn run(&self) -> Result<()> {
         info!(
             "bridge-orchestrator started network={} poll={}ms bridge_cycle={}ms",
-            self.cfg
-                .ethereum
+            self.ethereum
                 .as_ref()
-                .map_or("none", |ethereum| ethereum.network.name()),
+                .map_or("none", |side| side.chain.network.name()),
             self.cfg.poll_interval_ms,
             self.cfg.bridge_cycle_interval_ms
         );
@@ -349,10 +345,9 @@ impl BridgeOrchestrator {
                 }
             };
         let lock_flow = self
-            .cfg
             .ethereum
-            .clone()
-            .map(|ethereum| LockFlow::new(ethereum, self.db.clone()));
+            .as_ref()
+            .map(|side| LockFlow::new(side.chain.clone(), self.db.clone()));
 
         let mut last_bridge_cycle =
             std::time::Instant::now() - Duration::from_millis(self.cfg.bridge_cycle_interval_ms);
@@ -710,8 +705,14 @@ impl BridgeOrchestrator {
         let cl_parked_live = live.on(&conductor, &credit_limit_ea_id).await?.len();
         let br_parked_live = live.on(&conductor, &bridging_ea_id).await?.len();
 
-        let s1_rows = self.lock_rows_needing_vault(WorkStep::New)?;
-        let s3_rows_initial = self.lock_rows_needing_vault(WorkStep::ClRaveExecuted)?;
+        let vault = self
+            .ethereum
+            .as_ref()
+            .map(|side| side.chain.lock_vault_address);
+        let s1_rows = self.db.list_pending_by_step("lock", WorkStep::New, 5000)?;
+        let s3_rows_initial =
+            self.db
+                .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?;
         let br_spend_pending_initial =
             self.db
                 .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?;
@@ -743,7 +744,10 @@ impl BridgeOrchestrator {
         // ---------------------------------------------------------------
         // S1: create_parked_link on credit-limit EA
         // ---------------------------------------------------------------
-        let s1_batch = self.build_cl_batch(&s1_rows, tag_cap)?;
+        let s1_batch = match vault {
+            Some(vault) => self.build_cl_batch(vault, &s1_rows, tag_cap)?,
+            None => ProofBatch::default(),
+        };
         let s1_attempted = !s1_batch.ids.is_empty();
         if s1_attempted {
             for id in &s1_batch.ids {
@@ -880,35 +884,38 @@ impl BridgeOrchestrator {
         // Re-list `cl_rave_executed` rows here (not reusing the initial
         // snapshot) because S2 may have just promoted additional rows
         // into this step.
-        let s3_rows = self.lock_rows_needing_vault(WorkStep::ClRaveExecuted)?;
-        let s3_batch = if s3_rows.is_empty() {
-            ProofBatch::default()
-        } else {
-            // Read on the same connection as the write, and immediately before
-            // it: the tag carries this agent's ledger as it stands when the
-            // zome reads it, and every zome call in between would move it.
-            let Some(ledger) = self
-                .spend_tag_ledger(ham.call_zome(
-                    &self.cfg.role_name,
-                    "transactor",
-                    "get_ledger",
-                    &(),
-                ))
-                .await?
-            else {
-                return Ok(());
-            };
-            let tag_context = SpendTagContext {
-                ledger,
-                global_definition: global_definition_hash.clone(),
-                lane_definitions: lane_definitions_written(&context),
-                unit_fees: global_definition
-                    .system_rave_agreements
-                    .compute_transaction_fee
-                    .unit_fees
-                    .clone(),
-            };
-            self.build_spend_batch(&s3_rows, tag_cap, &tag_context)?
+        let s3_rows = self
+            .db
+            .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?;
+        let s3_batch = match vault {
+            Some(vault) if !s3_rows.is_empty() => {
+                // Read on the same connection as the write, and immediately before
+                // it: the tag carries this agent's ledger as it stands when the
+                // zome reads it, and every zome call in between would move it.
+                let Some(ledger) = self
+                    .spend_tag_ledger(ham.call_zome(
+                        &self.cfg.role_name,
+                        "transactor",
+                        "get_ledger",
+                        &(),
+                    ))
+                    .await?
+                else {
+                    return Ok(());
+                };
+                let tag_context = SpendTagContext {
+                    ledger,
+                    global_definition: global_definition_hash.clone(),
+                    lane_definitions: lane_definitions_written(&context),
+                    unit_fees: global_definition
+                        .system_rave_agreements
+                        .compute_transaction_fee
+                        .unit_fees
+                        .clone(),
+                };
+                self.build_spend_batch(vault, &s3_rows, tag_cap, &tag_context)?
+            }
+            _ => ProofBatch::default(),
         };
         let s3_attempted = !s3_batch.ids.is_empty();
         let mut s3_written = 0usize;
@@ -970,7 +977,12 @@ impl BridgeOrchestrator {
             coupons: mut coupons_map,
             coupon_bytes: coupon_cumulative_bytes,
             withdrawals_found: total_withdrawals_found,
-        } = select_bridging_links(self.signer.as_ref(), &bridging_links, coupons_budget).await?;
+        } = select_bridging_links(
+            self.ethereum.as_ref().map(|side| &side.signer),
+            &bridging_links,
+            coupons_budget,
+        )
+        .await?;
 
         // Build the pooled RAVE link Vec (deposits first, then selected
         // withdrawals) before applying the optional per-cycle cap. The
@@ -1152,7 +1164,7 @@ impl BridgeOrchestrator {
         let br_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, &bridging).await?);
         let mut counts = ReconcileCounts::default();
 
-        for row in self.lock_rows_needing_vault(WorkStep::New)? {
+        for row in self.db.list_pending_by_step("lock", WorkStep::New, 5000)? {
             let Some(tx_hash) = self.lock_tx_hash(&row) else {
                 continue;
             };
@@ -1179,7 +1191,10 @@ impl BridgeOrchestrator {
             }
         }
 
-        for row in self.lock_rows_needing_vault(WorkStep::ClRaveExecuted)? {
+        for row in self
+            .db
+            .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?
+        {
             let Some(tx_hash) = self.lock_tx_hash(&row) else {
                 continue;
             };
@@ -1288,28 +1303,13 @@ impl BridgeOrchestrator {
         Ok(false)
     }
 
-    /// Extract a single lock row's proof `tx_hash` for reconcile lookups,
-    /// tolerating extraction failures (they're handled by the batch
-    /// builders, which mark the row permanently failed at the next
-    /// processing pass). Routes through [`normalize_tx_hash`] so the
-    /// comparison side of the reconciler matches the emission side in
-    /// [`BridgeOrchestrator::extract_lock_proof`].
-    ///
-    /// On extraction failure we warn! with the `item_id` — otherwise a
-    /// malformed-payload row would be silently skipped by the
-    /// reconciler every cycle while staying stuck at `step='new'`
-    /// until the next write path sees it. The write path already
-    /// permanently-fails such a row, but that can take arbitrary time;
-    /// the warn log gives operators an immediate signal.
+    /// The `tx_hash` [`BridgeOrchestrator::extract_lock_proof`] writes into the row's proof.
     fn lock_tx_hash(&self, item: &WorkItem) -> Option<String> {
-        match self.extract_lock_proof(item) {
-            Ok((proof, _)) => proof
-                .get("tx_hash")
-                .and_then(|v| v.as_str())
-                .map(normalize_tx_hash),
+        match LockPayload::deserialize(item.payload_json.clone()) {
+            Ok(payload) => Some(normalize_tx_hash(&payload.tx_hash)),
             Err(e) => {
                 warn!(
-                    "[bridge/reconcile] lock={} unable to extract tx_hash for reconcile: {}",
+                    "[bridge/reconcile] lock={} unable to read tx_hash for reconcile: {}",
                     item.item_id, e
                 );
                 None
@@ -1321,10 +1321,15 @@ impl BridgeOrchestrator {
     /// respecting the link-tag cap. A row whose payload cannot be read,
     /// encoded, or written at any cap is marked permanently failed and
     /// excluded; a row the cap alone cannot take waits for the next cycle.
-    fn build_cl_batch(&self, rows: &[WorkItem], tag_cap: usize) -> Result<ProofBatch> {
+    fn build_cl_batch(
+        &self,
+        vault: Address,
+        rows: &[WorkItem],
+        tag_cap: usize,
+    ) -> Result<ProofBatch> {
         let mut out = ProofBatch::default();
         for item in rows {
-            let (proof, amount) = match self.extract_lock_proof(item) {
+            let (proof, amount) = match self.extract_lock_proof(vault, item) {
                 Ok(v) => v,
                 Err(e) => {
                     error!(
@@ -1413,13 +1418,14 @@ impl BridgeOrchestrator {
     /// measurement.
     fn build_spend_batch(
         &self,
+        vault: Address,
         rows: &[WorkItem],
         tag_cap: usize,
         tag_context: &SpendTagContext,
     ) -> Result<ProofBatch> {
         let mut out = ProofBatch::default();
         for item in rows {
-            let (proof, amount) = match self.extract_lock_proof(item) {
+            let (proof, amount) = match self.extract_lock_proof(vault, item) {
                 Ok(v) => v,
                 Err(e) => {
                     error!(
@@ -1543,23 +1549,8 @@ impl BridgeOrchestrator {
         UnfittableHead::Abandoned
     }
 
-    /// Lock rows at `step` whose next move builds a deposit proof, which names the
-    /// vault. NETWORK=none names no vault, so they wait for a run on a chain.
-    fn lock_rows_needing_vault(&self, step: WorkStep) -> Result<Vec<WorkItem>> {
-        if self.cfg.ethereum.is_none() {
-            return Ok(Vec::new());
-        }
-        self.db.list_pending_by_step("lock", step, 5000)
-    }
-
-    fn extract_lock_proof(&self, item: &WorkItem) -> Result<(Value, UnitMap)> {
+    fn extract_lock_proof(&self, vault: Address, item: &WorkItem) -> Result<(Value, UnitMap)> {
         let payload = LockPayload::deserialize(item.payload_json.clone())?;
-        let vault = self
-            .cfg
-            .ethereum
-            .as_ref()
-            .map(|ethereum| ethereum.lock_vault_address)
-            .context("a lock's deposit proof names the vault, and NETWORK=none names none")?;
         let contract_hex = format!("{vault:x}");
         let depositor = decode_holochain_agent_as_pubkey_string(&payload.holochain_agent)?;
         let normalized = payload.normalized_amounts()?;
@@ -2223,8 +2214,7 @@ mod tests {
     // the transition is step-gated) negative test.
     // -----------------------------------------------------------------
 
-    use crate::config::{Ethereum, Network, RetentionConfig};
-    use alloy::primitives::Address;
+    use crate::config::{Network, RetentionConfig};
     use alloy::signers::local::PrivateKeySigner;
     use holo_hash::{ActionHash, AgentPubKey, AgentPubKeyB64};
     use holochain_client::ExternIO;
@@ -2254,12 +2244,6 @@ mod tests {
     fn test_config(db_path: String) -> Config {
         let agent_pubkey: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1u8; 32]).into();
         Config {
-            ethereum: Some(Ethereum {
-                network: Network::Sepolia,
-                rpc_url: "http://localhost:0".to_string(),
-                lock_vault_address: Address::ZERO,
-                confirmations: 5,
-            }),
             poll_interval_ms: 1000,
             bridge_cycle_interval_ms: 1000,
             max_link_tag_bytes: 800,
@@ -2298,9 +2282,19 @@ mod tests {
             cfg: test_config(path),
             db,
             reporter: ReporterState::new(),
-            signer: Some(CouponSigner::with_key(PrivateKeySigner::random())),
+            ethereum: Some(EthereumSide {
+                chain: Ethereum {
+                    network: Network::Sepolia,
+                    rpc_url: "http://localhost:0".to_string(),
+                    lock_vault_address: VAULT,
+                    confirmations: 5,
+                },
+                signer: CouponSigner::with_key(PrivateKeySigner::random()),
+            }),
         }
     }
+
+    const VAULT: Address = Address::ZERO;
 
     const LAIR_URL: &str = "unix:///var/lib/holochain/lair/socket?k=abc123";
 
@@ -2889,17 +2883,21 @@ mod tests {
         let fees = [unit_fee(0, "100"), unit_fee(1, "250.5")];
         let ctx = tag_context(Ledger::empty(), &fees);
 
-        let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
-        let (proof_b, amount_b) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let (proof_a, amount_a) = orch.extract_lock_proof(VAULT, &rows[0]).unwrap();
+        let (proof_b, amount_b) = orch.extract_lock_proof(VAULT, &rows[1]).unwrap();
         let both = UnitMap::sum_vec(vec![amount_a, amount_b]).unwrap();
         let both_bytes = spend_estimate(&ctx, &both, &[proof_a, proof_b]);
 
-        let exact = orch.build_spend_batch(&rows, both_bytes, &ctx).unwrap();
+        let exact = orch
+            .build_spend_batch(VAULT, &rows, both_bytes, &ctx)
+            .unwrap();
         assert_eq!(exact.ids.len(), 2, "a tag of exactly the cap still fits");
         assert!(!exact.capped);
         assert_eq!(exact.tag_bytes, both_bytes);
 
-        let short = orch.build_spend_batch(&rows, both_bytes - 1, &ctx).unwrap();
+        let short = orch
+            .build_spend_batch(VAULT, &rows, both_bytes - 1, &ctx)
+            .unwrap();
         assert_eq!(
             short.ids,
             vec![id_a],
@@ -2909,6 +2907,7 @@ mod tests {
 
         let wider = orch
             .build_spend_batch(
+                VAULT,
                 &rows,
                 both_bytes,
                 &tag_context(
@@ -2942,11 +2941,11 @@ mod tests {
         let rows = pending_rows(&orch);
 
         let ctx = tag_context(Ledger::empty(), &[unit_fee(0, "100")]);
-        let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
+        let (proof_a, amount_a) = orch.extract_lock_proof(VAULT, &rows[0]).unwrap();
         let single_bytes = spend_estimate(&ctx, &amount_a, &[proof_a]);
 
         let batch = orch
-            .build_spend_batch(&rows, single_bytes - 1, &ctx)
+            .build_spend_batch(VAULT, &rows, single_bytes - 1, &ctx)
             .unwrap();
         assert!(batch.ids.is_empty(), "no proof fits under the cap");
         assert!(batch.capped, "every row waits for the next cycle");
@@ -2974,7 +2973,7 @@ mod tests {
         let mut ctx = tag_context(Ledger::empty(), &fees);
         ctx.lane_definitions = (0..12).map(|seed| action_hash(0xE0 + seed)).collect();
 
-        let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
+        let (proof_a, amount_a) = orch.extract_lock_proof(VAULT, &rows[0]).unwrap();
         let bytes = spend_estimate(&ctx, &amount_a, &[proof_a]);
         assert!(
             bytes > crate::config::LINK_TAG_BYTES_CEILING,
@@ -2982,7 +2981,7 @@ mod tests {
         );
 
         let batch = orch
-            .build_spend_batch(&rows, crate::config::LINK_TAG_BYTES_DEFAULT, &ctx)
+            .build_spend_batch(VAULT, &rows, crate::config::LINK_TAG_BYTES_DEFAULT, &ctx)
             .unwrap();
         assert!(batch.ids.is_empty());
         assert!(batch.capped);
@@ -3007,10 +3006,12 @@ mod tests {
         let rows = pending_rows(&orch);
 
         let ctx = tag_context(Ledger::empty(), &[unit_fee(0, "100")]);
-        let (proof_small, amount_small) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let (proof_small, amount_small) = orch.extract_lock_proof(VAULT, &rows[1]).unwrap();
         let small_bytes = spend_estimate(&ctx, &amount_small, &[proof_small]);
 
-        let batch = orch.build_spend_batch(&rows, small_bytes, &ctx).unwrap();
+        let batch = orch
+            .build_spend_batch(VAULT, &rows, small_bytes, &ctx)
+            .unwrap();
         assert_eq!(
             batch.ids,
             vec![id_small],
@@ -3032,10 +3033,12 @@ mod tests {
         let rows = pending_rows(&orch);
 
         let ctx = tag_context(Ledger::empty(), &[unit_fee(0, "100")]);
-        let (proof_tail, amount_tail) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let (proof_tail, amount_tail) = orch.extract_lock_proof(VAULT, &rows[1]).unwrap();
         let tail_bytes = spend_estimate(&ctx, &amount_tail, &[proof_tail]);
 
-        let batch = orch.build_spend_batch(&rows, tail_bytes, &ctx).unwrap();
+        let batch = orch
+            .build_spend_batch(VAULT, &rows, tail_bytes, &ctx)
+            .unwrap();
         assert_eq!(
             batch.ids,
             vec![id_tail],
@@ -3066,20 +3069,20 @@ mod tests {
         enqueue_lock(&orch, "lock:cl:b", "0xe2");
         let rows = pending_rows(&orch);
 
-        let (proof_a, amount_a) = orch.extract_lock_proof(&rows[0]).unwrap();
-        let (proof_b, amount_b) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let (proof_a, amount_a) = orch.extract_lock_proof(VAULT, &rows[0]).unwrap();
+        let (proof_b, amount_b) = orch.extract_lock_proof(VAULT, &rows[1]).unwrap();
         let single_bytes = cl_estimate(&amount_a, std::slice::from_ref(&proof_a));
         let both_bytes = cl_estimate(
             &UnitMap::sum_vec(vec![amount_a, amount_b]).unwrap(),
             &[proof_a, proof_b],
         );
 
-        let exact = orch.build_cl_batch(&rows, both_bytes).unwrap();
+        let exact = orch.build_cl_batch(VAULT, &rows, both_bytes).unwrap();
         assert_eq!(exact.ids.len(), 2, "a tag of exactly the cap still fits");
         assert!(!exact.capped);
         assert_eq!(exact.tag_bytes, both_bytes);
 
-        let short = orch.build_cl_batch(&rows, both_bytes - 1).unwrap();
+        let short = orch.build_cl_batch(VAULT, &rows, both_bytes - 1).unwrap();
         assert_eq!(
             short.ids,
             vec![id_a],
@@ -3092,7 +3095,7 @@ mod tests {
             "a deferred proof stays pending for the next cycle, it is never failed"
         );
 
-        let none = orch.build_cl_batch(&rows, single_bytes - 1).unwrap();
+        let none = orch.build_cl_batch(VAULT, &rows, single_bytes - 1).unwrap();
         assert!(none.ids.is_empty(), "no proof fits under the cap");
         assert!(none.capped, "a writable proof waits for the next cycle");
         assert!(
@@ -3111,10 +3114,10 @@ mod tests {
         let id_tail = enqueue_lock(&orch, "lock:cl:tail", "0xe4");
         let rows = pending_rows(&orch);
 
-        let (proof_tail, amount_tail) = orch.extract_lock_proof(&rows[1]).unwrap();
+        let (proof_tail, amount_tail) = orch.extract_lock_proof(VAULT, &rows[1]).unwrap();
         let tail_bytes = cl_estimate(&amount_tail, std::slice::from_ref(&proof_tail));
 
-        let batch = orch.build_cl_batch(&rows, tail_bytes).unwrap();
+        let batch = orch.build_cl_batch(VAULT, &rows, tail_bytes).unwrap();
         assert_eq!(
             batch.ids,
             vec![id_tail],
@@ -3686,7 +3689,9 @@ mod tests {
         orch.cfg.hot_unit_index = 3;
         enqueue_lock(&orch, "lock:unit:a", "0xd1");
 
-        let (_, amount) = orch.extract_lock_proof(&pending_rows(&orch)[0]).unwrap();
+        let (_, amount) = orch
+            .extract_lock_proof(VAULT, &pending_rows(&orch)[0])
+            .unwrap();
 
         assert_eq!(amount.get_unit_indexes(), vec!["3".to_string()]);
     }
@@ -4043,6 +4048,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_matches_a_row_stored_with_a_mixed_case_tx_hash() {
+        let orch = test_orchestrator("reconcile-s1-mixed-case");
+        enqueue_lock(&orch, "lock:r:case", " 0xABC123");
+
+        let counts = reconcile(&orch, &[parked_tx(0x12, "0xabc123")], &[]).await;
+
+        assert_eq!(counts.s1_advanced, 1);
+    }
+
+    #[tokio::test]
     async fn reconcile_leaves_new_row_untouched_when_tx_hash_absent_from_live_cl() {
         // Negative case: if the live CL set doesn't include a matching
         // tx_hash, the row stays at step='new' and S1 will re-issue
@@ -4206,7 +4221,7 @@ mod tests {
         assert_eq!(rows.len(), 3, "all three rows must be pending at 'new'");
 
         let batch = orch
-            .build_cl_batch(&rows, 16 * 1024)
+            .build_cl_batch(VAULT, &rows, 16 * 1024)
             .expect("batch construction must succeed for well-formed rows");
         assert_eq!(
             batch.ids.len(),
@@ -5218,35 +5233,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_ethereum_off_reconcile_moves_only_the_rows_needing_no_vault() {
+    async fn with_ethereum_off_reconcile_still_records_what_is_already_parked() {
         let mut orch = test_orchestrator("ethereum-off-reconcile");
-        orch.cfg.ethereum = None;
-        orch.signer = None;
+        orch.ethereum = None;
         let new = enqueue_lock(&orch, "lock:off:1", "0xa1");
-        let rave_executed = enqueue_lock(&orch, "lock:off:2", "0xa2");
+        let link_created = enqueue_lock(&orch, "lock:off:2", "0xa2");
         orch.db
-            .advance_to_cl_link_created(rave_executed, &action_hash(0x70).to_string(), &ea(CL_EA))
+            .advance_to_cl_link_created(link_created, &action_hash(0x70).to_string(), &ea(CL_EA))
+            .unwrap();
+        let rave_executed = enqueue_lock(&orch, "lock:off:3", "0xa3");
+        orch.db
+            .advance_to_cl_link_created(rave_executed, &action_hash(0x71).to_string(), &ea(CL_EA))
             .unwrap();
         orch.db
             .advance_to_cl_rave_executed(rave_executed, None)
             .unwrap();
-        let link_created = enqueue_lock(&orch, "lock:off:3", "0xa3");
+        let spend_created = enqueue_lock(&orch, "lock:off:4", "0xa4");
         orch.db
-            .advance_to_cl_link_created(link_created, &action_hash(0x71).to_string(), &ea(CL_EA))
+            .advance_to_cl_link_created(spend_created, &action_hash(0x72).to_string(), &ea(CL_EA))
+            .unwrap();
+        orch.db
+            .advance_to_cl_rave_executed(spend_created, None)
+            .unwrap();
+        orch.db
+            .advance_to_br_spend_created(spend_created, &action_hash(0x73).to_string(), &ea(BR_EA))
             .unwrap();
 
         let counts = reconcile(
             &orch,
-            &[parked_tx(0x72, "0xa1")],
-            &[parked_spend_tx(0x73, "0xa2")],
+            &[parked_tx(0x74, "0xa1")],
+            &[parked_spend_tx(0x75, "0xa3")],
         )
         .await;
 
         assert_eq!(
             counts,
             ReconcileCounts {
+                s1_advanced: 1,
                 s2_advanced: 1,
-                ..ReconcileCounts::default()
+                s3_advanced: 1,
+                s4_advanced: 1,
             }
         );
         let at = |step| {
@@ -5257,15 +5283,9 @@ mod tests {
                 .map(|row| row.id)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(at(WorkStep::New), vec![new]);
-        assert_eq!(
-            at(WorkStep::ClRaveExecuted),
-            vec![rave_executed, link_created]
-        );
-        assert!(orch
-            .lock_rows_needing_vault(WorkStep::New)
-            .unwrap()
-            .is_empty());
-        assert!(orch.extract_lock_proof(&pending_rows(&orch)[0]).is_err());
+        assert_eq!(at(WorkStep::ClLinkCreated), vec![new]);
+        assert_eq!(at(WorkStep::ClRaveExecuted), vec![link_created]);
+        assert_eq!(at(WorkStep::BrSpendCreated), vec![rave_executed]);
+        assert!(at(WorkStep::New).is_empty());
     }
 }

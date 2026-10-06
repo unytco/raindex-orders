@@ -10,7 +10,7 @@ mod watchtower_reporter;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::Config;
-use orchestrator::BridgeOrchestrator;
+use orchestrator::{BridgeOrchestrator, EthereumSide};
 use signer::CouponSigner;
 use state::{StateFilter, WorkState};
 use tracing::info;
@@ -66,17 +66,18 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let config = Config::from_env()?;
+    let ethereum = config::ethereum_from_env()?;
 
     match args.command {
         Command::Run => {
             info!("bridge-orchestrator starting");
-            let signer = match &config.ethereum {
-                Some(ethereum) => {
-                    let signer = CouponSigner::from_env(ethereum.network)?;
+            let ethereum = match ethereum {
+                Some(chain) => {
+                    let signer = CouponSigner::from_env(chain.network)?;
                     preflight::check(
-                        ethereum.network,
-                        &ethereum.rpc_url,
-                        ethereum.lock_vault_address,
+                        chain.network,
+                        &chain.rpc_url,
+                        chain.lock_vault_address,
                         &signer,
                     )
                     .await?;
@@ -86,7 +87,7 @@ async fn main() -> Result<()> {
                         signer = %signer.order().signer,
                         "startup checks passed: the chain, vault and claim order match, and the order accepts the signer"
                     );
-                    Some(signer)
+                    Some(EthereumSide { chain, signer })
                 }
                 None => {
                     info!(
@@ -104,7 +105,7 @@ async fn main() -> Result<()> {
                     None
                 }
             };
-            BridgeOrchestrator::new(config, signer)?.run().await?;
+            BridgeOrchestrator::new(config, ethereum)?.run().await?;
         }
         Command::Status {
             flow,

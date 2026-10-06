@@ -249,7 +249,7 @@ fn a_run_on_testnet_values_refuses_a_mainnet_rpc() {
 }
 
 #[test]
-fn run_with_ethereum_off_calls_no_rpc_and_names_the_chain_variables_it_ignores() {
+fn run_with_ethereum_off_checks_no_chain_takes_no_testnet_value_and_names_what_it_ignores() {
     let dir = tempfile::tempdir().unwrap();
     let rpc = TcpListener::bind("127.0.0.1:0").unwrap();
     rpc.set_nonblocking(true).unwrap();
@@ -286,6 +286,7 @@ fn run_with_ethereum_off_calls_no_rpc_and_names_the_chain_variables_it_ignores()
         logged.contains("bridge-orchestrator started network=none"),
         "{logged}"
     );
+    assert!(!logged.contains("TestNet"), "{logged}");
     assert!(logged.contains("no-conductor.yaml"), "{logged}");
     assert!(
         matches!(rpc.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),

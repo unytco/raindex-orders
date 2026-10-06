@@ -49,9 +49,9 @@ its supervisor restarts it. Once the checks pass it logs
 emulation. `run` then makes no Ethereum call: it skips the checks above,
 watches no lock and signs no coupon. It still does its Holochain work. Deposits
 parked on the bridging agreement go through, and every withdrawal stays parked.
-Lock rows from an earlier run on a chain wait for the next one. It logs once
-that Ethereum is off, and names each chain variable it ignores. Only an
-explicit `none` turns Ethereum off.
+A lock row whose next step writes a deposit proof waits for a run on a chain.
+It logs once that Ethereum is off, and names each chain variable it ignores.
+Only an explicit `none` turns Ethereum off.
 
 ### `bridge-orchestrator status`
 
