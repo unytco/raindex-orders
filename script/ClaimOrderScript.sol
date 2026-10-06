@@ -119,18 +119,23 @@ abstract contract ClaimOrderScript is Script {
         );
     }
 
+    /// An EIP-7702 delegation leaves a key a key.
+    function isContract(address account) internal view returns (bool) {
+        bytes memory code = account.code;
+        bool delegatedKey = code.length == 23 && code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00;
+        return code.length > 0 && !delegatedKey;
+    }
+
     /// Refuses the test signer on mainnet, and a contract signer whose signatures the
     /// website cannot read: it reads a Safe's 2 to 20 owner signatures, and 65 bytes
-    /// as a key's. An EIP-7702 delegation leaves a key a key.
+    /// as a key's.
     function requireSigner(ClaimNetwork memory net, address signer) internal view {
         require(signer != address(0), "VALID_SIGNER must be a nonzero address");
         require(
             net.chainId != 1 || signer != TEST_SIGNER_ADDRESS,
             "VALID_SIGNER is the test signer, whose key is public: mainnet refuses it"
         );
-        bytes memory code = signer.code;
-        bool delegatedKey = code.length == 23 && code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00;
-        if (code.length > 0 && !delegatedKey) {
+        if (isContract(signer)) {
             (bool answered, bytes memory threshold) = signer.staticcall(abi.encodeCall(SafeThreshold.getThreshold, ()));
             require(
                 answered && threshold.length == 32 && abi.decode(threshold, (uint256)) >= 2
@@ -188,7 +193,7 @@ abstract contract ClaimOrderScript is Script {
     /// its calls are printed for it to execute.
     function asAdmin(HoloLockVault vault, bytes[] memory calls) internal {
         address admin = vault.admin();
-        if (admin.code.length > 0) {
+        if (isContract(admin)) {
             console2.log(
                 string.concat(
                     "The vault admin ",
