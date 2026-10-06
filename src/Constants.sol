@@ -29,7 +29,7 @@ address constant SEPOLIA_CLAIM_EXPRESSION = 0x0a1369aee76570Cc7404492d55a5D1468D
 bytes32 constant TEST_SIGNER_KEY = 0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd;
 address constant TEST_SIGNER_ADDRESS = 0x8E72b7568738da52ca3DCd9b24E178127A4E7d37;
 
-// Vault ID used by the HoloLockVault (same as in holo-claim.rain)
+// Vault ID used by the HoloLockVault
 uint256 constant HOLO_VAULT_ID = 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b;
 
 // Minimum lock amount (1 token with 18 decimals)

@@ -28,29 +28,3 @@ contract DeploySepoliaHoloLockVault is Script {
         console2.log("HoloLockVault deployed at:", address(lockVault));
     }
 }
-
-/// @notice Deploy with a custom token address (useful for testing with your own test token)
-contract DeployHoloLockVaultCustomToken is Script {
-    function run() external {
-        address token = vm.envAddress("TOKEN_ADDRESS");
-        address orderbook = vm.envAddress("ORDERBOOK_ADDRESS");
-        uint256 vaultId = vm.envOr("VAULT_ID", HOLO_VAULT_ID);
-        address admin = vm.envOr("ADMIN_ADDRESS", msg.sender);
-        uint256 minLockAmount = vm.envOr("MIN_LOCK_AMOUNT", MIN_LOCK_AMOUNT);
-
-        console2.log("Deploying HoloLockVault with custom token...");
-        console2.log("Token:", token);
-        console2.log("Orderbook:", orderbook);
-        console2.log("Vault ID:", vaultId);
-        console2.log("Admin:", admin);
-        console2.log("Min Lock Amount:", minLockAmount);
-
-        vm.startBroadcast();
-
-        HoloLockVault lockVault = new HoloLockVault(token, orderbook, vaultId, admin, minLockAmount);
-
-        vm.stopBroadcast();
-
-        console2.log("HoloLockVault deployed at:", address(lockVault));
-    }
-}

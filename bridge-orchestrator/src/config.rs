@@ -1,11 +1,10 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
-use clap::ValueEnum;
 use holo_hash::AgentPubKeyB64;
 use std::env;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
     Mainnet,
     Sepolia,

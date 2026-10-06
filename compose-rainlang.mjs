@@ -2,7 +2,6 @@
 // Composes the claim expression for one network:
 //   node compose-rainlang.mjs --network mainnet --subparser 0x... --signer 0x... [src/holo-claim.rain]
 //   node compose-rainlang.mjs     TestNet's network and bindings
-// The inputs replace the file's scenario bindings, whose mainnet one names the test signer.
 import pkg from '@rainlanguage/dotrain'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'

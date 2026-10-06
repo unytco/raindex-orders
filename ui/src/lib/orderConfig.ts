@@ -7,28 +7,21 @@ export interface OrderConfig {
 	owner: Address
 	// The only signer whose coupons the order accepts.
 	signer: Address
-	interpreter: Address
 	store: Address
-	expression: Address
-	inputToken: Address
-	inputDecimals: number
-	inputVaultId: bigint
 	outputToken: Address
 	outputDecimals: number
 	outputVaultId: bigint
-	handleIO: boolean
 }
 
 /** The claim order HoloLockVault added, from this build's variables. */
 export const CLAIM_ORDER: OrderConfig = {
-	...bridge.claimOrder,
+	orderHash: bridge.claimOrder.orderHash,
 	owner: bridge.lockVaultAddress,
-	inputDecimals: 18,
-	inputVaultId: HOLO_VAULT_ID,
+	signer: bridge.claimOrder.signer,
+	store: bridge.claimOrder.store,
 	outputToken: bridge.tokenAddress,
 	outputDecimals: 18,
-	outputVaultId: HOLO_VAULT_ID,
-	handleIO: true
+	outputVaultId: HOLO_VAULT_ID
 }
 
 export function getOrderConfig(orderHash: string): OrderConfig | undefined {

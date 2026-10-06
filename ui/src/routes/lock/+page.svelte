@@ -140,11 +140,6 @@
 	async function handleLock() {
 		if (!amount || !agentHex) return
 
-		if (!agentHex) {
-			error = 'Invalid Unyt agent public key. Provide a Holochain agent key (uhCA...).'
-			return
-		}
-
 		const parts = amount.split('.')
 		if (parts.length === 2 && parts[1].length > MAX_DECIMAL_PLACES) {
 			error = `Amount can have at most ${MAX_DECIMAL_PLACES} decimal places.`

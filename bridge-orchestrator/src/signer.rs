@@ -389,10 +389,6 @@ mod tests {
     const TEST_SIGNER_KEY: &str =
         "0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd";
 
-    fn sepolia_order() -> ClaimOrder {
-        CouponSigner::with_key(PrivateKeySigner::random()).order
-    }
-
     async fn coupon(signer: &CouponSigner, withdrawal: &ActionHash, now: u64) -> String {
         let terms = Payout::new("0x1111111111111111111111111111111111111111", "1.5").unwrap();
         signer.coupon_at(terms, withdrawal, now).await.unwrap()
@@ -585,7 +581,7 @@ mod tests {
         let signer =
             CouponSigner::from_settings(Network::Sepolia, sepolia_settings_with(&[])).unwrap();
 
-        assert_eq!(signer.order(), &sepolia_order());
+        assert_eq!(signer.order(), &ClaimOrder::sepolia());
         assert_eq!(signer.key.address(), TEST_SIGNER);
         assert_eq!(signer.expiry_seconds, DEFAULT_EXPIRY_SECONDS);
     }
@@ -687,11 +683,10 @@ mod tests {
         );
         assert!(CouponSigner::from_settings(Network::Sepolia, sepolia_settings_with(&[])).is_ok());
 
-        let other_key = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
         let mainnet = CouponSigner::from_settings(
             Network::Mainnet,
             sepolia_settings_with(&[
-                ("SIGNER_PRIVATE_KEY", Some(other_key)),
+                ("SIGNER_PRIVATE_KEY", Some(MAINNET_KEY)),
                 (
                     "CLAIM_SIGNER",
                     Some("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"),
