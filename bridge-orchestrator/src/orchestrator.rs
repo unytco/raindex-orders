@@ -1012,6 +1012,23 @@ impl BridgeOrchestrator {
         )
         .await?;
 
+        let deposit_ids: HashSet<String> = deposit_rave_links
+            .iter()
+            .map(|t| t.id.to_string())
+            .collect();
+        let rows = self.db.list_flow("lock")?;
+        for spend in bridging_links
+            .iter()
+            .filter(|t| !deposit_ids.contains(&t.id.to_string()))
+        {
+            self.send_rows_recording_to_a_person(
+                &rows,
+                |row| row.br_spend_hash.as_deref(),
+                &spend.id.to_string(),
+                "is no deposit spend of the bridging agent",
+            )?;
+        }
+
         // Build the pooled RAVE link Vec (deposits first, then selected
         // withdrawals) before applying the optional per-cycle cap. The
         // deposits-first ordering makes `apply_rave_link_cap` preferentially
@@ -1529,19 +1546,30 @@ impl BridgeOrchestrator {
                 reason = why,
                 "[bridge/{stage}] link {id} is withheld from the RAVE: {why}"
             );
-            let recording = rows
-                .iter()
-                .filter(|row| recorded(row) == Some(id.as_str()) && row.state != WorkState::Failed);
-            for row in recording {
-                self.for_a_person(
-                    row,
-                    "bridge.rave.link_withheld",
-                    &id,
-                    &format!("is withheld from the RAVE: {why}"),
-                )?;
-            }
+            self.send_rows_recording_to_a_person(
+                &rows,
+                &recorded,
+                &id,
+                &format!("is withheld from the RAVE: {why}"),
+            )?;
         }
         Ok(accounted)
+    }
+
+    fn send_rows_recording_to_a_person(
+        &self,
+        rows: &[WorkItem],
+        recorded: impl Fn(&WorkItem) -> Option<&str>,
+        link: &str,
+        why: &str,
+    ) -> Result<()> {
+        for row in rows
+            .iter()
+            .filter(|row| recorded(row) == Some(link) && row.state != WorkState::Failed)
+        {
+            self.for_a_person(row, "bridge.rave.link_withheld", link, why)?;
+        }
+        Ok(())
     }
 
     /// The links among `sent` that the RAVE on `agreement` consumed, as its own
@@ -6920,6 +6948,33 @@ mod tests {
                 !conductor.calls.take().contains(&rewrite_at(&step)),
                 "nothing is written again for it"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_recording_a_live_spend_s4_takes_no_deposit_from_goes_to_a_person() {
+        let mut withdrawer = parked_spend_tx(0x55, &[proof("lock:no-deposit:2", "0xaa")]);
+        if let TransactionDetails::ParkedSpend { ct_role_id, .. } = &mut withdrawer.details {
+            *ct_role_id = WITHDRAWER_ROLE.to_string();
+        }
+        let foreign =
+            signed_by_another(parked_spend_tx(0x54, &[proof("lock:no-deposit:1", "0xa9")]));
+        for (spend, lock, tx) in [
+            (foreign, "lock:no-deposit:1", "0xa9"),
+            (withdrawer, "lock:no-deposit:2", "0xaa"),
+        ] {
+            let orch = test_orchestrator("no-deposit-spend");
+            let id = enqueue_at_cl_rave_executed(&orch, lock, tx);
+            orch.record_br_spend(id, &spend.id.to_string(), &in_force(CL_EA, BR_EA))
+                .unwrap();
+            let conductor =
+                bridging_conductor().parking(action_hash(BR_EA), std::slice::from_ref(&spend));
+
+            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+            let reason = failed_row(&orch, id).last_error.unwrap();
+            assert!(reason.contains(&spend.id.to_string()), "{reason}");
+            assert!(reason.contains("no deposit spend"), "{reason}");
         }
     }
 
