@@ -699,6 +699,44 @@ async fn mark_failed_marks_no_row_when_a_row_it_would_mark_is_gone() {
         .settle(&mut Vec::new(), &orch.db, true)
         .expect_err("a row it would mark is gone");
 
-    assert!(format!("{e:#}").contains("is not in the database"), "{e:#}");
+    assert!(
+        format!("{e:#}").contains("no longer in the database"),
+        "{e:#}"
+    );
     assert_eq!(snapshot(&orch), before);
+}
+
+#[tokio::test]
+async fn mark_failed_marks_no_row_when_a_row_it_read_as_pending_has_since_settled() {
+    for settled in ["succeeded", "failed"] {
+        let orch = test_orchestrator("in-transit-mark-settled");
+        waiting_at(
+            &orch,
+            WorkStep::ClLinkCreated,
+            "lock:settled:1",
+            "0xf1",
+            0x7F,
+        );
+        let late = waiting_at(
+            &orch,
+            WorkStep::BrSpendCreated,
+            "lock:settled:2",
+            "0xf2",
+            0x80,
+        );
+        let found = orch.in_transit(&bridging_conductor()).await.unwrap();
+        match settled {
+            "succeeded" => orch.db.advance_to_br_rave_executed(late, None),
+            _ => orch.db.mark_failed_permanent(late, "resolved by a person"),
+        }
+        .unwrap();
+        let before = snapshot(&orch);
+
+        let e = found
+            .settle(&mut Vec::new(), &orch.db, true)
+            .expect_err("a row settled since it was read");
+
+        assert!(format!("{e:#}").contains("no longer pending"), "{e:#}");
+        assert_eq!(snapshot(&orch), before, "{settled}: nothing is marked");
+    }
 }
