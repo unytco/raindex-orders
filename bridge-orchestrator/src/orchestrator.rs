@@ -2848,16 +2848,6 @@ fn deposit_proofs(tx: &Transaction) -> Option<&Value> {
     }
 }
 
-fn link_locks(link: &Transaction) -> Result<Vec<LockKey>, &'static str> {
-    deposit_proofs(link)
-        .and_then(Value::as_array)
-        .ok_or("it carries no list of deposit proofs")?
-        .iter()
-        .map(LockKey::of_proof)
-        .collect::<Option<Vec<_>>>()
-        .ok_or("a deposit proof it carries names no lock")
-}
-
 enum Gap {
     Unrecorded(String),
     Conflict(String),
@@ -2879,9 +2869,15 @@ fn unaccounted(
     if link.creator != *bridging_agent {
         return conflict(format!("it was parked by {}", link.creator));
     }
-    let locks = match link_locks(link) {
-        Ok(locks) => locks,
-        Err(why) => return conflict(why.to_string()),
+    let Some(proofs) = deposit_proofs(link).and_then(Value::as_array) else {
+        return conflict("it carries no list of deposit proofs".to_string());
+    };
+    let Some(locks) = proofs
+        .iter()
+        .map(LockKey::of_proof)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return conflict("a deposit proof it carries names no lock".to_string());
     };
     if locks.is_empty() {
         return conflict("it carries no deposit proof".to_string());

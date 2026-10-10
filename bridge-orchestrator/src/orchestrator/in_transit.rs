@@ -1,14 +1,15 @@
 use super::{
-    bridging_spend, connect_ham, link_locks, own_deposit, BridgeOrchestrator, BridgingSpend,
-    Conductor, ConductorReads,
+    bridging_spend, connect_ham, deposit_proofs, normalize_tx_hash, own_deposit,
+    BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey,
 };
 use crate::config::{Config, Ethereum};
-use crate::state::{StateStore, WorkState, WorkStep};
+use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
 use crate::watchtower_reporter::ReporterState;
 use anyhow::{Context, Result};
 use holo_hash::ActionHash;
 use rave_engine::types::UnitMap;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::Path;
@@ -56,18 +57,26 @@ impl Found {
         for listed in &self.listed {
             writeln!(out, "{}", serde_json::to_string(listed)?)?;
         }
+        let cannot_tell = format!(
+            "it cannot tell which rows the listed links carry: {}",
+            self.unmatchable.join("; ")
+        );
         if !mark_failed {
             anyhow::ensure!(
                 self.listed.is_empty(),
-                "the old network holds transfers in transit: {} line(s) listed",
-                self.listed.len()
+                "the old network holds transfers in transit: {} line(s) listed{}",
+                self.listed.len(),
+                if self.unmatchable.is_empty() {
+                    String::new()
+                } else {
+                    format!(", and --mark-failed would mark no row, as {cannot_tell}")
+                }
             );
             return Ok(());
         }
         anyhow::ensure!(
             self.unmatchable.is_empty(),
-            "marks no row, as it cannot tell which rows the listed links carry: {}",
-            self.unmatchable.join("; ")
+            "marks no row, as {cannot_tell}"
         );
         let ids: Vec<i64> = self.rows.keys().copied().collect();
         db.mark_all_failed_permanent(&ids, PAID_BY_HAND)?;
@@ -147,17 +156,58 @@ impl BridgeOrchestrator {
                     })
                     .map(|spend| (&context.bridging_agreement, spend)),
             );
+        let unreadable = self.db.unreadable_rows("lock")?;
+        anyhow::ensure!(
+            unreadable.is_empty(),
+            "rows whose state or step cannot be read: {}",
+            unreadable.join(", ")
+        );
+        let pending: Vec<(WorkItem, Option<LockKey>)> = self
+            .db
+            .list_flow("lock")?
+            .into_iter()
+            .filter(|row| !matches!(row.state, WorkState::Succeeded | WorkState::Failed))
+            .map(|row| {
+                let lock = self.lock_key(&row);
+                (row, lock)
+            })
+            .collect();
+
         let mut links = Vec::new();
         let mut carried = HashSet::new();
         let mut unmatchable = Vec::new();
         for (agreement, link) in deposits {
+            let proofs = match deposit_proofs(link) {
+                Some(Value::Array(proofs)) => proofs.as_slice(),
+                Some(proof) => std::slice::from_ref(proof),
+                None => &[],
+            };
             let mut lock_ids = Vec::new();
-            match link_locks(link) {
-                Ok(locks) => {
-                    lock_ids.extend(locks.iter().map(|lock| lock.lock_id.clone()));
-                    carried.extend(locks);
+            for proof in proofs {
+                if let Some(lock) = LockKey::of_proof(proof) {
+                    lock_ids.push(lock.lock_id.clone());
+                    carried.insert(lock);
+                    continue;
                 }
-                Err(why) => unmatchable.push(format!("deposit link {}: {why}", link.id)),
+                let named = |field: &str| proof.get(field).and_then(Value::as_str);
+                let rows: Vec<&str> = pending
+                    .iter()
+                    .filter(|(_, lock)| {
+                        lock.as_ref().is_some_and(|lock| {
+                            named("lock_id") == Some(lock.lock_id.as_str())
+                                || named("tx_hash").map(normalize_tx_hash).as_ref()
+                                    == Some(&lock.tx_hash)
+                        })
+                    })
+                    .map(|(row, _)| row.item_id.as_str())
+                    .collect();
+                if !rows.is_empty() {
+                    unmatchable.push(format!(
+                        "deposit link {} carries proof {proof}, which names no lock but may be that of {}",
+                        link.id,
+                        rows.join(", ")
+                    ));
+                }
             }
             lock_ids.sort();
             lock_ids.dedup();
@@ -180,19 +230,9 @@ impl BridgeOrchestrator {
             })
         });
 
-        let unreadable = self.db.unreadable_rows("lock")?;
-        anyhow::ensure!(
-            unreadable.is_empty(),
-            "rows whose state or step cannot be read: {}",
-            unreadable.join(", ")
-        );
         let mut listed = Vec::new();
         let mut rows = BTreeMap::new();
-        for row in self.db.list_flow("lock")? {
-            if matches!(row.state, WorkState::Succeeded | WorkState::Failed) {
-                continue;
-            }
-            let lock = self.lock_key(&row);
+        for (row, lock) in pending {
             let waits_on_its_link =
                 matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated);
             if waits_on_its_link {
@@ -206,7 +246,10 @@ impl BridgeOrchestrator {
             if waits_on_its_link || lock.as_ref().is_some_and(|lock| carried.contains(lock)) {
                 rows.insert(row.id, row.item_id);
             } else if lock.is_none() && !carried.is_empty() {
-                unmatchable.push(format!("row {}: its lock cannot be read", row.item_id));
+                unmatchable.push(format!(
+                    "row {} has a lock that cannot be read, which the next cycle of `run` fails for a person",
+                    row.item_id
+                ));
             }
         }
         listed.extend(links);

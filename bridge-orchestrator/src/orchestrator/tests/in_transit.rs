@@ -547,29 +547,26 @@ fn with_proofs(mut link: Transaction, proofs: Value) -> Transaction {
 }
 
 #[tokio::test]
-async fn mark_failed_marks_no_row_when_it_cannot_tell_which_rows_a_link_carries() {
-    let readable = parked_tx(0x75, &[proof("lock:no-row:5", "0xe4")]);
+async fn mark_failed_marks_no_row_when_a_link_may_carry_a_row_it_cannot_match() {
+    let readable = proof("lock:no-row:5", "0xe4");
     let cases = [
         (
-            with_proofs(parked_tx(0x76, &[]), json!("not a list")),
+            json!([readable, { "lock_id": "lock:blind:1" }]),
             None,
-            "it carries no list of deposit proofs",
+            "which names no lock but may be that of lock:blind:1",
         ),
         (
-            with_proofs(
-                parked_tx(0x77, &[]),
-                json!([proof("lock:blind:1", "0xe5"), {}]),
-            ),
+            json!([readable, { "tx_hash": "0xE5" }]),
             None,
-            "a deposit proof it carries names no lock",
+            "which names no lock but may be that of lock:blind:1",
         ),
         (
-            readable,
+            json!([readable]),
             Some("{}"),
-            "row lock:blind:1: its lock cannot be read",
+            "row lock:blind:1 has a lock that cannot be read",
         ),
     ];
-    for (link, payload, why) in cases {
+    for (proofs, payload, why) in cases {
         let orch = test_orchestrator("in-transit-mark-blind");
         let blind = enqueue_lock(&orch, "lock:blind:1", "0xe5");
         waiting_at(&orch, WorkStep::ClLinkCreated, "lock:blind:2", "0xe6", 0x78);
@@ -582,6 +579,7 @@ async fn mark_failed_marks_no_row_when_it_cannot_tell_which_rows_a_link_carries(
                 )
                 .unwrap();
         }
+        let link = with_proofs(parked_tx(0x76, &[]), proofs);
         let conductor =
             bridging_conductor().parking(action_hash(CL_EA), std::slice::from_ref(&link));
         let before = snapshot(&orch);
@@ -591,8 +589,49 @@ async fn mark_failed_marks_no_row_when_it_cannot_tell_which_rows_a_link_carries(
         let e = format!("{:#}", checked.exit.expect_err("it cannot tell"));
         assert!(e.contains(why), "{e}");
         assert_eq!(snapshot(&orch), before);
-        assert_eq!(checked.listed.len(), 2, "{:#?}", checked.listed);
+        assert_lists(
+            &checked.listed,
+            &[
+                listed_row("lock:blind:2", "cl_link_created", 0x78),
+                listed_link(CL_EA, &link, &["lock:no-row:5"]),
+            ],
+        );
+        let e = check(&orch, &conductor, false).await.unwrap().exit;
+        let e = format!("{:#}", e.expect_err("in transit"));
+        assert!(e.contains("--mark-failed would mark no row"), "{e}");
+        assert!(e.contains(why), "{e}");
     }
+}
+
+#[tokio::test]
+async fn a_proof_that_can_be_no_rows_lock_stops_no_mark() {
+    let orch = test_orchestrator("in-transit-mark-nameless");
+    let carried = enqueue_lock(&orch, "lock:named:1", "0xea");
+    let clear = enqueue_lock(&orch, "lock:named:2", "0xeb");
+    let unlisted = with_proofs(parked_tx(0x7B, &[]), json!("not a list"));
+    let partly = with_proofs(
+        parked_tx(0x7C, &[]),
+        json!([proof("lock:named:1", "0xea"), {}, { "lock_id": "lock:elsewhere" }]),
+    );
+    let conductor =
+        bridging_conductor().parking(action_hash(CL_EA), &[unlisted.clone(), partly.clone()]);
+    let before = snapshot(&orch);
+
+    let checked = check(&orch, &conductor, true).await.unwrap();
+
+    checked.exit.unwrap();
+    assert_lists(
+        &checked.listed,
+        &[
+            listed_link(CL_EA, &unlisted, &[]),
+            listed_link(CL_EA, &partly, &["lock:named:1"]),
+        ],
+    );
+    assert_eq!(
+        failed_row(&orch, carried).last_error.as_deref(),
+        Some(PAID_BY_HAND)
+    );
+    assert_eq!(snapshot(&orch)[&clear], before[&clear]);
 }
 
 #[tokio::test]
