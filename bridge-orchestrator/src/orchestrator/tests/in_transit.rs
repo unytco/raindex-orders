@@ -232,6 +232,8 @@ async fn each_live_withdrawal_and_deposit_link_is_in_transit_on_its_own() {
         attached_payload["proof_of_deposit"] = json!("not a list");
     }
     let spend = parked_spend_tx(0x67, &[proof("lock:no-row:3", "0xca")]);
+    let mut unaddressed = listed_withdrawal(0x6E);
+    unaddressed["withdraw_to_address"] = Value::Null;
 
     for (agreement, parked, expected) in [
         (
@@ -258,6 +260,15 @@ async fn each_live_withdrawal_and_deposit_link_is_in_transit_on_its_own() {
             vec![parked_withdrawal_tx(0x68), parked_withdrawal_tx(0x69)],
             vec![listed_withdrawal(0x68), listed_withdrawal(0x69)],
         ),
+        (
+            BR_EA,
+            vec![spend_as(
+                parked_withdrawal_tx(0x6E),
+                WITHDRAWER_ROLE,
+                json!({}),
+            )],
+            vec![unaddressed],
+        ),
     ] {
         let conductor = bridging_conductor().parking(action_hash(agreement), &parked);
 
@@ -269,7 +280,7 @@ async fn each_live_withdrawal_and_deposit_link_is_in_transit_on_its_own() {
 }
 
 #[tokio::test]
-async fn a_spend_no_cycle_takes_and_a_link_another_agent_parked_are_not_in_transit() {
+async fn another_agents_link_and_a_spend_in_another_role_are_not_in_transit() {
     let orch = test_orchestrator("in-transit-passed-by");
     enqueue_lock(&orch, "lock:copied:1", "0xcb");
     enqueue_at_cl_rave_executed(&orch, "lock:copied:2", "0xcc");
@@ -295,11 +306,6 @@ async fn a_spend_no_cycle_takes_and_a_link_another_agent_parked_are_not_in_trans
                     ORACLE_ROLE,
                     json!({ "proof_of_deposit": bridged }),
                 ),
-                spend_as(
-                    parked_withdrawal_tx(0x6D),
-                    WITHDRAWER_ROLE,
-                    json!({ "proof_of_deposit": bridged }),
-                ),
             ],
         );
     let before = snapshot(&orch);
@@ -310,6 +316,30 @@ async fn a_spend_no_cycle_takes_and_a_link_another_agent_parked_are_not_in_trans
         checked.exit.unwrap();
     }
     assert_eq!(snapshot(&orch), before, "a copied proof marks no row");
+}
+
+#[tokio::test]
+async fn a_row_whose_state_or_step_cannot_be_read_fails_the_check() {
+    for (column, garbled) in [("state", "Queued"), ("step", "cl_link_create")] {
+        let orch = test_orchestrator("in-transit-garbled");
+        let id = enqueue_lock(&orch, "lock:garbled:1", "0xdd");
+        rusqlite::Connection::open(&orch.cfg.db_path)
+            .unwrap()
+            .execute(
+                &format!("UPDATE work_items SET {column} = ?2 WHERE id = ?1"),
+                rusqlite::params![id, garbled],
+            )
+            .unwrap();
+        let before = snapshot(&orch);
+
+        for mark_failed in [false, true] {
+            let e = check(&orch, &bridging_conductor(), mark_failed)
+                .await
+                .expect_err("a row it cannot read");
+            assert!(format!("{e:#}").contains("lock:garbled:1"), "{e:#}");
+        }
+        assert_eq!(snapshot(&orch), before);
+    }
 }
 
 #[tokio::test]

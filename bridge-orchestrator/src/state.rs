@@ -747,6 +747,37 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Item IDs of the rows whose state or step `list_flow` reads as another.
+    pub fn unreadable_rows(&self, flow: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt =
+            conn.prepare("SELECT item_id, state, step FROM work_items WHERE flow = ?1")?;
+        let rows = stmt.query_map(params![flow], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut unreadable = Vec::new();
+        for row in rows {
+            let (item_id, state, step) = row?;
+            if state.parse::<WorkState>().is_err() || step.parse::<WorkStep>().is_err() {
+                unreadable.push(item_id);
+            }
+        }
+        Ok(unreadable)
+    }
+
+    pub fn vault(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(
+            conn.query_row("SELECT vault FROM schema_meta WHERE id = 1", [], |row| {
+                row.get(0)
+            })?,
+        )
+    }
+
     pub fn advance_to_cl_link_created(
         &self,
         id: i64,

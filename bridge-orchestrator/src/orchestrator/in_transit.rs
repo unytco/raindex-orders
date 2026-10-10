@@ -2,10 +2,10 @@ use super::{
     bridging_spend, connect_ham, own_deposit, BridgeOrchestrator, BridgingSpend, Conductor,
     ConductorReads,
 };
-use crate::config::Config;
+use crate::config::{Config, Ethereum};
 use crate::state::{StateStore, WorkState, WorkStep};
 use crate::watchtower_reporter::ReporterState;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use holo_hash::ActionHash;
 use rave_engine::types::UnitMap;
 use serde::Serialize;
@@ -36,7 +36,7 @@ enum InTransit {
         spend: String,
         spender: String,
         amount: UnitMap,
-        withdraw_to_address: String,
+        withdraw_to_address: Option<String>,
     },
 }
 
@@ -76,13 +76,26 @@ impl Found {
     }
 }
 
-pub async fn run(cfg: Config, mark_failed: bool) -> Result<()> {
+pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> Result<()> {
+    let exists = Path::new(&cfg.db_path)
+        .try_exists()
+        .with_context(|| format!("DB_PATH {} cannot be read", cfg.db_path))?;
     anyhow::ensure!(
-        Path::new(&cfg.db_path).exists(),
+        exists,
         "DB_PATH {} does not exist: opening it would create an empty database, which lists nothing in transit",
         cfg.db_path
     );
     let db = StateStore::open(&cfg.db_path)?;
+    if let Some(chain) = ethereum {
+        let configured = format!("{:#x}", chain.lock_vault_address);
+        let served = db.vault()?;
+        anyhow::ensure!(
+            served.as_deref() == Some(configured.as_str()),
+            "DB_PATH {} serves vault {}, and vault {configured} is configured",
+            cfg.db_path,
+            served.as_deref().unwrap_or("none")
+        );
+    }
     let ham = connect_ham(&cfg).await?;
     let orchestrator = BridgeOrchestrator {
         cfg,
@@ -142,8 +155,7 @@ impl BridgeOrchestrator {
             });
         }
         let withdrawals = bridging_links.iter().filter_map(|spend| {
-            let Some(BridgingSpend::Withdrawal(Some(withdraw_to))) = bridging_spend(spend, agent)
-            else {
+            let Some(BridgingSpend::Withdrawal(withdraw_to)) = bridging_spend(spend, agent) else {
                 return None;
             };
             Some(InTransit::Withdrawal {
@@ -151,10 +163,16 @@ impl BridgeOrchestrator {
                 spend: spend.id.to_string(),
                 spender: spend.creator.to_string(),
                 amount: spend.amount.clone(),
-                withdraw_to_address: withdraw_to.to_string(),
+                withdraw_to_address: withdraw_to.map(str::to_string),
             })
         });
 
+        let unreadable = self.db.unreadable_rows("lock")?;
+        anyhow::ensure!(
+            unreadable.is_empty(),
+            "rows whose state or step cannot be read: {}",
+            unreadable.join(", ")
+        );
         let mut listed = Vec::new();
         let mut rows = BTreeMap::new();
         for row in self.db.list_flow("lock")? {

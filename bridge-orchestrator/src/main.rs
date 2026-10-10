@@ -173,7 +173,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&output)?);
         }
         Command::InTransit { mark_failed } => {
-            orchestrator::in_transit::run(config, mark_failed).await?;
+            orchestrator::in_transit::run(config, ethereum, mark_failed).await?;
         }
     }
 

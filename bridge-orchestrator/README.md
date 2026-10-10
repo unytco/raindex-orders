@@ -117,18 +117,19 @@ It prints one JSON object per line:
 |--------|--------------------|--------|
 | `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created` | `item_id`, `lock_id`, `step`, `link` |
 | `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the credit-limit adjustment agreement or the bridging agreement of its lane in force | `agreement`, `link`, `lock_ids` |
-| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement, naming `withdraw_to_address` | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address` |
+| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address` |
 
-`lock_id` is `null` for a row whose payload cannot be read, and `link` for one
-that records none.
-`amount` is the spend's unit map, its HOT under `HOT_UNIT_INDEX`. A `failed`
-row is not listed, and nor is a spend no cycle takes: another agent's spend in
-the `bridging_agent` role, a spend in any other role, or a `withdrawer` spend
-naming no `withdraw_to_address`. Log lines go to stdout too, and never start
-with `{`.
+`lock_id` is `null` for a row whose payload cannot be read, `link` for one that
+records none, and `withdraw_to_address` for a withdrawal that names none, which
+no coupon can pay. `amount` is the spend's unit map, its HOT under
+`HOT_UNIT_INDEX`. A `failed` row is not listed, and nor is another agent's spend
+in the `bridging_agent` role or a spend in any other role: no cycle takes them.
+Log lines go to stdout too, and never start with `{`.
 
 It exits 0 only when it read the database and the conductor and found nothing.
-A `DB_PATH` that does not exist fails it.
+It fails on a `DB_PATH` that does not exist, on one that serves another vault
+than the one configured when Ethereum is on, and on a row whose state or step it
+cannot read.
 
 `--mark-failed` lists the same, then marks `failed` each listed row and each
 row, neither `succeeded` nor `failed`, whose lock is in a listed link. Each
