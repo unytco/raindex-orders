@@ -324,7 +324,10 @@ impl BridgeOrchestrator {
         for (tx, role) in self.untold("spend_skipped", &skipped, |(tx, _)| tx.id.to_string()) {
             warn!(
                 event = "bridge.spend_skipped",
-                "[bridge/withdrawals] spend {:?} by {} in role {role} is neither the bridging agent's deposit nor a withdrawal, and stays parked",
+                link = %tx.id,
+                creator = %tx.creator,
+                role,
+                "[bridge/withdrawals] spend {} by {} in role {role} is neither the bridging agent's deposit nor a withdrawal, and stays parked",
                 tx.id,
                 tx.creator
             );
@@ -1078,7 +1081,6 @@ impl BridgeOrchestrator {
         // ---------------------------------------------------------------
         let bridging_links = conductor.parked_links(&bridging_ea_id).await?;
         self.log_foreign_proofs("proof_foreign/bridging", &bridging_links);
-        self.log_skipped_spends(&bridging_links);
 
         let BridgingSelection {
             deposits: deposit_rave_links,
