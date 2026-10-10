@@ -2302,10 +2302,13 @@ fn tag_proofs(record: &Record, step: &WorkStep) -> Result<Vec<Value>> {
             record.action_address()
         )
     })?;
-    Ok(payload["proof_of_deposit"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default())
+    let proofs = &payload["proof_of_deposit"];
+    proofs.as_array().cloned().with_context(|| {
+        format!(
+            "the tag of link {} carries a proof_of_deposit that is not a list: {proofs}",
+            record.action_address()
+        )
+    })
 }
 
 /// The input of the transactor's `hdk_get`, whose fields are named unlike
@@ -6601,6 +6604,32 @@ mod tests {
             !conductor.calls.take().contains(&"create_parked_spend"),
             "it is not written again"
         );
+    }
+
+    #[tokio::test]
+    async fn a_held_link_whose_proofs_are_not_a_list_leaves_its_row_where_it_is() {
+        for (step, _) in RAVE_STAGES {
+            let orch = test_orchestrator("held-proofs-not-a-list");
+            let ([unread, _], mut links) = two_parked_deposits(&orch, step.clone());
+            if let TransactionDetails::Parked {
+                attached_payload, ..
+            }
+            | TransactionDetails::ParkedSpend {
+                attached_payload, ..
+            } = &mut links[0].details
+            {
+                attached_payload["proof_of_deposit"] = json!("lock:rave:1");
+            }
+            let conductor = bridging_conductor().holding(&links);
+
+            reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+
+            let row = lock_row(&orch, unread);
+            assert_eq!(
+                (row.state, row.step),
+                (crate::state::WorkState::Queued, step)
+            );
+        }
     }
 
     #[tokio::test]
