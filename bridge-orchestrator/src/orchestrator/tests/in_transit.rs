@@ -191,8 +191,16 @@ async fn a_live_withdrawal_and_a_link_no_row_records_are_in_transit() {
 #[tokio::test]
 async fn a_foreign_spend_in_the_bridging_agents_role_is_not_in_transit() {
     let orch = test_orchestrator("in-transit-foreign");
-    let foreign = signed_by_another(parked_spend_tx(0x65, &[proof("lock:foreign:1", "0xc8")]));
-    let conductor = bridging_conductor().parking(action_hash(BR_EA), &[foreign]);
+    let lock = [proof("lock:foreign:1", "0xc8")];
+    let conductor = bridging_conductor()
+        .parking(
+            action_hash(CL_EA),
+            &[signed_by_another(parked_tx(0x6D, &lock))],
+        )
+        .parking(
+            action_hash(BR_EA),
+            &[signed_by_another(parked_spend_tx(0x65, &lock))],
+        );
 
     let checked = check(&orch, &conductor, false).await.unwrap();
 
