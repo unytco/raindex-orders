@@ -1333,8 +1333,6 @@ impl BridgeOrchestrator {
         Ok(false)
     }
 
-    /// Whether `record`, the link a row recorded, is the row's own write: signed
-    /// by the bridging agent and carrying the row's own proof.
     fn recorded_write(&self, record: &Record, row: &WorkItem) -> RecordedWrite {
         let author = AgentPubKeyB64::from(record.action().author().clone());
         if author != self.cfg.bridging_agent_pubkey {
@@ -1370,7 +1368,6 @@ impl BridgeOrchestrator {
         )
     }
 
-    /// Fails `row` with `why` for a person to resolve.
     fn for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<bool> {
         let lock = self.lock_key(row);
         error!(
@@ -1391,8 +1388,6 @@ impl BridgeOrchestrator {
         Ok(false)
     }
 
-    /// A read for `row` that failed: a stop or a failing conductor ends the
-    /// cycle, and any other failure leaves the row where it is.
     fn unresolved(row: &WorkItem, link: &str, e: anyhow::Error) -> Result<bool> {
         if is_stopped(&e) {
             return Err(e);
@@ -2301,8 +2296,6 @@ enum RecordedWrite {
     Unreadable(anyhow::Error),
 }
 
-/// The deposit proofs in a parked link's tag, read as the row's step says it
-/// was written: a link by S1, a spend by S3.
 fn tag_proofs(record: &Record, step: &WorkStep) -> Result<Vec<Value>> {
     let ActionData::CreateLink(link) = &record.action().data else {
         anyhow::bail!("{} is not a link", record.action_address());
@@ -2555,7 +2548,6 @@ fn consumed_links(inputs: &RAVEInput) -> Result<Vec<ActionHashB64>> {
         .get_link_hashes())
 }
 
-/// A RAVE's ActionHash, and the links its record says it consumed.
 struct RaveRun {
     hash: ActionHash,
     consumed: Vec<ActionHashB64>,
@@ -2770,8 +2762,6 @@ fn deposit_proofs(tx: &Transaction) -> Option<&Value> {
     }
 }
 
-/// Why a deposit link's rows do not account for it: only rows that have not
-/// recorded it yet, as when its write landed after reconcile, or anything else.
 enum Gap {
     Unrecorded(String),
     Conflict(String),
@@ -4047,8 +4037,6 @@ mod tests {
             self
         }
 
-        /// The chain holds `links`, which no agreement lists any more: a RAVE
-        /// took them off the agreement their details name.
         fn holding(self, links: &[Transaction]) -> Self {
             self.taken(links).holding_unconsumed(links)
         }
@@ -4072,7 +4060,6 @@ mod tests {
             self
         }
 
-        /// A power loss rolled `link` back off the bridging agent's chain.
         fn rolled_back(self, link: &Transaction) -> Self {
             let link: ActionHash = link.id.clone().into();
             self.holds.borrow_mut().remove(&link);
@@ -4083,7 +4070,6 @@ mod tests {
             self
         }
 
-        /// The conductor holds a record for `link` whose tag does not decode.
         fn garbling(self, link: &Transaction) -> Self {
             let hash: ActionHash = link.id.clone().into();
             let garbled = signed_record(
@@ -4344,7 +4330,6 @@ mod tests {
         reconcile_holding(orch, cl_links, br_links, &[]).await
     }
 
-    /// `reconcile`, with the chain also holding `taken`, links a RAVE took.
     async fn reconcile_holding(
         orch: &BridgeOrchestrator,
         cl_links: &[Transaction],
@@ -5843,8 +5828,6 @@ mod tests {
         }
     }
 
-    /// A RAVE's inputs, naming links `consumed` among its consumed inputs and
-    /// links `other` among the rest.
     fn rave_input(consumed: &[u8], other: &[u8]) -> RAVEInput {
         let named = |role: &str, links: &[u8]| {
             let mut inputs = RAVEInputHandler::new();
@@ -6668,7 +6651,6 @@ mod tests {
             .expect("the row is failed")
     }
 
-    /// The write that would write `step`'s row again.
     fn rewrite_at(step: &WorkStep) -> &'static str {
         match step {
             WorkStep::ClLinkCreated => "create_parked_link",
