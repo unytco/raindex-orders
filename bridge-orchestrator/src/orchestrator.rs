@@ -2,6 +2,7 @@ use crate::config::{Config, Ethereum, LINK_TAG_BYTES_CEILING};
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{CouponSigner, Payout};
 use crate::state::{StateStore, WorkItem, WorkStep};
+use crate::stop::{ensure_running, is_stopped};
 use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -241,17 +242,36 @@ impl BridgeOrchestrator {
         });
     }
 
-    /// `None` means the read was slow enough to eject the stage before the
-    /// spend, the same verdict the calls around it get.
+    /// Whether the cycle ends after `fn_name` returned in `elapsed_ms`: a stop
+    /// was signalled while it ran, or it was slow enough to eject the stage.
+    fn ends_cycle(&self, stage: &str, fn_name: &str, elapsed_ms: u128, stop: &ShutdownRx) -> bool {
+        if *stop.borrow() {
+            info!(
+                event = "bridge.stage_stopped",
+                stage,
+                fn_name,
+                "[bridge/cycle] stop signalled, ending the cycle after {stage} {fn_name}"
+            );
+            return true;
+        }
+        if self.should_eject(elapsed_ms) {
+            self.log_stage_ejected(stage, fn_name, elapsed_ms);
+            return true;
+        }
+        false
+    }
+
+    /// `None` means the cycle ends before the spend, on the same verdict the
+    /// calls around the read get.
     async fn spend_tag_ledger(
         &self,
         read: impl std::future::Future<Output = Result<Ledger>>,
+        stop: &ShutdownRx,
     ) -> Result<Option<Ledger>> {
         let (ledger, elapsed_ms) = timed_call("s3", "get_ledger", read)
             .await
             .context("failed to read the bridging agent's ledger")?;
-        if self.should_eject(elapsed_ms) {
-            self.log_stage_ejected("s3", "get_ledger", elapsed_ms);
+        if self.ends_cycle("s3", "get_ledger", elapsed_ms, stop) {
             return Ok(None);
         }
         Ok(Some(ledger))
@@ -360,7 +380,7 @@ impl BridgeOrchestrator {
         let lock_flow = self
             .ethereum
             .as_ref()
-            .map(|side| LockFlow::new(side.chain.clone(), self.db.clone()));
+            .map(|side| LockFlow::new(side.chain.clone(), self.db.clone(), shutdown.clone()));
 
         let mut last_bridge_cycle =
             std::time::Instant::now() - Duration::from_millis(self.cfg.bridge_cycle_interval_ms);
@@ -388,7 +408,9 @@ impl BridgeOrchestrator {
 
             if let Some(lock_flow) = &lock_flow {
                 if let Err(e) = lock_flow.run_cycle().await {
-                    error!("[lock-flow] cycle failed: {}", e);
+                    if !is_stopped(&e) {
+                        error!("[lock-flow] cycle failed: {}", e);
+                    }
                 }
             }
 
@@ -415,7 +437,7 @@ impl BridgeOrchestrator {
                             ham: &ham,
                             role_name: &self.cfg.role_name,
                         };
-                        match self.run_bridge_cycle(&conductor).await {
+                        match self.run_bridge_cycle(&conductor, &shutdown).await {
                             Ok(()) => {
                                 last_bridge_cycle = std::time::Instant::now();
                                 let duration_ms =
@@ -447,6 +469,10 @@ impl BridgeOrchestrator {
                                     );
                                     unclassified_consecutive = 0;
                                 }
+                            }
+                            Err(e) if is_stopped(&e) => {
+                                info!("[bridge] shutdown signal received, exiting cleanly");
+                                return Ok(());
                             }
                             Err(e) => {
                                 // `{:#}` and not `{}`: an `anyhow` chain prints
@@ -679,7 +705,9 @@ impl BridgeOrchestrator {
     async fn run_bridge_cycle<C: ConductorReads + ConductorWrites>(
         &self,
         conductor: &C,
+        stop: &ShutdownRx,
     ) -> Result<()> {
+        let conductor = &Gated { conductor, stop };
         let started = std::time::Instant::now();
 
         let global_definition = conductor.global_definition().await?;
@@ -790,8 +818,7 @@ impl BridgeOrchestrator {
             for id in &s1_batch.ids {
                 self.record_cl_link(*id, &cl_link_hash, &context)?;
             }
-            if self.should_eject(s1_elapsed_ms) {
-                self.log_stage_ejected("s1", "create_parked_link", s1_elapsed_ms);
+            if self.ends_cycle("s1", "create_parked_link", s1_elapsed_ms, stop) {
                 return Ok(());
             }
         }
@@ -840,8 +867,7 @@ impl BridgeOrchestrator {
             .await?;
             let cl_rave_hash = cl_rave_hash.to_string();
             info!("[bridge/s2] RAVE executed action_hash={}", cl_rave_hash);
-            if self.should_eject(s2_elapsed_ms) {
-                self.log_stage_ejected("s2", "execute_rave", s2_elapsed_ms);
+            if self.ends_cycle("s2", "execute_rave", s2_elapsed_ms, stop) {
                 return Ok(());
             }
             let outcome = self
@@ -879,7 +905,7 @@ impl BridgeOrchestrator {
                 // Read on the same connection as the write, and immediately before
                 // it: the tag carries this agent's ledger as it stands when the
                 // zome reads it, and every zome call in between would move it.
-                let Some(ledger) = self.spend_tag_ledger(conductor.ledger()).await? else {
+                let Some(ledger) = self.spend_tag_ledger(conductor.ledger(), stop).await? else {
                     return Ok(());
                 };
                 let tag_context = SpendTagContext {
@@ -928,8 +954,7 @@ impl BridgeOrchestrator {
                     self.record_br_spend(*id, &spend_hash_str, &context)?;
                 }
                 s3_written = s3_batch.ids.len();
-                if self.should_eject(s3_elapsed_ms) {
-                    self.log_stage_ejected("s3", "create_parked_spend", s3_elapsed_ms);
+                if self.ends_cycle("s3", "create_parked_spend", s3_elapsed_ms, stop) {
                     return Ok(());
                 }
             } else {
@@ -1049,8 +1074,7 @@ impl BridgeOrchestrator {
             .await?;
             let br_rave_hash = br_rave_hash.to_string();
             info!("[bridge/s4] RAVE executed action_hash={}", br_rave_hash);
-            if self.should_eject(s4_elapsed_ms) {
-                self.log_stage_ejected("s4", "execute_rave", s4_elapsed_ms);
+            if self.ends_cycle("s4", "execute_rave", s4_elapsed_ms, stop) {
                 return Ok(());
             }
             let outcome = self
@@ -1212,6 +1236,7 @@ impl BridgeOrchestrator {
         };
         let (agreement, parked) = match parked_on(conductor, live, link, recorded).await {
             Ok(checked) => checked,
+            Err(e) if is_stopped(&e) => return Err(e),
             Err(e) if classify_cycle_failure(&e) != CycleFailureAction::UnclassifiedCooldown => {
                 return Err(e.context(format!(
                     "lock {} at {}: its link {} could not be checked",
@@ -1771,10 +1796,77 @@ async fn read_once<'a, T>(
     read: impl std::future::Future<Output = Result<T>>,
 ) -> Result<&'a T> {
     if !reads.contains_key(hash) {
-        let read = read.await.map_err(|e| format!("{e:#}"));
+        let read = match read.await {
+            Err(e) if is_stopped(&e) => return Err(e),
+            read => read.map_err(|e| format!("{e:#}")),
+        };
         reads.insert(hash.clone(), read);
     }
     reads[hash].as_ref().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The conductor a cycle calls, which sends no call once a stop is signalled.
+/// A call it refuses can leave a batch `in_flight` or a RAVE's rows unrecorded,
+/// for startup recovery and the next reconcile to settle (workshop
+/// `documentation/specs/bridge-stop/README.md` § Operating assumptions and
+/// limits).
+struct Gated<'a, C> {
+    conductor: &'a C,
+    stop: &'a ShutdownRx,
+}
+
+impl<C: ConductorReads> ConductorReads for Gated<'_, C> {
+    async fn global_definition(&self) -> Result<GlobalDefinitionExt> {
+        ensure_running(self.stop)?;
+        self.conductor.global_definition().await
+    }
+
+    async fn all_lanes(&self) -> Result<Vec<LaneExt>> {
+        ensure_running(self.stop)?;
+        self.conductor.all_lanes().await
+    }
+
+    async fn version_in_force(&self, newest: ActionHash) -> Result<Option<ActionHash>> {
+        ensure_running(self.stop)?;
+        self.conductor.version_in_force(newest).await
+    }
+
+    async fn lane_definition(&self, version: ActionHash) -> Result<LaneDefinition> {
+        ensure_running(self.stop)?;
+        self.conductor.lane_definition(version).await
+    }
+
+    async fn parked_links(&self, agreement: &ActionHash) -> Result<Vec<Transaction>> {
+        ensure_running(self.stop)?;
+        self.conductor.parked_links(agreement).await
+    }
+
+    async fn agreement_of(&self, link: ActionHash) -> Result<ActionHash> {
+        ensure_running(self.stop)?;
+        self.conductor.agreement_of(link).await
+    }
+
+    async fn ledger(&self) -> Result<Ledger> {
+        ensure_running(self.stop)?;
+        self.conductor.ledger().await
+    }
+}
+
+impl<C: ConductorWrites> ConductorWrites for Gated<'_, C> {
+    async fn create_parked_link(&self, input: &CreateParkedLinkInput) -> Result<ActionHashB64> {
+        ensure_running(self.stop)?;
+        self.conductor.create_parked_link(input).await
+    }
+
+    async fn execute_rave(&self, input: &RAVEExecuteInputs) -> Result<ActionHash> {
+        ensure_running(self.stop)?;
+        self.conductor.execute_rave(input).await
+    }
+
+    async fn create_parked_spend(&self, input: &CreateParkedSpendInput) -> Result<ActionHashB64> {
+        ensure_running(self.stop)?;
+        self.conductor.create_parked_spend(input).await
+    }
 }
 
 struct Conductor<'a> {
@@ -3432,6 +3524,7 @@ mod tests {
         raved: RefCell<HashSet<ActionHash>>,
         unreadable_once_raved: Cell<bool>,
         rave_delay_ms: u64,
+        stops_during: Option<(usize, tokio::sync::watch::Sender<bool>)>,
         parked_reads: RefCell<Vec<ActionHash>>,
         link_reads: RefCell<Vec<ActionHash>>,
         fails_on: Option<(ActionHash, &'static str)>,
@@ -3485,6 +3578,11 @@ mod tests {
 
         fn call(&self, name: &'static str) {
             self.calls.borrow_mut().push(name);
+            if let Some((call, stop)) = &self.stops_during {
+                if self.calls.borrow().len() == *call {
+                    stop.send_replace(true);
+                }
+            }
         }
 
         /// The ActionHash of the next write, which this conductor numbers from
@@ -4947,7 +5045,7 @@ mod tests {
         let id = enqueue_lock(&orch, "lock:cycle:1", "0x80");
         let conductor = bridging_conductor();
 
-        orch.run_bridge_cycle(&conductor).await.unwrap();
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
         let row = lock_row(&orch, id);
         assert_eq!(
@@ -5003,7 +5101,7 @@ mod tests {
             &[&links[1]],
         );
 
-        orch.run_bridge_cycle(&conductor).await.unwrap();
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
         assert_ne!(lock_row(&orch, taken).step, WorkStep::ClLinkCreated);
         assert_eq!(
@@ -5026,7 +5124,7 @@ mod tests {
             &[&links[1]],
         );
 
-        orch.run_bridge_cycle(&conductor).await.unwrap();
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
         assert_eq!(
             lock_row(&orch, taken).state,
@@ -5086,7 +5184,7 @@ mod tests {
                 &[&links[0], &links[1]],
             );
 
-            orch.run_bridge_cycle(&conductor).await.unwrap();
+            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
             for id in rows {
                 assert_eq!(lock_row(&orch, id).step, step);
@@ -5108,7 +5206,7 @@ mod tests {
             };
 
             let e = orch
-                .run_bridge_cycle(&conductor)
+                .run_bridge_cycle(&conductor, &running())
                 .await
                 .expect_err("a RAVE whose outcome cannot be read ends the cycle");
 
@@ -5134,7 +5232,7 @@ mod tests {
                 ..bridging_conductor().parking(action_hash(agreement), &links)
             };
 
-            orch.run_bridge_cycle(&conductor).await.unwrap();
+            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
             assert_eq!(conductor.calls.take().last(), Some(&"execute_rave"));
             for id in rows {
@@ -5145,6 +5243,180 @@ mod tests {
                 assert_eq!(lock_row(&orch, id).step, taken_at(&step));
             }
         }
+    }
+
+    fn running() -> ShutdownRx {
+        tokio::sync::watch::channel(false).1
+    }
+
+    /// `conductor`, on which a stop is signalled while its `call`th call
+    /// (counting from 1) is in flight.
+    fn stopping_during(call: usize, conductor: FakeConductor) -> (FakeConductor, ShutdownRx) {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let conductor = FakeConductor {
+            stops_during: Some((call, stop)),
+            ..conductor
+        };
+        (conductor, stopped)
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_s1s_write_records_its_link_and_calls_nothing_more() {
+        let orch = test_orchestrator("stop-s1");
+        let id = enqueue_lock(&orch, "lock:stop:1", "0x81");
+        let (conductor, stop) = stopping_during(5, bridging_conductor());
+
+        orch.run_bridge_cycle(&conductor, &stop).await.unwrap();
+
+        let row = lock_row(&orch, id);
+        assert_eq!(
+            (row.state, row.step),
+            (crate::state::WorkState::Queued, WorkStep::ClLinkCreated)
+        );
+        let written = ids(&conductor.parked.borrow()[&action_hash(CL_EA)]);
+        assert_eq!(row.cl_link_hash.into_iter().collect::<Vec<_>>(), written);
+        assert_eq!(conductor.calls.take(), ONE_DEPOSIT_CYCLE[..5]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_s3s_write_records_its_spend_and_calls_nothing_more() {
+        let orch = test_orchestrator("stop-s3");
+        let id = enqueue_at_cl_rave_executed(&orch, "lock:stop:3", "0x83");
+        let (conductor, stop) = stopping_during(7, bridging_conductor());
+
+        orch.run_bridge_cycle(&conductor, &stop).await.unwrap();
+
+        let row = lock_row(&orch, id);
+        assert_eq!(
+            (row.state, row.step),
+            (crate::state::WorkState::Queued, WorkStep::BrSpendCreated)
+        );
+        let written = ids(&conductor.parked.borrow()[&action_hash(BR_EA)]);
+        assert_eq!(row.br_spend_hash.into_iter().collect::<Vec<_>>(), written);
+        assert_eq!(
+            conductor.calls.take(),
+            [
+                "global_definition",
+                "all_lanes",
+                "parked_links",
+                "parked_links",
+                "parked_links",
+                "ledger",
+                "create_parked_spend",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_a_rave_leaves_its_rows_to_the_next_reconcile() {
+        let orch = test_orchestrator("stop-rave");
+        let (rows, links) = two_parked_deposits(&orch, WorkStep::ClLinkCreated);
+        let (conductor, stop) =
+            stopping_during(6, bridging_conductor().parking(action_hash(CL_EA), &links));
+
+        orch.run_bridge_cycle(&conductor, &stop).await.unwrap();
+
+        assert_eq!(conductor.calls.take().last(), Some(&"execute_rave"));
+        for id in rows {
+            assert_eq!(lock_row(&orch, id).step, WorkStep::ClLinkCreated);
+        }
+        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+        for id in rows {
+            assert_eq!(lock_row(&orch, id).step, WorkStep::ClRaveExecuted);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_the_ledger_read_ends_the_cycle_before_s3_marks_its_batch() {
+        let orch = test_orchestrator("stop-ledger");
+        let id = enqueue_at_cl_rave_executed(&orch, "lock:stop:l", "0x84");
+        let (conductor, stop) = stopping_during(6, bridging_conductor());
+
+        orch.run_bridge_cycle(&conductor, &stop).await.unwrap();
+
+        let row = lock_row(&orch, id);
+        assert_eq!(
+            (row.state, row.step),
+            (crate::state::WorkState::Queued, WorkStep::ClRaveExecuted)
+        );
+        assert_eq!(conductor.calls.take().last(), Some(&"ledger"));
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_a_read_sends_no_further_call() {
+        let orch = test_orchestrator("stop-read");
+        let id = enqueue_lock(&orch, "lock:stop:r", "0x85");
+        let (conductor, stop) = stopping_during(3, bridging_conductor());
+
+        let e = orch
+            .run_bridge_cycle(&conductor, &stop)
+            .await
+            .expect_err("the cycle ends at the first call it does not send");
+
+        assert!(is_stopped(&e), "{e:#}");
+        assert_eq!(conductor.calls.take(), ONE_DEPOSIT_CYCLE[..3]);
+        let row = lock_row(&orch, id);
+        assert_eq!(
+            (row.state, row.step),
+            (crate::state::WorkState::Queued, WorkStep::New)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_before_s1s_write_leaves_its_batch_in_flight_and_writes_nothing() {
+        let orch = test_orchestrator("stop-before-write");
+        let id = enqueue_lock(&orch, "lock:stop:w", "0x86");
+        let (conductor, stop) = stopping_during(4, bridging_conductor());
+
+        let e = orch
+            .run_bridge_cycle(&conductor, &stop)
+            .await
+            .expect_err("the write is not sent");
+
+        assert!(is_stopped(&e), "{e:#}");
+        assert_eq!(conductor.calls.take(), ONE_DEPOSIT_CYCLE[..4]);
+        assert!(conductor.parked.borrow()[&action_hash(CL_EA)].is_empty());
+        let row = rows_at(&orch, WorkStep::New);
+        assert_eq!(
+            (row[0].id, row[0].state.clone()),
+            (id, crate::state::WorkState::InFlight),
+            "startup recovery returns it to queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_ends_on_a_stop_rather_than_taking_it_for_an_unreadable_row() {
+        const REPLACED_CL_EA: u8 = 0xE6;
+        let orch = test_orchestrator("stop-reconcile");
+        let link = parked_tx(0x3B, &[proof("lock:stop:c", "0xe5")]);
+        let waiting = enqueue_lock(&orch, "lock:stop:c", "0xe5");
+        orch.db
+            .advance_to_cl_link_created(waiting, &link.id.to_string(), &ea(CL_EA))
+            .unwrap();
+        forget_agreements(&orch, &[waiting]);
+        let (conductor, stop) = stopping_during(
+            3,
+            FakeConductor::default()
+                .parking(action_hash(REPLACED_CL_EA), &[link])
+                .consumed(action_hash(CL_EA))
+                .consumed(action_hash(BR_EA)),
+        );
+
+        let e = orch
+            .reconcile_pipeline(
+                &Gated {
+                    conductor: &conductor,
+                    stop: &stop,
+                },
+                &mut LiveLinks::default(),
+                &in_force(CL_EA, BR_EA),
+            )
+            .await
+            .expect_err("the read after the stop is not sent");
+
+        assert!(is_stopped(&e), "{e:#}");
+        assert_eq!(conductor.calls.take().last(), Some(&"agreement_of"));
+        assert_eq!(lock_row(&orch, waiting).step, WorkStep::ClLinkCreated);
     }
 
     #[tokio::test]
@@ -5549,10 +5821,13 @@ mod tests {
         let mut orch = test_orchestrator("spend-tag-ledger-slow");
         orch.cfg.slow_call_threshold_ms = 5;
         let ledger = orch
-            .spend_tag_ledger(async {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                Ok(Ledger::empty())
-            })
+            .spend_tag_ledger(
+                async {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    Ok(Ledger::empty())
+                },
+                &running(),
+            )
             .await
             .expect("a slow read ejects the stage rather than failing the cycle");
         assert!(ledger.is_none());
@@ -5565,10 +5840,13 @@ mod tests {
         orch.cfg.slow_call_threshold_ms = 15_000;
         let read = Ledger::new(vec![(1, "5")], vec![], vec![(2, "1")], vec![]);
         let ledger = orch
-            .spend_tag_ledger({
-                let read = read.clone();
-                async move { Ok(read) }
-            })
+            .spend_tag_ledger(
+                {
+                    let read = read.clone();
+                    async move { Ok(read) }
+                },
+                &running(),
+            )
             .await
             .expect("a prompt read is the ledger the tag is sized from");
         assert_eq!(ledger, Some(read));
@@ -5579,7 +5857,10 @@ mod tests {
     async fn spend_tag_ledger_propagates_a_failed_read() {
         let orch = test_orchestrator("spend-tag-ledger-failed");
         let err = orch
-            .spend_tag_ledger(async { Err::<Ledger, _>(anyhow::anyhow!("conductor gone")) })
+            .spend_tag_ledger(
+                async { Err::<Ledger, _>(anyhow::anyhow!("conductor gone")) },
+                &running(),
+            )
             .await
             .expect_err("a failed read is the cycle's error, not an empty ledger");
         let chain = format!("{err:#}");

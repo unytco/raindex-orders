@@ -239,11 +239,20 @@ dropped socket cannot cause a write to be replayed mid-cycle.
 
 ### Graceful shutdown
 
-`bridge-orchestrator run` installs handlers for `SIGINT` and `SIGTERM`. On
-signal, the currently running bridge cycle is allowed to finish
-(interrupting mid-write would leave state ambiguous), and the main loop
-then exits cleanly between iterations. systemd `Restart=` and rolling
-deploys are safe.
+`bridge-orchestrator run` installs handlers for `SIGINT` and `SIGTERM`. On a
+signal:
+
+- the request in flight to Holochain or Ethereum finishes, and the link or
+  spend a write returns is recorded on its rows;
+- no other request starts: no next stage, no next window of the lock read, no
+  next cycle;
+- the process exits 0.
+
+The cycle ends where a slow call would eject it, each row at the step it
+reached, and the next start carries it on. The rows a RAVE took when the stop
+came are recorded by the next start's reconcile. A stop waits for at most one
+Holochain call, `HAM_REQUEST_TIMEOUT_SECS`, or one Ethereum request, which the
+lock read gives up on after 30 s.
 
 ### Signer (run only)
 

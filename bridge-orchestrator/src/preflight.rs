@@ -69,7 +69,7 @@ sol! {
     }
 }
 
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+pub const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Refuses to run the bridge unless the RPC answers for `network`, the vault and
 /// claim order the configuration names are the ones deployed there, and that order
@@ -361,12 +361,13 @@ fn causes(err: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake_rpc::{read_request, serve};
     use alloy::primitives::{address, PrimitiveSignature};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
     use serde_json::{json, Value};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     const VAULT: Address = address!("E3E064e3C2EEf66cb93dA8D8114F5084E92F48D6");
     const HOT: Address = address!("6c6EE5e31d828De241282B9606C8e98Ea48526E2");
@@ -546,57 +547,6 @@ mod tests {
         value.as_str().unwrap().parse().unwrap()
     }
 
-    /// Serves `chain` over HTTP JSON-RPC, one request per connection.
-    async fn serve(chain: Chain) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                let chain = chain.clone();
-                tokio::spawn(async move { respond(socket, &chain).await });
-            }
-        });
-        url
-    }
-
-    async fn respond(mut socket: TcpStream, chain: &Chain) {
-        let body = read_request(&mut socket).await;
-        let call: Value = serde_json::from_slice(&body).unwrap();
-        let reply = match chain.answer(call["method"].as_str().unwrap(), &call["params"]) {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": call["id"], "result": result}),
-            Err(error) => json!({"jsonrpc": "2.0", "id": call["id"], "error": error}),
-        }
-        .to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-            reply.len()
-        );
-        socket.write_all(response.as_bytes()).await.unwrap();
-    }
-
-    async fn read_request(socket: &mut TcpStream) -> Vec<u8> {
-        let mut request = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let body = loop {
-            let read = socket.read(&mut chunk).await.unwrap();
-            assert!(read > 0, "connection closed mid-request");
-            request.extend_from_slice(&chunk[..read]);
-            let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
-            let length: usize = headers
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .map(|value| value.trim().parse().unwrap())
-                .unwrap_or(0);
-            if request.len() >= end + 4 + length {
-                break request[end + 4..end + 4 + length].to_vec();
-            }
-        };
-        body
-    }
-
     /// Answers every request with `status` and `body`, whatever it asks.
     async fn serve_answer(status: &'static str, body: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -648,7 +598,8 @@ mod tests {
     }
 
     async fn check_against(network: Network, chain: Chain, order: &ClaimOrder) -> Result<()> {
-        let url = serve(chain).await;
+        let url =
+            serve(move |method, params| chain.answer(method, params).map(Value::String)).await;
         check(network, &url, VAULT, &signer_for(order.clone())).await
     }
 
