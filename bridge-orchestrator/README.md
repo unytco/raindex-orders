@@ -354,9 +354,12 @@ systemctl start bridge-orchestrator
 ```
 
 Add `AND id IN (...)` to target specific rows. `attempts` must be under
-`max_attempts` or the next cycle fails it again. Leave a row whose `last_error`
-ends `resolve by hand` failed: re-queued unchanged it fails again.
-Check by hand whether its depositor was credited, and credit it by hand if not.
+`max_attempts` or the next cycle fails it again. Before you re-queue a row,
+check the link it records (`cl_link_hash`, or `br_spend_hash` once it has one):
+while a failed row records a live link, that link is never paid, and re-queuing
+the row can let the next RAVE pay it. Leave a row whose `last_error` ends
+`resolve by hand` failed: check by hand whether its depositor was credited, and
+credit it by hand only if not and its link is not live.
 Rows left `claimed` or `in_flight` need no action: startup re-queues them.
 
 ### systemd service management
@@ -424,7 +427,7 @@ back to `queued` with its attempts unchanged. Only a failed cycle counts an
 attempt, against the items it had in flight.
 
 S2 and S4 give the RAVE a deposit link only when the row of every lock it
-carries records exactly that link. A link whose only gap is rows that record
+carries records exactly that link and is not failed. A link whose only gap is rows that record
 no link yet waits one cycle for reconcile to record them
 (`bridge.rave.link_deferred`). Any other deposit link, or one still short a
 cycle later, stays parked, `bridge.rave.link_withheld` logs it with the reason,

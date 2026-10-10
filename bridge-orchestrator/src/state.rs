@@ -735,7 +735,6 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Every row of `flow`, in any state.
     pub fn list_flow(&self, flow: &str) -> Result<Vec<WorkItem>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(&format!(
