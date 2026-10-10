@@ -1988,7 +1988,10 @@ struct DepositContext {
 
 /// The links among `sent` that the RAVE on `agreement` took off it, read from
 /// the agreement once the RAVE has run: a template leaves a link it rejects
-/// parked. Each link left parked is logged.
+/// parked. Each link left parked is logged. A link gone counts as used because
+/// the HOT templates redact none; were one to, the RAVE's own consumed inputs
+/// are the record to read (workshop `documentation/specs/bridge-stop/README.md`
+/// § Operating assumptions and limits).
 async fn taken_by_rave(
     conductor: &impl ConductorReads,
     agreement: &ActionHash,
