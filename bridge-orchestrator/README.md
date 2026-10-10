@@ -42,7 +42,9 @@ refuses to start, naming each variable at fault, when:
   `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
 
 An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
-its supervisor restarts it. Once the checks pass it logs
+its supervisor restarts it. So does a conductor config, at `CONDUCTOR_CONFIG`,
+that does not set `db_sync_level: Full`: without it a power loss can roll back
+the conductor's latest writes behind what the bridge has recorded. Once the checks pass it logs
 `startup checks passed`.
 
 `NETWORK=none` turns Ethereum off, for a node with no chain such as a local
