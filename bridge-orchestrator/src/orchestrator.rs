@@ -124,7 +124,7 @@ async fn select_bridging_links(
     let mut withdrawal_capped = false;
 
     for tx in bridging_links {
-        let payload = match bridging_spend(tx, bridging_agent) {
+        let withdraw_to = match bridging_spend(tx, bridging_agent) {
             None => continue,
             Some(BridgingSpend::Deposit) => {
                 selection.deposits.push(tx.clone());
@@ -139,10 +139,8 @@ async fn select_bridging_links(
                 );
                 continue;
             }
-            Some(BridgingSpend::Withdrawal(payload)) => payload,
-        };
-        let Some(withdraw_to) = payload.get("withdraw_to_address").and_then(|v| v.as_str()) else {
-            continue;
+            Some(BridgingSpend::Withdrawal(None)) => continue,
+            Some(BridgingSpend::Withdrawal(Some(withdraw_to))) => withdraw_to,
         };
         selection.withdrawals_found += 1;
         let Some(signer) = signer else {
@@ -202,7 +200,7 @@ async fn select_bridging_links(
 
 enum BridgingSpend<'a> {
     Deposit,
-    Withdrawal(&'a Value),
+    Withdrawal(Option<&'a str>),
     Other(&'a str),
 }
 
@@ -222,7 +220,11 @@ fn bridging_spend<'a>(
         if own_deposit(tx, bridging_agent) && ct_role_id == BRIDGING_AGENT_ROLE {
             BridgingSpend::Deposit
         } else if ct_role_id == WITHDRAWER_ROLE {
-            BridgingSpend::Withdrawal(attached_payload)
+            BridgingSpend::Withdrawal(
+                attached_payload
+                    .get("withdraw_to_address")
+                    .and_then(Value::as_str),
+            )
         } else {
             BridgingSpend::Other(ct_role_id)
         },

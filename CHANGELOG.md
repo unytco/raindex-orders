@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `bridge-orchestrator in-transit` lists each transfer the old network still holds before a migration's close, and `--mark-failed` fails its deposits for payment by hand.
+- `bridge-orchestrator in-transit` lists what a migration's close would strand, and `--mark-failed` marks those deposit rows failed for payment by hand.
 
 ### Fixed
 

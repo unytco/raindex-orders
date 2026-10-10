@@ -9,17 +9,17 @@ use anyhow::Result;
 use holo_hash::ActionHash;
 use rave_engine::types::UnitMap;
 use serde::Serialize;
-use serde_json::Value;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::path::Path;
 use tracing::info;
 
-pub(super) const PAID_BY_HAND: &str =
+const PAID_BY_HAND: &str =
     "in transit at the old network's close; it is paid by hand on the new network";
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(super) enum InTransit {
+enum InTransit {
     Row {
         item_id: String,
         lock_id: Option<String>,
@@ -36,31 +36,41 @@ pub(super) enum InTransit {
         spend: String,
         spender: String,
         amount: UnitMap,
-        withdraw_to_address: Option<String>,
+        withdraw_to_address: String,
     },
 }
 
 pub(super) struct Found {
-    pub(super) listed: Vec<InTransit>,
-    rows: Vec<i64>,
+    listed: Vec<InTransit>,
+    rows: BTreeMap<i64, String>,
 }
 
 impl Found {
-    pub(super) fn settle(&self, db: &StateStore, mark_failed: bool) -> Result<()> {
+    pub(super) fn settle(
+        &self,
+        out: &mut impl Write,
+        db: &StateStore,
+        mark_failed: bool,
+    ) -> Result<()> {
+        for listed in &self.listed {
+            writeln!(out, "{}", serde_json::to_string(listed)?)?;
+        }
         if !mark_failed {
             anyhow::ensure!(
                 self.listed.is_empty(),
-                "the old network holds {} transfer(s) in transit",
+                "the old network holds transfers in transit: {} line(s) listed",
                 self.listed.len()
             );
             return Ok(());
         }
-        db.mark_all_failed_permanent(&self.rows, PAID_BY_HAND)?;
+        let ids: Vec<i64> = self.rows.keys().copied().collect();
+        db.mark_all_failed_permanent(&ids, PAID_BY_HAND)?;
+        let items: Vec<&str> = self.rows.values().map(String::as_str).collect();
         info!(
             event = "bridge.in_transit.marked_failed",
-            rows = ?self.rows,
-            "[bridge/in-transit] marked {} row(s) failed, to be paid by hand on the new network",
-            self.rows.len()
+            "[bridge/in-transit] marked {} row(s) failed, to be paid by hand on the new network: {}",
+            items.len(),
+            items.join(", ")
         );
         Ok(())
     }
@@ -69,7 +79,7 @@ impl Found {
 pub async fn run(cfg: Config, mark_failed: bool) -> Result<()> {
     anyhow::ensure!(
         Path::new(&cfg.db_path).exists(),
-        "DB_PATH {} does not exist, so it holds no row to read",
+        "DB_PATH {} does not exist: opening it would create an empty database, which lists nothing in transit",
         cfg.db_path
     );
     let db = StateStore::open(&cfg.db_path)?;
@@ -87,10 +97,7 @@ pub async fn run(cfg: Config, mark_failed: bool) -> Result<()> {
             role_name: &orchestrator.cfg.role_name,
         })
         .await?;
-    for listed in &found.listed {
-        println!("{}", serde_json::to_string(listed)?);
-    }
-    found.settle(&orchestrator.db, mark_failed)
+    found.settle(&mut std::io::stdout(), &orchestrator.db, mark_failed)
 }
 
 impl BridgeOrchestrator {
@@ -135,7 +142,8 @@ impl BridgeOrchestrator {
             });
         }
         let withdrawals = bridging_links.iter().filter_map(|spend| {
-            let Some(BridgingSpend::Withdrawal(payload)) = bridging_spend(spend, agent) else {
+            let Some(BridgingSpend::Withdrawal(Some(withdraw_to))) = bridging_spend(spend, agent)
+            else {
                 return None;
             };
             Some(InTransit::Withdrawal {
@@ -143,15 +151,12 @@ impl BridgeOrchestrator {
                 spend: spend.id.to_string(),
                 spender: spend.creator.to_string(),
                 amount: spend.amount.clone(),
-                withdraw_to_address: payload
-                    .get("withdraw_to_address")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                withdraw_to_address: withdraw_to.to_string(),
             })
         });
 
         let mut listed = Vec::new();
-        let mut rows = BTreeSet::new();
+        let mut rows = BTreeMap::new();
         for row in self.db.list_flow("lock")? {
             if matches!(row.state, WorkState::Succeeded | WorkState::Failed) {
                 continue;
@@ -168,14 +173,11 @@ impl BridgeOrchestrator {
                 });
             }
             if waits_on_its_link || lock.is_some_and(|lock| carried.contains(&lock)) {
-                rows.insert(row.id);
+                rows.insert(row.id, row.item_id);
             }
         }
         listed.extend(links);
         listed.extend(withdrawals);
-        Ok(Found {
-            listed,
-            rows: rows.into_iter().collect(),
-        })
+        Ok(Found { listed, rows })
     }
 }

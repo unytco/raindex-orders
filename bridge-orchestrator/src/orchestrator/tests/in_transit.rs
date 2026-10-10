@@ -1,5 +1,7 @@
 use super::*;
-use crate::orchestrator::in_transit::PAID_BY_HAND;
+
+const PAID_BY_HAND: &str =
+    "in transit at the old network's close; it is paid by hand on the new network";
 
 #[derive(Debug)]
 struct Checked {
@@ -13,13 +15,15 @@ async fn check(
     mark_failed: bool,
 ) -> Result<Checked> {
     let found = orch.in_transit(conductor).await?;
+    let mut printed = Vec::new();
+    let exit = found.settle(&mut printed, &orch.db, mark_failed);
     Ok(Checked {
-        listed: found
-            .listed
-            .iter()
-            .map(|listed| serde_json::to_value(listed).unwrap())
+        listed: String::from_utf8(printed)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
             .collect(),
-        exit: found.settle(&orch.db, mark_failed),
+        exit,
     })
 }
 
@@ -37,6 +41,20 @@ fn snapshot(orch: &BridgeOrchestrator) -> BTreeMap<i64, Value> {
         .into_iter()
         .map(|row| (row.id, serde_json::to_value(&row).unwrap()))
         .collect()
+}
+
+fn without_the_mark(row: &Value) -> Value {
+    let mut row = row.clone();
+    for field in [
+        "state",
+        "error_class",
+        "last_error",
+        "next_retry_at",
+        "updated_at",
+    ] {
+        row.as_object_mut().unwrap().remove(field);
+    }
+    row
 }
 
 fn waiting_at(
@@ -69,6 +87,19 @@ fn paid(orch: &BridgeOrchestrator, lock: &str, tx_hash: &str) -> i64 {
     let id = enqueue_lock(orch, lock, tx_hash);
     orch.db.advance_to_br_rave_executed(id, None).unwrap();
     id
+}
+
+fn spend_as(mut spend: Transaction, role: &str, payload: Value) -> Transaction {
+    if let TransactionDetails::ParkedSpend {
+        attached_payload,
+        ct_role_id,
+        ..
+    } = &mut spend.details
+    {
+        *attached_payload = payload;
+        *ct_role_id = role.to_string();
+    }
+    spend
 }
 
 fn listed_row(lock: &str, step: &str, link: u8) -> Value {
@@ -112,24 +143,33 @@ fn failing_on(agreement: u8) -> FakeConductor {
 #[tokio::test]
 async fn with_no_pending_row_and_no_live_link_nothing_is_in_transit() {
     let orch = test_orchestrator("in-transit-nothing");
-
-    let checked = check(&orch, &bridging_conductor(), false).await.unwrap();
-    assert_lists(&checked.listed, &[]);
-    checked.exit.unwrap();
+    for mark_failed in [false, true] {
+        let checked = check(&orch, &bridging_conductor(), mark_failed)
+            .await
+            .unwrap();
+        assert_lists(&checked.listed, &[]);
+        checked.exit.unwrap();
+    }
 
     enqueue_lock(&orch, "lock:carried-on:1", "0xc1");
     enqueue_at_cl_rave_executed(&orch, "lock:carried-on:2", "0xc2");
     paid(&orch, "lock:carried-on:3", "0xc3");
+    let before = snapshot(&orch);
 
-    let checked = check(&orch, &bridging_conductor(), false).await.unwrap();
-    assert_lists(&checked.listed, &[]);
-    checked
-        .exit
-        .expect("the new orchestrator carries on a row that waits on no link");
+    for mark_failed in [false, true] {
+        let checked = check(&orch, &bridging_conductor(), mark_failed)
+            .await
+            .unwrap();
+        assert_lists(&checked.listed, &[]);
+        checked
+            .exit
+            .expect("the new orchestrator carries on a row that waits on no link");
+    }
+    assert_eq!(snapshot(&orch), before);
 }
 
 #[tokio::test]
-async fn a_row_waiting_on_its_link_is_in_transit_until_it_is_failed() {
+async fn a_row_waiting_on_its_link_is_in_transit_in_any_pending_state_until_it_is_failed() {
     let orch = test_orchestrator("in-transit-rows");
     let rows = [
         waiting_at(&orch, WorkStep::ClLinkCreated, "lock:waits:1", "0xc4", 0x61),
@@ -140,7 +180,17 @@ async fn a_row_waiting_on_its_link_is_in_transit_until_it_is_failed() {
             "0xc5",
             0x62,
         ),
+        waiting_at(&orch, WorkStep::ClLinkCreated, "lock:waits:3", "0xc6", 0x63),
+        waiting_at(
+            &orch,
+            WorkStep::BrSpendCreated,
+            "lock:waits:4",
+            "0xc7",
+            0x64,
+        ),
     ];
+    set_state(&orch, rows[2], "in_flight");
+    set_state(&orch, rows[3], "claimed");
 
     let checked = check(&orch, &bridging_conductor(), false).await.unwrap();
     assert_lists(
@@ -148,9 +198,11 @@ async fn a_row_waiting_on_its_link_is_in_transit_until_it_is_failed() {
         &[
             listed_row("lock:waits:1", "cl_link_created", 0x61),
             listed_row("lock:waits:2", "br_spend_created", 0x62),
+            listed_row("lock:waits:3", "cl_link_created", 0x63),
+            listed_row("lock:waits:4", "br_spend_created", 0x64),
         ],
     );
-    checked.exit.expect_err("a row in transit");
+    checked.exit.expect_err("rows in transit");
 
     for id in rows {
         orch.db
@@ -163,49 +215,101 @@ async fn a_row_waiting_on_its_link_is_in_transit_until_it_is_failed() {
 }
 
 #[tokio::test]
-async fn a_live_withdrawal_and_a_link_no_row_records_are_in_transit() {
+async fn each_live_withdrawal_and_deposit_link_is_in_transit_on_its_own() {
     let orch = test_orchestrator("in-transit-live");
     let unrecorded = parked_tx(
-        0x63,
+        0x65,
         &[
-            proof("lock:no-row:2", "0xc7"),
-            proof("lock:no-row:1", "0xc6"),
+            proof("lock:no-row:2", "0xc9"),
+            proof("lock:no-row:1", "0xc8"),
         ],
     );
-    let conductor = bridging_conductor()
-        .parking(action_hash(CL_EA), std::slice::from_ref(&unrecorded))
-        .parking(action_hash(BR_EA), &[parked_withdrawal_tx(0x64)]);
+    let mut unreadable = parked_tx(0x66, &[]);
+    if let TransactionDetails::Parked {
+        attached_payload, ..
+    } = &mut unreadable.details
+    {
+        attached_payload["proof_of_deposit"] = json!("not a list");
+    }
+    let spend = parked_spend_tx(0x67, &[proof("lock:no-row:3", "0xca")]);
 
-    let checked = check(&orch, &conductor, false).await.unwrap();
+    for (agreement, parked, expected) in [
+        (
+            CL_EA,
+            vec![unrecorded.clone()],
+            vec![listed_link(
+                CL_EA,
+                &unrecorded,
+                &["lock:no-row:1", "lock:no-row:2"],
+            )],
+        ),
+        (
+            CL_EA,
+            vec![unreadable.clone()],
+            vec![listed_link(CL_EA, &unreadable, &[])],
+        ),
+        (
+            BR_EA,
+            vec![spend.clone()],
+            vec![listed_link(BR_EA, &spend, &["lock:no-row:3"])],
+        ),
+        (
+            BR_EA,
+            vec![parked_withdrawal_tx(0x68), parked_withdrawal_tx(0x69)],
+            vec![listed_withdrawal(0x68), listed_withdrawal(0x69)],
+        ),
+    ] {
+        let conductor = bridging_conductor().parking(action_hash(agreement), &parked);
 
-    assert_lists(
-        &checked.listed,
-        &[
-            listed_link(CL_EA, &unrecorded, &["lock:no-row:1", "lock:no-row:2"]),
-            listed_withdrawal(0x64),
-        ],
-    );
-    checked.exit.expect_err("links in transit");
+        let checked = check(&orch, &conductor, false).await.unwrap();
+
+        assert_lists(&checked.listed, &expected);
+        checked.exit.expect_err("in transit");
+    }
 }
 
 #[tokio::test]
-async fn a_foreign_spend_in_the_bridging_agents_role_is_not_in_transit() {
-    let orch = test_orchestrator("in-transit-foreign");
-    let lock = [proof("lock:foreign:1", "0xc8")];
+async fn a_spend_no_cycle_takes_and_a_link_another_agent_parked_are_not_in_transit() {
+    let orch = test_orchestrator("in-transit-passed-by");
+    enqueue_lock(&orch, "lock:copied:1", "0xcb");
+    enqueue_at_cl_rave_executed(&orch, "lock:copied:2", "0xcc");
+    let (credit, bridged) = (
+        [proof("lock:copied:1", "0xcb")],
+        [proof("lock:copied:2", "0xcc")],
+    );
     let conductor = bridging_conductor()
         .parking(
             action_hash(CL_EA),
-            &[signed_by_another(parked_tx(0x6D, &lock))],
+            &[signed_by_another(parked_tx(0x6A, &credit))],
         )
         .parking(
             action_hash(BR_EA),
-            &[signed_by_another(parked_spend_tx(0x65, &lock))],
+            &[
+                spend_as(
+                    signed_by_another(parked_spend_tx(0x6B, &[])),
+                    BRIDGING_AGENT_ROLE,
+                    json!({ "proof_of_deposit": bridged, "withdraw_to_address": "0x11" }),
+                ),
+                spend_as(
+                    parked_spend_tx(0x6C, &[]),
+                    ORACLE_ROLE,
+                    json!({ "proof_of_deposit": bridged }),
+                ),
+                spend_as(
+                    parked_withdrawal_tx(0x6D),
+                    WITHDRAWER_ROLE,
+                    json!({ "proof_of_deposit": bridged }),
+                ),
+            ],
         );
+    let before = snapshot(&orch);
 
-    let checked = check(&orch, &conductor, false).await.unwrap();
-
-    assert_lists(&checked.listed, &[]);
-    checked.exit.unwrap();
+    for mark_failed in [false, true] {
+        let checked = check(&orch, &conductor, mark_failed).await.unwrap();
+        assert_lists(&checked.listed, &[]);
+        checked.exit.unwrap();
+    }
+    assert_eq!(snapshot(&orch), before, "a copied proof marks no row");
 }
 
 #[tokio::test]
@@ -222,59 +326,108 @@ async fn an_agreement_that_cannot_be_read_fails_the_check() {
 #[tokio::test]
 async fn mark_failed_fails_each_row_in_transit_and_changes_no_other() {
     let orch = test_orchestrator("in-transit-mark");
-    let parked = waiting_at(&orch, WorkStep::ClLinkCreated, "lock:mark:1", "0xd1", 0x66);
-    let spent = waiting_at(&orch, WorkStep::BrSpendCreated, "lock:mark:2", "0xd2", 0x67);
+    let parked = waiting_at(&orch, WorkStep::ClLinkCreated, "lock:mark:1", "0xd1", 0x70);
+    let spent = waiting_at(&orch, WorkStep::BrSpendCreated, "lock:mark:2", "0xd2", 0x71);
     let written = enqueue_lock(&orch, "lock:mark:3", "0xd3");
+    set_state(&orch, written, "in_flight");
     let paid = paid(&orch, "lock:mark:4", "0xd4");
     let failed = enqueue_lock(&orch, "lock:mark:5", "0xd5");
     orch.db
         .mark_failed_permanent(failed, "resolved by a person")
         .unwrap();
     let carried_on = enqueue_lock(&orch, "lock:mark:6", "0xd6");
+    let spent_late = enqueue_at_cl_rave_executed(&orch, "lock:mark:7", "0xd7");
+    let own = parked_tx(0x70, &[proof("lock:mark:1", "0xd1")]);
     let late = parked_tx(
-        0x68,
+        0x73,
         &[
             proof("lock:mark:3", "0xd3"),
             proof("lock:mark:4", "0xd4"),
             proof("lock:mark:5", "0xd5"),
         ],
     );
-    let conductor = bridging_conductor().parking(action_hash(CL_EA), std::slice::from_ref(&late));
+    let late_spend = parked_spend_tx(0x72, &[proof("lock:mark:7", "0xd7")]);
+    let conductor = bridging_conductor()
+        .parking(action_hash(CL_EA), &[own.clone(), late.clone()])
+        .parking(action_hash(BR_EA), std::slice::from_ref(&late_spend));
     let before = snapshot(&orch);
 
     let checked = check(&orch, &conductor, true).await.unwrap();
 
-    assert_lists(
-        &checked.listed,
-        &[
-            listed_row("lock:mark:1", "cl_link_created", 0x66),
-            listed_row("lock:mark:2", "br_spend_created", 0x67),
-            listed_link(CL_EA, &late, &["lock:mark:3", "lock:mark:4", "lock:mark:5"]),
-        ],
-    );
+    let links = [
+        listed_link(CL_EA, &own, &["lock:mark:1"]),
+        listed_link(CL_EA, &late, &["lock:mark:3", "lock:mark:4", "lock:mark:5"]),
+        listed_link(BR_EA, &late_spend, &["lock:mark:7"]),
+    ];
+    let rows = [
+        listed_row("lock:mark:1", "cl_link_created", 0x70),
+        listed_row("lock:mark:2", "br_spend_created", 0x71),
+    ];
+    assert_lists(&checked.listed, &[&rows[..], &links].concat());
     checked.exit.unwrap();
     let after = snapshot(&orch);
-    for id in [parked, spent, written] {
+    for id in [parked, spent, written, spent_late] {
         let row = failed_row(&orch, id);
         assert_eq!(row.error_class.as_deref(), Some("permanent"));
         assert_eq!(row.last_error.as_deref(), Some(PAID_BY_HAND));
-        assert_eq!(after[&id]["step"], before[&id]["step"]);
+        assert_eq!(
+            without_the_mark(&after[&id]),
+            without_the_mark(&before[&id])
+        );
     }
     for id in [paid, failed, carried_on] {
         assert_eq!(after[&id], before[&id]);
     }
+
+    let checked = check(&orch, &conductor, false).await.unwrap();
+    assert_lists(&checked.listed, &links);
+    checked.exit.expect_err("the links stay live");
+}
+
+#[tokio::test]
+async fn mark_failed_takes_a_row_by_its_own_lock_only() {
+    let orch = test_orchestrator("in-transit-mark-lock");
+    let sibling = enqueue_lock(&orch, "lock:match:1", "0xe1");
+    let own = enqueue_lock(&orch, "lock:match:2", "0xE3AB");
+    let link = parked_tx(
+        0x74,
+        &[
+            proof("lock:match:1", "0xe2"),
+            proof("lock:match:2", "0xe3ab"),
+        ],
+    );
+    let conductor = bridging_conductor().parking(action_hash(CL_EA), &[link]);
+    let before = snapshot(&orch);
+
+    check(&orch, &conductor, true).await.unwrap().exit.unwrap();
+
+    assert_eq!(
+        failed_row(&orch, own).last_error.as_deref(),
+        Some(PAID_BY_HAND)
+    );
+    assert_eq!(
+        snapshot(&orch)[&sibling],
+        before[&sibling],
+        "the same lock ID in another transaction is another lock"
+    );
 }
 
 #[tokio::test]
 async fn mark_failed_records_a_link_no_row_records_and_a_withdrawal_only_in_its_list() {
     let orch = test_orchestrator("in-transit-mark-unrecorded");
-    enqueue_lock(&orch, "lock:unmarked:1", "0xd7");
-    paid(&orch, "lock:unmarked:2", "0xd8");
-    let unrecorded = parked_spend_tx(0x69, &[proof("lock:no-row:3", "0xd9")]);
-    let conductor = bridging_conductor().parking(
-        action_hash(BR_EA),
-        &[unrecorded.clone(), parked_withdrawal_tx(0x6A)],
+    enqueue_lock(&orch, "lock:unmarked:1", "0xd8");
+    paid(&orch, "lock:unmarked:2", "0xd9");
+    let unrecorded = parked_spend_tx(0x69, &[proof("lock:no-row:4", "0xda")]);
+    let withdrawal = spend_as(
+        parked_withdrawal_tx(0x6A),
+        WITHDRAWER_ROLE,
+        json!({
+            "withdraw_to_address": format!("{:#x}", Address::repeat_byte(0x6A)),
+            "proof_of_deposit": [proof("lock:unmarked:1", "0xd8")],
+        }),
     );
+    let conductor =
+        bridging_conductor().parking(action_hash(BR_EA), &[unrecorded.clone(), withdrawal]);
     let before = snapshot(&orch);
 
     let checked = check(&orch, &conductor, true).await.unwrap();
@@ -282,7 +435,7 @@ async fn mark_failed_records_a_link_no_row_records_and_a_withdrawal_only_in_its_
     assert_lists(
         &checked.listed,
         &[
-            listed_link(BR_EA, &unrecorded, &["lock:no-row:3"]),
+            listed_link(BR_EA, &unrecorded, &["lock:no-row:4"]),
             listed_withdrawal(0x6A),
         ],
     );
@@ -297,14 +450,14 @@ async fn mark_failed_changes_no_row_when_a_read_or_the_second_write_fails() {
         &orch,
         WorkStep::ClLinkCreated,
         "lock:refused:1",
-        "0xda",
+        "0xdb",
         0x6B,
     );
     let second = waiting_at(
         &orch,
         WorkStep::BrSpendCreated,
         "lock:refused:2",
-        "0xdb",
+        "0xdc",
         0x6C,
     );
     let before = snapshot(&orch);
@@ -331,4 +484,11 @@ async fn mark_failed_changes_no_row_when_a_read_or_the_second_write_fails() {
         "{e:#}"
     );
     assert_eq!(snapshot(&orch), before, "the first write is undone with it");
+    assert_lists(
+        &checked.listed,
+        &[
+            listed_row("lock:refused:1", "cl_link_created", 0x6B),
+            listed_row("lock:refused:2", "br_spend_created", 0x6C),
+        ],
+    );
 }

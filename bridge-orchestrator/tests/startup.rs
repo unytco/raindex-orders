@@ -122,13 +122,19 @@ fn in_transit_refuses_a_database_that_is_not_there() {
 }
 
 #[test]
-fn in_transit_fails_when_it_cannot_reach_the_conductor() {
+fn in_transit_fails_when_the_conductor_refuses_it() {
     let dir = tempfile::tempdir().unwrap();
+    let passphrase = dir.path().join("lair-passphrase");
+    std::fs::write(&passphrase, "deadbeef\n").unwrap();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port().to_string();
+    drop(closed);
     let mut env = node(dir.path());
-    env.push((
-        "LAIR_PASSPHRASE_FILE",
-        dir.path().join("no-passphrase").display().to_string(),
-    ));
+    env.extend([
+        ("LAIR_PASSPHRASE_FILE", passphrase.display().to_string()),
+        ("HOLOCHAIN_ADMIN_PORT", port.clone()),
+        ("HOLOCHAIN_APP_PORT", port),
+    ]);
     assert!(orchestrator(dir.path(), &env, &["status"]).status.success());
 
     for args in IN_TRANSIT {
@@ -136,7 +142,10 @@ fn in_transit_fails_when_it_cannot_reach_the_conductor() {
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{args:?}");
-        assert!(stderr.contains("no-passphrase"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("Failed to connect to Holochain"),
+            "{args:?}: {stderr}"
+        );
     }
 }
 

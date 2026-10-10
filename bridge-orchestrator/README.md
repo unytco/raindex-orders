@@ -111,30 +111,39 @@ bridge-orchestrator in-transit
 bridge-orchestrator in-transit --mark-failed
 ```
 
-It prints one JSON object per line for each transfer in transit:
+It prints one JSON object per line:
 
 | `kind` | What is in transit | Fields |
 |--------|--------------------|--------|
 | `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created` | `item_id`, `lock_id`, `step`, `link` |
-| `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the lane's credit-limit adjustment agreement or its bridging agreement | `agreement`, `link`, `lock_ids` |
-| `withdrawal` | A live spend in the `withdrawer` role on the bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address` |
+| `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the credit-limit adjustment agreement or the bridging agreement of its lane in force | `agreement`, `link`, `lock_ids` |
+| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement, naming `withdraw_to_address` | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address` |
 
-A `failed` row is not listed, and nor is a spend that no cycle takes: one in
-another role that is not the bridging agent's own deposit. Log lines go to
-stdout too, and never start with `{`.
+`lock_id` is `null` for a row whose payload cannot be read, and `link` for one
+that records none.
+`amount` is the spend's unit map, its HOT under `HOT_UNIT_INDEX`. A `failed`
+row is not listed, and nor is a spend no cycle takes: another agent's spend in
+the `bridging_agent` role, a spend in any other role, or a `withdrawer` spend
+naming no `withdraw_to_address`. Log lines go to stdout too, and never start
+with `{`.
 
-It exits 0 only when it read both and found nothing. A `DB_PATH` that does not
-exist fails it.
+It exits 0 only when it read the database and the conductor and found nothing.
+A `DB_PATH` that does not exist fails it.
 
 `--mark-failed` lists the same, then marks `failed` each listed row and each
 row, neither `succeeded` nor `failed`, whose lock is in a listed link. Each
 gets `last_error` `in transit at the old network's close; it is paid by hand on
 the new network`, so the new network's orchestrator pays none of them. It marks
 all of them in one transaction, or none, and changes no other row. It exits 0
-only when it read both and marked them. A listed link no row records, and a
-withdrawal, are recorded only in what it prints. Each transfer it lists is paid
-by hand on the new network, once the person who pays has checked that the old
-network did not pay it.
+only when it read the database and the conductor and marked them. A lock in a
+listed link whose row is already `succeeded` or `failed`, a lock with no row,
+and a withdrawal are recorded only in what it prints.
+
+What it lists is paid by hand on the new network, once the person who pays has
+checked that the old network did not pay it. Pay each lock ID once: a deposit
+waiting on its link shows both as its `row` and in the `lock_ids` of the link
+carrying it, and an earlier `failed` row may name it too. A lock whose row is
+`succeeded` was paid. Pay each withdrawal once, by its `spend`.
 
 ## Environment variables
 
@@ -403,8 +412,9 @@ check the link it records (`cl_link_hash`, or `br_spend_hash` once it has one):
 while a failed row records a live link, that link is never paid, and re-queuing
 the row can let the next RAVE pay it. Leave a row whose `last_error` ends
 `resolve by hand` failed: check by hand whether its depositor was credited, and
-credit it by hand only if not and its link is not live. Leave failed, too, a
-row `in-transit --mark-failed` marked: it is paid by hand on the new network.
+credit it by hand only if not and its link is not live. Also leave failed a row
+whose `last_error` is `in transit at the old network's close; it is paid by hand
+on the new network`.
 Rows left `claimed` or `in_flight` need no action: startup re-queues them.
 
 ### systemd service management

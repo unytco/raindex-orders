@@ -62,8 +62,8 @@ enum Command {
     },
     /// List each transfer the bridging agent's network still holds, for a migration's close.
     InTransit {
-        /// Then mark failed, in one transaction, each pending row in transit, to be paid by hand
-        /// on the new network.
+        /// After listing, mark failed each pending row in transit or carried by a listed link, all
+        /// or none, to be paid by hand on the new network. Exits 0 once they are marked.
         #[arg(long)]
         mark_failed: bool,
     },
