@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - bridge-orchestrator credits both deposits when one Ethereum transaction locks twice, for deposits it records from this release on.
+- bridge-orchestrator marks a deposit bridged only once a RAVE has taken its link, so a deposit whose link the template refused waits instead.
 
 ## [0.3.0] - 2026-10-06
 
