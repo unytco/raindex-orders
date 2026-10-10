@@ -1,5 +1,14 @@
 import { derived, get, writable, type Readable, type Writable } from 'svelte/store'
-import { numberToHex, type Abi, type Hex } from 'viem'
+import {
+	createPublicClient,
+	custom,
+	numberToHex,
+	WaitForTransactionReceiptTimeoutError,
+	type Abi,
+	type Hex,
+	type ReplacementReason,
+	type TransactionReceipt
+} from 'viem'
 import { bridge } from './config'
 import { errorMessage } from './utils'
 
@@ -118,6 +127,8 @@ function handleChainChanged(chainId: string) {
 	}))
 }
 
+export const userRejected = (err: unknown) => (err as { code?: number } | null)?.code === 4001
+
 export async function connectWallet(): Promise<string | null> {
 	const eth = getEthereum()
 	if (!eth) {
@@ -141,11 +152,12 @@ export async function connectWallet(): Promise<string | null> {
 
 		return accounts[0]
 	} catch (err) {
-		const rejected = (err as { code?: number } | null)?.code === 4001
 		ethereumStore.update(s => ({
 			...s,
 			isLoading: false,
-			error: rejected ? 'Connection rejected by user' : errorMessage(err, 'Failed to connect')
+			error: userRejected(err)
+				? 'Connection rejected by user'
+				: errorMessage(err, 'Failed to connect')
 		}))
 		return null
 	}
@@ -181,32 +193,118 @@ export async function switchNetwork(): Promise<boolean> {
 	}
 }
 
-/** The receipt of `txHash` once it is mined, or an error if the transaction reverted. */
-export async function waitForTransaction(txHash: string): Promise<unknown> {
+export const CONFIRMATION_TIMEOUT_MS = 5 * 60_000
+
+export type TransactionOutcome = 'reverted' | 'cancelled' | 'replaced' | 'pending' | 'unreadable'
+
+const OUTCOME_MESSAGES: Record<TransactionOutcome, string> = {
+	reverted: 'The transaction failed on the network, so nothing changed. Try again.',
+	cancelled: 'You cancelled the transaction in your wallet, so nothing changed.',
+	replaced:
+		"Your wallet replaced the transaction with another one. Check your wallet's activity before you try again.",
+	pending:
+		"The transaction is still waiting to be confirmed. Check your wallet's activity before you try again.",
+	unreadable:
+		"The transaction was sent, but its result could not be read. Check your wallet's activity before you try again."
+}
+
+export type MinedDetails = {
+	blockNumber: bigint
+	gasUsed: bigint
+	gasLimit?: bigint
+	effectiveGasPrice: bigint
+}
+
+/** A sent transaction that did not end in success. `hash` is the one that landed, if another did. */
+export class TransactionOutcomeError extends Error {
+	readonly outcome: TransactionOutcome
+	readonly sentHash: string
+	readonly hash: string
+	readonly mined?: MinedDetails
+
+	constructor(
+		outcome: TransactionOutcome,
+		init: { sentHash: string; hash?: string; mined?: MinedDetails; cause?: unknown }
+	) {
+		super(OUTCOME_MESSAGES[outcome], { cause: init.cause })
+		this.outcome = outcome
+		this.sentHash = init.sentHash
+		this.hash = init.hash ?? init.sentHash
+		this.mined = init.mined
+	}
+
+	get unconfirmed() {
+		return this.outcome === 'pending' || this.outcome === 'unreadable'
+	}
+}
+
+const POLLING_INTERVAL_MS = 2_000
+
+/** `eth`'s requests while it is on this build's chain: another chain's block numbers derail the wait. */
+function onBridgeChain(eth: Eip1193Provider) {
+	return async (args: { method: string; params?: unknown[] }) => {
+		await requireBridgeChain(eth)
+		const result = await eth.request(args)
+		await requireBridgeChain(eth)
+		return result
+	}
+}
+
+/** The receipt of `sentHash`, or of the transaction the wallet sped it up with. */
+export async function waitForTransaction(sentHash: string): Promise<TransactionReceipt> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
-
-	return new Promise((resolve, reject) => {
-		const checkReceipt = async () => {
-			try {
-				const receipt = (await eth.request({
-					method: 'eth_getTransactionReceipt',
-					params: [txHash]
-				})) as { status?: string } | null
-
-				if (!receipt) {
-					setTimeout(checkReceipt, 2000)
-				} else if (receipt.status === '0x1') {
-					resolve(receipt)
-				} else {
-					reject(new Error(`Transaction ${txHash} reverted`))
-				}
-			} catch (err) {
-				reject(err)
-			}
-		}
-		checkReceipt()
+	const client = createPublicClient({
+		chain: bridge.chain,
+		transport: custom({ request: onBridgeChain(eth) })
 	})
+	const deadline = Date.now() + CONFIRMATION_TIMEOUT_MS
+	let lastFailure: { error: unknown; at: number } | undefined
+	const stillFailing = () =>
+		lastFailure && Date.now() - lastFailure.at < 3 * POLLING_INTERVAL_MS ? lastFailure : undefined
+
+	for (;;) {
+		let replacement: ReplacementReason | undefined
+		let receipt: TransactionReceipt
+		try {
+			receipt = await client.waitForTransactionReceipt({
+				hash: sentHash as Hex,
+				pollingInterval: POLLING_INTERVAL_MS,
+				timeout: Math.max(deadline - Date.now(), 1),
+				onReplaced: replaced => {
+					replacement = replaced.reason
+				}
+			})
+		} catch (err) {
+			if (err instanceof WaitForTransactionReceiptTimeoutError) {
+				const failing = stillFailing()
+				throw new TransactionOutcomeError(failing ? 'unreadable' : 'pending', {
+					sentHash,
+					cause: failing?.error ?? err
+				})
+			}
+			lastFailure = { error: err, at: Date.now() }
+			if (Date.now() + POLLING_INTERVAL_MS >= deadline) {
+				throw new TransactionOutcomeError('unreadable', { sentHash, cause: err })
+			}
+			await new Promise(resolve => setTimeout(resolve, POLLING_INTERVAL_MS))
+			continue
+		}
+
+		if (receipt.status === 'success' && (!replacement || replacement === 'repriced')) {
+			return receipt
+		}
+		const landed = await client.getTransaction({ hash: receipt.transactionHash }).catch(() => null)
+		const mined = {
+			blockNumber: receipt.blockNumber,
+			gasUsed: receipt.gasUsed,
+			gasLimit: landed?.gas,
+			effectiveGasPrice: receipt.effectiveGasPrice
+		}
+		const outcome =
+			replacement === 'cancelled' || replacement === 'replaced' ? replacement : 'reverted'
+		throw new TransactionOutcomeError(outcome, { sentHash, hash: receipt.transactionHash, mined })
+	}
 }
 
 // Contract interaction helpers using raw ethereum calls
@@ -248,12 +346,24 @@ export async function readContract(params: {
 	return result
 }
 
+export const SWITCH_NETWORK = `Switch your wallet to ${bridge.networkName} first`
+
+/** The chain the wallet itself is on, which can differ from the one it last reported. */
+export async function walletChainId(eth: Eip1193Provider) {
+	return parseInt((await eth.request({ method: 'eth_chainId' })) as string, 16)
+}
+
+export async function requireBridgeChain(eth: Eip1193Provider) {
+	if ((await walletChainId(eth)) !== bridge.chain.id) throw new Error(SWITCH_NETWORK)
+}
+
 export async function writeContract(params: {
 	address: string
 	abi: Abi
 	functionName: string
 	args?: readonly unknown[]
 	value?: bigint
+	from?: string
 }): Promise<string> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
@@ -266,12 +376,9 @@ export async function writeContract(params: {
 		args: params.args || []
 	})
 
-	const { account } = get(ethereumStore)
+	const account = params.from ?? get(ethereumStore).account
 	if (!account) throw new Error('Not connected')
-	const walletChain = parseInt((await eth.request({ method: 'eth_chainId' })) as string, 16)
-	if (walletChain !== bridge.chain.id) {
-		throw new Error(`Switch your wallet to ${bridge.networkName} first`)
-	}
+	await requireBridgeChain(eth)
 
 	const txHash = (await eth.request({
 		method: 'eth_sendTransaction',

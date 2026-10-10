@@ -66,7 +66,66 @@ describe.each(['sepolia', 'mainnet'] as const)('TransactionModal on %s', network
 		expect(hasCloseButton(html)).toBe(true)
 	})
 
+	it('a transaction that failed shows its message and links to the explorer', () => {
+		transactionStore.awaitWalletConfirmation()
+		transactionStore.awaitTxReceipt(HASH)
+		transactionStore.transactionError({ message: 'Your claim did not go through.' })
+		const html = render()
+
+		expect(html).toContain('>Your claim did not go through.</p>')
+		expect(html).toContain(ETHERSCAN)
+		expect(html.split(HASH)).toHaveLength(2)
+		expect(hasCloseButton(html)).toBe(true)
+	})
+
+	it('an error before any transaction links nowhere, even after an earlier one', () => {
+		transactionStore.awaitWalletConfirmation()
+		transactionStore.awaitTxReceipt(HASH)
+		transactionStore.awaitWalletConfirmation(true)
+		transactionStore.transactionError({ message: 'This coupon has already been claimed.' })
+		const html = render()
+
+		expect(html).toContain('This coupon has already been claimed.')
+		expect(html).not.toContain(HASH)
+		expect(html).not.toContain('View transaction on Etherscan')
+	})
+
+	it('shows the coupon check as its own step', () => {
+		transactionStore.awaitCheck()
+		const html = render()
+
+		expect(html).toContain('Checking your coupon…')
+		expect(html).not.toContain('Waiting for your manual confirmation')
+	})
+
+	it('a claim not confirmed in time says so with its link, apart from a failure', () => {
+		transactionStore.awaitCheck()
+		transactionStore.awaitTxReceipt(HASH)
+		transactionStore.transactionError({
+			message: 'Your claim is still waiting to be confirmed.',
+			unconfirmed: true
+		})
+		const html = render()
+
+		expect(html).toContain('>Your claim is still waiting to be confirmed.</p>')
+		expect(html).toContain('⏳')
+		expect(html).not.toContain('❌')
+		expect(html).toContain(ETHERSCAN)
+		expect(hasCloseButton(html)).toBe(true)
+	})
+
+	it('a failure keeps the link of a transaction even after the modal was closed', () => {
+		transactionStore.awaitCheck()
+		transactionStore.reset()
+		transactionStore.transactionError({ message: 'Your claim did not go through.', hash: HASH })
+		const html = render()
+
+		expect(html).toContain('❌')
+		expect(html).toContain(ETHERSCAN)
+	})
+
 	it.each([
+		['checking the coupon', () => transactionStore.awaitCheck()],
 		['waiting for the wallet', () => transactionStore.awaitWalletConfirmation(true)],
 		[
 			'confirming on-chain',
@@ -75,13 +134,24 @@ describe.each(['sepolia', 'mainnet'] as const)('TransactionModal on %s', network
 				transactionStore.awaitTxReceipt(HASH)
 			}
 		]
-	])('cannot be dismissed while %s', (_state, enter) => {
+	])('can be closed while %s', (_state, enter) => {
 		enter()
 		const html = render()
 
 		expect(html).toContain('role="dialog"')
-		expect(hasX(html)).toBe(false)
-		expect(hasCloseButton(html)).toBe(false)
+		expect(hasX(html)).toBe(true)
+	})
+
+	it('a pending step the user hides comes back at the next step, still a lock', () => {
+		transactionStore.awaitWalletConfirmation(true)
+		transactionStore.dismiss()
+		expect(render()).not.toContain('role="dialog"')
+
+		transactionStore.awaitTxReceipt(HASH)
+		expect(render()).toContain('role="dialog"')
+
+		transactionStore.transactionSuccess(HASH)
+		expect(render()).toContain('Lock almost complete')
 	})
 
 	it('renders nothing while idle', () => {

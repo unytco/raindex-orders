@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- the claim page says why a claim failed and what to do next, and sends no claim the bridge would refuse.
+- a claim or lock sped up, cancelled or replaced in the wallet ends with its real result, a transaction not confirmed within five minutes says it is still pending, and the transaction window can always be closed.
+
 ## [0.3.0] - 2026-10-06
 
 ### Added
