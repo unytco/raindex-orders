@@ -1387,6 +1387,24 @@ mod tests {
     }
 
     #[test]
+    fn the_cycles_mark_takes_a_row_by_its_id_alone() {
+        let path = test_db_path("mark-failed-by-id");
+        let store = StateStore::open(&path).unwrap();
+        insert_work_item_with_state(&path, "lock:1", WorkState::Failed);
+        let id = store
+            .list_work_items("lock", WorkState::Failed, 10)
+            .unwrap()[0]
+            .id;
+
+        store.mark_failed_permanent(id, "a second reason").unwrap();
+
+        let failed = store
+            .list_work_items("lock", WorkState::Failed, 10)
+            .unwrap();
+        assert_eq!(failed[0].last_error.as_deref(), Some("a second reason"));
+    }
+
+    #[test]
     fn fail_exhausted_queued_promotes_rows_over_cap() {
         let path = test_db_path("fail-exhausted-over-cap");
         let store = StateStore::open(&path).unwrap();
