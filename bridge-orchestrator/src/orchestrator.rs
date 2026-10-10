@@ -14,9 +14,9 @@ use ham::{
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey, AgentPubKeyB64, AnyDhtHash};
 use holochain_zome_types::prelude::{ActionData, GetOptions, GetStrategy, Record};
 use rave_engine::types::{
-    CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, LaneDefinition, LaneExt,
-    Ledger, ParkedData, ParkedLinkType, ParkedSpendData, RAVEExecuteInputs, RAVEInput, Transaction,
-    TransactionDetails, UnitFee, UnitMap, RAVE,
+    CreateParkedLinkInput, CreateParkedSpendInput, GlobalDefinitionExt, History, LaneDefinition,
+    LaneExt, Ledger, Pagination, ParkedData, ParkedLinkType, ParkedSpendData, RAVEExecuteInputs,
+    RAVEInput, Transaction, TransactionDetails, UnitFee, UnitMap, RAVE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1148,8 +1148,7 @@ impl BridgeOrchestrator {
     /// * `step='new'` and the lock's own proof is in a live CL parked link →
     ///   advance to `cl_link_created` with that link's ActionHash.
     /// * `step='cl_link_created'` and [`Self::link_consumed`] → advance to
-    ///   `cl_rave_executed` with `cl_rave_hash=NULL` (we can't recover the
-    ///   actual RAVE hash after the fact).
+    ///   `cl_rave_executed` with `cl_rave_hash=NULL`.
     /// * `step='cl_rave_executed'` and the lock's own proof is in a live
     ///   bridging parked spend → advance to `br_spend_created` with that
     ///   spend's ActionHash.
@@ -1240,9 +1239,10 @@ impl BridgeOrchestrator {
     }
 
     /// Whether a RAVE consumed the link a row waits on: it has left the
-    /// agreement it was parked on, and the bridging agent's conductor still
-    /// holds it as the row's own write. A link it no longer holds was rolled
-    /// back, and its row goes back to the step that writes it.
+    /// agreement it was parked on, the bridging agent's conductor still holds
+    /// it as the row's own write, and one of the bridging agent's own RAVEs
+    /// records it consumed. A link it no longer holds was rolled back, and its
+    /// row goes back to the step that writes it.
     async fn link_consumed(
         &self,
         conductor: &impl ConductorReads,
@@ -1278,18 +1278,24 @@ impl BridgeOrchestrator {
         if !parked {
             match held_link(conductor, live, link).await {
                 Ok(Some(record)) => {
+                    let link_seq = record.action().action_seq();
                     return match self.recorded_write(record, row) {
-                        // A link gone counts as consumed: the HOT templates
-                        // redact none (workshop
-                        // `documentation/specs/bridge-stop/README.md`
-                        // § Operating assumptions and limits).
-                        RecordedWrite::Own => {
-                            debug!(
-                                "[bridge/reconcile] lock={} at {}: link {} left agreement {}",
-                                row.item_id, row.step, link, agreement
-                            );
-                            Ok(true)
-                        }
+                        RecordedWrite::Own => match live.consumer(conductor, link, link_seq).await {
+                            Ok(Some(rave)) => {
+                                debug!(
+                                    "[bridge/reconcile] lock={} at {}: RAVE {} consumed link {} off agreement {}",
+                                    row.item_id, row.step, rave, link, agreement
+                                );
+                                Ok(true)
+                            }
+                            Ok(None) => self.for_a_person(
+                                row,
+                                "bridge.reconcile.link_not_consumed",
+                                link,
+                                &format!("left agreement {agreement}, and no RAVE of the bridging agent consumed it"),
+                            ),
+                            Err(e) => Self::unresolved(row, link, e),
+                        },
                         RecordedWrite::Unreadable(e) => {
                             error!(
                                 event = "bridge.reconcile.unresolved",
@@ -1305,7 +1311,9 @@ impl BridgeOrchestrator {
                         // credited cannot be told from here, so a person resolves it
                         // (workshop `documentation/specs/bridge-stop/README.md`
                         // § Operating assumptions and limits).
-                        RecordedWrite::Misrecorded(why) => self.for_a_person(row, link, &why),
+                        RecordedWrite::Misrecorded(why) => {
+                            self.for_a_person(row, "bridge.rave.proof_missing", link, &why)
+                        }
                     };
                 }
                 Ok(None) => return self.lost(row, link),
@@ -1361,6 +1369,7 @@ impl BridgeOrchestrator {
         if !row.parked_link_own() {
             return self.for_a_person(
                 row,
+                "bridge.reconcile.link_not_held",
                 link,
                 "is not held by this node, and an older release recorded it",
             );
@@ -1377,10 +1386,10 @@ impl BridgeOrchestrator {
     }
 
     /// Fails `row` with `why` for a person to resolve.
-    fn for_a_person(&self, row: &WorkItem, link: &str, why: &str) -> Result<bool> {
+    fn for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<bool> {
         let lock = self.lock_key(row);
         error!(
-            event = "bridge.rave.proof_missing",
+            event,
             lock_id = lock.as_ref().map(|lock| lock.lock_id.as_str()),
             tx_hash = lock.as_ref().map(|lock| lock.tx_hash.as_str()),
             link,
@@ -1392,7 +1401,7 @@ impl BridgeOrchestrator {
         );
         self.db.mark_failed_permanent(
             row.id,
-            &format!("mis-recorded legacy row: its recorded link {link} {why}; resolve by hand"),
+            &format!("its recorded link {link} {why}; resolve by hand"),
         )?;
         Ok(false)
     }
@@ -1918,6 +1927,12 @@ trait ConductorReads {
     /// The link's record from the bridging agent's conductor's local
     /// databases, `None` if it holds none.
     async fn held(&self, link: ActionHash) -> Result<Option<Record>>;
+    async fn raves(&self, from: ChainRead) -> Result<ChainPage>;
+}
+
+struct ChainPage {
+    raves: Vec<RaveRun>,
+    next: ChainRead,
 }
 
 /// The writes a bridge cycle makes, each answering the ActionHash it wrote.
@@ -1934,6 +1949,22 @@ struct LiveLinks {
     parked: HashMap<ActionHash, Result<Vec<Transaction>, String>>,
     agreements: HashMap<ActionHash, Result<ActionHash, String>>,
     held: HashMap<ActionHash, Result<Option<Record>, String>>,
+    raves: RavesRead,
+}
+
+#[derive(Default)]
+struct RavesRead {
+    consumers: HashMap<String, ActionHash>,
+    next: ChainRead,
+    failed: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+enum ChainRead {
+    #[default]
+    Head,
+    From(u32),
+    Done,
 }
 
 impl LiveLinks {
@@ -1964,6 +1995,53 @@ impl LiveLinks {
     ) -> Result<&Option<Record>> {
         let read = conductor.held(link.clone());
         read_once(&mut self.held, &link, read).await
+    }
+
+    async fn consumer(
+        &mut self,
+        conductor: &impl ConductorReads,
+        link: &str,
+        link_seq: u32,
+    ) -> Result<Option<ActionHash>> {
+        let read = &mut self.raves;
+        loop {
+            if let Some(rave) = read.consumers.get(link) {
+                return Ok(Some(rave.clone()));
+            }
+            if let Some(failed) = &read.failed {
+                anyhow::bail!("{failed}");
+            }
+            let from = read.next;
+            match from {
+                ChainRead::From(seq) if seq <= link_seq => return Ok(None),
+                ChainRead::Done => return Ok(None),
+                _ => {}
+            }
+            let page = match conductor.raves(from).await {
+                Ok(page) => page,
+                Err(e) if is_stopped(&e) => return Err(e),
+                Err(e) => {
+                    read.failed = Some(format!("{e:#}"));
+                    return Err(e);
+                }
+            };
+            for rave in page.raves {
+                for consumed in rave.consumed {
+                    read.consumers
+                        .insert(consumed.to_string(), rave.hash.clone());
+                }
+            }
+            if let (ChainRead::From(seq), ChainRead::From(next)) = (from, page.next) {
+                if next >= seq {
+                    let failed = format!(
+                        "the read of the bridging agent's chain from action {seq} moved no further back"
+                    );
+                    read.failed = Some(failed.clone());
+                    anyhow::bail!(failed);
+                }
+            }
+            read.next = page.next;
+        }
     }
 }
 
@@ -2031,6 +2109,11 @@ impl<C: ConductorReads> ConductorReads for Gated<'_, C> {
     async fn held(&self, link: ActionHash) -> Result<Option<Record>> {
         ensure_running(self.stop)?;
         self.conductor.held(link).await
+    }
+
+    async fn raves(&self, from: ChainRead) -> Result<ChainPage> {
+        ensure_running(self.stop)?;
+        self.conductor.raves(from).await
     }
 }
 
@@ -2155,6 +2238,57 @@ impl ConductorReads for Conductor<'_> {
                 format!("failed to read link {link} from the bridging agent's conductor")
             })
     }
+
+    async fn raves(&self, from: ChainRead) -> Result<ChainPage> {
+        let high = match from {
+            ChainRead::From(seq) => Some(seq),
+            _ => None,
+        };
+        let history: History = self
+            .ham
+            .call_zome(
+                self.role_name,
+                "transactor",
+                "get_history",
+                &Pagination {
+                    high_boundary: high,
+                    per_page: CHAIN_PAGE,
+                },
+            )
+            .await
+            .context("failed to read the bridging agent's chain")?;
+        chain_page(history)
+    }
+}
+
+const CHAIN_PAGE: u32 = 50;
+
+fn chain_page(history: History) -> Result<ChainPage> {
+    let raves = history
+        .items
+        .iter()
+        .filter_map(|tx| match &tx.details {
+            TransactionDetails::RAVE {
+                required_inputs, ..
+            } => Some((tx, required_inputs)),
+            _ => None,
+        })
+        .map(|(tx, inputs)| {
+            Ok(RaveRun {
+                hash: tx.id.clone().into(),
+                consumed: consumed_links(inputs).with_context(|| {
+                    format!("RAVE {} records consumed inputs that do not read", tx.id)
+                })?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok(ChainPage {
+        raves,
+        next: match history.end_of_chain {
+            true => ChainRead::Done,
+            false => ChainRead::From(history.low_boundary),
+        },
+    })
 }
 
 enum RecordedWrite {
@@ -3799,7 +3933,12 @@ mod tests {
         parked_reads: RefCell<Vec<ActionHash>>,
         link_reads: RefCell<Vec<ActionHash>>,
         fails_on: Option<(ActionHash, &'static str)>,
+        raves: RefCell<Vec<(ActionHash, Vec<ActionHashB64>)>>,
+        chain_reads: RefCell<Vec<ChainRead>>,
     }
+
+    const LINK_SEQ: u32 = 5;
+    const FIRST_RAVE_SEQ: u32 = LINK_SEQ + 1;
 
     /// A conductor on which the global definition's lane bridges for the test
     /// config's agent through `CL_EA` and `BR_EA`, with nothing parked on
@@ -3848,6 +3987,17 @@ mod tests {
         /// The chain holds `links`, which no agreement lists any more: a RAVE
         /// took them off the agreement their details name.
         fn holding(self, links: &[Transaction]) -> Self {
+            self.taken(links).holding_unconsumed(links)
+        }
+
+        fn taken(self, links: &[Transaction]) -> Self {
+            let consumed = links.iter().map(|link| link.id.clone()).collect();
+            let rave = action_hash(0xE8 + self.raves.borrow().len() as u8);
+            self.raves.borrow_mut().push((rave, consumed));
+            self
+        }
+
+        fn holding_unconsumed(self, links: &[Transaction]) -> Self {
             for link in links {
                 let (TransactionDetails::Parked { ea_id, .. }
                 | TransactionDetails::ParkedSpend { ea_id, .. }) = &link.details
@@ -4050,6 +4200,29 @@ mod tests {
             self.check_fails_on(&link)?;
             Ok(self.holds.borrow().get(&link).map(off_the_wire))
         }
+
+        async fn raves(&self, from: ChainRead) -> Result<ChainPage> {
+            self.call("raves");
+            self.chain_reads.borrow_mut().push(from);
+            let raves = self.raves.borrow();
+            let newest = (FIRST_RAVE_SEQ..)
+                .zip(raves.iter())
+                .filter(|(seq, _)| !matches!(from, ChainRead::From(high) if *seq > high))
+                .last();
+            Ok(match newest {
+                Some((seq, (hash, consumed))) => ChainPage {
+                    raves: vec![RaveRun {
+                        hash: hash.clone(),
+                        consumed: consumed.clone(),
+                    }],
+                    next: ChainRead::From(seq - 1),
+                },
+                None => ChainPage {
+                    raves: vec![],
+                    next: ChainRead::Done,
+                },
+            })
+        }
     }
 
     impl ConductorWrites for FakeConductor {
@@ -4076,10 +4249,11 @@ mod tests {
             if let Some(links) = self.parked.borrow_mut().get_mut(&input.ea_id) {
                 links.retain(|link| !deleted.contains(&link.id.clone().into()));
             }
-            Ok(RaveRun {
-                hash,
-                consumed: consumed.into_iter().map(Into::into).collect(),
-            })
+            let consumed: Vec<ActionHashB64> = consumed.into_iter().map(Into::into).collect();
+            self.raves
+                .borrow_mut()
+                .push((hash.clone(), consumed.clone()));
+            Ok(RaveRun { hash, consumed })
         }
 
         async fn create_parked_spend(
@@ -4201,7 +4375,7 @@ mod tests {
             header: ActionHeader {
                 author,
                 timestamp: Timestamp(0),
-                action_seq: 5,
+                action_seq: LINK_SEQ,
                 prev_action: Some(action_hash(0x01)),
             },
             data,
@@ -5600,24 +5774,34 @@ mod tests {
         }
     }
 
+    /// A RAVE's inputs, naming links `consumed` among its consumed inputs and
+    /// links `other` among the rest.
+    fn rave_input(consumed: &[u8], other: &[u8]) -> RAVEInput {
+        let named = |role: &str, links: &[u8]| {
+            let mut inputs = RAVEInputHandler::new();
+            inputs.insert(
+                role.to_string(),
+                RAVEInputStdPayload::Vec(
+                    links
+                        .iter()
+                        .map(|seed| RAVEInputStdPayloadInner {
+                            data: Box::new(json!({})),
+                            link_hash: Some(action_hash(*seed).into()),
+                        })
+                        .collect(),
+                ),
+            );
+            inputs
+        };
+        off_the_wire(&RAVEInput::new(
+            named("proof_of_deposit", consumed),
+            named("withdrawer_allocations", other),
+        ))
+    }
+
     #[test]
     fn a_rave_consumed_only_the_links_its_consumed_inputs_name() {
-        let named = |links: &[u8]| {
-            RAVEInputStdPayload::Vec(
-                links
-                    .iter()
-                    .map(|seed| RAVEInputStdPayloadInner {
-                        data: Box::new(json!({})),
-                        link_hash: Some(action_hash(*seed).into()),
-                    })
-                    .collect(),
-            )
-        };
-        let mut consumed = RAVEInputHandler::new();
-        consumed.insert("proof_of_deposit".to_string(), named(&[0xC1, 0xC2]));
-        let mut other = RAVEInputHandler::new();
-        other.insert("withdrawer_allocations".to_string(), named(&[0xC3]));
-        let inputs: RAVEInput = off_the_wire(&RAVEInput::new(consumed, other));
+        let inputs = rave_input(&[0xC1, 0xC2], &[0xC3]);
 
         let mut links = consumed_links(&inputs).unwrap();
         links.sort();
@@ -5648,6 +5832,106 @@ mod tests {
                 "a redacted link credited no one"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_link_the_template_redacts_goes_to_a_person_at_the_next_reconcile() {
+        for (step, agreement) in RAVE_STAGES {
+            let orch = test_orchestrator("rave-redacts-later");
+            let (rows, links) = two_parked_deposits(&orch, step.clone());
+            let conductor = FakeConductor {
+                rave_redacts: [links[1].id.clone().into()].into_iter().collect(),
+                ..bridging_conductor().parking(action_hash(agreement), &links)
+            };
+
+            for _ in 0..2 {
+                orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+            }
+
+            let redacted = failed_row(&orch, rows[1]);
+            assert_eq!(redacted.step, step, "a redacted link credited no one");
+            let reason = redacted.last_error.unwrap();
+            assert!(reason.contains(&links[1].id.to_string()), "{reason}");
+            assert!(reason.contains("no RAVE"), "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_reads_the_chain_back_no_further_than_the_link_it_waits_on() {
+        for (step, _) in RAVE_STAGES {
+            let orch = test_orchestrator("chain-read-back");
+            let (rows, links) = two_parked_deposits(&orch, step.clone());
+            let conductor = bridging_conductor()
+                .taken(&[parked_tx(0xB7, &[proof("lock:elsewhere:1", "0x93")])])
+                .taken(&[parked_tx(0xB8, &[proof("lock:elsewhere:2", "0x94")])])
+                .holding_unconsumed(&links[1..])
+                .holding(&links[..1]);
+
+            reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+
+            assert_eq!(lock_row(&orch, rows[0]).step, taken_at(&step));
+            assert_eq!(failed_row(&orch, rows[1]).step, step);
+            assert_eq!(
+                *conductor.chain_reads.borrow(),
+                [
+                    ChainRead::Head,
+                    ChainRead::From(FIRST_RAVE_SEQ + 1),
+                    ChainRead::From(FIRST_RAVE_SEQ)
+                ],
+                "one read reaches the newest RAVE, and the last stops above the links"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chain_page_names_each_rave_it_read_and_where_the_next_read_starts() {
+        let rave_tx = |seed: u8, consumed: &[u8]| {
+            let mut tx = parked_tx(seed, &[]);
+            tx.details = TransactionDetails::RAVE {
+                total_amount: UnitMap::new(),
+                spenders: vec![],
+                receivers: vec![],
+                code_template: action_hash(0x01).into(),
+                smart_agreement: action_hash(CL_EA).into(),
+                smart_agreement_title: String::new(),
+                required_inputs: rave_input(consumed, &[]),
+                output: Default::default(),
+                global_definition: action_hash(0x02).into(),
+                lane_definitions: vec![],
+                executed_timestamp: Timestamp(0),
+                required_action: rave_engine::types::AgreementRequiredAction::None,
+            };
+            tx
+        };
+        let history = |end_of_chain| History {
+            items: vec![
+                rave_tx(0xD1, &[0xD2]),
+                parked_tx(0xD3, &[]),
+                rave_tx(0xD4, &[]),
+            ],
+            low_boundary: 7,
+            end_of_chain,
+        };
+
+        let page = chain_page(off_the_wire(&history(false))).unwrap();
+
+        let read: Vec<_> = page
+            .raves
+            .iter()
+            .map(|rave| (rave.hash.clone(), rave.consumed.clone()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                (action_hash(0xD1), vec![action_hash(0xD2).into()]),
+                (action_hash(0xD4), vec![])
+            ]
+        );
+        assert_eq!(page.next, ChainRead::From(7));
+        assert_eq!(
+            chain_page(off_the_wire(&history(true))).unwrap().next,
+            ChainRead::Done
+        );
     }
 
     #[tokio::test]
@@ -6089,7 +6373,7 @@ mod tests {
             let left = failed_row(&orch, second);
             assert_eq!(left.error_class.as_deref(), Some("permanent"));
             let reason = left.last_error.unwrap();
-            assert!(reason.contains("mis-recorded legacy row"), "{reason}");
+            assert!(reason.ends_with("resolve by hand"), "{reason}");
             assert!(reason.contains("does not carry its proof"), "{reason}");
             assert!(reason.contains(&link.id.to_string()), "{reason}");
             assert!(
@@ -6271,8 +6555,14 @@ mod tests {
 
         let hash = |agreement: &ActionHashB64| ActionHash::from(agreement.clone());
         let conductor = lane(PENDING)
-            .parking(hash(&before.credit_limit_adjustment), &[link])
-            .parking(hash(&before.bridging_agreement), &[spend])
+            .parking(
+                hash(&before.credit_limit_adjustment),
+                std::slice::from_ref(&link),
+            )
+            .parking(
+                hash(&before.bridging_agreement),
+                std::slice::from_ref(&spend),
+            )
             .consumed(hash(&after.credit_limit_adjustment))
             .consumed(hash(&after.bridging_agreement));
 
@@ -6290,7 +6580,8 @@ mod tests {
 
         let conductor = conductor
             .consumed(hash(&before.credit_limit_adjustment))
-            .consumed(hash(&before.bridging_agreement));
+            .consumed(hash(&before.bridging_agreement))
+            .taken(&[link, spend]);
         assert_eq!(
             reconcile_on(&orch, &conductor, &after).await,
             ReconcileCounts {
@@ -6363,8 +6654,9 @@ mod tests {
         let conductor = FakeConductor::default()
             .parking(action_hash(REPLACED_CL_EA), &[link])
             .consumed(action_hash(CL_EA))
-            .parking(action_hash(BR_EA), &[spend])
-            .consumed(action_hash(BR_EA));
+            .parking(action_hash(BR_EA), std::slice::from_ref(&spend))
+            .consumed(action_hash(BR_EA))
+            .taken(&[spend]);
 
         let counts = reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
