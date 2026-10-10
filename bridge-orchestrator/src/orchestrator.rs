@@ -212,6 +212,8 @@ fn bridging_spend<'a>(
         if own_deposit(tx, bridging_agent) && ct_role_id == BRIDGING_AGENT_ROLE {
             BridgingSpend::Deposit
         } else if ct_role_id == WITHDRAWER_ROLE {
+            // The template pays a withdrawal from a `withdrawer` link alone, so a
+            // coupon for any other role would be claimable with no spend taken.
             BridgingSpend::Withdrawal(
                 attached_payload
                     .get("withdraw_to_address")
