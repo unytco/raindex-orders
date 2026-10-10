@@ -1263,7 +1263,7 @@ impl BridgeOrchestrator {
             Err(e) if recorded.is_some() => return Self::unresolved(row, link, e),
             Err(e) => {
                 return match held_link(conductor, live, link).await {
-                    Ok(None) => self.write_lost(row, link),
+                    Ok(None) => self.lost(row, link),
                     Ok(Some(_)) => Self::unresolved(row, link, e),
                     Err(held) => Self::unresolved(row, link, held),
                 }
@@ -1306,28 +1306,10 @@ impl BridgeOrchestrator {
                         // credited cannot be told from here, so a person resolves it
                         // (workshop `documentation/specs/bridge-stop/README.md`
                         // § Operating assumptions and limits).
-                        RecordedWrite::Misrecorded(why) => {
-                            let lock = self.lock_key(row);
-                            error!(
-                                event = "bridge.rave.proof_missing",
-                                lock_id = lock.as_ref().map(|lock| lock.lock_id.as_str()),
-                                tx_hash = lock.as_ref().map(|lock| lock.tx_hash.as_str()),
-                                link,
-                                "[bridge/reconcile] lock={} at {} is failed for manual resolution: its recorded link {} {}",
-                                row.item_id,
-                                row.step,
-                                link,
-                                why
-                            );
-                            self.db.mark_failed_permanent(
-                                row.id,
-                                &format!("mis-recorded legacy row: its recorded link {link} {why}; resolve by hand"),
-                            )?;
-                            Ok(false)
-                        }
+                        RecordedWrite::Misrecorded(why) => self.for_a_person(row, link, &why),
                     };
                 }
-                Ok(None) => return self.write_lost(row, link),
+                Ok(None) => return self.lost(row, link),
                 Err(e) => return Self::unresolved(row, link, e),
             }
         }
@@ -1371,7 +1353,19 @@ impl BridgeOrchestrator {
         })
     }
 
-    fn write_lost(&self, row: &WorkItem, link: &str) -> Result<bool> {
+    /// A row whose recorded link the conductor does not hold.
+    fn lost(&self, row: &WorkItem, link: &str) -> Result<bool> {
+        // Only a link this release recorded is provably the bridging agent's, so
+        // only that one is written again (workshop
+        // `documentation/specs/bridge-stop/README.md` § Operating assumptions and
+        // limits).
+        if !row.parked_link_own() {
+            return self.for_a_person(
+                row,
+                link,
+                "is not held by this node, and an older release recorded it",
+            );
+        }
         self.db.return_to_writing_step(row.id)?;
         warn!(
             event = "bridge.reconcile.write_lost",
@@ -1380,6 +1374,27 @@ impl BridgeOrchestrator {
             row.step,
             link
         );
+        Ok(false)
+    }
+
+    /// Fails `row` with `why` for a person to resolve.
+    fn for_a_person(&self, row: &WorkItem, link: &str, why: &str) -> Result<bool> {
+        let lock = self.lock_key(row);
+        error!(
+            event = "bridge.rave.proof_missing",
+            lock_id = lock.as_ref().map(|lock| lock.lock_id.as_str()),
+            tx_hash = lock.as_ref().map(|lock| lock.tx_hash.as_str()),
+            link,
+            "[bridge/reconcile] lock={} at {} is failed for manual resolution: its recorded link {} {}",
+            row.item_id,
+            row.step,
+            link,
+            why
+        );
+        self.db.mark_failed_permanent(
+            row.id,
+            &format!("mis-recorded legacy row: its recorded link {link} {why}; resolve by hand"),
+        )?;
         Ok(false)
     }
 
@@ -4102,7 +4117,7 @@ mod tests {
         let db = rusqlite::Connection::open(&orch.cfg.db_path).unwrap();
         for id in ids {
             db.execute(
-                "UPDATE work_items SET cl_ea_id = NULL, br_ea_id = NULL WHERE id = ?1",
+                "UPDATE work_items SET cl_ea_id = NULL, br_ea_id = NULL, cl_link_own = NULL, br_spend_own = NULL WHERE id = ?1",
                 [id],
             )
             .unwrap();
@@ -5989,19 +6004,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_lost_link_on_a_row_naming_no_agreement_is_written_again_too() {
-        let orch = test_orchestrator("lost-write-unnamed");
-        let ([lost, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
-        forget_agreements(&orch, &[lost]);
-        let conductor = bridging_conductor().holding(&links).rolled_back(&links[0]);
+    async fn a_link_an_older_release_recorded_and_the_node_does_not_hold_goes_to_a_person() {
+        for names_its_agreement in [true, false] {
+            let orch = test_orchestrator("lost-write-legacy");
+            let ([legacy, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+            let unmark = if names_its_agreement {
+                "UPDATE work_items SET br_spend_own = NULL WHERE id = ?1"
+            } else {
+                "UPDATE work_items SET br_ea_id = NULL, br_spend_own = NULL WHERE id = ?1"
+            };
+            rusqlite::Connection::open(&orch.cfg.db_path)
+                .unwrap()
+                .execute(unmark, [legacy])
+                .unwrap();
+            let conductor = bridging_conductor().holding(&links).rolled_back(&links[0]);
 
-        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
-        let row = lock_row(&orch, lost);
-        assert_eq!(
-            (row.step, row.br_spend_hash),
-            (WorkStep::ClRaveExecuted, None)
-        );
+            let reason = failed_row(&orch, legacy).last_error.unwrap();
+            assert!(reason.contains("an older release recorded it"), "{reason}");
+            assert!(
+                !conductor.calls.take().contains(&"create_parked_spend"),
+                "it is not written again"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6416,7 +6442,7 @@ mod tests {
             assert_eq!(lock_row(&orch, id).cl_ea_id, Some(ea(REPLACED_CL_EA)));
         }
         for id in on_unknown {
-            assert_eq!(lock_row(&orch, id).cl_ea_id, None);
+            assert_eq!(failed_row(&orch, id).cl_ea_id, None);
         }
     }
 
