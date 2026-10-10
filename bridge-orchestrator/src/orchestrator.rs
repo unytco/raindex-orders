@@ -5888,21 +5888,26 @@ mod tests {
         assert_eq!(told(cl, br).await, ids(cl), "it left, and is parked again");
     }
 
+    fn withdrawal_carrying(seed: u8, proof: Value) -> Transaction {
+        let mut withdrawal = parked_withdrawal_tx(seed);
+        if let TransactionDetails::ParkedSpend {
+            attached_payload, ..
+        } = &mut withdrawal.details
+        {
+            attached_payload["proof_of_deposit"] = json!([proof]);
+        }
+        withdrawal
+    }
+
     #[tokio::test]
     async fn another_agents_spend_carrying_a_proof_is_selected_as_a_withdrawal() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
-        let mut copy = signed_by_another(parked_withdrawal_tx(0xAD));
-        if let TransactionDetails::ParkedSpend {
-            attached_payload, ..
-        } = &mut copy.details
-        {
-            attached_payload["proof_of_deposit"] = json!([proof("lock:copied:3", "0x8c")]);
-        }
+        let copy = withdrawal_carrying(0xAD, proof("lock:copied:3", "0x8c"));
 
         let selection = select_bridging_links(
             Some(&signer),
             &bridging_agent(),
-            &[copy.clone()],
+            std::slice::from_ref(&copy),
             usize::MAX,
             1,
         )
@@ -5911,6 +5916,32 @@ mod tests {
 
         assert!(selection.deposits.is_empty());
         assert_eq!(ids(&selection.withdrawals), ids(&[copy]));
+    }
+
+    #[tokio::test]
+    async fn spends_parked_ahead_of_a_deposit_with_copies_of_its_proof_do_not_hold_it_back() {
+        let mut orch = test_orchestrator("planted-copies");
+        orch.cfg.rave_max_links = Some(1);
+        let id = enqueue_at_cl_rave_executed(&orch, "lock:planted:1", "0x90");
+        let own = parked_spend_tx(0xC0, &[proof("lock:planted:1", "0x90")]);
+        orch.record_br_spend(id, &own.id.to_string(), &in_force(CL_EA, BR_EA))
+            .unwrap();
+        let planted: Vec<Transaction> = (0xC1..=0xC5)
+            .map(|seed| withdrawal_carrying(seed, proof("lock:planted:1", "0x90")))
+            .collect();
+        let conductor = bridging_conductor()
+            .parking(action_hash(BR_EA), &[planted.clone(), vec![own]].concat());
+
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+        assert_eq!(
+            lock_row(&orch, id).state,
+            crate::state::WorkState::Succeeded
+        );
+        assert_eq!(
+            ids(&conductor.parked.borrow()[&action_hash(BR_EA)]),
+            ids(&planted)
+        );
     }
 
     #[tokio::test]
