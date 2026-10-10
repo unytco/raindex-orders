@@ -5842,6 +5842,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_credit_limit_side_records_its_own_link_with_a_copy_listed_after_it() {
+        let orch = test_orchestrator("own-cl-before-copy");
+        let id = enqueue_lock(&orch, "lock:copied:4", "0x8e");
+        let own = parked_tx(0xB1, &[proof("lock:copied:4", "0x8e")]);
+        let copy = signed_by_another(parked_tx(0xB2, &[proof("lock:copied:4", "0x8e")]));
+
+        let counts = reconcile(&orch, &[own.clone(), copy], &[]).await;
+
+        assert_eq!(counts.s1_advanced, 1);
+        assert_eq!(lock_row(&orch, id).cl_link_hash, Some(own.id.to_string()));
+    }
+
+    #[tokio::test]
     async fn another_agents_spend_carrying_a_proof_is_selected_as_a_withdrawal() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let mut copy = signed_by_another(parked_withdrawal_tx(0xAD));
