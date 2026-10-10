@@ -7,11 +7,10 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+pub const LOCK_CHECKPOINT_KEY: &str = "lock.last_processed_block";
 /// In the order [`row_to_work_item`] reads them.
 const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id";
-#[cfg(test)]
-const DEFAULT_MAX_ATTEMPTS: i64 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -458,10 +457,6 @@ impl StateStore {
             conn.execute("ALTER TABLE schema_meta ADD COLUMN vault TEXT", [])?;
         }
         conn.execute(
-            "UPDATE schema_meta SET version = ?1 WHERE id = 1",
-            [SCHEMA_VERSION],
-        )?;
-        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_work_items_state_created ON work_items(state, created_at)",
             [],
         )?;
@@ -477,6 +472,15 @@ impl StateStore {
             )",
             [],
         )?;
+        let tx = conn.unchecked_transaction()?;
+        if version.is_some_and(|version| version < 3) {
+            forget_unconfirmed_locks(&tx)?;
+        }
+        tx.execute(
+            "UPDATE schema_meta SET version = ?1 WHERE id = 1",
+            [SCHEMA_VERSION],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -532,7 +536,7 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn enqueue_detected(
+    pub fn enqueue_queued(
         &self,
         flow: &str,
         task_type: &str,
@@ -543,7 +547,7 @@ impl StateStore {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
             "INSERT OR IGNORE INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'detected')",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued')",
             params![
                 flow,
                 task_type,
@@ -553,17 +557,6 @@ impl StateStore {
             ],
         )?;
         Ok(())
-    }
-
-    pub fn move_detected_to_queued(&self, idempotency_key: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let changed = conn.execute(
-            "UPDATE work_items
-             SET state='queued', updated_at=strftime('%s', 'now')
-             WHERE idempotency_key = ?1 AND state = 'detected'",
-            [idempotency_key],
-        )?;
-        Ok(changed > 0)
     }
 
     pub fn mark_in_flight(&self, id: i64) -> Result<()> {
@@ -594,14 +587,7 @@ impl StateStore {
 
     pub fn set_checkpoint_u64(&self, key: &str, value: u64) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "INSERT INTO checkpoints (checkpoint_key, checkpoint_value, updated_at)
-             VALUES (?1, ?2, strftime('%s', 'now'))
-             ON CONFLICT(checkpoint_key) DO UPDATE
-               SET checkpoint_value=excluded.checkpoint_value, updated_at=excluded.updated_at",
-            params![key, value.to_string()],
-        )?;
-        Ok(())
+        write_checkpoint(&conn, key, value)
     }
 
     pub fn status(&self, filter: StateFilter) -> Result<Vec<StatusRow>> {
@@ -728,27 +714,6 @@ impl StateStore {
     pub fn aggregate_stats(&self) -> Result<BridgeAggregateStats> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         compute_aggregate_stats(&conn)
-    }
-
-    pub fn list_work_items(
-        &self,
-        flow: &str,
-        state: WorkState,
-        limit: usize,
-    ) -> Result<Vec<WorkItem>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {WORK_ITEM_COLUMNS}
-             FROM work_items
-             WHERE flow = ?1 AND state = ?2
-             ORDER BY created_at ASC, id ASC
-             LIMIT ?3"
-        ))?;
-        let rows = stmt.query_map(
-            params![flow, state.to_string(), limit as i64],
-            row_to_work_item,
-        )?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Rows of `flow` at `step` that are `queued` or `in_flight`, oldest first.
@@ -943,6 +908,31 @@ impl StateStore {
     }
 }
 
+fn forget_unconfirmed_locks(conn: &Connection) -> Result<()> {
+    let earliest: Option<u64> = conn.query_row(
+        "SELECT MIN(json_extract(payload_json, '$.block_number'))
+         FROM work_items WHERE state = 'detected'",
+        [],
+        |row| row.get(0),
+    )?;
+    conn.execute("DELETE FROM work_items WHERE state = 'detected'", [])?;
+    if let Some(earliest) = earliest {
+        write_checkpoint(conn, LOCK_CHECKPOINT_KEY, earliest.saturating_sub(1))?;
+    }
+    Ok(())
+}
+
+fn write_checkpoint(conn: &Connection, key: &str, value: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO checkpoints (checkpoint_key, checkpoint_value, updated_at)
+         VALUES (?1, ?2, strftime('%s', 'now'))
+         ON CONFLICT(checkpoint_key) DO UPDATE
+           SET checkpoint_value=excluded.checkpoint_value, updated_at=excluded.updated_at",
+        params![key, value.to_string()],
+    )?;
+    Ok(())
+}
+
 fn json_value_to_string(value: Option<&Value>) -> Option<String> {
     match value {
         Some(Value::String(v)) => Some(v.clone()),
@@ -1049,28 +1039,25 @@ fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
 
 #[cfg(test)]
 impl StateStore {
-    pub fn enqueue_queued(
+    pub fn list_work_items(
         &self,
         flow: &str,
-        task_type: &str,
-        item_id: &str,
-        idempotency_key: &str,
-        payload_json: &Value,
-    ) -> Result<()> {
+        state: WorkState,
+        limit: usize,
+    ) -> Result<Vec<WorkItem>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "INSERT OR IGNORE INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state, next_retry_at, max_attempts)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', NULL, ?6)",
-            params![
-                flow,
-                task_type,
-                item_id,
-                idempotency_key,
-                serde_json::to_string(payload_json)?,
-                DEFAULT_MAX_ATTEMPTS
-            ],
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORK_ITEM_COLUMNS}
+             FROM work_items
+             WHERE flow = ?1 AND state = ?2
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![flow, state.to_string(), limit as i64],
+            row_to_work_item,
         )?;
-        Ok(())
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn claim_next(&self, preferred_flow: Option<&str>) -> Result<Option<WorkItem>> {
@@ -2106,6 +2093,40 @@ mod tests {
         store
             .bind_vault(VAULT_B)
             .expect("the failed bind bound nothing");
+    }
+
+    #[test]
+    fn an_upgrade_that_cannot_move_the_checkpoint_keeps_the_detected_rows() {
+        let path = test_db_path("forget-fails");
+        let store = StateStore::open(&path).unwrap();
+        store.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 100).unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state)
+               VALUES ('lock', 'create_parked_link', 'lock:3', 'lock:3:key', '{"block_number": 90}', 'detected');
+               UPDATE schema_meta SET version = 2;
+               CREATE TRIGGER refuse BEFORE UPDATE ON checkpoints
+               BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;"#,
+        )
+        .unwrap();
+
+        assert!(StateStore::open(&path).is_err());
+
+        let detected: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_items WHERE state = 'detected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detected, 1);
+        conn.execute_batch("DROP TRIGGER refuse").unwrap();
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_checkpoint_u64(LOCK_CHECKPOINT_KEY).unwrap(),
+            Some(89)
+        );
     }
 
     #[test]

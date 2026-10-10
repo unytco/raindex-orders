@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bridge-orchestrator fails a deposit for a person when its conductor no longer holds the deposit's link or spend, instead of marking it bridged.
 - bridge-orchestrator fails for manual resolution a deposit an older release recorded on a link it cannot prove its own.
 - bridge-orchestrator keys each lock by its vault and lock ID, and refuses a database that serves another vault.
+- bridge-orchestrator records a lock once its block has 5 confirmations, on mainnet as on Sepolia.
 
 ## [0.3.0] - 2026-10-06
 

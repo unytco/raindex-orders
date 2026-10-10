@@ -73,7 +73,7 @@ bridge-orchestrator status [OPTIONS]
 | `--item-id` | string | _(all)_ | Filter by specific item ID |
 | `--limit` | integer | `50` | Maximum rows returned |
 
-`--state` values: `detected`, `queued`, `claimed`, `in_flight`, `succeeded`, `failed`
+`--state` values: `queued`, `claimed`, `in_flight`, `succeeded`, `failed`
 
 ### `bridge-orchestrator clear`
 
@@ -134,7 +134,10 @@ and the chain. A network variable set to an empty value counts as unset.
 | `RAVE_MAX_LINKS` | No | _(unset = no cap)_ — if set to a positive integer, each `execute_rave` call in a cycle consumes at most this many parked links; the rest stay live server-side and are picked up by the next cycle. Applied independently to the S2 credit-limit RAVE (`cl_links`) and the S4 bridging RAVE (pooled deposits + selected withdrawals; deposits are kept preferentially). `0` is treated as disabled (warn at startup). The existing `COUPONS_TARGET_KB` withdrawal-coupon cap still applies on top. Intended as a mitigation when `execute_rave` hangs correlate with large batch sizes; leave unset unless you've observed that pattern. |
 | `RUST_LOG` | No | `info` |
 
-Confirmations are not configurable: 15 (mainnet) / 5 (sepolia).
+Confirmations are not configurable: the lock read reads only blocks with 5
+confirmations, on both networks. A new `DB_PATH` starts at the newest of them.
+A database an earlier release left `detected` rows in loses them on its first
+start, and the lock read goes back to read their blocks again.
 
 ### Watchtower reporter (optional)
 
@@ -410,14 +413,13 @@ Each line from `bridge-orchestrator status` is a JSON object with these fields:
 ## Work item lifecycle
 
 ```
-detected ─> queued ─> claimed ─> in_flight ─┬─> succeeded
-                ^                            │
-                └──── (transient retry) ─────┤
-                                             └─> failed (after max_attempts)
+queued ─> claimed ─> in_flight ─┬─> succeeded
+    ^                            │
+    └──── (transient retry) ─────┤
+                                 └─> failed (after max_attempts)
 ```
 
-- **detected**: lock event seen on-chain, waiting for confirmations
-- **queued**: ready to be processed in the next bridge cycle
+- **queued**: a lock in a block with 5 confirmations, ready for the next bridge cycle
 - **claimed**: picked up by the single-writer executor
 - **in_flight**: actively being processed (Holochain call or on-chain tx)
 - **succeeded**: completed successfully

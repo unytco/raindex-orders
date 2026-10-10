@@ -24,6 +24,8 @@ impl FromStr for Network {
     }
 }
 
+const LOCK_CONFIRMATIONS: u64 = 5;
+
 impl Network {
     pub fn name(self) -> &'static str {
         match self {
@@ -50,13 +52,6 @@ impl Network {
         match self {
             Network::Mainnet => "MAINNET_LOCK_VAULT_ADDRESS",
             Network::Sepolia => "SEPOLIA_LOCK_VAULT_ADDRESS",
-        }
-    }
-
-    fn confirmations(self) -> u64 {
-        match self {
-            Network::Mainnet => 15,
-            Network::Sepolia => 5,
         }
     }
 
@@ -195,7 +190,9 @@ pub fn ethereum_from_env() -> Result<Option<Ethereum>> {
     ethereum_settings(|key| env::var(key).ok())
 }
 
-fn ethereum_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Option<Ethereum>> {
+pub(crate) fn ethereum_settings(
+    setting: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Ethereum>> {
     if setting("NETWORK").is_some_and(|raw| raw.eq_ignore_ascii_case("none")) {
         return Ok(None);
     }
@@ -249,7 +246,7 @@ fn ethereum_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Option<
             network,
             rpc_url,
             lock_vault_address,
-            confirmations: network.confirmations(),
+            confirmations: LOCK_CONFIRMATIONS,
         })),
         _ => anyhow::bail!("{}", faults.join("; ")),
     }
@@ -834,7 +831,7 @@ mod tests {
         ]);
         assert_eq!(mainnet.network, Network::Mainnet);
         assert_eq!(mainnet.rpc_url, "https://eth.rpc.test");
-        assert_eq!(mainnet.confirmations, 15);
+        assert_eq!(mainnet.confirmations, 5);
     }
 
     #[test]
