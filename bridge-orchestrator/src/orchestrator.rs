@@ -1358,6 +1358,12 @@ impl BridgeOrchestrator {
             Ok(proofs) => proofs,
             Err(e) => return RecordedWrite::Unreadable(e),
         };
+        let Some(proofs) = proofs.as_array() else {
+            return RecordedWrite::Misrecorded(match proofs {
+                Value::Null => "carries no proof_of_deposit".to_string(),
+                other => format!("carries a proof_of_deposit that is not a list: {other}"),
+            });
+        };
         let locks: Vec<LockKey> = proofs.iter().filter_map(LockKey::of_proof).collect();
         if locks.contains(&lock) {
             return RecordedWrite::Own;
@@ -2329,7 +2335,7 @@ enum RecordedWrite {
     Unreadable(anyhow::Error),
 }
 
-fn tag_proofs(record: &Record, step: &WorkStep) -> Result<Vec<Value>> {
+fn tag_proofs(record: &Record, step: &WorkStep) -> Result<Value> {
     let ActionData::CreateLink(link) = &record.action().data else {
         anyhow::bail!("{} is not a link", record.action_address());
     };
@@ -2345,13 +2351,7 @@ fn tag_proofs(record: &Record, step: &WorkStep) -> Result<Vec<Value>> {
             record.action_address()
         )
     })?;
-    let proofs = &payload["proof_of_deposit"];
-    proofs.as_array().cloned().with_context(|| {
-        format!(
-            "the tag of link {} carries a proof_of_deposit that is not a list: {proofs}",
-            record.action_address()
-        )
-    })
+    Ok(payload["proof_of_deposit"].clone())
 }
 
 /// The input of the transactor's `hdk_get`, whose fields are named unlike
@@ -6957,8 +6957,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_held_link_whose_proofs_are_not_a_list_leaves_its_row_where_it_is() {
-        for (step, _) in RAVE_STAGES {
+    async fn a_held_link_whose_proofs_are_missing_or_not_a_list_goes_to_a_person() {
+        for ((step, _), proofs) in RAVE_STAGES
+            .into_iter()
+            .flat_map(|stage| [(stage.clone(), json!("lock:rave:1")), (stage, Value::Null)])
+        {
             let orch = test_orchestrator("held-proofs-not-a-list");
             let ([unread, _], mut links) = two_parked_deposits(&orch, step.clone());
             if let TransactionDetails::Parked {
@@ -6968,17 +6971,20 @@ mod tests {
                 attached_payload, ..
             } = &mut links[0].details
             {
-                attached_payload["proof_of_deposit"] = json!("lock:rave:1");
+                attached_payload["proof_of_deposit"] = proofs.clone();
             }
             let conductor = bridging_conductor().holding(&links);
 
             reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
-            let row = lock_row(&orch, unread);
-            assert_eq!(
-                (row.state, row.step),
-                (crate::state::WorkState::Queued, step)
-            );
+            let row = failed_row(&orch, unread);
+            assert_eq!(row.step, step);
+            let reason = row.last_error.unwrap();
+            let expected = match proofs {
+                Value::Null => "carries no proof_of_deposit",
+                _ => "carries a proof_of_deposit that is not a list",
+            };
+            assert!(reason.contains(expected), "{reason}");
         }
     }
 
