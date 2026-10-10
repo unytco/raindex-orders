@@ -1149,7 +1149,7 @@ impl BridgeOrchestrator {
     /// * `step='new'` and the lock's own proof is in a live CL parked link →
     ///   advance to `cl_link_created` with that link's ActionHash.
     /// * `step='cl_link_created'` and [`Self::link_consumed`] → advance to
-    ///   `cl_rave_executed` with `cl_rave_hash=NULL`.
+    ///   `cl_rave_executed` with the hash of the RAVE that consumed it.
     /// * `step='cl_rave_executed'` and the lock's own proof is in a live
     ///   bridging parked spend → advance to `br_spend_created` with that
     ///   spend's ActionHash.
@@ -1183,11 +1183,12 @@ impl BridgeOrchestrator {
             .db
             .list_pending_by_step("lock", WorkStep::ClLinkCreated, 5000)?
         {
-            if self
+            if let Some(rave) = self
                 .link_consumed(conductor, live, &row, &credit_limit)
                 .await?
             {
-                self.db.advance_to_cl_rave_executed(row.id, None)?;
+                self.db
+                    .advance_to_cl_rave_executed(row.id, Some(&rave.to_string()))?;
                 counts.s2_advanced += 1;
             }
         }
@@ -1211,8 +1212,9 @@ impl BridgeOrchestrator {
             .db
             .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?
         {
-            if self.link_consumed(conductor, live, &row, &bridging).await? {
-                self.db.advance_to_br_rave_executed(row.id, None)?;
+            if let Some(rave) = self.link_consumed(conductor, live, &row, &bridging).await? {
+                self.db
+                    .advance_to_br_rave_executed(row.id, Some(&rave.to_string()))?;
                 counts.s4_advanced += 1;
             }
         }
@@ -1250,19 +1252,20 @@ impl BridgeOrchestrator {
         live: &mut LiveLinks,
         row: &WorkItem,
         in_force: &ActionHash,
-    ) -> Result<bool> {
+    ) -> Result<Option<ActionHash>> {
         let Some((link, recorded)) = row.parked_link() else {
-            return Ok(false);
+            return Ok(None);
         };
         let (agreement, parked) = match parked_on(conductor, live, link, recorded).await {
             Ok(checked) => checked,
-            Err(e) if recorded.is_some() => return Self::unresolved(row, link, e),
+            Err(e) if recorded.is_some() => return Self::unresolved(row, link, e).map(|()| None),
             Err(e) => {
                 return match held_link(conductor, live, link).await {
                     Ok(None) => self.lost(row, link),
                     Ok(Some(_)) => Self::unresolved(row, link, e),
                     Err(held) => Self::unresolved(row, link, held),
                 }
+                .map(|()| None)
             }
         };
         if recorded.is_none() {
@@ -1280,20 +1283,27 @@ impl BridgeOrchestrator {
             match held_link(conductor, live, link).await {
                 Ok(Some(record)) => {
                     let link_seq = record.action().action_seq();
-                    return match self.recorded_write(record, row) {
+                    let consumer = match self.recorded_write(record, row) {
                         RecordedWrite::Own => match live.consumer(conductor, link, link_seq).await {
                             Ok(Some(rave)) => {
-                                debug!(
+                                info!(
+                                    event = "bridge.reconcile.consumed",
+                                    link,
+                                    rave = %rave,
                                     "[bridge/reconcile] lock={} at {}: RAVE {} consumed link {} off agreement {}",
-                                    row.item_id, row.step, rave, link, agreement
+                                    row.item_id,
+                                    row.step,
+                                    rave,
+                                    link,
+                                    agreement
                                 );
-                                Ok(true)
+                                return Ok(Some(rave));
                             }
                             Ok(None) => self.for_a_person(
                                 row,
                                 "bridge.reconcile.link_not_consumed",
                                 link,
-                                &format!("left agreement {agreement}, and no RAVE of the bridging agent consumed it"),
+                                &format!("left agreement {agreement}, and no RAVE in the bridging agent's chain history records it consumed"),
                             ),
                             Err(e) => Self::unresolved(row, link, e),
                         },
@@ -1306,7 +1316,7 @@ impl BridgeOrchestrator {
                                 link,
                                 e
                             );
-                            Ok(false)
+                            Ok(())
                         }
                         // Neither advanced nor written again: whether this deposit was
                         // credited cannot be told from here, so a person resolves it
@@ -1316,9 +1326,10 @@ impl BridgeOrchestrator {
                             self.for_a_person(row, "bridge.rave.proof_missing", link, &why)
                         }
                     };
+                    return consumer.map(|()| None);
                 }
-                Ok(None) => return self.lost(row, link),
-                Err(e) => return Self::unresolved(row, link, e),
+                Ok(None) => return self.lost(row, link).map(|()| None),
+                Err(e) => return Self::unresolved(row, link, e).map(|()| None),
             }
         }
         if agreement != *in_force {
@@ -1330,7 +1341,7 @@ impl BridgeOrchestrator {
                 link
             );
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn recorded_write(&self, record: &Record, row: &WorkItem) -> RecordedWrite {
@@ -1359,7 +1370,7 @@ impl BridgeOrchestrator {
         })
     }
 
-    fn lost(&self, row: &WorkItem, link: &str) -> Result<bool> {
+    fn lost(&self, row: &WorkItem, link: &str) -> Result<()> {
         self.for_a_person(
             row,
             "bridge.reconcile.link_not_held",
@@ -1368,7 +1379,7 @@ impl BridgeOrchestrator {
         )
     }
 
-    fn for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<bool> {
+    fn for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<()> {
         let lock = self.lock_key(row);
         error!(
             event,
@@ -1385,10 +1396,10 @@ impl BridgeOrchestrator {
             row.id,
             &format!("its recorded link {link} {why}; resolve by hand"),
         )?;
-        Ok(false)
+        Ok(())
     }
 
-    fn unresolved(row: &WorkItem, link: &str, e: anyhow::Error) -> Result<bool> {
+    fn unresolved(row: &WorkItem, link: &str, e: anyhow::Error) -> Result<()> {
         if is_stopped(&e) {
             return Err(e);
         }
@@ -1406,7 +1417,7 @@ impl BridgeOrchestrator {
             link,
             e
         );
-        Ok(false)
+        Ok(())
     }
 
     /// Advances, through `advance`, each row at `step` whose own proof is in
@@ -5155,9 +5166,10 @@ mod tests {
             .into_iter()
             .find(|r| r.id == row_id)
             .expect("row must have advanced to cl_rave_executed");
-        assert!(
-            row.cl_rave_hash.is_none(),
-            "inferred advancement must leave cl_rave_hash NULL"
+        assert_eq!(
+            row.cl_rave_hash,
+            Some(action_hash(0xE8).to_string()),
+            "the advance records the RAVE that consumed the link"
         );
     }
 
@@ -5248,9 +5260,10 @@ mod tests {
             .expect("row must be succeeded");
         assert_eq!(row.step, WorkStep::BrRaveExecuted);
         assert_eq!(row.br_spend_hash.as_deref(), Some(spend_hash.as_str()));
-        assert!(
-            row.br_rave_hash.is_none(),
-            "inferred S4 advancement must leave br_rave_hash NULL"
+        assert_eq!(
+            row.br_rave_hash,
+            Some(action_hash(0xE8).to_string()),
+            "the advance records the RAVE that consumed the spend"
         );
     }
 
@@ -6025,7 +6038,17 @@ mod tests {
 
             reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
-            assert_eq!(lock_row(&orch, rows[0]).step, taken_at(&step));
+            let advanced = lock_row(&orch, rows[0]);
+            assert_eq!(advanced.step, taken_at(&step));
+            let rave = match step {
+                WorkStep::ClLinkCreated => advanced.cl_rave_hash,
+                _ => advanced.br_rave_hash,
+            };
+            assert_eq!(
+                rave,
+                Some(action_hash(0xEA).to_string()),
+                "the RAVE that consumed it"
+            );
             assert_eq!(failed_row(&orch, rows[1]).step, step);
             assert_eq!(
                 *conductor.chain_reads.borrow(),
