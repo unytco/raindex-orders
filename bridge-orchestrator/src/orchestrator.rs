@@ -754,15 +754,6 @@ impl BridgeOrchestrator {
         let tag_cap = self.cfg.max_link_tag_bytes;
         let coupons_budget = self.cfg.coupons_target_bytes;
 
-        // The only place a lock that has used up its attempts is failed.
-        let promoted = self.db.fail_exhausted_queued("lock")?;
-        if promoted > 0 {
-            warn!(
-                "[bridge] promoted {} queued lock(s) to failed (attempts >= max_attempts)",
-                promoted
-            );
-        }
-
         let credit_limit_ea_id: ActionHash = context.credit_limit_adjustment.clone().into();
         let bridging_ea_id: ActionHash = context.bridging_agreement.clone().into();
         let global_definition_hash: ActionHash = global_definition.id.clone().into();
@@ -771,6 +762,14 @@ impl BridgeOrchestrator {
         let reconcile = self
             .reconcile_pipeline(conductor, &mut live, &context)
             .await?;
+
+        let promoted = self.db.fail_exhausted_queued("lock")?;
+        if promoted > 0 {
+            warn!(
+                "[bridge] promoted {} queued lock(s) to failed (attempts >= max_attempts)",
+                promoted
+            );
+        }
         let cl_parked_live = live.on(conductor, &credit_limit_ea_id).await?.len();
         let br_parked_live = live.on(conductor, &bridging_ea_id).await?.len();
 
@@ -5316,6 +5315,60 @@ mod tests {
             ..conductor
         };
         (conductor, stopped)
+    }
+
+    fn out_of_attempts(orch: &BridgeOrchestrator, id: i64) {
+        rusqlite::Connection::open(&orch.cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE work_items SET attempts = max_attempts WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_row_out_of_attempts_is_reconciled_before_it_is_failed() {
+        let orch = test_orchestrator("exhausted-reconciled");
+        let written = enqueue_lock(&orch, "lock:exhausted:1", "0x9c");
+        let unmatched = enqueue_lock(&orch, "lock:exhausted:2", "0x9d");
+        for id in [written, unmatched] {
+            out_of_attempts(&orch, id);
+        }
+        let late = parked_tx(0xBD, &[proof("lock:exhausted:1", "0x9c")]);
+        let conductor = bridging_conductor().parking(action_hash(CL_EA), &[late]);
+
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+        assert_eq!(
+            lock_row(&orch, written).state,
+            crate::state::WorkState::Succeeded,
+            "its late link is recorded, and it goes on"
+        );
+        let failed = orch
+            .db
+            .list_work_items("lock", crate::state::WorkState::Failed, 10)
+            .unwrap();
+        assert_eq!(
+            failed.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [unmatched]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_out_of_attempts_whose_spend_a_rave_took_succeeds_rather_than_fails() {
+        let orch = test_orchestrator("exhausted-but-paid");
+        let ([paid, _], _) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        out_of_attempts(&orch, paid);
+
+        orch.run_bridge_cycle(&bridging_conductor(), &running())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lock_row(&orch, paid).state,
+            crate::state::WorkState::Succeeded
+        );
     }
 
     #[tokio::test]
