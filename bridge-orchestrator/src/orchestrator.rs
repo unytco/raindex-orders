@@ -242,8 +242,6 @@ impl BridgeOrchestrator {
         });
     }
 
-    /// Whether the cycle ends after `fn_name` returned in `elapsed_ms`: a stop
-    /// was signalled while it ran, or it was slow enough to eject the stage.
     fn ends_cycle(&self, stage: &str, fn_name: &str, elapsed_ms: u128, stop: &ShutdownRx) -> bool {
         if *stop.borrow() {
             info!(
@@ -261,8 +259,7 @@ impl BridgeOrchestrator {
         false
     }
 
-    /// `None` means the cycle ends before the spend, on the same verdict the
-    /// calls around the read get.
+    /// `None` means the cycle ends before the spend.
     async fn spend_tag_ledger(
         &self,
         read: impl std::future::Future<Output = Result<Ledger>>,
@@ -673,7 +670,6 @@ impl BridgeOrchestrator {
                 }
             }
 
-            // Interruptible so shutdown is never observed mid-write.
             sleep_or_shutdown(self.cfg.poll_interval_ms, &mut shutdown).await;
         }
     }
@@ -722,9 +718,7 @@ impl BridgeOrchestrator {
         let tag_cap = self.cfg.max_link_tag_bytes;
         let coupons_budget = self.cfg.coupons_target_bytes;
 
-        // Per-cycle safety valve: `recover_stale_items` only runs at startup, so
-        // without this a permanently broken lock retries forever in a long
-        // session.
+        // The only place a lock that has used up its attempts is failed.
         let promoted = self.db.fail_exhausted_queued("lock")?;
         if promoted > 0 {
             warn!(

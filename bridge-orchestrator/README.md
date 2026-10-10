@@ -248,11 +248,11 @@ signal:
   next cycle;
 - the process exits 0.
 
-The cycle ends where a slow call would eject it, each row at the step it
-reached, and the next start carries it on. The rows a RAVE took when the stop
-came are recorded by the next start's reconcile. A stop waits for at most one
-Holochain call, `HAM_REQUEST_TIMEOUT_SECS`, or one Ethereum request, which the
-lock read gives up on after 30 s.
+The cycle ends before its next call, each row at the step it reached. The next
+start returns a row left `in_flight` to `queued`, and its reconcile records the
+rows a RAVE took when the stop came. A stop waits for at most one request: a
+Holochain call, bounded by `HAM_REQUEST_TIMEOUT_SECS`, or an Ethereum request,
+which the lock read gives up on after 30 s.
 
 ### Signer (run only)
 
@@ -406,12 +406,13 @@ detected ─> queued ─> claimed ─> in_flight ─┬─> succeeded
                                              └─> failed (after max_attempts)
 ```
 
-- **detected** -- lock event seen on-chain, waiting for confirmations
-- **queued** -- ready to be processed in the next bridge cycle
-- **claimed** -- picked up by the single-writer executor
-- **in_flight** -- actively being processed (Holochain call or on-chain tx)
-- **succeeded** -- completed successfully
-- **failed** -- exhausted all retry attempts (`max_attempts` = 8)
+- **detected**: lock event seen on-chain, waiting for confirmations
+- **queued**: ready to be processed in the next bridge cycle
+- **claimed**: picked up by the single-writer executor
+- **in_flight**: actively being processed (Holochain call or on-chain tx)
+- **succeeded**: completed successfully
+- **failed**: used up its attempts (`max_attempts` = 8), or cannot be processed
+  and needs a person (`last_error` says why)
 
 On startup, every item a stop or a crash left `claimed` or `in_flight` goes
 back to `queued` with its attempts unchanged. Only a failed cycle counts an

@@ -41,7 +41,6 @@ where
     socket.write_all(response.as_bytes()).await.unwrap();
 }
 
-/// The body of the HTTP request on `socket`.
 pub async fn read_request(socket: &mut TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut chunk = [0u8; 4096];

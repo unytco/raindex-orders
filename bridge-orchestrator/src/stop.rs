@@ -1,4 +1,4 @@
-//! Once a stop is signalled, no new request goes to Holochain or Ethereum.
+//! The error a call refused after a stop carries, recognised under any context.
 
 use ham::ShutdownRx;
 

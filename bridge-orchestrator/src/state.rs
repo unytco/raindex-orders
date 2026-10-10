@@ -470,8 +470,8 @@ impl StateStore {
         Ok(())
     }
 
-    /// A stop is not an attempt, so the rows one left in progress go back to
-    /// `queued` with their attempts as they were.
+    /// A stop or a crash is not an attempt, so the rows it left in progress go
+    /// back to `queued` with their attempts unchanged.
     fn recover_stale_items(&self) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
@@ -706,10 +706,7 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// List all non-terminal rows (state IN `queued` or `in_flight`) for the
-    /// given flow at the given pipeline step, ordered oldest-first. This is
-    /// the core query used by the step-driven bridge cycle: each stage
-    /// (S1..S4) selects its input by `step` value.
+    /// Rows of `flow` at `step` that are `queued` or `in_flight`, oldest first.
     pub fn list_pending_by_step(
         &self,
         flow: &str,
@@ -859,8 +856,7 @@ impl StateStore {
     /// Promote any `queued` rows that have already exhausted their retry
     /// budget to `failed` with `error_class='permanent'`. Intended to be
     /// called at the top of each cycle so a broken lock cannot loop
-    /// forever in a long-running session (the `recover_stale_items`
-    /// equivalent only runs on startup).
+    /// forever in a long-running session.
     pub fn fail_exhausted_queued(&self, flow: &str) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let updated = conn.execute(
@@ -1287,9 +1283,6 @@ mod tests {
 
     #[test]
     fn fail_exhausted_queued_promotes_rows_over_cap() {
-        // Per-cycle safety valve: queued rows whose `attempts` have already
-        // reached `max_attempts` are promoted to `failed`, so a lock whose
-        // cycles keep failing stops being retried.
         let path = test_db_path("fail-exhausted-over-cap");
         let store = StateStore::open(&path).unwrap();
 

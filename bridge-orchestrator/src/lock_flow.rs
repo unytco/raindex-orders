@@ -82,8 +82,6 @@ impl LockFlow {
         Ok(ProviderBuilder::new().on_http(self.cfg.rpc_url.parse()?))
     }
 
-    /// Sends one request unless a stop has been signalled, and gives up on it
-    /// after `rpc_timeout`.
     async fn request<T, E, F>(&self, method: &str, send: impl FnOnce() -> F) -> Result<T>
     where
         F: IntoFuture<Output = Result<T, E>>,
