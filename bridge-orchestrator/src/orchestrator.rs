@@ -2522,7 +2522,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("/tmp/bridge-orchestrator-orch-{}-{}.db", name, ts)
+        std::env::temp_dir()
+            .join(format!("bridge-orchestrator-orch-{name}-{ts}.db"))
+            .display()
+            .to_string()
     }
 
     fn test_config(db_path: String) -> Config {

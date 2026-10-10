@@ -114,7 +114,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("/tmp/bridge-orchestrator-retention-{}-{}.db", name, ts)
+        std::env::temp_dir()
+            .join(format!("bridge-orchestrator-retention-{name}-{ts}.db"))
+            .display()
+            .to_string()
     }
 
     fn insert_row(path: &str, item_id: &str, state: WorkState) {

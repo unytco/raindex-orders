@@ -1114,7 +1114,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("/tmp/bridge-orchestrator-{}-{}.db", name, ts)
+        std::env::temp_dir()
+            .join(format!("bridge-orchestrator-{name}-{ts}.db"))
+            .display()
+            .to_string()
     }
 
     fn insert_work_item_with_state(path: &str, item_id: &str, state: WorkState) {
