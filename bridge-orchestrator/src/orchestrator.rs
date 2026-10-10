@@ -650,11 +650,11 @@ impl BridgeOrchestrator {
     /// Single unified bridge cycle built as a four-stage pipeline.
     ///
     /// Each lock row's `step` column (see [`WorkStep`]) tracks which zome calls
-    /// have been proven to land on-chain. A stage advances a row by comparing
-    /// its recorded ActionHash against a freshly-fetched live-link set, never by
-    /// walking past RAVE history: `execute_rave` is invoked with the just-read
-    /// live set, so a silently-committed RAVE drops the consumed links out of
-    /// the next fetch and the rows behind them advance on their own.
+    /// have been proven to land on-chain. A stage advances a row only on
+    /// evidence in a freshly-fetched live-link set, never by walking past RAVE
+    /// history: `execute_rave` is invoked with the just-read live set, so a
+    /// silently-committed RAVE drops the consumed links out of the next fetch
+    /// and the rows behind them advance on their own.
     ///
     /// 1. Resolve context.
     /// 2. Reconcile: promote rows through the pipeline based on what is
@@ -663,12 +663,12 @@ impl BridgeOrchestrator {
     /// 3. S1: `create_parked_link` (CL EA) packing proofs from rows at
     ///    `step='new'` up to the link-tag cap.
     /// 4. S2: `execute_rave` (CL EA) over the refetched live set; advances
-    ///    rows whose `cl_link_hash` it consumed carrying their own proof.
+    ///    each row at `cl_link_created` whose own proof it consumed.
     /// 5. S3: `create_parked_spend` (bridging EA) packing proofs from rows
     ///    at `step='cl_rave_executed'` up to the tag cap.
     /// 6. S4: `execute_rave` (bridging EA) over the refetched live set
-    ///    plus withdrawal coupons; advances rows whose `br_spend_hash` it
-    ///    consumed carrying their own proof to `state='succeeded'`.
+    ///    plus withdrawal coupons; advances to `state='succeeded'` each row
+    ///    at `br_spend_created` whose own proof it consumed.
     async fn run_bridge_cycle(&self, ham: &Ham) -> Result<()> {
         let started = std::time::Instant::now();
 
@@ -806,18 +806,13 @@ impl BridgeOrchestrator {
         // S2: execute_rave on credit-limit EA
         // ---------------------------------------------------------------
         //
-        // Re-fetch the live CL link set so the RAVE sees exactly the links
-        // it will consume — including any link we wrote in S1 plus
-        // orphaned links from earlier cycles.
+        // Re-fetch the live CL link set so the RAVE sees exactly the links it
+        // will consume, including any link S1 just wrote and orphaned links
+        // from earlier cycles.
         let cl_links_fetched = conductor.parked_links(&credit_limit_ea_id).await?;
-        // Apply the optional per-cycle RAVE link cap. Deferred links stay
-        // live server-side and are picked up by the next cycle via the
-        // reconcile prelude (rows at `cl_link_created` whose hash is no
-        // longer live get swept into `cl_rave_executed`).
         let cl_fetched_count = cl_links_fetched.len();
         let (cl_links, deferred_cl_links) =
             apply_rave_link_cap(cl_links_fetched, self.cfg.rave_max_links);
-        // From the capped slice: a link the cap deferred was not consumed.
         let consumed_cl = links_by_lock(&cl_links);
         let mut cl_rave_advanced = 0usize;
         if !cl_links.is_empty() {
@@ -861,11 +856,6 @@ impl BridgeOrchestrator {
                 self.advance_consumed(WorkStep::ClLinkCreated, &consumed_cl, |id| {
                     self.db.advance_to_cl_rave_executed(id, Some(&cl_rave_hash))
                 })?;
-            // Always log after the RAVE ran, even when 0 rows advanced.
-            // A zero here is the diagnostic signal for "RAVE fired but
-            // no stored cl_link_hash matched the consumed set" — i.e.
-            // orphaned links or a silent write failure on a prior
-            // cycle's S1.
             info!(
                 "[bridge/s2] RAVE executed: {} lock(s) advanced cl_link_created → cl_rave_executed",
                 cl_rave_advanced
@@ -1005,10 +995,6 @@ impl BridgeOrchestrator {
         let (rave_links, deferred_br_rave) =
             apply_rave_link_cap(rave_links, self.cfg.rave_max_links);
 
-        // Derive the post-cap retained subsets. Every bookkeeping step
-        // below must key off these, not the pre-cap Vecs, or we'd advance
-        // DB rows / forward coupons for links that never made it into
-        // `execute_rave`.
         let retained_deposit_ids: HashSet<String> = rave_links
             .iter()
             .filter(|t| deposit_rave_ids.contains(&t.id.to_string()))
@@ -1088,9 +1074,6 @@ impl BridgeOrchestrator {
                 self.advance_consumed(WorkStep::BrSpendCreated, &consumed_deposits, |id| {
                     self.db.advance_to_br_rave_executed(id, Some(&br_rave_hash))
                 })?;
-            // Same rationale as S2: always log after the bridging
-            // RAVE ran. A zero here means the RAVE consumed nothing
-            // stored by us, which is an orphaned-spend warning sign.
             info!(
                 "[bridge/s4] RAVE executed: {} lock(s) advanced br_spend_created → br_rave_executed (succeeded)",
                 succeeded_locks
@@ -1130,9 +1113,8 @@ impl BridgeOrchestrator {
     /// evidence at multiple steps gets cascaded forward each time we
     /// re-query its step after advancing):
     ///
-    /// * `step='new'` and the lock's own proof, by lock ID and transaction
-    ///   hash, is in a live CL parked link → advance to `cl_link_created`
-    ///   with that link's ActionHash.
+    /// * `step='new'` and the lock's own proof is in a live CL parked link →
+    ///   advance to `cl_link_created` with that link's ActionHash.
     /// * `step='cl_link_created'` and `cl_link_hash` has left the agreement
     ///   it was parked on → that agreement's RAVE consumed the link. Advance
     ///   to `cl_rave_executed` with `cl_rave_hash=NULL` (we can't recover the
@@ -1291,8 +1273,8 @@ impl BridgeOrchestrator {
         Ok(false)
     }
 
-    /// Advances each row at `step` whose recorded link the RAVE consumed with the row's own
-    /// proof in it, through `advance`, and returns how many it advanced.
+    /// Advances, through `advance`, each row at `step` whose own proof was in a
+    /// link the RAVE was sent, and returns how many it advanced.
     fn advance_consumed(
         &self,
         step: WorkStep,
@@ -1302,17 +1284,19 @@ impl BridgeOrchestrator {
         let consumed_links: HashSet<&str> = consumed.values().map(String::as_str).collect();
         let mut advanced = 0;
         for row in self.db.list_pending_by_step("lock", step, 5000)? {
-            let Some((link, _)) = row.parked_link() else {
+            let (Some((link, _)), Some(lock)) = (row.parked_link(), self.lock_key(&row)) else {
                 continue;
             };
-            let carried_in = self.lock_key(&row).and_then(|lock| consumed.get(&lock));
-            if carried_in.map(String::as_str) == Some(link) {
+            if consumed.contains_key(&lock) {
                 advance(row.id)?;
                 advanced += 1;
             } else if consumed_links.contains(link) {
                 error!(
                     event = "bridge.rave.proof_missing",
-                    "[bridge/rave] lock={} stays at {}: the RAVE consumed its link {} without its proof",
+                    lock_id = lock.lock_id,
+                    tx_hash = lock.tx_hash,
+                    link,
+                    "[bridge/rave] lock={} at {}: its recorded link {} went to the RAVE without its proof",
                     row.item_id,
                     row.step,
                     link
@@ -1327,8 +1311,8 @@ impl BridgeOrchestrator {
         match LockPayload::deserialize(item.payload_json.clone()) {
             Ok(payload) => Some(LockKey::new(&payload.lock_id, &payload.tx_hash)),
             Err(e) => {
-                warn!(
-                    "[bridge/reconcile] lock={} unable to read its lock for reconcile: {}",
+                error!(
+                    "[bridge] lock={} has an unreadable lock payload: {}",
                     item.item_id, e
                 );
                 None
@@ -2150,8 +2134,8 @@ fn normalize_tx_hash(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-/// The lock a deposit proof stands for. Its ID is unique per vault; its
-/// transaction is not, since one transaction can lock twice.
+/// The lock a deposit proof stands for. Neither field names a lock alone: the
+/// ID repeats across vaults, and one transaction can lock twice.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LockKey {
     lock_id: String,
@@ -2188,11 +2172,37 @@ fn links_by_lock(parked: &[Transaction]) -> HashMap<LockKey, String> {
             } => attached_payload,
             _ => continue,
         };
-        let Some(Value::Array(proofs)) = payload.get("proof_of_deposit") else {
+        let Some(proofs) = payload.get("proof_of_deposit") else {
             continue;
         };
-        for lock in proofs.iter().filter_map(LockKey::of_proof) {
-            out.insert(lock, tx.id.to_string());
+        let link = tx.id.to_string();
+        let Some(proofs) = proofs.as_array() else {
+            error!(
+                event = "bridge.proof_unreadable",
+                link, "[bridge] link {link} carries a proof_of_deposit that is not a list"
+            );
+            continue;
+        };
+        for (index, proof) in proofs.iter().enumerate() {
+            let Some(lock) = LockKey::of_proof(proof) else {
+                error!(
+                    event = "bridge.proof_unreadable",
+                    link, "[bridge] proof {index} in link {link} names no lock: {proof}"
+                );
+                continue;
+            };
+            if let Some(other) = out.insert(lock.clone(), link.clone()) {
+                if other != link {
+                    error!(
+                        event = "bridge.proof_duplicated",
+                        lock_id = lock.lock_id,
+                        tx_hash = lock.tx_hash,
+                        "[bridge] lock {} in {} is carried by two live links, {other} and {link}: a RAVE taking both acts on it twice",
+                        lock.lock_id,
+                        lock.tx_hash
+                    );
+                }
+            }
         }
     }
     out
@@ -2392,13 +2402,11 @@ mod tests {
         action_hash(seed).to_string()
     }
 
-    /// The proof S1 and S3 write for lock `lock_id`, made in `tx_hash`.
+    /// The fields of a deposit proof that name its lock.
     fn proof(lock_id: &str, tx_hash: &str) -> Value {
         json!({ "lock_id": lock_id, "tx_hash": tx_hash })
     }
 
-    /// A link parked on the CL EA carrying `proofs`, its ActionHash derived
-    /// from `seed`.
     fn parked_tx(seed: u8, proofs: &[Value]) -> Transaction {
         let id = action_hash(seed).into();
         let executor: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![2u8; 32]).into();
@@ -2424,8 +2432,6 @@ mod tests {
         }
     }
 
-    /// A spend parked on the bridging EA carrying `proofs`, as for
-    /// [`parked_tx`].
     fn parked_spend_tx(seed: u8, proofs: &[Value]) -> Transaction {
         let id = action_hash(seed).into();
         let spender: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![3u8; 32]).into();
@@ -2459,7 +2465,7 @@ mod tests {
     }
 
     /// Enqueue a lock row `extract_lock_proof` can read, with `item_id` as
-    /// its lock ID, so its proof is `proof(item_id, tx_hash)`.
+    /// its lock ID.
     fn enqueue_lock(orch: &BridgeOrchestrator, item_id: &str, tx_hash: &str) -> i64 {
         let agent_hex = "00".repeat(32);
         let payload = serde_json::json!({
@@ -4030,13 +4036,11 @@ mod tests {
             );
         }
         assert_eq!(map.get(&LockKey::new("3", "0xab")), None);
+        assert_eq!(map.get(&LockKey::new("1", "0xcd")), None);
     }
 
     #[test]
     fn links_by_lock_skips_non_parked_and_missing_hashes() {
-        // A RAVE or any payload without a `proof_of_deposit` array must
-        // not pollute the reconciler's index — otherwise a row could be
-        // advanced against a live link that has nothing to do with it.
         let mut rave_tx = parked_tx(0x33, &[]);
         rave_tx.tx_type = TransactionType::RAVE;
         rave_tx.details = TransactionDetails::Parked {
@@ -4096,10 +4100,6 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_leaves_new_row_untouched_when_its_proof_is_absent_from_live_cl() {
-        // Negative case: if no live CL link carries the row's proof, the
-        // row stays at step='new' and S1 will re-issue the batch on this
-        // cycle. This is the branch that prevents silent advancement on
-        // unrelated links.
         let orch = test_orchestrator("reconcile-s1-noop");
         let row_id = enqueue_lock(&orch, "lock:r:2", "0xabc999");
         let unrelated = parked_tx(0x20, &[proof("lock:r:other", "0xdeadbeef")]);
@@ -4311,7 +4311,7 @@ mod tests {
         // exactly one advancement available.
         let orch = test_orchestrator("reconcile-counts-each-step");
 
-        // S1: step='new', tx_hash matches a live CL link.
+        // S1: step='new', its proof is in a live CL link.
         let id_s1 = enqueue_lock(&orch, "lock:counts:s1", "0xa1");
         let s1_live = parked_tx(0x81, &[proof("lock:counts:s1", "0xa1")]);
 
@@ -4323,8 +4323,8 @@ mod tests {
             .advance_to_cl_link_created(id_s2, &s2_stored, &ea(CL_EA))
             .unwrap();
 
-        // S3: step='cl_rave_executed', tx_hash matches a live bridging
-        // parked-spend.
+        // S3: step='cl_rave_executed', its proof is in a live bridging
+        // parked spend.
         let id_s3 = enqueue_lock(&orch, "lock:counts:s3", "0xa3");
         orch.db
             .advance_to_cl_link_created(id_s3, &action_hash(0x83).to_string(), &ea(CL_EA))
@@ -4439,12 +4439,31 @@ mod tests {
         .unwrap()
     }
 
+    /// The batch S1 builds when its tag has room for the first proof alone.
+    fn s1_batch_of_one(orch: &BridgeOrchestrator) -> ProofBatch {
+        let rows = rows_at(orch, WorkStep::New);
+        let (proof, amount) = orch.extract_lock_proof(VAULT, &rows[0]).unwrap();
+        orch.build_cl_batch(VAULT, &rows, cl_estimate(&amount, &[proof]))
+            .unwrap()
+    }
+
+    /// The batch S3 builds when its tag has room for the first proof alone.
+    fn s3_batch_of_one(orch: &BridgeOrchestrator) -> ProofBatch {
+        let rows = rows_at(orch, WorkStep::ClRaveExecuted);
+        let ctx = tag_context(Ledger::empty(), &[]);
+        let (proof, amount) = orch.extract_lock_proof(VAULT, &rows[0]).unwrap();
+        let cap = spend_estimate(&ctx, &amount, &[proof]);
+        orch.build_spend_batch(VAULT, &rows, cap, &ctx).unwrap()
+    }
+
     #[tokio::test]
     async fn of_two_locks_in_one_transaction_reconcile_records_only_the_one_s1_wrote() {
         let orch = test_orchestrator("one-tx-two-locks-s1");
-        let first = enqueue_lock(&orch, "lock:twice:1", "0x7a");
-        let second = enqueue_lock(&orch, "lock:twice:2", "0x7a");
-        let written = parked_tx(0x90, &[proof("lock:twice:1", "0x7a")]);
+        let first = enqueue_lock(&orch, "lock:twice:1", "0x7A");
+        let second = enqueue_lock(&orch, "lock:twice:2", "0x7A");
+        let batch = s1_batch_of_one(&orch);
+        assert_eq!((batch.ids.clone(), batch.capped), (vec![first], true));
+        let written = parked_tx(0x90, &batch.proofs);
 
         let counts = reconcile(&orch, std::slice::from_ref(&written), &[]).await;
 
@@ -4453,15 +4472,8 @@ mod tests {
         assert_eq!(recorded.step, WorkStep::ClLinkCreated);
         assert_eq!(recorded.cl_link_hash, Some(written.id.to_string()));
         assert_eq!(lock_row(&orch, second).step, WorkStep::New);
-        let next = orch
-            .build_cl_batch(
-                VAULT,
-                &rows_at(&orch, WorkStep::New),
-                orch.cfg.max_link_tag_bytes,
-            )
-            .unwrap();
         assert_eq!(
-            next.ids,
+            s1_batch_of_one(&orch).ids,
             vec![second],
             "the next S1 batch writes the second lock"
         );
@@ -4470,9 +4482,11 @@ mod tests {
     #[tokio::test]
     async fn of_two_locks_in_one_transaction_reconcile_records_only_the_one_s3_wrote() {
         let orch = test_orchestrator("one-tx-two-locks-s3");
-        let first = enqueue_at_cl_rave_executed(&orch, "lock:twice:1", "0x7b");
-        let second = enqueue_at_cl_rave_executed(&orch, "lock:twice:2", "0x7b");
-        let written = parked_spend_tx(0x91, &[proof("lock:twice:1", "0x7b")]);
+        let first = enqueue_at_cl_rave_executed(&orch, "lock:twice:1", "0x7B");
+        let second = enqueue_at_cl_rave_executed(&orch, "lock:twice:2", "0x7B");
+        let batch = s3_batch_of_one(&orch);
+        assert_eq!((batch.ids.clone(), batch.capped), (vec![first], true));
+        let written = parked_spend_tx(0x91, &batch.proofs);
 
         let counts = reconcile(&orch, &[], std::slice::from_ref(&written)).await;
 
@@ -4481,16 +4495,8 @@ mod tests {
         assert_eq!(recorded.step, WorkStep::BrSpendCreated);
         assert_eq!(recorded.br_spend_hash, Some(written.id.to_string()));
         assert_eq!(lock_row(&orch, second).step, WorkStep::ClRaveExecuted);
-        let next = orch
-            .build_spend_batch(
-                VAULT,
-                &rows_at(&orch, WorkStep::ClRaveExecuted),
-                orch.cfg.max_link_tag_bytes,
-                &tag_context(Ledger::empty(), &[]),
-            )
-            .unwrap();
         assert_eq!(
-            next.ids,
+            s3_batch_of_one(&orch).ids,
             vec![second],
             "the next S3 batch writes the second lock"
         );
@@ -4499,11 +4505,10 @@ mod tests {
     #[tokio::test]
     async fn of_two_locks_in_one_transaction_each_succeeds_only_once_its_own_spend_is_consumed() {
         let orch = test_orchestrator("one-tx-two-locks-s4");
-        let context = in_force(CL_EA, BR_EA);
         let first = enqueue_at_cl_rave_executed(&orch, "lock:twice:1", "0x7c");
         let second = enqueue_at_cl_rave_executed(&orch, "lock:twice:2", "0x7c");
-        let first_spend = parked_spend_tx(0x92, &[proof("lock:twice:1", "0x7c")]);
-        orch.record_br_spend(first, &first_spend.id.to_string(), &context)
+        let first_spend = parked_spend_tx(0x92, &s3_batch_of_one(&orch).proofs);
+        orch.record_br_spend(first, &first_spend.id.to_string(), &in_force(CL_EA, BR_EA))
             .unwrap();
 
         reconcile(&orch, &[], std::slice::from_ref(&first_spend)).await;
@@ -4520,11 +4525,13 @@ mod tests {
             "the second depositor is not credited by the first lock's spend"
         );
 
-        let second_spend = parked_spend_tx(0x93, &[proof("lock:twice:2", "0x7c")]);
-        orch.record_br_spend(second, &second_spend.id.to_string(), &context)
-            .unwrap();
-        reconcile(&orch, &[], std::slice::from_ref(&second_spend)).await;
-        assert_eq!(lock_row(&orch, second).step, WorkStep::BrSpendCreated);
+        let second_spend = parked_spend_tx(0x93, &s3_batch_of_one(&orch).proofs);
+        let counts = reconcile(&orch, &[], std::slice::from_ref(&second_spend)).await;
+        assert_eq!(counts.s3_advanced, 1);
+        assert_eq!(
+            lock_row(&orch, second).br_spend_hash,
+            Some(second_spend.id.to_string())
+        );
         assert_eq!(s4_consumes(&orch, &[second_spend]), 1);
         assert_eq!(
             lock_row(&orch, second).state,
@@ -4533,25 +4540,34 @@ mod tests {
     }
 
     #[test]
-    fn a_rave_advances_only_the_rows_whose_own_proof_its_consumed_link_carried() {
+    fn a_rave_advances_only_the_rows_whose_own_proof_it_was_sent() {
         let orch = test_orchestrator("rave-own-proof");
         let link = parked_tx(0x94, &[proof("lock:own:1", "0x7d")]);
+        let other_link = parked_tx(0x97, &[proof("lock:own:3", "0x7d")]);
         let carried = enqueue_lock(&orch, "lock:own:1", "0x7d");
         let missing = enqueue_lock(&orch, "lock:own:2", "0x7d");
-        for id in [carried, missing] {
+        let elsewhere = enqueue_lock(&orch, "lock:own:3", "0x7d");
+        for id in [carried, missing, elsewhere] {
             orch.db
                 .advance_to_cl_link_created(id, &link.id.to_string(), &ea(CL_EA))
                 .unwrap();
         }
 
         let advanced = orch
-            .advance_consumed(WorkStep::ClLinkCreated, &links_by_lock(&[link]), |id| {
-                orch.db.advance_to_cl_rave_executed(id, Some("s2"))
-            })
+            .advance_consumed(
+                WorkStep::ClLinkCreated,
+                &links_by_lock(&[link, other_link]),
+                |id| orch.db.advance_to_cl_rave_executed(id, Some("s2")),
+            )
             .unwrap();
 
-        assert_eq!(advanced, 1);
+        assert_eq!(advanced, 2);
         assert_eq!(lock_row(&orch, carried).step, WorkStep::ClRaveExecuted);
+        assert_eq!(
+            lock_row(&orch, elsewhere).step,
+            WorkStep::ClRaveExecuted,
+            "a row whose own proof the RAVE took in another link was credited"
+        );
         assert_eq!(lock_row(&orch, missing).step, WorkStep::ClLinkCreated);
 
         let spend = parked_spend_tx(0x95, &[proof("lock:own:1", "0x7d")]);

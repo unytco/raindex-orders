@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- bridge-orchestrator credits both deposits when one Ethereum transaction locks twice, instead of marking the second bridged after a restart without crediting it.
+- bridge-orchestrator credits both deposits when one Ethereum transaction locks twice, for deposits it records from this release on.
 
 ## [0.3.0] - 2026-10-06
 
