@@ -1242,8 +1242,12 @@ impl BridgeOrchestrator {
     ) -> Result<ReconcileCounts> {
         let credit_limit: ActionHash = context.credit_limit_adjustment.clone().into();
         let bridging: ActionHash = context.bridging_agreement.clone().into();
-        let cl_by_lock = self.links_by_lock(live.on(conductor, &credit_limit).await?);
-        let br_by_lock = self.links_by_lock(live.on(conductor, &bridging).await?);
+        let cl_live = live.on(conductor, &credit_limit).await?;
+        self.log_foreign_proofs("proof_foreign/credit_limit", cl_live);
+        let cl_by_lock = self.links_by_lock(cl_live);
+        let br_live = live.on(conductor, &bridging).await?;
+        self.log_foreign_proofs("proof_foreign/bridging", br_live);
+        let br_by_lock = self.links_by_lock(br_live);
         let mut counts = ReconcileCounts::default();
 
         for row in self.db.list_pending_by_step("lock", WorkStep::New, 5000)? {
@@ -1548,6 +1552,25 @@ impl BridgeOrchestrator {
 
     fn links_by_lock(&self, parked: &[Transaction]) -> HashMap<LockKey, String> {
         links_by_lock(parked, &self.cfg.bridging_agent_pubkey)
+    }
+
+    fn log_foreign_proofs(&self, check: &'static str, live: &[Transaction]) {
+        let foreign: Vec<&Transaction> = live
+            .iter()
+            .filter(|tx| {
+                tx.creator != self.cfg.bridging_agent_pubkey && deposit_proofs(tx).is_some()
+            })
+            .collect();
+        for tx in self.newly_flagged(check, &foreign, |tx| tx.id.to_string()) {
+            warn!(
+                event = "bridge.proof_foreign",
+                link = %tx.id,
+                creator = %tx.creator,
+                "[bridge] link {} by {} carries a proof_of_deposit, which counts only on the bridging agent's own links",
+                tx.id,
+                tx.creator
+            );
+        }
     }
 
     /// `links` without each deposit link its rows do not account for: every
@@ -2950,21 +2973,11 @@ fn links_by_lock(
     bridging_agent: &AgentPubKeyB64,
 ) -> HashMap<LockKey, String> {
     let mut out = HashMap::new();
-    for tx in parked {
+    for tx in parked.iter().filter(|tx| tx.creator == *bridging_agent) {
         let Some(proofs) = deposit_proofs(tx) else {
             continue;
         };
         let link = tx.id.to_string();
-        if tx.creator != *bridging_agent {
-            warn!(
-                event = "bridge.proof_foreign",
-                link,
-                creator = %tx.creator,
-                "[bridge] link {link} by {} carries a proof_of_deposit, which counts only on the bridging agent's own links",
-                tx.creator
-            );
-            continue;
-        }
         let Some(proofs) = proofs.as_array() else {
             error!(
                 event = "bridge.proof_unreadable",
@@ -5852,6 +5865,27 @@ mod tests {
 
         assert_eq!(counts.s1_advanced, 1);
         assert_eq!(lock_row(&orch, id).cl_link_hash, Some(own.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn another_agents_link_carrying_a_proof_is_logged_once_while_it_stays_parked() {
+        let orch = test_orchestrator("foreign-proof-once");
+        let cl_copy = signed_by_another(parked_tx(0xB3, &[proof("lock:copied:5", "0x8f")]));
+        let br_copy = signed_by_another(parked_spend_tx(0xB4, &[proof("lock:copied:5", "0x8f")]));
+        let both = [cl_copy.clone(), br_copy.clone()];
+        let told = async |cl: &[Transaction], br: &[Transaction]| {
+            let logged = warnings_logged(reconcile(&orch, cl, br)).await;
+            told_of(&logged, "bridge.proof_foreign", &both)
+        };
+        let (cl, br) = (
+            std::slice::from_ref(&cl_copy),
+            std::slice::from_ref(&br_copy),
+        );
+
+        assert_eq!(told(cl, br).await, ids(&both));
+        assert_eq!(told(cl, br).await, ids(&[]), "both are still parked");
+        assert_eq!(told(&[], br).await, ids(&[]));
+        assert_eq!(told(cl, br).await, ids(cl), "it left, and is parked again");
     }
 
     #[tokio::test]
