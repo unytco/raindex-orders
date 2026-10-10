@@ -3961,6 +3961,7 @@ mod tests {
         fails_on: Option<(ActionHash, &'static str)>,
         raves: RefCell<Vec<(ActionHash, Vec<ActionHashB64>)>>,
         chain_reads: RefCell<Vec<ChainRead>>,
+        chain_stalls: bool,
     }
 
     const LINK_SEQ: u32 = 5;
@@ -4230,6 +4231,12 @@ mod tests {
         async fn raves(&self, from: ChainRead) -> Result<ChainPage> {
             self.call("raves");
             self.chain_reads.borrow_mut().push(from);
+            if self.chain_stalls {
+                return Ok(ChainPage {
+                    raves: vec![],
+                    next: ChainRead::From(FIRST_RAVE_SEQ),
+                });
+            }
             let raves = self.raves.borrow();
             let newest = (FIRST_RAVE_SEQ..)
                 .zip(raves.iter())
@@ -5909,6 +5916,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_chain_read_that_moves_no_further_back_leaves_the_row_where_it_is() {
+        let orch = test_orchestrator("chain-read-stalls");
+        let ([waiting, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        let conductor = FakeConductor {
+            chain_stalls: true,
+            ..bridging_conductor().holding_unconsumed(&links[..1])
+        };
+
+        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+
+        let row = lock_row(&orch, waiting);
+        assert_eq!(
+            (row.state, row.step),
+            (crate::state::WorkState::Queued, WorkStep::BrSpendCreated)
+        );
+        assert_eq!(
+            *conductor.chain_reads.borrow(),
+            [ChainRead::Head, ChainRead::From(FIRST_RAVE_SEQ)]
+        );
+    }
+
     #[test]
     fn a_chain_page_names_each_rave_it_read_and_where_the_next_read_starts() {
         let rave_tx = |seed: u8, consumed: &[u8]| {
@@ -6192,42 +6221,53 @@ mod tests {
     #[tokio::test]
     async fn a_row_recording_a_withheld_link_goes_to_a_person() {
         for (step, agreement) in RAVE_STAGES {
-            let orch = test_orchestrator("withheld-row");
-            let (first, second) = ("lock:withheld:1", "lock:withheld:2");
-            let shared = link_at(&step, 0x4F, &[proof(first, "0xa2"), proof(second, "0xa3")]);
-            let own = link_at(&step, 0x50, &[proof(second, "0xa3")]);
-            let context = in_force(CL_EA, BR_EA);
-            let rows =
-                [(first, "0xa2", &shared), (second, "0xa3", &own)].map(|(lock, tx, link)| {
-                    let id = match step {
-                        WorkStep::ClLinkCreated => enqueue_lock(&orch, lock, tx),
-                        _ => enqueue_at_cl_rave_executed(&orch, lock, tx),
-                    };
-                    match step {
-                        WorkStep::ClLinkCreated => {
-                            orch.record_cl_link(id, &link.id.to_string(), &context)
+            for failed_before in [false, true] {
+                let orch = test_orchestrator("withheld-row");
+                let (first, second) = ("lock:withheld:1", "lock:withheld:2");
+                let shared = link_at(&step, 0x4F, &[proof(first, "0xa2"), proof(second, "0xa3")]);
+                let own = link_at(&step, 0x50, &[proof(second, "0xa3")]);
+                let context = in_force(CL_EA, BR_EA);
+                let rows =
+                    [(first, "0xa2", &shared), (second, "0xa3", &own)].map(|(lock, tx, link)| {
+                        let id = match step {
+                            WorkStep::ClLinkCreated => enqueue_lock(&orch, lock, tx),
+                            _ => enqueue_at_cl_rave_executed(&orch, lock, tx),
+                        };
+                        match step {
+                            WorkStep::ClLinkCreated => {
+                                orch.record_cl_link(id, &link.id.to_string(), &context)
+                            }
+                            _ => orch.record_br_spend(id, &link.id.to_string(), &context),
                         }
-                        _ => orch.record_br_spend(id, &link.id.to_string(), &context),
-                    }
-                    .unwrap();
-                    id
-                });
-            let conductor =
-                bridging_conductor().parking(action_hash(agreement), &[shared.clone(), own]);
+                        .unwrap();
+                        id
+                    });
+                if failed_before {
+                    orch.db
+                        .mark_failed_permanent(rows[0], "out of attempts")
+                        .unwrap();
+                }
+                let conductor =
+                    bridging_conductor().parking(action_hash(agreement), &[shared.clone(), own]);
 
-            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+                orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
-            assert_eq!(
-                ids(&conductor.parked.borrow()[&action_hash(agreement)]),
-                ids(std::slice::from_ref(&shared)),
-                "only the link both rows account for went to the RAVE"
-            );
-            let failed = failed_row(&orch, rows[0]);
-            assert_eq!(failed.step, step);
-            let reason = failed.last_error.unwrap();
-            assert!(reason.contains(&shared.id.to_string()), "{reason}");
-            assert!(reason.contains(second), "{reason}");
-            assert_ne!(lock_row(&orch, rows[1]).step, step, "its own link paid it");
+                assert_eq!(
+                    ids(&conductor.parked.borrow()[&action_hash(agreement)]),
+                    ids(std::slice::from_ref(&shared)),
+                    "only the link both rows account for went to the RAVE"
+                );
+                let failed = failed_row(&orch, rows[0]);
+                assert_eq!(failed.step, step);
+                let reason = failed.last_error.unwrap();
+                if failed_before {
+                    assert_eq!(reason, "out of attempts", "a failed row keeps its reason");
+                } else {
+                    assert!(reason.contains(&shared.id.to_string()), "{reason}");
+                    assert!(reason.contains(second), "{reason}");
+                }
+                assert_ne!(lock_row(&orch, rows[1]).step, step, "its own link paid it");
+            }
         }
     }
 
