@@ -104,6 +104,7 @@ struct BridgingSelection {
 
 async fn select_bridging_links(
     signer: Option<&CouponSigner>,
+    bridging_agent: &AgentPubKeyB64,
     bridging_links: &[Transaction],
     coupons_budget: usize,
     hot_unit_index: u32,
@@ -124,7 +125,7 @@ async fn select_bridging_links(
         else {
             continue;
         };
-        if attached_payload.get("proof_of_deposit").is_some() {
+        if attached_payload.get("proof_of_deposit").is_some() && tx.creator == *bridging_agent {
             selection.deposits.push(tx.clone());
             continue;
         }
@@ -840,10 +841,11 @@ impl BridgeOrchestrator {
             let cl_rave_hash = cl_rave_hash.to_string();
             info!("[bridge/s2] RAVE executed action_hash={}", cl_rave_hash);
             let taken = taken_by_rave(conductor, &credit_limit_ea_id, &cl_links).await?;
-            cl_rave_advanced =
-                self.advance_consumed(WorkStep::ClLinkCreated, &links_by_lock(&taken), |id| {
-                    self.db.advance_to_cl_rave_executed(id, Some(&cl_rave_hash))
-                })?;
+            cl_rave_advanced = self.advance_consumed(
+                WorkStep::ClLinkCreated,
+                &self.links_by_lock(&taken),
+                |id| self.db.advance_to_cl_rave_executed(id, Some(&cl_rave_hash)),
+            )?;
             info!(
                 "[bridge/s2] RAVE executed: {} lock(s) advanced cl_link_created → cl_rave_executed",
                 cl_rave_advanced
@@ -943,6 +945,7 @@ impl BridgeOrchestrator {
             withdrawals_found: total_withdrawals_found,
         } = select_bridging_links(
             self.ethereum.as_ref().map(|side| &side.signer),
+            &self.cfg.bridging_agent_pubkey,
             &bridging_links,
             coupons_budget,
             self.cfg.hot_unit_index,
@@ -1039,10 +1042,11 @@ impl BridgeOrchestrator {
             let br_rave_hash = br_rave_hash.to_string();
             info!("[bridge/s4] RAVE executed action_hash={}", br_rave_hash);
             let taken = taken_by_rave(conductor, &bridging_ea_id, &rave_links).await?;
-            succeeded_locks =
-                self.advance_consumed(WorkStep::BrSpendCreated, &links_by_lock(&taken), |id| {
-                    self.db.advance_to_br_rave_executed(id, Some(&br_rave_hash))
-                })?;
+            succeeded_locks = self.advance_consumed(
+                WorkStep::BrSpendCreated,
+                &self.links_by_lock(&taken),
+                |id| self.db.advance_to_br_rave_executed(id, Some(&br_rave_hash)),
+            )?;
             info!(
                 "[bridge/s4] RAVE executed: {} lock(s) advanced br_spend_created → br_rave_executed (succeeded)",
                 succeeded_locks
@@ -1103,8 +1107,8 @@ impl BridgeOrchestrator {
     ) -> Result<ReconcileCounts> {
         let credit_limit: ActionHash = context.credit_limit_adjustment.clone().into();
         let bridging: ActionHash = context.bridging_agreement.clone().into();
-        let cl_by_lock = links_by_lock(live.on(conductor, &credit_limit).await?);
-        let br_by_lock = links_by_lock(live.on(conductor, &bridging).await?);
+        let cl_by_lock = self.links_by_lock(live.on(conductor, &credit_limit).await?);
+        let br_by_lock = self.links_by_lock(live.on(conductor, &bridging).await?);
         let mut counts = ReconcileCounts::default();
 
         for row in self.db.list_pending_by_step("lock", WorkStep::New, 5000)? {
@@ -1273,6 +1277,10 @@ impl BridgeOrchestrator {
             }
         }
         Ok(advanced)
+    }
+
+    fn links_by_lock(&self, parked: &[Transaction]) -> HashMap<LockKey, String> {
+        links_by_lock(parked, &self.cfg.bridging_agent_pubkey)
     }
 
     /// The lock [`BridgeOrchestrator::extract_lock_proof`] writes into the row's proof.
@@ -2208,9 +2216,14 @@ impl LockKey {
     }
 }
 
-/// Each deposit proof the given parked links carry, by its lock, with the
-/// ActionHash of the link carrying it.
-fn links_by_lock(parked: &[Transaction]) -> HashMap<LockKey, String> {
+/// Each deposit proof the bridging agent's own parked links carry, by its
+/// lock, with the ActionHash of the link carrying it. Anyone can park a spend
+/// carrying a copy of a proof, so a link the agent did not sign counts for
+/// nothing.
+fn links_by_lock(
+    parked: &[Transaction],
+    bridging_agent: &AgentPubKeyB64,
+) -> HashMap<LockKey, String> {
     let mut out = HashMap::new();
     for tx in parked {
         let payload = match &tx.details {
@@ -2226,6 +2239,16 @@ fn links_by_lock(parked: &[Transaction]) -> HashMap<LockKey, String> {
             continue;
         };
         let link = tx.id.to_string();
+        if tx.creator != *bridging_agent {
+            warn!(
+                event = "bridge.proof_foreign",
+                link,
+                creator = %tx.creator,
+                "[bridge] link {link} by {} carries a proof_of_deposit, which counts only on the bridging agent's own links",
+                tx.creator
+            );
+            continue;
+        }
         let Some(proofs) = proofs.as_array() else {
             error!(
                 event = "bridge.proof_unreadable",
@@ -2458,9 +2481,20 @@ mod tests {
         json!({ "lock_id": lock_id, "tx_hash": tx_hash })
     }
 
+    /// The agent `test_config` bridges for, which signs every link the
+    /// orchestrator writes.
+    fn bridging_agent() -> AgentPubKeyB64 {
+        AgentPubKey::from_raw_32(vec![1u8; 32]).into()
+    }
+
+    fn signed_by_another(mut link: Transaction) -> Transaction {
+        link.creator = AgentPubKey::from_raw_32(vec![0xF0; 32]).into();
+        link
+    }
+
     fn parked_tx(seed: u8, proofs: &[Value]) -> Transaction {
         let id = action_hash(seed).into();
-        let executor: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![2u8; 32]).into();
+        let executor = bridging_agent();
         let ea_id = action_hash(CL_EA).into();
         Transaction {
             id,
@@ -2485,8 +2519,8 @@ mod tests {
 
     fn parked_spend_tx(seed: u8, proofs: &[Value]) -> Transaction {
         let id = action_hash(seed).into();
-        let spender: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![3u8; 32]).into();
-        let executor: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![4u8; 32]).into();
+        let spender = bridging_agent();
+        let executor = bridging_agent();
         let ea_id = action_hash(BR_EA).into();
         Transaction {
             id,
@@ -4166,7 +4200,7 @@ mod tests {
     fn links_by_lock_lowercases_mixed_case_hashes() {
         let tx = parked_tx(0x11, &[proof("7", "0xABCDEF0123456789")]);
         let expected_id = tx.id.to_string();
-        let map = links_by_lock(&[tx]);
+        let map = links_by_lock(&[tx], &bridging_agent());
         assert_eq!(
             map.get(&LockKey::new("7", "0xabcdef0123456789"))
                 .map(String::as_str),
@@ -4179,7 +4213,7 @@ mod tests {
     fn links_by_lock_indexes_parked_spend_payloads_too() {
         let tx_spend = parked_spend_tx(0x22, &[proof("8", "0xdeadbeef")]);
         let expected = tx_spend.id.to_string();
-        let map = links_by_lock(&[tx_spend]);
+        let map = links_by_lock(&[tx_spend], &bridging_agent());
         assert_eq!(
             map.get(&LockKey::new("8", "0xdeadbeef"))
                 .map(String::as_str),
@@ -4190,7 +4224,7 @@ mod tests {
     #[test]
     fn links_by_lock_keys_each_proof_by_its_lock_id_as_well_as_its_transaction() {
         let tx = parked_tx(0x23, &[proof("1", "0xab"), proof("2", "0xab")]);
-        let map = links_by_lock(std::slice::from_ref(&tx));
+        let map = links_by_lock(std::slice::from_ref(&tx), &bridging_agent());
         assert_eq!(map.len(), 2);
         for lock_id in ["1", "2"] {
             assert_eq!(
@@ -4215,7 +4249,7 @@ mod tests {
             attached_payload: json!({ "something_else": [] }),
             consumed_link: false,
         };
-        let map = links_by_lock(&[rave_tx]);
+        let map = links_by_lock(&[rave_tx], &bridging_agent());
         assert!(
             map.is_empty(),
             "payloads missing proof_of_deposit must not be indexed"
@@ -4596,9 +4630,11 @@ mod tests {
     }
 
     fn s4_consumes(orch: &BridgeOrchestrator, spends: &[Transaction]) -> usize {
-        orch.advance_consumed(WorkStep::BrSpendCreated, &links_by_lock(spends), |id| {
-            orch.db.advance_to_br_rave_executed(id, Some("s4"))
-        })
+        orch.advance_consumed(
+            WorkStep::BrSpendCreated,
+            &links_by_lock(spends, &bridging_agent()),
+            |id| orch.db.advance_to_br_rave_executed(id, Some("s4")),
+        )
         .unwrap()
     }
 
@@ -4719,7 +4755,7 @@ mod tests {
         let advanced = orch
             .advance_consumed(
                 WorkStep::ClLinkCreated,
-                &links_by_lock(&[link, other_link]),
+                &links_by_lock(&[link, other_link], &bridging_agent()),
                 |id| orch.db.advance_to_cl_rave_executed(id, Some("s2")),
             )
             .unwrap();
@@ -4751,6 +4787,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_proof_copied_into_another_agents_spend_is_not_the_rows_own() {
+        let orch = test_orchestrator("foreign-copy");
+        let id = enqueue_at_cl_rave_executed(&orch, "lock:copied:1", "0x8a");
+        let copy = signed_by_another(parked_spend_tx(0xAA, &[proof("lock:copied:1", "0x8a")]));
+
+        let counts = reconcile(&orch, &[], std::slice::from_ref(&copy)).await;
+
+        assert_eq!(counts.s3_advanced, 0);
+        assert_eq!(lock_row(&orch, id).step, WorkStep::ClRaveExecuted);
+        orch.db
+            .advance_to_br_spend_created(id, &copy.id.to_string(), &ea(BR_EA))
+            .unwrap();
+        assert_eq!(
+            s4_consumes(&orch, &[copy]),
+            0,
+            "a RAVE taking another agent's spend credits no deposit of ours"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agents_own_spend_still_matches_with_a_copy_listed_after_it() {
+        let orch = test_orchestrator("own-before-copy");
+        let id = enqueue_at_cl_rave_executed(&orch, "lock:copied:2", "0x8b");
+        let own = parked_spend_tx(0xAB, &[proof("lock:copied:2", "0x8b")]);
+        let copy = signed_by_another(parked_spend_tx(0xAC, &[proof("lock:copied:2", "0x8b")]));
+
+        let counts = reconcile(&orch, &[], &[own.clone(), copy]).await;
+
+        assert_eq!(counts.s3_advanced, 1);
+        assert_eq!(lock_row(&orch, id).br_spend_hash, Some(own.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn another_agents_spend_carrying_a_proof_is_selected_as_a_withdrawal() {
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
+        let mut copy = signed_by_another(parked_withdrawal_tx(0xAD));
+        if let TransactionDetails::ParkedSpend {
+            attached_payload, ..
+        } = &mut copy.details
+        {
+            attached_payload["proof_of_deposit"] = json!([proof("lock:copied:3", "0x8c")]);
+        }
+
+        let selection = select_bridging_links(
+            Some(&signer),
+            &bridging_agent(),
+            &[copy.clone()],
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert!(selection.deposits.is_empty());
+        assert_eq!(ids(&selection.withdrawals), ids(&[copy]));
+    }
+
     #[test]
     fn a_rave_advances_every_row_of_a_batch_its_consumed_link_carried() {
         let orch = test_orchestrator("rave-batch");
@@ -4769,9 +4863,11 @@ mod tests {
         }
 
         let advanced = orch
-            .advance_consumed(WorkStep::ClLinkCreated, &links_by_lock(&[link]), |id| {
-                orch.db.advance_to_cl_rave_executed(id, Some("s2"))
-            })
+            .advance_consumed(
+                WorkStep::ClLinkCreated,
+                &links_by_lock(&[link], &bridging_agent()),
+                |id| orch.db.advance_to_cl_rave_executed(id, Some("s2")),
+            )
             .unwrap();
 
         assert_eq!(advanced, 2);
@@ -5743,7 +5839,7 @@ mod tests {
             parked_withdrawal_tx(0x62),
         ];
 
-        let selection = select_bridging_links(None, &links, usize::MAX, 1)
+        let selection = select_bridging_links(None, &bridging_agent(), &links, usize::MAX, 1)
             .await
             .unwrap();
 
@@ -5764,9 +5860,10 @@ mod tests {
             withdrawals[1].clone(),
         ];
 
-        let selection = select_bridging_links(Some(&signer), &links, usize::MAX, 1)
-            .await
-            .unwrap();
+        let selection =
+            select_bridging_links(Some(&signer), &bridging_agent(), &links, usize::MAX, 1)
+                .await
+                .unwrap();
 
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
         assert_eq!(ids(&selection.withdrawals), ids(&withdrawals));
@@ -5782,7 +5879,7 @@ mod tests {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
 
-        let selection = select_bridging_links(Some(&signer), &withdrawals, 1, 1)
+        let selection = select_bridging_links(Some(&signer), &bridging_agent(), &withdrawals, 1, 1)
             .await
             .unwrap();
 
@@ -5797,9 +5894,15 @@ mod tests {
         let mut withdrawal = parked_withdrawal_tx(0x61);
         withdrawal.amount = UnitMap::from(vec![(1, "7"), (3, "5")]);
 
-        let selection = select_bridging_links(Some(&signer), &[withdrawal.clone()], usize::MAX, 3)
-            .await
-            .unwrap();
+        let selection = select_bridging_links(
+            Some(&signer),
+            &bridging_agent(),
+            &[withdrawal.clone()],
+            usize::MAX,
+            3,
+        )
+        .await
+        .unwrap();
 
         let coupon = selection.coupons[&withdrawal.id.to_string()]
             .as_str()
@@ -5834,9 +5937,10 @@ mod tests {
             deposit.clone(),
         ];
 
-        let selection = select_bridging_links(Some(&signer), &links, usize::MAX, 1)
-            .await
-            .unwrap();
+        let selection =
+            select_bridging_links(Some(&signer), &bridging_agent(), &links, usize::MAX, 1)
+                .await
+                .unwrap();
 
         assert_eq!(ids(&selection.withdrawals), ids(&[payable]));
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
