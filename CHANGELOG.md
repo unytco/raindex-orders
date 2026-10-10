@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- the claim page says why a claim failed and what to do next, and sends no claim the bridge would refuse.
+
 ## [0.3.0] - 2026-10-06
 
 ### Added

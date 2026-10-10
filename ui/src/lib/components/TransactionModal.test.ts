@@ -66,6 +66,30 @@ describe.each(['sepolia', 'mainnet'] as const)('TransactionModal on %s', network
 		expect(hasCloseButton(html)).toBe(true)
 	})
 
+	it('a transaction that failed shows its message and links to the explorer', () => {
+		transactionStore.awaitWalletConfirmation()
+		transactionStore.awaitTxReceipt(HASH)
+		transactionStore.transactionError({ message: 'Your claim did not go through.' })
+		const html = render()
+
+		expect(html).toContain('>Your claim did not go through.</p>')
+		expect(html).toContain(ETHERSCAN)
+		expect(html.split(HASH)).toHaveLength(2)
+		expect(hasCloseButton(html)).toBe(true)
+	})
+
+	it('an error before any transaction links nowhere, even after an earlier one', () => {
+		transactionStore.awaitWalletConfirmation()
+		transactionStore.awaitTxReceipt(HASH)
+		transactionStore.awaitWalletConfirmation(true)
+		transactionStore.transactionError({ message: 'This coupon has already been claimed.' })
+		const html = render()
+
+		expect(html).toContain('This coupon has already been claimed.')
+		expect(html).not.toContain(HASH)
+		expect(html).not.toContain('View transaction on Etherscan')
+	})
+
 	it.each([
 		['waiting for the wallet', () => transactionStore.awaitWalletConfirmation(true)],
 		[

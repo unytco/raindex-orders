@@ -118,6 +118,8 @@ function handleChainChanged(chainId: string) {
 	}))
 }
 
+export const userRejected = (err: unknown) => (err as { code?: number } | null)?.code === 4001
+
 export async function connectWallet(): Promise<string | null> {
 	const eth = getEthereum()
 	if (!eth) {
@@ -141,11 +143,12 @@ export async function connectWallet(): Promise<string | null> {
 
 		return accounts[0]
 	} catch (err) {
-		const rejected = (err as { code?: number } | null)?.code === 4001
 		ethereumStore.update(s => ({
 			...s,
 			isLoading: false,
-			error: rejected ? 'Connection rejected by user' : errorMessage(err, 'Failed to connect')
+			error: userRejected(err)
+				? 'Connection rejected by user'
+				: errorMessage(err, 'Failed to connect')
 		}))
 		return null
 	}
@@ -181,7 +184,15 @@ export async function switchNetwork(): Promise<boolean> {
 	}
 }
 
-/** The receipt of `txHash` once it is mined, or an error if the transaction reverted. */
+export class TransactionRevertedError extends Error {
+	readonly hash: string
+
+	constructor(hash: string) {
+		super(`Transaction ${hash} reverted`)
+		this.hash = hash
+	}
+}
+
 export async function waitForTransaction(txHash: string): Promise<unknown> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
@@ -199,7 +210,7 @@ export async function waitForTransaction(txHash: string): Promise<unknown> {
 				} else if (receipt.status === '0x1') {
 					resolve(receipt)
 				} else {
-					reject(new Error(`Transaction ${txHash} reverted`))
+					reject(new TransactionRevertedError(txHash))
 				}
 			} catch (err) {
 				reject(err)
@@ -248,12 +259,21 @@ export async function readContract(params: {
 	return result
 }
 
+/** Throws unless the wallet itself, not the chain it last reported, is on this build's network. */
+export async function requireBridgeChain(eth: Eip1193Provider) {
+	const walletChain = parseInt((await eth.request({ method: 'eth_chainId' })) as string, 16)
+	if (walletChain !== bridge.chain.id) {
+		throw new Error(`Switch your wallet to ${bridge.networkName} first`)
+	}
+}
+
 export async function writeContract(params: {
 	address: string
 	abi: Abi
 	functionName: string
 	args?: readonly unknown[]
 	value?: bigint
+	from?: string
 }): Promise<string> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
@@ -266,12 +286,9 @@ export async function writeContract(params: {
 		args: params.args || []
 	})
 
-	const { account } = get(ethereumStore)
+	const account = params.from ?? get(ethereumStore).account
 	if (!account) throw new Error('Not connected')
-	const walletChain = parseInt((await eth.request({ method: 'eth_chainId' })) as string, 16)
-	if (walletChain !== bridge.chain.id) {
-		throw new Error(`Switch your wallet to ${bridge.networkName} first`)
-	}
+	await requireBridgeChain(eth)
 
 	const txHash = (await eth.request({
 		method: 'eth_sendTransaction',

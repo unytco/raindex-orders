@@ -14,14 +14,6 @@
 	$: isPending =
 		$transactionStore.status === TransactionStatus.PENDING_WALLET ||
 		$transactionStore.status === TransactionStatus.PENDING_TX
-
-	function unescapeString(str: string) {
-		return str
-			.replace(/\\n/g, '\n')
-			.replace(/\\'/g, "'")
-			.replace(/\\"/g, '"')
-			.replace(/\\\\/g, '\\')
-	}
 </script>
 
 <Modal
@@ -83,9 +75,14 @@
 				>
 					<h1 class="text-2xl">❌</h1>
 				</div>
-				<div class="flex flex-col">
-					{unescapeString($transactionStore.error.message)}
-				</div>
+				<p class="w-full break-words text-center">{$transactionStore.error.message}</p>
+				{#if $transactionStore.hash}
+					<a
+						class="text-blue-500 hover:underline"
+						href={explorerTx($transactionStore.hash)}
+						target="_blank">View transaction on Etherscan</a
+					>
+				{/if}
 				<Button on:click={() => transactionStore.reset()}>Close</Button>
 			{/if}
 		</div>

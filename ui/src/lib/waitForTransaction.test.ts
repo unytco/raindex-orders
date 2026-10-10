@@ -30,6 +30,6 @@ describe('waitForTransaction', () => {
 	it('rejects for a transaction that reverted, so no success is shown', async () => {
 		const wait = await polling([{ status: '0x0' }])
 
-		await expect(wait(HASH)).rejects.toThrow(`Transaction ${HASH} reverted`)
+		await expect(wait(HASH)).rejects.toMatchObject({ hash: HASH })
 	})
 })

@@ -2,7 +2,6 @@
 	import { Button, Card, Spinner, Alert, Input, Label } from 'flowbite-svelte'
 	import { orderbookAbi } from '../../generated'
 	import { formatUnits, type Hex } from 'viem'
-	import { transactionStore } from '$lib/stores/transactionStore'
 	import TransactionModal from '$lib/components/TransactionModal.svelte'
 	import TransactionReceipt from '$lib/components/TransactionReceipt.svelte'
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
@@ -10,15 +9,8 @@
 	import { bridge, explorerAddress } from '$lib/config'
 	import { deserializeSignedContext, parseCoupon, type SignedContextV1Struct } from '$lib/coupon'
 	import { getOrderConfig, type OrderConfig } from '$lib/orderConfig'
-	import { claimOrderStruct } from '$lib/network'
-	import {
-		ethereumStore,
-		onWrongNetwork,
-		connectWallet,
-		writeContract,
-		readContract,
-		waitForTransaction
-	} from '$lib/ethereum'
+	import { claimCoupon } from '$lib/claim'
+	import { ethereumStore, onWrongNetwork, connectWallet, readContract } from '$lib/ethereum'
 	import { errorMessage } from '$lib/utils'
 	import { onMount } from 'svelte'
 	import { browser } from '$app/environment'
@@ -121,42 +113,14 @@
 		error = ''
 		success = false
 		isLoading = true
-		transactionStore.awaitWalletConfirmation()
 
 		try {
-			const order = claimOrderStruct(bridge)
-
-			const takeOrderConfig = {
-				order: order,
-				inputIOIndex: BigInt(0),
-				outputIOIndex: BigInt(0),
-				signedContext: [signedContext]
-			}
-
-			const takeOrdersConfig = {
-				minimumInput: signedContext.context[1],
-				maximumInput: signedContext.context[1],
-				maximumIORatio: BigInt(0),
-				orders: [takeOrderConfig],
-				data: '' as Hex
-			}
-
-			const hash = await writeContract({
-				address: bridge.orderbookAddress,
-				abi: orderbookAbi,
-				functionName: 'takeOrders',
-				args: [takeOrdersConfig]
-			})
-
-			transactionStore.awaitTxReceipt(hash)
-			await waitForTransaction(hash)
-			transactionStore.transactionSuccess(hash)
+			const hash = await claimCoupon(signedContext)
 			success = true
 			successTxHash = hash
 			await getVaultBalance()
 		} catch (e) {
 			error = errorMessage(e, 'Claim failed')
-			transactionStore.transactionError({ message: error })
 			console.error(e)
 		} finally {
 			isLoading = false
@@ -275,7 +239,7 @@
 					{/if}
 
 					{#if error}
-						<Alert color="red">{error}</Alert>
+						<Alert color="red" class="break-words">{error}</Alert>
 					{/if}
 
 					<Button

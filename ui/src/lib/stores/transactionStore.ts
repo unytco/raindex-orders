@@ -37,7 +37,12 @@ export const createTransactionStore = () => {
 	const { subscribe, set, update } = writable(initialState)
 	const reset = () => set(initialState)
 	const awaitWalletConfirmation = (isLockTransaction = false) =>
-		update(state => ({ ...state, status: TransactionStatus.PENDING_WALLET, isLockTransaction }))
+		update(state => ({
+			...state,
+			status: TransactionStatus.PENDING_WALLET,
+			isLockTransaction,
+			hash: ''
+		}))
 	const awaitTxReceipt = (txHash: string) =>
 		update(state => ({ ...state, status: TransactionStatus.PENDING_TX, hash: txHash }))
 	const transactionSuccess = (hash: string) =>
@@ -50,7 +55,7 @@ export const createTransactionStore = () => {
 		update(state => ({
 			...state,
 			status: TransactionStatus.ERROR,
-			error: { message: JSON.stringify(txError.message) }
+			error: { message: txError.message }
 		}))
 
 	return {
