@@ -754,6 +754,18 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Rows of `flow`, in any state, that record a link at either stage.
+    pub fn list_recording_a_link(&self, flow: &str) -> Result<Vec<WorkItem>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORK_ITEM_COLUMNS}
+             FROM work_items
+             WHERE flow = ?1 AND (cl_link_hash IS NOT NULL OR br_spend_hash IS NOT NULL)"
+        ))?;
+        let rows = stmt.query_map(params![flow], row_to_work_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn advance_to_cl_link_created(
         &self,
         id: i64,

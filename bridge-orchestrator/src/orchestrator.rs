@@ -129,7 +129,10 @@ async fn select_bridging_links(
         else {
             continue;
         };
-        if attached_payload.get("proof_of_deposit").is_some() && tx.creator == *bridging_agent {
+        if attached_payload.get("proof_of_deposit").is_some()
+            && tx.creator == *bridging_agent
+            && ct_role_id == BRIDGING_AGENT_ROLE
+        {
             selection.deposits.push(tx.clone());
             continue;
         }
@@ -861,6 +864,8 @@ impl BridgeOrchestrator {
         // from earlier cycles.
         let cl_links_fetched = conductor.parked_links(&credit_limit_ea_id).await?;
         let cl_fetched_count = cl_links_fetched.len();
+        let cl_links_fetched =
+            self.withhold_second_links("s2", cl_links_fetched, |row| row.cl_link_hash.as_deref())?;
         let (cl_links, deferred_cl_links) =
             apply_rave_link_cap(cl_links_fetched, self.cfg.rave_max_links);
         let mut cl_rave_advanced = 0usize;
@@ -1021,6 +1026,8 @@ impl BridgeOrchestrator {
         // already have their HOT-side settled in S3, so finishing their
         // CL→BR flow unlocks user-facing progress faster than re-batching
         // withdrawals.
+        let deposit_rave_links = self
+            .withhold_second_links("s4", deposit_rave_links, |row| row.br_spend_hash.as_deref())?;
         let pre_cap_deposit_count = deposit_rave_links.len();
         let pre_cap_withdrawal_count = selected_withdrawal_links.len();
         let deposit_rave_ids: HashSet<String> = deposit_rave_links
@@ -1458,6 +1465,45 @@ impl BridgeOrchestrator {
 
     fn links_by_lock(&self, parked: &[Transaction]) -> HashMap<LockKey, String> {
         links_by_lock(parked, &self.cfg.bridging_agent_pubkey)
+    }
+
+    /// `links` without each deposit link that carries a lock whose row records
+    /// another link at this stage: the RAVE would pay that lock a second time.
+    fn withhold_second_links(
+        &self,
+        stage: &str,
+        links: Vec<Transaction>,
+        recorded: impl Fn(&WorkItem) -> Option<&str>,
+    ) -> Result<Vec<Transaction>> {
+        let rows = self.db.list_recording_a_link("lock")?;
+        let recorded: HashMap<LockKey, String> = rows
+            .iter()
+            .filter_map(|row| Some((self.lock_key(row)?, recorded(row)?.to_string())))
+            .collect();
+        Ok(links
+            .into_iter()
+            .filter(|link| {
+                let id = link.id.to_string();
+                let carried = self.links_by_lock(std::slice::from_ref(link));
+                let Some((lock, other)) = carried.keys().find_map(|lock| {
+                    recorded
+                        .get(lock)
+                        .filter(|other| **other != id)
+                        .map(|other| (lock, other))
+                }) else {
+                    return true;
+                };
+                error!(
+                    event = "bridge.rave.link_withheld",
+                    lock_id = lock.lock_id,
+                    link = id,
+                    recorded = other,
+                    "[bridge/{stage}] link {id} is withheld from the RAVE: it carries lock {}, whose row records link {other}",
+                    lock.lock_id
+                );
+                false
+            })
+            .collect())
     }
 
     /// The links among `sent` that the RAVE `rave` took off `agreement`, read
@@ -5680,6 +5726,67 @@ mod tests {
             lock_row(&orch, paid).state,
             crate::state::WorkState::Succeeded
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_link_for_one_lock_is_withheld_and_the_one_its_row_records_pays() {
+        for (step, agreement) in RAVE_STAGES {
+            let orch = test_orchestrator("second-link");
+            let lock = [proof("lock:twice-written:1", "0x98")];
+            let (late, recorded) = match step {
+                WorkStep::ClLinkCreated => (parked_tx(0xB8, &lock), parked_tx(0xB9, &lock)),
+                _ => (parked_spend_tx(0xB8, &lock), parked_spend_tx(0xB9, &lock)),
+            };
+            let id = match step {
+                WorkStep::ClLinkCreated => enqueue_lock(&orch, "lock:twice-written:1", "0x98"),
+                _ => enqueue_at_cl_rave_executed(&orch, "lock:twice-written:1", "0x98"),
+            };
+            let context = in_force(CL_EA, BR_EA);
+            match step {
+                WorkStep::ClLinkCreated => {
+                    orch.record_cl_link(id, &recorded.id.to_string(), &context)
+                }
+                _ => orch.record_br_spend(id, &recorded.id.to_string(), &context),
+            }
+            .unwrap();
+            let conductor = bridging_conductor()
+                .parking(action_hash(agreement), &[late.clone(), recorded.clone()]);
+
+            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+            assert_eq!(
+                ids(&conductor.parked.borrow()[&action_hash(agreement)]),
+                ids(&[late]),
+                "only the link the row records went to the RAVE"
+            );
+            assert_eq!(
+                lock_row(&orch, id).state,
+                crate::state::WorkState::Succeeded
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_bridging_agents_own_spend_in_its_role_is_a_deposit() {
+        let mut misfiled = parked_spend_tx(0xBA, &[proof("lock:misfiled:1", "0x99")]);
+        if let TransactionDetails::ParkedSpend { ct_role_id, .. } = &mut misfiled.details {
+            *ct_role_id = WITHDRAWER_ROLE.to_string();
+        }
+        let foreign = signed_by_another(parked_spend_tx(0xBB, &[proof("lock:misfiled:2", "0x9a")]));
+        let own = parked_spend_tx(0xBC, &[proof("lock:misfiled:3", "0x9b")]);
+
+        let selection = select_bridging_links(
+            None,
+            &bridging_agent(),
+            &[misfiled, foreign, own.clone()],
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids(&selection.deposits), ids(&[own]));
+        assert!(selection.withdrawals.is_empty());
     }
 
     #[tokio::test]
