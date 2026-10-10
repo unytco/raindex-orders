@@ -479,32 +479,13 @@ impl BridgeOrchestrator {
                                     unclassified_consecutive = 0;
                                 }
                             }
-                            Err(e) if is_stopped(&e) => {
-                                info!("[bridge] shutdown signal received, exiting cleanly");
-                                return Ok(());
-                            }
                             Err(e) => {
-                                // `{:#}` and not `{}`: an `anyhow` chain prints
-                                // only its outermost context otherwise, which
-                                // here is our wording, not the conductor's.
+                                let Some(action) = self.cycle_failed(&e) else {
+                                    info!("[bridge] shutdown signal received, exiting cleanly");
+                                    return Ok(());
+                                };
                                 let err_str = format!("{e:#}");
-                                error!("[bridge] cycle failed: {}", err_str);
-                                self.reporter.update(|h| {
-                                    h.last_cycle_finished_at_ms = Some(Self::now_ms());
-                                    h.consecutive_failed_cycles =
-                                        h.consecutive_failed_cycles.saturating_add(1);
-                                    h.last_error = Some(err_str.clone());
-                                    h.last_error_at_ms = Some(Self::now_ms());
-                                });
-                                if let Err(reset_err) =
-                                    self.db.reset_in_flight_to_queued("lock", &err_str)
-                                {
-                                    error!(
-                                        "[bridge] failed to reset in_flight locks: {}",
-                                        reset_err
-                                    );
-                                }
-                                match classify_cycle_failure(&e) {
+                                match action {
                                     CycleFailureAction::Reconnect => {
                                         warn!(event = "ham.disconnected", error = %err_str);
                                         // A lost socket is neither cooldown class, so drop
@@ -684,6 +665,29 @@ impl BridgeOrchestrator {
 
             sleep_or_shutdown(self.cfg.poll_interval_ms, &mut shutdown).await;
         }
+    }
+
+    /// Records a cycle that ended in `e` as failed, counting an attempt against
+    /// the rows it had in flight, and returns how the loop goes on. `None` for
+    /// a stop, which is no failure: its rows wait for startup recovery.
+    fn cycle_failed(&self, e: &anyhow::Error) -> Option<CycleFailureAction> {
+        if is_stopped(e) {
+            return None;
+        }
+        // `{:#}` and not `{}`: an `anyhow` chain prints only its outermost
+        // context otherwise, which here is our wording, not the conductor's.
+        let err_str = format!("{e:#}");
+        error!("[bridge] cycle failed: {}", err_str);
+        self.reporter.update(|h| {
+            h.last_cycle_finished_at_ms = Some(Self::now_ms());
+            h.consecutive_failed_cycles = h.consecutive_failed_cycles.saturating_add(1);
+            h.last_error = Some(err_str.clone());
+            h.last_error_at_ms = Some(Self::now_ms());
+        });
+        if let Err(reset_err) = self.db.reset_in_flight_to_queued("lock", &err_str) {
+            error!("[bridge] failed to reset in_flight locks: {}", reset_err);
+        }
+        Some(classify_cycle_failure(e))
     }
 
     /// Single unified bridge cycle built as a four-stage pipeline.
@@ -5412,6 +5416,43 @@ mod tests {
             (id, crate::state::WorkState::InFlight),
             "startup recovery returns it to queued"
         );
+    }
+
+    fn failed_cycles(orch: &BridgeOrchestrator) -> u32 {
+        let mut failed = None;
+        orch.reporter
+            .update(|h| failed = Some(h.consecutive_failed_cycles));
+        failed.expect("reporter state was contended")
+    }
+
+    #[tokio::test]
+    async fn a_stopped_cycle_is_no_failure_and_counts_no_attempt() {
+        let orch = test_orchestrator("stopped-cycle");
+        let id = enqueue_lock(&orch, "lock:stopped:1", "0x97");
+        let (conductor, stop) = stopping_during(4, bridging_conductor());
+        let stopped = orch.run_bridge_cycle(&conductor, &stop).await.unwrap_err();
+
+        assert_eq!(orch.cycle_failed(&stopped), None);
+
+        let row = &rows_at(&orch, WorkStep::New)[0];
+        assert_eq!(
+            (row.state.clone(), row.attempts),
+            (crate::state::WorkState::InFlight, 0)
+        );
+        assert_eq!(failed_cycles(&orch), 0);
+
+        let dropped = anyhow::anyhow!("Failed to call zome: Websocket error: Websocket closed");
+        assert_eq!(
+            orch.cycle_failed(&dropped),
+            Some(CycleFailureAction::Reconnect)
+        );
+        let row = lock_row(&orch, id);
+        assert_eq!(
+            (row.state, row.attempts),
+            (crate::state::WorkState::Queued, 1),
+            "a failed cycle does count an attempt"
+        );
+        assert_eq!(failed_cycles(&orch), 1);
     }
 
     #[tokio::test]
