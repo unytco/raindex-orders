@@ -1286,12 +1286,40 @@ impl BridgeOrchestrator {
                 Err(e) => Err(e),
             };
             match held {
-                Ok(Some(_)) => {
-                    debug!(
-                        "[bridge/reconcile] lock={} at {}: link {} left agreement {}",
-                        row.item_id, row.step, link, agreement
-                    );
-                    return Ok(true);
+                Ok(Some(record)) => {
+                    return match self.recorded_write(record, row) {
+                        RecordedWrite::Own => {
+                            debug!(
+                                "[bridge/reconcile] lock={} at {}: link {} left agreement {}",
+                                row.item_id, row.step, link, agreement
+                            );
+                            Ok(true)
+                        }
+                        RecordedWrite::Unreadable(e) => Self::unresolved(row, link, e),
+                        // Neither advanced nor written again: whether this deposit was
+                        // credited cannot be told from here, so a person resolves it
+                        // (workshop `documentation/specs/bridge-stop/README.md`
+                        // § Operating assumptions and limits).
+                        RecordedWrite::Misrecorded(why) => {
+                            let lock = self.lock_key(row);
+                            error!(
+                                event = "bridge.rave.proof_missing",
+                                lock_id = lock.as_ref().map(|lock| lock.lock_id.as_str()),
+                                tx_hash = lock.as_ref().map(|lock| lock.tx_hash.as_str()),
+                                link,
+                                "[bridge/reconcile] lock={} at {} is failed for manual resolution: its recorded link {} {}",
+                                row.item_id,
+                                row.step,
+                                link,
+                                why
+                            );
+                            self.db.mark_failed_permanent(
+                                row.id,
+                                &format!("mis-recorded legacy row: its recorded link {link} {why}; resolve by hand"),
+                            )?;
+                            Ok(false)
+                        }
+                    };
                 }
                 Ok(None) => {
                     self.db.return_to_writing_step(row.id)?;
@@ -1317,6 +1345,30 @@ impl BridgeOrchestrator {
             );
         }
         Ok(false)
+    }
+
+    /// Whether `record`, the link a row recorded, is the row's own write: signed
+    /// by the bridging agent and carrying the row's own proof.
+    fn recorded_write(&self, record: &Record, row: &WorkItem) -> RecordedWrite {
+        let author = AgentPubKeyB64::from(record.action().author().clone());
+        if author != self.cfg.bridging_agent_pubkey {
+            return RecordedWrite::Misrecorded(format!("was signed by {author}"));
+        }
+        let Some(lock) = self.lock_key(row) else {
+            return RecordedWrite::Own;
+        };
+        match tag_proofs(record, &row.step) {
+            Ok(proofs)
+                if proofs
+                    .iter()
+                    .filter_map(LockKey::of_proof)
+                    .any(|proof| proof == lock) =>
+            {
+                RecordedWrite::Own
+            }
+            Ok(_) => RecordedWrite::Misrecorded("does not carry its proof".to_string()),
+            Err(e) => RecordedWrite::Unreadable(e),
+        }
     }
 
     /// A read for `row` that failed: a stop or a failing conductor ends the
@@ -2046,6 +2098,36 @@ impl ConductorReads for Conductor<'_> {
             .await
             .with_context(|| format!("failed to read link {link} from the bridging agent's chain"))
     }
+}
+
+enum RecordedWrite {
+    Own,
+    Misrecorded(String),
+    Unreadable(anyhow::Error),
+}
+
+/// The deposit proofs in a parked link's tag, read as the row's step says it
+/// was written: a link by S1, a spend by S3.
+fn tag_proofs(record: &Record, step: &WorkStep) -> Result<Vec<Value>> {
+    let ActionData::CreateLink(link) = &record.action().data else {
+        anyhow::bail!("{} is not a link", record.action_address());
+    };
+    let payload = match step {
+        WorkStep::ClLinkCreated => {
+            rmp_serde::from_slice::<(ParkedData, bool)>(&link.tag.0).map(|(data, _)| data.payload)
+        }
+        _ => rmp_serde::from_slice::<ParkedSpendData>(&link.tag.0).map(|data| data.payload),
+    }
+    .with_context(|| {
+        format!(
+            "the tag of link {} does not decode",
+            record.action_address()
+        )
+    })?;
+    Ok(payload["proof_of_deposit"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
 }
 
 /// The input of the transactor's `hdk_get`, whose fields are named unlike
@@ -3715,7 +3797,7 @@ mod tests {
                 .insert(hash.clone(), agreement.clone());
             self.holds
                 .borrow_mut()
-                .insert(hash.clone(), parked_link_record(hash, agreement.clone()));
+                .insert(hash, written_record(link, agreement.clone()));
         }
 
         fn call(&self, name: &'static str) {
@@ -4005,9 +4087,18 @@ mod tests {
     }
 
     fn record(hash: ActionHash, data: ActionData, entry: RecordEntry) -> Record {
+        signed_record(AgentPubKey::from_raw_32(vec![9u8; 32]), hash, data, entry)
+    }
+
+    fn signed_record(
+        author: AgentPubKey,
+        hash: ActionHash,
+        data: ActionData,
+        entry: RecordEntry,
+    ) -> Record {
         let action = Action {
             header: ActionHeader {
-                author: AgentPubKey::from_raw_32(vec![9u8; 32]),
+                author,
                 timestamp: Timestamp(0),
                 action_seq: 5,
                 prev_action: Some(action_hash(0x01)),
@@ -4031,6 +4122,34 @@ mod tests {
                 entry_hash: EntryHash::from_raw_32(vec![1u8; 32]),
             }),
             RecordEntry::Present(Entry::try_from(definition).unwrap()),
+        )
+    }
+
+    /// `link`'s record as its author's chain holds it, its tag the one the
+    /// zome writes for its kind of link.
+    fn written_record(link: &Transaction, agreement: ActionHash) -> Record {
+        let tag = match &link.details {
+            TransactionDetails::Parked {
+                attached_payload, ..
+            } => ParkedLinkType::ParkedData((parked_data(&link.amount, attached_payload), true)),
+            TransactionDetails::ParkedSpend {
+                attached_payload, ..
+            } => ParkedLinkType::ParkedSpendBalance(
+                tag_context(Ledger::empty(), &[]).widest_spend_data(&link.amount, attached_payload),
+            ),
+            _ => panic!("a parked link is Parked or ParkedSpend"),
+        };
+        signed_record(
+            link.creator.clone().into(),
+            link.id.clone().into(),
+            ActionData::CreateLink(CreateLinkData {
+                base_address: agreement.into(),
+                target_address: AgentPubKey::from_raw_32(vec![1u8; 32]).into(),
+                zome_index: 0.into(),
+                link_type: 0.into(),
+                tag: tag.link_tag().expect("the zome encoder accepts the tag"),
+            }),
+            RecordEntry::NA,
         )
     }
 
@@ -5751,6 +5870,83 @@ mod tests {
                 "the next batch writes it again, and it bridges"
             );
         }
+    }
+
+    fn failed_row(orch: &BridgeOrchestrator, id: i64) -> WorkItem {
+        orch.db
+            .list_work_items("lock", crate::state::WorkState::Failed, 100)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the row is failed")
+    }
+
+    /// The write that would write `step`'s row again.
+    fn rewrite_at(step: &WorkStep) -> &'static str {
+        match step {
+            WorkStep::ClLinkCreated => "create_parked_link",
+            _ => "create_parked_spend",
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_an_older_binary_recorded_on_a_siblings_link_is_left_for_a_person() {
+        for (step, _) in RAVE_STAGES {
+            let orch = test_orchestrator("legacy-sibling");
+            let first_proof = [proof("lock:legacy:1", "0x95")];
+            let (first, second, link) = match step {
+                WorkStep::ClLinkCreated => (
+                    enqueue_lock(&orch, "lock:legacy:1", "0x95"),
+                    enqueue_lock(&orch, "lock:legacy:2", "0x95"),
+                    parked_tx(0xB6, &first_proof),
+                ),
+                _ => (
+                    enqueue_at_cl_rave_executed(&orch, "lock:legacy:1", "0x95"),
+                    enqueue_at_cl_rave_executed(&orch, "lock:legacy:2", "0x95"),
+                    parked_spend_tx(0xB6, &first_proof),
+                ),
+            };
+            let context = in_force(CL_EA, BR_EA);
+            for id in [first, second] {
+                match step {
+                    WorkStep::ClLinkCreated => {
+                        orch.record_cl_link(id, &link.id.to_string(), &context)
+                    }
+                    _ => orch.record_br_spend(id, &link.id.to_string(), &context),
+                }
+                .unwrap();
+            }
+            let conductor = bridging_conductor().holding(std::slice::from_ref(&link));
+
+            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+            assert_ne!(lock_row(&orch, first).step, step, "its own link was taken");
+            let left = failed_row(&orch, second);
+            assert_eq!(left.error_class.as_deref(), Some("permanent"));
+            let reason = left.last_error.unwrap();
+            assert!(reason.contains("mis-recorded legacy row"), "{reason}");
+            assert!(reason.contains("does not carry its proof"), "{reason}");
+            assert!(
+                !conductor.calls.take().contains(&rewrite_at(&step)),
+                "nothing is written again for it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_row_recorded_on_another_agents_copy_of_its_proof_is_left_for_a_person() {
+        let orch = test_orchestrator("legacy-foreign");
+        let id = enqueue_at_cl_rave_executed(&orch, "lock:legacy:3", "0x96");
+        let copy = signed_by_another(parked_spend_tx(0xB7, &[proof("lock:legacy:3", "0x96")]));
+        orch.record_br_spend(id, &copy.id.to_string(), &in_force(CL_EA, BR_EA))
+            .unwrap();
+        let conductor = bridging_conductor().holding(std::slice::from_ref(&copy));
+
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+        let reason = failed_row(&orch, id).last_error.unwrap();
+        assert!(reason.contains("was signed by"), "{reason}");
+        assert!(!conductor.calls.take().contains(&"create_parked_spend"));
     }
 
     #[tokio::test]
