@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 use zfuel::fuel::ZFuel;
 
 const BRIDGING_AGENT_ROLE: &str = "bridging_agent";
+const WITHDRAWER_ROLE: &str = "withdrawer";
 const ORACLE_ROLE: &str = "oracle";
 
 pub struct BridgeOrchestrator {
@@ -121,13 +122,24 @@ async fn select_bridging_links(
 
     for tx in bridging_links {
         let TransactionDetails::ParkedSpend {
-            attached_payload, ..
+            attached_payload,
+            ct_role_id,
+            ..
         } = &tx.details
         else {
             continue;
         };
         if attached_payload.get("proof_of_deposit").is_some() && tx.creator == *bridging_agent {
             selection.deposits.push(tx.clone());
+            continue;
+        }
+        if ct_role_id != WITHDRAWER_ROLE {
+            warn!(
+                event = "bridge.spend_skipped",
+                "[bridge/withdrawals] spend {:?} by {} in role {ct_role_id} is neither the bridging agent's deposit nor a withdrawal, and stays parked",
+                tx.id,
+                tx.creator
+            );
             continue;
         }
         let Some(withdraw_to) = attached_payload
@@ -2669,7 +2681,7 @@ mod tests {
                 smart_agreement_title: "test".to_string(),
                 spender,
                 executor,
-                ct_role_id: "role".to_string(),
+                ct_role_id: BRIDGING_AGENT_ROLE.to_string(),
                 role_display_name: "Role".to_string(),
                 global_definition: action_hash(0xAA).into(),
                 lane_definitions: vec![],
@@ -4985,6 +4997,30 @@ mod tests {
         assert_eq!(ids(&selection.withdrawals), ids(&[copy]));
     }
 
+    #[tokio::test]
+    async fn another_agents_spend_in_the_bridging_agents_role_gets_no_coupon() {
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
+        let mut forged = signed_by_another(parked_withdrawal_tx(0xAE));
+        if let TransactionDetails::ParkedSpend {
+            attached_payload,
+            ct_role_id,
+            ..
+        } = &mut forged.details
+        {
+            attached_payload["proof_of_deposit"] = json!([proof("lock:forged:1", "0x8d")]);
+            *ct_role_id = BRIDGING_AGENT_ROLE.to_string();
+        }
+
+        let selection =
+            select_bridging_links(Some(&signer), &bridging_agent(), &[forged], usize::MAX, 1)
+                .await
+                .unwrap();
+
+        assert!(selection.deposits.is_empty());
+        assert!(selection.withdrawals.is_empty());
+        assert!(selection.coupons.is_empty(), "it stays parked, unpaid");
+    }
+
     #[test]
     fn a_rave_advances_every_row_of_a_batch_its_consumed_link_carried() {
         let orch = test_orchestrator("rave-batch");
@@ -6199,14 +6235,17 @@ mod tests {
     }
 
     fn parked_withdrawal_tx(seed: u8) -> Transaction {
-        let mut tx = parked_spend_tx(seed, &[]);
+        let mut tx = signed_by_another(parked_spend_tx(seed, &[]));
         tx.amount = UnitMap::from(vec![(1, "5")]);
         if let TransactionDetails::ParkedSpend {
-            attached_payload, ..
+            attached_payload,
+            ct_role_id,
+            ..
         } = &mut tx.details
         {
             *attached_payload =
                 json!({ "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)) });
+            *ct_role_id = WITHDRAWER_ROLE.to_string();
         }
         tx
     }
