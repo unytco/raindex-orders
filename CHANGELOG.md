@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - bridge-orchestrator credits both deposits when one Ethereum transaction locks twice, for deposits it records from this release on.
-- bridge-orchestrator marks a deposit bridged only once a RAVE has taken its link, so a deposit whose link the template refused waits instead.
+- bridge-orchestrator marks a deposit bridged only once a RAVE has consumed its link, so a deposit whose link the template refused or redacted waits instead.
 - bridge-orchestrator counts a deposit proof only on a link its bridging agent signed, so a copy in another agent's spend cannot mark a deposit bridged.
 - bridge-orchestrator signs a withdrawal coupon only for a spend in the withdrawer role.
 - bridge-orchestrator pays each deposit once when a write of it lands late and is made again.
