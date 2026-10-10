@@ -5957,14 +5957,19 @@ mod tests {
         let mut orch = test_orchestrator("planted-copies");
         orch.cfg.rave_max_links = Some(1);
         let id = enqueue_at_cl_rave_executed(&orch, "lock:planted:1", "0x90");
-        let own = parked_spend_tx(0xC0, &[proof("lock:planted:1", "0x90")]);
+        let own = parked_spend_tx(0xD0, &[proof("lock:planted:1", "0x90")]);
         orch.record_br_spend(id, &own.id.to_string(), &in_force(CL_EA, BR_EA))
             .unwrap();
-        let planted: Vec<Transaction> = (0xC1..=0xC5)
-            .map(|seed| withdrawal_carrying(seed, proof("lock:planted:1", "0x90")))
-            .collect();
-        let conductor = bridging_conductor()
-            .parking(action_hash(BR_EA), &[planted.clone(), vec![own]].concat());
+        let withdrawals =
+            (0xD1..=0xD5).map(|seed| withdrawal_carrying(seed, proof("lock:planted:1", "0x90")));
+        let spoofs = (0xD6..=0xD7).map(|seed| {
+            signed_by_another(parked_spend_tx(seed, &[proof("lock:planted:1", "0x90")]))
+        });
+        let planted: Vec<Transaction> = withdrawals.chain(spoofs).collect();
+        let conductor = bridging_conductor().parking(
+            action_hash(BR_EA),
+            &[&planted[..5], &[own], &planted[5..]].concat(),
+        );
 
         orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
