@@ -3,7 +3,7 @@ import { env } from '$env/dynamic/private'
 import { PAUSED_CONTACT, PAUSED_LEAD, PAUSED_TEXT } from '$lib/pause'
 
 // Exactly `true`, as the spec fixes it: `True` or `1` leaves the bridge open
-// (documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
+// (workshop documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
 export const bridgePaused = () => env.BRIDGE_PAUSED === 'true'
 
 // Loads no script of the site: the SvelteKit client would render the real page in its place.

@@ -4,7 +4,7 @@ import { bridgePaused, stopApi, stopPage } from '$lib/server/pause'
 
 const FAUCET_ROUTES = new Set(['/faucet', '/api/faucet'])
 // Claim stays open, as a coupon's expiry runs on through a pause and none is reissued
-// (documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
+// (workshop documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
 const PAUSED_PAGES = new Set(['/lock', '/faucet'])
 const PAUSED_APIS = new Set(['/api/faucet'])
 
@@ -15,7 +15,7 @@ export const handle: Handle = ({ event, resolve }) => {
 		return new Response('Not found', { status: 404 })
 	}
 	// Stops the website only: a lock sent to the vault without it still lands, and the
-	// orchestrator bridges it (documentation/specs/bridge-stop/README.md, "Operating
+	// orchestrator bridges it (workshop documentation/specs/bridge-stop/README.md, "Operating
 	// assumptions and limits").
 	if (bridgePaused()) {
 		if (PAUSED_PAGES.has(route)) return stopPage()

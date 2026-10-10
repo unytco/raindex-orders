@@ -165,7 +165,7 @@
 
 		try {
 			// A lock already in the wallet's prompt when the pause lands can still be confirmed
-			// (documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
+			// (workshop documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
 			if (!(await bridgeOpen())) return
 
 			const amountWei = parseUnits(amount, tokenDecimals)
