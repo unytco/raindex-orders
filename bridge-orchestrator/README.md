@@ -98,11 +98,71 @@ output also includes `succeeded_deleted` and `failed_deleted`. Steady-state ops
 should rely on the in-process retention task and reserve this CLI for one-off
 hygiene.
 
+### `bridge-orchestrator in-transit`
+
+Lists each transfer the bridging agent's network still holds, so a migration
+closes the old network only once nothing is in transit, or the operator accepts
+what is. Run it with the orchestrator stopped. It takes the configuration of
+`run`, reads `DB_PATH` and the bridging agent's conductor, and sends no write
+to Holochain or Ethereum.
+
+```
+bridge-orchestrator in-transit
+bridge-orchestrator in-transit --mark-failed
+```
+
+It prints one JSON object per line:
+
+| `kind` | What is in transit | Fields |
+|--------|--------------------|--------|
+| `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created`, or a row `in_flight` or `claimed` at any step | `item_id`, `lock_id`, `state`, `step`, `link` |
+| `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the credit-limit adjustment agreement or the bridging agreement of its lane in force | `agreement`, `link`, `lock_ids` |
+| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address` |
+
+`lock_id` is `null` for a row whose payload cannot be read, `link` for one that
+records none, and `withdraw_to_address` for a withdrawal that names none, which
+no coupon can pay. A row `in_flight` or `claimed` had a write that may or may
+not have reached the conductor: a start of the orchestrator queues it again,
+and its reconcile settles it. `amount` is the spend's unit map, its HOT under
+`HOT_UNIT_INDEX`. A `failed` row is not listed, and nor is another agent's spend
+in the `bridging_agent` role or a spend in any other role: no cycle takes them.
+Log lines go to stdout too, and never start with `{`.
+
+It exits 0 only when it read the database and the conductor and found nothing.
+It fails on a `DB_PATH` that does not exist, on one that serves no vault or
+another than the one configured when Ethereum is on, and on a row whose state or
+step it cannot read.
+
+`--mark-failed` lists the same, then marks `failed` each listed row and each
+row, neither `succeeded` nor `failed`, whose lock is in a listed link. Each
+gets `last_error` `in transit at the old network's close; it is paid by hand on
+the new network`, so the new network's orchestrator pays none of them. It marks
+all of them in one transaction, or none, and changes no other row. It exits 0
+only when it read the database and the conductor and marked them. It marks none,
+and fails, when it cannot tell which rows a listed link carries: when a proof in
+it names the lock ID or the transaction of a row it would not otherwise mark,
+neither `succeeded` nor `failed`, without naming both, or when a `queued` row at
+`new` or `cl_rave_executed` has a lock it cannot read while a listed link
+carries any.
+The next cycle of `run` fails such a row for a person. A lock in a
+listed link whose row is already `succeeded` or `failed`, a lock with no row,
+and a withdrawal are recorded only in what it prints.
+
+What it lists is paid by hand on the new network, once the person who pays has
+checked that the old network did not pay it. Pay each lock ID once: a deposit
+waiting on its link shows both as its `row` and in the `lock_ids` of the link
+carrying it, and an earlier `failed` row may name it too. A lock whose row is
+`succeeded` was paid. A lock with no row may have been paid too, as retention
+deletes `succeeded` and `failed` rows, and so may a `row` whose `link` is not
+listed live, as a RAVE may have taken it. Pay each withdrawal once, by its
+`spend`.
+
 ## Environment variables
 
 Every subcommand loads the config below on startup, so the env file must be
 sourced even for `status` and `clear`. Only `run` reads the signer variables
-and the chain. A network variable set to an empty value counts as unset.
+and the chain, and only `run` and `in-transit` the conductor. A network
+variable set to an empty value counts as unset.
 
 ### Config (all commands)
 
@@ -122,6 +182,8 @@ and the chain. A network variable set to an empty value counts as unset.
 | `HOLOCHAIN_APP_PORT` | No | `30001` |
 | `HOLOCHAIN_APP_ID` | No | `bridging-app` |
 | `HOLOCHAIN_ROLE_NAME` | No | `alliance` |
+| `CONDUCTOR_CONFIG` | No | `/etc/holochain/conductor-config.yaml` (the conductor config naming the external `lair_server` that signs zome calls; `run` also requires it to set `db_sync_level: Full`) |
+| `LAIR_PASSPHRASE_FILE` | No | `/var/lib/holochain/lair-passphrase` |
 | `HOLOCHAIN_BRIDGING_AGENT_PUBKEY` | **Yes** | -- (each cycle bridges on the one lane that names this key its bridging agent and lists `HOT_UNIT_INDEX` in its service units, counting the global definition's lane and each lane's definition in force. No such lane, or more than one, fails the cycle, and so does that lane setting no credit limit adjustment or no bridging agreement) |
 | `HOT_UNIT_INDEX` | No | `1` (`HOLOCHAIN_UNIT_INDEX` or `HOLOCHAIN_LANE_DEFINITION` set at all, even empty, stops the orchestrator at startup) |
 | `HAM_REQUEST_TIMEOUT_SECS` | No | `120` (per-request timeout applied to the Holochain app websocket; prevents a slow/hung zome call from blocking the orchestrator indefinitely) |
@@ -364,7 +426,9 @@ check the link it records (`cl_link_hash`, or `br_spend_hash` once it has one):
 while a failed row records a live link, that link is never paid, and re-queuing
 the row can let the next RAVE pay it. Leave a row whose `last_error` ends
 `resolve by hand` failed: check by hand whether its depositor was credited, and
-credit it by hand only if not and its link is not live.
+credit it by hand only if not and its link is not live. Also leave failed a row
+whose `last_error` is `in transit at the old network's close; it is paid by hand
+on the new network`.
 Rows left `claimed` or `in_flight` need no action: startup re-queues them.
 
 ### systemd service management

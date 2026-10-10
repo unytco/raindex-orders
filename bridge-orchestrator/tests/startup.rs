@@ -105,6 +105,81 @@ fn status_and_clear_read_no_chain_and_need_no_signer() {
     }
 }
 
+const IN_TRANSIT: [&[&str]; 2] = [&["in-transit"], &["in-transit", "--mark-failed"]];
+
+#[test]
+fn in_transit_refuses_a_database_that_is_not_there() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for args in IN_TRANSIT {
+        let output = orchestrator(dir.path(), &node(dir.path()), args);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(stderr.contains("does not exist"), "{args:?}: {stderr}");
+        assert!(!db(dir.path()).exists());
+    }
+}
+
+#[test]
+fn in_transit_refuses_a_database_that_serves_no_vault_or_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = node(dir.path());
+    assert!(orchestrator(dir.path(), &env, &["status"]).status.success());
+    let configured = "0xe3e064e3c2eef66cb93da8d8114f5084e92f48d6";
+
+    for served in [None, Some("0x1111111111111111111111111111111111111111")] {
+        rusqlite::Connection::open(db(dir.path()))
+            .unwrap()
+            .execute("UPDATE schema_meta SET vault = ?1", [served])
+            .unwrap();
+
+        for args in IN_TRANSIT {
+            let output = orchestrator(dir.path(), &env, args);
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{args:?}");
+            assert!(
+                stderr.contains(&format!(
+                    "serves vault {}, and vault {configured} is configured",
+                    served.unwrap_or("none")
+                )),
+                "{args:?}: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn in_transit_fails_when_the_conductor_refuses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let passphrase = dir.path().join("lair-passphrase");
+    std::fs::write(&passphrase, "deadbeef\n").unwrap();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = closed.local_addr().unwrap().port().to_string();
+    drop(closed);
+    let mut env = node(dir.path());
+    env.retain(|(key, _)| *key != "NETWORK");
+    env.extend([
+        ("NETWORK", "none".to_string()),
+        ("LAIR_PASSPHRASE_FILE", passphrase.display().to_string()),
+        ("HOLOCHAIN_ADMIN_PORT", port.clone()),
+        ("HOLOCHAIN_APP_PORT", port),
+    ]);
+    assert!(orchestrator(dir.path(), &env, &["status"]).status.success());
+
+    for args in IN_TRANSIT {
+        let output = orchestrator(dir.path(), &env, args);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            stderr.contains("Failed to connect to Holochain"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn status_and_clear_refuse_an_unknown_network() {
     let dir = tempfile::tempdir().unwrap();

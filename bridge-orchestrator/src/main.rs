@@ -55,10 +55,17 @@ enum Command {
         all: bool,
         /// Only with `--non-in-progress`: delete terminal rows whose
         /// `updated_at` is older than this many seconds. Applied to
-        /// both `succeeded` and `failed` rows. When omitted the flag
-        /// behaves like the previous (unbounded) `--non-in-progress`.
+        /// both `succeeded` and `failed` rows.
         #[arg(long, conflicts_with = "all")]
         older_than_s: Option<u64>,
+    },
+    /// List each transfer the bridging agent's network still holds, for a migration's close.
+    /// Run it with the orchestrator stopped.
+    InTransit {
+        /// After listing, mark failed each pending row in transit or carried by a listed link, all
+        /// or none, to be paid by hand on the new network. Exits 0 once they are marked.
+        #[arg(long)]
+        mark_failed: bool,
     },
 }
 
@@ -165,6 +172,9 @@ async fn main() -> Result<()> {
                 unreachable!("clap enforces one clear mode flag")
             };
             println!("{}", serde_json::to_string(&output)?);
+        }
+        Command::InTransit { mark_failed } => {
+            orchestrator::in_transit::run(config, ethereum, mark_failed).await?;
         }
     }
 

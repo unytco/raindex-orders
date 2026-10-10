@@ -25,6 +25,8 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use zfuel::fuel::ZFuel;
 
+pub mod in_transit;
+
 const BRIDGING_AGENT_ROLE: &str = "bridging_agent";
 const WITHDRAWER_ROLE: &str = "withdrawer";
 const ORACLE_ROLE: &str = "oracle";
@@ -122,35 +124,23 @@ async fn select_bridging_links(
     let mut withdrawal_capped = false;
 
     for tx in bridging_links {
-        let TransactionDetails::ParkedSpend {
-            attached_payload,
-            ct_role_id,
-            ..
-        } = &tx.details
-        else {
-            continue;
-        };
-        if attached_payload.get("proof_of_deposit").is_some()
-            && tx.creator == *bridging_agent
-            && ct_role_id == BRIDGING_AGENT_ROLE
-        {
-            selection.deposits.push(tx.clone());
-            continue;
-        }
-        if ct_role_id != WITHDRAWER_ROLE {
-            warn!(
-                event = "bridge.spend_skipped",
-                "[bridge/withdrawals] spend {:?} by {} in role {ct_role_id} is neither the bridging agent's deposit nor a withdrawal, and stays parked",
-                tx.id,
-                tx.creator
-            );
-            continue;
-        }
-        let Some(withdraw_to) = attached_payload
-            .get("withdraw_to_address")
-            .and_then(|v| v.as_str())
-        else {
-            continue;
+        let withdraw_to = match bridging_spend(tx, bridging_agent) {
+            None => continue,
+            Some(BridgingSpend::Deposit) => {
+                selection.deposits.push(tx.clone());
+                continue;
+            }
+            Some(BridgingSpend::Other(role)) => {
+                warn!(
+                    event = "bridge.spend_skipped",
+                    "[bridge/withdrawals] spend {:?} by {} in role {role} is neither the bridging agent's deposit nor a withdrawal, and stays parked",
+                    tx.id,
+                    tx.creator
+                );
+                continue;
+            }
+            Some(BridgingSpend::Withdrawal(None)) => continue,
+            Some(BridgingSpend::Withdrawal(Some(withdraw_to))) => withdraw_to,
         };
         selection.withdrawals_found += 1;
         let Some(signer) = signer else {
@@ -206,6 +196,43 @@ async fn select_bridging_links(
     }
 
     Ok(selection)
+}
+
+enum BridgingSpend<'a> {
+    Deposit,
+    Withdrawal(Option<&'a str>),
+    Other(&'a str),
+}
+
+fn bridging_spend<'a>(
+    tx: &'a Transaction,
+    bridging_agent: &AgentPubKeyB64,
+) -> Option<BridgingSpend<'a>> {
+    let TransactionDetails::ParkedSpend {
+        attached_payload,
+        ct_role_id,
+        ..
+    } = &tx.details
+    else {
+        return None;
+    };
+    Some(
+        if own_deposit(tx, bridging_agent) && ct_role_id == BRIDGING_AGENT_ROLE {
+            BridgingSpend::Deposit
+        } else if ct_role_id == WITHDRAWER_ROLE {
+            BridgingSpend::Withdrawal(
+                attached_payload
+                    .get("withdraw_to_address")
+                    .and_then(Value::as_str),
+            )
+        } else {
+            BridgingSpend::Other(ct_role_id)
+        },
+    )
+}
+
+fn own_deposit(tx: &Transaction, bridging_agent: &AgentPubKeyB64) -> bool {
+    tx.creator == *bridging_agent && deposit_proofs(tx).is_some()
 }
 
 impl BridgeOrchestrator {
@@ -3007,6 +3034,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use zfuel::fraction::Fraction;
     use zfuel::fuel::Precision;
+
+    mod in_transit;
 
     fn test_db_path(name: &str) -> String {
         let ts = SystemTime::now()
