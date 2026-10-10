@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- bridge-orchestrator keeps bridging deposits when another agent parks a link carrying a copy of a deposit's proof.
+
 ## [0.3.0] - 2026-10-06
 
 ### Added

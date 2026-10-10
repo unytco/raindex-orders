@@ -102,8 +102,16 @@ struct BridgingSelection {
     withdrawals_found: usize,
 }
 
+/// Lock proofs are public, and any agent may park a link carrying a copy of one
+/// under a role it qualifies for, `withdrawer` on the bridging agreement among
+/// them: only the bridging agent's own links carry its deposits.
+fn parked_by(tx: &Transaction, bridging_agent: &AgentPubKeyB64) -> bool {
+    tx.creator == *bridging_agent
+}
+
 async fn select_bridging_links(
     signer: Option<&CouponSigner>,
+    bridging_agent: &AgentPubKeyB64,
     bridging_links: &[Transaction],
     coupons_budget: usize,
     hot_unit_index: u32,
@@ -124,7 +132,7 @@ async fn select_bridging_links(
         else {
             continue;
         };
-        if attached_payload.get("proof_of_deposit").is_some() {
+        if parked_by(tx, bridging_agent) && attached_payload.get("proof_of_deposit").is_some() {
             selection.deposits.push(tx.clone());
             continue;
         }
@@ -991,6 +999,7 @@ impl BridgeOrchestrator {
             withdrawals_found: total_withdrawals_found,
         } = select_bridging_links(
             self.ethereum.as_ref().map(|side| &side.signer),
+            &self.cfg.bridging_agent_pubkey,
             &bridging_links,
             coupons_budget,
             self.cfg.hot_unit_index,
@@ -1144,22 +1153,22 @@ impl BridgeOrchestrator {
 
     /// Reconcile each lock against live chain truth before running the
     /// pipeline's write stages. Every advancement here is driven by
-    /// observing the expected side-effect on `get_parked_links_by_ea` — we
+    /// observing the expected side-effect on `get_parked_links_by_ea`: we
     /// never walk past RAVE history.
     ///
     /// Rules, applied in step-order (a single row that already has chain
     /// evidence at multiple steps gets cascaded forward each time we
     /// re-query its step after advancing):
     ///
-    /// * `step='new'` and the lock's `tx_hash` is present in a live CL
-    ///   parked-link payload → advance to `cl_link_created` with that
-    ///   link's ActionHash.
+    /// * `step='new'` and the lock's `tx_hash` is in the payload of a live CL
+    ///   link the bridging agent parked → advance to `cl_link_created` with
+    ///   that link's ActionHash.
     /// * `step='cl_link_created'` and `cl_link_hash` has left the agreement
     ///   it was parked on → that agreement's RAVE consumed the link. Advance
     ///   to `cl_rave_executed` with `cl_rave_hash=NULL` (we can't recover the
     ///   actual RAVE hash after the fact).
-    /// * `step='cl_rave_executed'` and the lock's `tx_hash` is present in
-    ///   a live bridging parked-spend payload → advance to
+    /// * `step='cl_rave_executed'` and the lock's `tx_hash` is in the payload
+    ///   of a live bridging spend the bridging agent parked → advance to
     ///   `br_spend_created` with that spend's ActionHash.
     /// * `step='br_spend_created'` and `br_spend_hash` has left the
     ///   agreement it was parked on → that agreement's RAVE consumed the
@@ -1173,8 +1182,11 @@ impl BridgeOrchestrator {
     ) -> Result<ReconcileCounts> {
         let credit_limit: ActionHash = context.credit_limit_adjustment.clone().into();
         let bridging: ActionHash = context.bridging_agreement.clone().into();
-        let cl_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, &credit_limit).await?);
-        let br_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, &bridging).await?);
+        let bridging_agent = &self.cfg.bridging_agent_pubkey;
+        let cl_by_tx_hash =
+            build_tx_hash_to_link_id(live.on(conductor, &credit_limit).await?, bridging_agent);
+        let br_by_tx_hash =
+            build_tx_hash_to_link_id(live.on(conductor, &bridging).await?, bridging_agent);
         let mut counts = ReconcileCounts::default();
 
         for row in self.db.list_pending_by_step("lock", WorkStep::New, 5000)? {
@@ -2149,18 +2161,12 @@ fn normalize_tx_hash(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-/// Build a `tx_hash -> parked-link ActionHash` index from a live
-/// `get_parked_links_by_ea` result. Used by the reconciler to advance a
-/// `step='new'` / `step='cl_rave_executed'` row the moment it sees its
-/// proof's `tx_hash` inside a live parked payload, without having to
-/// inspect RAVE history.
-///
-/// Keys are normalised via [`normalize_tx_hash`] so mixed-case or
-/// whitespace-padded writers on either side of the comparison still
-/// match.
-fn build_tx_hash_to_link_id(parked: &[Transaction]) -> HashMap<String, String> {
+fn build_tx_hash_to_link_id(
+    parked: &[Transaction],
+    bridging_agent: &AgentPubKeyB64,
+) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    for tx in parked {
+    for tx in parked.iter().filter(|tx| parked_by(tx, bridging_agent)) {
         let payload = match &tx.details {
             TransactionDetails::Parked {
                 attached_payload, ..
@@ -2255,7 +2261,6 @@ mod tests {
     }
 
     fn test_config(db_path: String) -> Config {
-        let agent_pubkey: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1u8; 32]).into();
         Config {
             poll_interval_ms: 1000,
             bridge_cycle_interval_ms: 1000,
@@ -2268,7 +2273,7 @@ mod tests {
             app_port: 0,
             conductor_config: "/etc/holochain/conductor-config.yaml".to_string(),
             lair_passphrase_file: "/var/lib/holochain/lair-passphrase".to_string(),
-            bridging_agent_pubkey: agent_pubkey,
+            bridging_agent_pubkey: agent_key(BRIDGE),
             hot_unit_index: 1,
             ham_request_timeout_secs: 120,
             ham_reconnect_backoff_initial_ms: 1000,
@@ -2376,27 +2381,21 @@ mod tests {
         action_hash(seed).to_string()
     }
 
-    /// Build a synthetic `TransactionDetails::Parked` fixture with the
-    /// given `tx_hash` embedded in the attached proof payload, keyed
-    /// under a parked-link ActionHash derived from `seed`.
     fn parked_tx(seed: u8, tx_hash: &str) -> Transaction {
-        let id = action_hash(seed).into();
-        let executor: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![2u8; 32]).into();
-        let ea_id = action_hash(CL_EA).into();
         Transaction {
-            id,
+            id: action_hash(seed).into(),
             tx_type: TransactionType::Parked,
             amount: UnitMap::new(),
             fee: UnitMap::new(),
             counterparty: vec![],
             history: vec![],
             timestamp: Timestamp(0),
-            creator: executor.clone(),
+            creator: agent_key(BRIDGE),
             details: TransactionDetails::Parked {
-                ea_id,
+                ea_id: action_hash(CL_EA).into(),
                 smart_agreement_title: "test".to_string(),
-                executor,
-                ct_role_id: "role".to_string(),
+                executor: agent_key(BRIDGE),
+                ct_role_id: ORACLE_ROLE.to_string(),
                 role_display_name: "Role".to_string(),
                 attached_payload: json!({
                     "proof_of_deposit": [{ "tx_hash": tx_hash }]
@@ -2406,30 +2405,23 @@ mod tests {
         }
     }
 
-    /// Build a synthetic `TransactionDetails::ParkedSpend` fixture the
-    /// same way. The reconciler uses the same proof-walker for both,
-    /// so S3 recovery is symmetric with S1 recovery.
     fn parked_spend_tx(seed: u8, tx_hash: &str) -> Transaction {
-        let id = action_hash(seed).into();
-        let spender: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![3u8; 32]).into();
-        let executor: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![4u8; 32]).into();
-        let ea_id = action_hash(BR_EA).into();
         Transaction {
-            id,
+            id: action_hash(seed).into(),
             tx_type: TransactionType::ParkedSpend,
             amount: UnitMap::new(),
             fee: UnitMap::new(),
             counterparty: vec![],
             history: vec![],
             timestamp: Timestamp(0),
-            creator: spender.clone(),
+            creator: agent_key(BRIDGE),
             details: TransactionDetails::ParkedSpend {
                 is_parked_spend_credit: false,
-                ea_id,
+                ea_id: action_hash(BR_EA).into(),
                 smart_agreement_title: "test".to_string(),
-                spender,
-                executor,
-                ct_role_id: "role".to_string(),
+                spender: agent_key(BRIDGE),
+                executor: agent_key(BRIDGE),
+                ct_role_id: BRIDGING_AGENT_ROLE.to_string(),
                 role_display_name: "Role".to_string(),
                 global_definition: action_hash(0xAA).into(),
                 lane_definitions: vec![],
@@ -2441,6 +2433,28 @@ mod tests {
                 }),
             },
         }
+    }
+
+    fn foreign_spend_tx(seed: u8, tx_hash: &str) -> Transaction {
+        let mut tx = parked_spend_tx(seed, tx_hash);
+        tx.creator = agent_key(STRANGER);
+        tx.amount = UnitMap::from(vec![(1, "5")]);
+        if let TransactionDetails::ParkedSpend {
+            spender,
+            ct_role_id,
+            attached_payload,
+            ..
+        } = &mut tx.details
+        {
+            *spender = agent_key(STRANGER);
+            *ct_role_id = "withdrawer".to_string();
+            *attached_payload = json!({
+                "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)),
+                "withdraw_contract_address": format!("{VAULT:#x}"),
+                "proof_of_deposit": [{ "lock_id": "lock:copied", "tx_hash": tx_hash }],
+            });
+        }
+        tx
     }
 
     /// Enqueue a minimal lock row with a well-formed payload that
@@ -3983,15 +3997,9 @@ mod tests {
 
     #[test]
     fn build_tx_hash_to_link_id_lowercases_mixed_case_hashes() {
-        // Guards the invariant that a past writer storing an uppercase
-        // `0xABC...` tx_hash in a parked payload still matches a queued
-        // lock whose proof carries the same hash lowercased. This is
-        // the only tx_hash-based lookup that survives the chain-history
-        // walker removal — make sure it stays robust against upstream
-        // case inconsistency.
         let tx = parked_tx(0x11, "0xABCDEF0123456789");
         let expected_id = tx.id.to_string();
-        let map = build_tx_hash_to_link_id(&[tx]);
+        let map = build_tx_hash_to_link_id(&[tx], &agent_key(BRIDGE));
         assert_eq!(
             map.get("0xabcdef0123456789").map(String::as_str),
             Some(expected_id.as_str()),
@@ -4001,12 +4009,9 @@ mod tests {
 
     #[test]
     fn build_tx_hash_to_link_id_indexes_parked_spend_payloads_too() {
-        // S3 recovery uses the same index against bridging-EA links,
-        // which show up as `TransactionDetails::ParkedSpend`. Confirm
-        // the walker covers both variants.
         let tx_spend = parked_spend_tx(0x22, "0xdeadbeef");
         let expected = tx_spend.id.to_string();
-        let map = build_tx_hash_to_link_id(&[tx_spend]);
+        let map = build_tx_hash_to_link_id(&[tx_spend], &agent_key(BRIDGE));
         assert_eq!(
             map.get("0xdeadbeef").map(String::as_str),
             Some(expected.as_str())
@@ -4015,9 +4020,6 @@ mod tests {
 
     #[test]
     fn build_tx_hash_to_link_id_skips_non_parked_and_missing_hashes() {
-        // A RAVE or any payload without a `proof_of_deposit` array must
-        // not pollute the reconciler's index — otherwise a row could be
-        // advanced against a live link that has nothing to do with it.
         let mut rave_tx = parked_tx(0x33, "0xshouldbeignored");
         rave_tx.tx_type = TransactionType::RAVE;
         rave_tx.details = TransactionDetails::Parked {
@@ -4029,7 +4031,7 @@ mod tests {
             attached_payload: json!({ "something_else": [] }),
             consumed_link: false,
         };
-        let map = build_tx_hash_to_link_id(&[rave_tx]);
+        let map = build_tx_hash_to_link_id(&[rave_tx], &agent_key(BRIDGE));
         assert!(
             map.is_empty(),
             "payloads missing proof_of_deposit must not be indexed"
@@ -4210,6 +4212,79 @@ mod tests {
             row.br_rave_hash.is_none(),
             "inferred S4 advancement must leave br_rave_hash NULL"
         );
+    }
+
+    fn awaiting_spend(orch: &BridgeOrchestrator, item_id: &str, tx_hash: &str) -> i64 {
+        let id = enqueue_lock(orch, item_id, tx_hash);
+        orch.db
+            .advance_to_cl_link_created(id, &action_hash(0x8F).to_string(), &ea(CL_EA))
+            .unwrap();
+        orch.db.advance_to_cl_rave_executed(id, None).unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn a_proof_copied_onto_a_foreign_spend_leaves_the_deposit_for_s3() {
+        let orch = test_orchestrator("foreign-spend-copied-proof");
+        let victim = awaiting_spend(&orch, "lock:victim", "0xd1");
+
+        let counts = reconcile(&orch, &[], &[foreign_spend_tx(0x91, "0xd1")]).await;
+
+        assert_eq!(counts.s3_advanced, 0);
+        let waiting = orch
+            .db
+            .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 10)
+            .unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].id, victim);
+        assert_eq!(waiting[0].br_spend_hash, None);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_spend_under_the_bridging_agent_role_is_not_the_bridging_agents() {
+        let orch = test_orchestrator("foreign-spend-role-spoof");
+        let victim = awaiting_spend(&orch, "lock:spoof", "0xd6");
+        let mut spoof = foreign_spend_tx(0xA0, "0xd6");
+        if let TransactionDetails::ParkedSpend { ct_role_id, .. } = &mut spoof.details {
+            *ct_role_id = BRIDGING_AGENT_ROLE.to_string();
+        }
+
+        let counts = reconcile(&orch, &[], std::slice::from_ref(&spoof)).await;
+        let selection = select_bridging_links(None, &agent_key(BRIDGE), &[spoof], usize::MAX, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(counts.s3_advanced, 0);
+        assert_eq!(lock_row(&orch, victim).br_spend_hash, None);
+        assert!(selection.deposits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_own_spend_is_recorded_though_a_foreign_one_after_it_copies_its_proof() {
+        let orch = test_orchestrator("own-spend-then-foreign-copy");
+        let row_id = awaiting_spend(&orch, "lock:own", "0xd2");
+        let own = parked_spend_tx(0x92, "0xd2");
+
+        reconcile(&orch, &[], &[own.clone(), foreign_spend_tx(0x93, "0xd2")]).await;
+
+        let row = lock_row(&orch, row_id);
+        assert_eq!(row.step, WorkStep::BrSpendCreated);
+        assert_eq!(row.br_spend_hash, Some(own.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_credit_limit_side_records_its_own_link_though_a_foreign_one_copies_its_proof() {
+        let orch = test_orchestrator("own-cl-link-then-foreign-copy");
+        let row_id = enqueue_lock(&orch, "lock:own-cl", "0xd3");
+        let own = parked_tx(0x94, "0xd3");
+        let mut foreign = parked_tx(0x95, "0xd3");
+        foreign.creator = agent_key(STRANGER);
+
+        reconcile(&orch, &[own.clone(), foreign], &[]).await;
+
+        let row = lock_row(&orch, row_id);
+        assert_eq!(row.step, WorkStep::ClLinkCreated);
+        assert_eq!(row.cl_link_hash, Some(own.id.to_string()));
     }
 
     #[test]
@@ -5172,8 +5247,7 @@ mod tests {
     }
 
     fn parked_withdrawal_tx(seed: u8) -> Transaction {
-        let mut tx = parked_spend_tx(seed, "");
-        tx.amount = UnitMap::from(vec![(1, "5")]);
+        let mut tx = foreign_spend_tx(seed, "");
         if let TransactionDetails::ParkedSpend {
             attached_payload, ..
         } = &mut tx.details
@@ -5197,7 +5271,7 @@ mod tests {
             parked_withdrawal_tx(0x62),
         ];
 
-        let selection = select_bridging_links(None, &links, usize::MAX, 1)
+        let selection = select_bridging_links(None, &agent_key(BRIDGE), &links, usize::MAX, 1)
             .await
             .unwrap();
 
@@ -5218,9 +5292,10 @@ mod tests {
             withdrawals[1].clone(),
         ];
 
-        let selection = select_bridging_links(Some(&signer), &links, usize::MAX, 1)
-            .await
-            .unwrap();
+        let selection =
+            select_bridging_links(Some(&signer), &agent_key(BRIDGE), &links, usize::MAX, 1)
+                .await
+                .unwrap();
 
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
         assert_eq!(ids(&selection.withdrawals), ids(&withdrawals));
@@ -5236,9 +5311,10 @@ mod tests {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
 
-        let selection = select_bridging_links(Some(&signer), &withdrawals, 1, 1)
-            .await
-            .unwrap();
+        let selection =
+            select_bridging_links(Some(&signer), &agent_key(BRIDGE), &withdrawals, 1, 1)
+                .await
+                .unwrap();
 
         assert_eq!(ids(&selection.withdrawals), ids(&withdrawals[..1]));
         assert_eq!(selection.coupons.len(), 1);
@@ -5251,9 +5327,15 @@ mod tests {
         let mut withdrawal = parked_withdrawal_tx(0x61);
         withdrawal.amount = UnitMap::from(vec![(1, "7"), (3, "5")]);
 
-        let selection = select_bridging_links(Some(&signer), &[withdrawal.clone()], usize::MAX, 3)
-            .await
-            .unwrap();
+        let selection = select_bridging_links(
+            Some(&signer),
+            &agent_key(BRIDGE),
+            &[withdrawal.clone()],
+            usize::MAX,
+            3,
+        )
+        .await
+        .unwrap();
 
         let coupon = selection.coupons[&withdrawal.id.to_string()]
             .as_str()
@@ -5288,14 +5370,34 @@ mod tests {
             deposit.clone(),
         ];
 
-        let selection = select_bridging_links(Some(&signer), &links, usize::MAX, 1)
-            .await
-            .unwrap();
+        let selection =
+            select_bridging_links(Some(&signer), &agent_key(BRIDGE), &links, usize::MAX, 1)
+                .await
+                .unwrap();
 
         assert_eq!(ids(&selection.withdrawals), ids(&[payable]));
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
         assert_eq!(selection.coupons.len(), 1);
         assert_eq!(selection.withdrawals_found, 5);
+    }
+
+    #[tokio::test]
+    async fn foreign_spends_carrying_a_proof_are_withdrawals_and_the_own_one_the_only_deposit() {
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
+        let own = parked_spend_tx(0x98, "0xd4");
+        let foreign: Vec<Transaction> = (0x99..0x9E)
+            .map(|seed| foreign_spend_tx(seed, "0xd4"))
+            .collect();
+        let links = [foreign.clone(), vec![own.clone()]].concat();
+
+        let selection =
+            select_bridging_links(Some(&signer), &agent_key(BRIDGE), &links, usize::MAX, 1)
+                .await
+                .unwrap();
+
+        assert_eq!(ids(&selection.deposits), ids(&[own]));
+        assert_eq!(ids(&selection.withdrawals), ids(&foreign));
+        assert_eq!(selection.coupons.len(), foreign.len());
     }
 
     #[tokio::test]
