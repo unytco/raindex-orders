@@ -2,10 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 import { erc20Abi, numberToHex } from 'viem'
 import { asBuild, BUILDS } from './testing/builds'
-
-const CHAIN = { sepolia: 11155111, mainnet: 1 }
-const OTHER = { sepolia: 1, mainnet: 11155111 }
-const ACCOUNT = '0x1111111111111111111111111111111111111111'
+import { ACCOUNT, CHAIN, connected, OTHER_CHAIN } from './testing/wallet'
 
 /** A wallet on `chainId` that records what it is asked. */
 function wallet(chainId: number, refuseSwitch?: number) {
@@ -27,13 +24,7 @@ function wallet(chainId: number, refuseSwitch?: number) {
 async function connectedOn(network: 'sepolia' | 'mainnet', walletChain: number) {
 	const asked = wallet(walletChain)
 	const ethereum = await asBuild(BUILDS[network], () => import('./ethereum'))
-	ethereum.ethereumStore.set({
-		isConnected: true,
-		account: ACCOUNT,
-		chainId: walletChain,
-		isLoading: false,
-		error: null
-	})
+	ethereum.ethereumStore.set(connected(walletChain))
 	return { ethereum, asked }
 }
 
@@ -51,7 +42,7 @@ afterEach(() => {
 
 describe.each(['sepolia', 'mainnet'] as const)('on a %s build', network => {
 	it('sends nothing while the wallet is on another chain', async () => {
-		const { ethereum, asked } = await connectedOn(network, OTHER[network])
+		const { ethereum, asked } = await connectedOn(network, OTHER_CHAIN[network])
 
 		expect(get(ethereum.onWrongNetwork)).toBe(true)
 		await expect(ethereum.writeContract(approve)).rejects.toThrow('Switch your wallet to')
@@ -59,7 +50,7 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build', network => {
 	})
 
 	it("checks the wallet's own chain, not the last one it reported", async () => {
-		const { ethereum, asked } = await connectedOn(network, OTHER[network])
+		const { ethereum, asked } = await connectedOn(network, OTHER_CHAIN[network])
 		ethereum.ethereumStore.update(s => ({ ...s, chainId: CHAIN[network] }))
 
 		expect(get(ethereum.onWrongNetwork)).toBe(false)
@@ -97,7 +88,7 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build', network => {
 
 	it("asks the wallet to switch to the build's chain, then reads the chain it is on", async () => {
 		const { ethereum, asked } = await connectedOn(network, CHAIN[network])
-		ethereum.ethereumStore.update(s => ({ ...s, chainId: OTHER[network] }))
+		ethereum.ethereumStore.update(s => ({ ...s, chainId: OTHER_CHAIN[network] }))
 
 		expect(await ethereum.switchNetwork()).toBe(true)
 		expect(asked).toEqual([

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { readable } from 'svelte/store'
-import { asBuild, BUILDS } from '$lib/testing/builds'
+import { asBuild, BUILDS, type Network } from '$lib/testing/builds'
+import { CHAIN, connected, OTHER_CHAIN } from '$lib/testing/wallet'
 
 vi.mock('$app/stores', () => ({ page: readable({ url: new URL('https://hot-bridge.test/') }) }))
 
@@ -12,11 +13,8 @@ afterEach(() => {
 	vi.restoreAllMocks()
 })
 
-type Network = 'sepolia' | 'mainnet'
 type Rendered = { render: (props?: Record<string, unknown>) => { html: string } }
 
-const CHAIN = { sepolia: 11155111, mainnet: 1 }
-const OTHER = { sepolia: 1, mainnet: 11155111 }
 const NAMES = {
 	sepolia: {
 		network: 'Sepolia Testnet',
@@ -42,15 +40,7 @@ async function render(
 ) {
 	return asBuild(BUILDS[network], async () => {
 		const { ethereumStore } = await import('$lib/ethereum')
-		if (chainId) {
-			ethereumStore.set({
-				isConnected: true,
-				account: '0x1111111111111111111111111111111111111111',
-				chainId,
-				isLoading: false,
-				error: null
-			})
-		}
+		if (chainId) ethereumStore.set(connected(chainId))
 		const component = (await PAGES[page]()).default as unknown as Rendered
 		return component.render(props).html
 	})
@@ -64,7 +54,7 @@ describe.each(['sepolia', 'mainnet'] as const)('a %s build', network => {
 	it.each(['home', 'lock', 'claim'] as const)(
 		'%s shows the switch, and no form, while the wallet is on another chain',
 		async page => {
-			const html = text(await render(network, page, OTHER[network]))
+			const html = text(await render(network, page, OTHER_CHAIN[network]))
 
 			expect(html).toContain(`Wrong network: please switch to ${names.network}`)
 			expect(html).toContain(`Switch to ${names.network}`)
