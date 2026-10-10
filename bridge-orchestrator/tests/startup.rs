@@ -105,6 +105,41 @@ fn status_and_clear_read_no_chain_and_need_no_signer() {
     }
 }
 
+const IN_TRANSIT: [&[&str]; 2] = [&["in-transit"], &["in-transit", "--mark-failed"]];
+
+#[test]
+fn in_transit_refuses_a_database_that_is_not_there() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for args in IN_TRANSIT {
+        let output = orchestrator(dir.path(), &node(dir.path()), args);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(stderr.contains("does not exist"), "{args:?}: {stderr}");
+        assert!(!db(dir.path()).exists());
+    }
+}
+
+#[test]
+fn in_transit_fails_when_it_cannot_reach_the_conductor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = node(dir.path());
+    env.push((
+        "LAIR_PASSPHRASE_FILE",
+        dir.path().join("no-passphrase").display().to_string(),
+    ));
+    assert!(orchestrator(dir.path(), &env, &["status"]).status.success());
+
+    for args in IN_TRANSIT {
+        let output = orchestrator(dir.path(), &env, args);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(stderr.contains("no-passphrase"), "{args:?}: {stderr}");
+    }
+}
+
 #[test]
 fn status_and_clear_refuse_an_unknown_network() {
     let dir = tempfile::tempdir().unwrap();

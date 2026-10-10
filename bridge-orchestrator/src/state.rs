@@ -853,22 +853,26 @@ impl StateStore {
         Ok(())
     }
 
-    /// Terminally fail a single row with `error_class='permanent'`. Used
-    /// by the cycle for per-lock failure modes that cannot possibly succeed
-    /// on retry (malformed payload, tag-size estimation bug, or a single
-    /// proof that is structurally larger than the link tag cap).
     pub fn mark_failed_permanent(&self, id: i64, error: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "UPDATE work_items
-             SET state='failed',
-                 error_class='permanent',
-                 last_error=?2,
-                 next_retry_at=NULL,
-                 updated_at=strftime('%s', 'now')
-             WHERE id=?1",
-            params![id, error],
-        )?;
+        self.mark_all_failed_permanent(&[id], error)
+    }
+
+    pub fn mark_all_failed_permanent(&self, ids: &[i64], error: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        for id in ids {
+            tx.execute(
+                "UPDATE work_items
+                 SET state='failed',
+                     error_class='permanent',
+                     last_error=?2,
+                     next_retry_at=NULL,
+                     updated_at=strftime('%s', 'now')
+                 WHERE id=?1",
+                params![id, error],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

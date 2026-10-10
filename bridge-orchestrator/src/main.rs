@@ -60,6 +60,13 @@ enum Command {
         #[arg(long, conflicts_with = "all")]
         older_than_s: Option<u64>,
     },
+    /// List each transfer the bridging agent's network still holds, for a migration's close.
+    InTransit {
+        /// Then mark failed, in one transaction, each pending row in transit, to be paid by hand
+        /// on the new network.
+        #[arg(long)]
+        mark_failed: bool,
+    },
 }
 
 #[tokio::main]
@@ -165,6 +172,9 @@ async fn main() -> Result<()> {
                 unreachable!("clap enforces one clear mode flag")
             };
             println!("{}", serde_json::to_string(&output)?);
+        }
+        Command::InTransit { mark_failed } => {
+            orchestrator::in_transit::run(config, mark_failed).await?;
         }
     }
 

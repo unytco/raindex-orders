@@ -98,11 +98,50 @@ output also includes `succeeded_deleted` and `failed_deleted`. Steady-state ops
 should rely on the in-process retention task and reserve this CLI for one-off
 hygiene.
 
+### `bridge-orchestrator in-transit`
+
+Lists each transfer the bridging agent's network still holds, so a migration
+closes the old network only once nothing is in transit, or the operator accepts
+what is. Run it with the orchestrator stopped. It takes the configuration of
+`run`, reads `DB_PATH` and the bridging agent's conductor, and sends no write
+to Holochain or Ethereum.
+
+```
+bridge-orchestrator in-transit
+bridge-orchestrator in-transit --mark-failed
+```
+
+It prints one JSON object per line for each transfer in transit:
+
+| `kind` | What is in transit | Fields |
+|--------|--------------------|--------|
+| `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created` | `item_id`, `lock_id`, `step`, `link` |
+| `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the lane's credit-limit adjustment agreement or its bridging agreement | `agreement`, `link`, `lock_ids` |
+| `withdrawal` | A live spend in the `withdrawer` role on the bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address` |
+
+A `failed` row is not listed, and nor is a spend that no cycle takes: one in
+another role that is not the bridging agent's own deposit. Log lines go to
+stdout too, and never start with `{`.
+
+It exits 0 only when it read both and found nothing. A `DB_PATH` that does not
+exist fails it.
+
+`--mark-failed` lists the same, then marks `failed` each listed row and each
+row, neither `succeeded` nor `failed`, whose lock is in a listed link. Each
+gets `last_error` `in transit at the old network's close; it is paid by hand on
+the new network`, so the new network's orchestrator pays none of them. It marks
+all of them in one transaction, or none, and changes no other row. It exits 0
+only when it read both and marked them. A listed link no row records, and a
+withdrawal, are recorded only in what it prints. Each transfer it lists is paid
+by hand on the new network, once the person who pays has checked that the old
+network did not pay it.
+
 ## Environment variables
 
 Every subcommand loads the config below on startup, so the env file must be
 sourced even for `status` and `clear`. Only `run` reads the signer variables
-and the chain. A network variable set to an empty value counts as unset.
+and the chain, and only `run` and `in-transit` the conductor. A network
+variable set to an empty value counts as unset.
 
 ### Config (all commands)
 
@@ -364,7 +403,8 @@ check the link it records (`cl_link_hash`, or `br_spend_hash` once it has one):
 while a failed row records a live link, that link is never paid, and re-queuing
 the row can let the next RAVE pay it. Leave a row whose `last_error` ends
 `resolve by hand` failed: check by hand whether its depositor was credited, and
-credit it by hand only if not and its link is not live.
+credit it by hand only if not and its link is not live. Leave failed, too, a
+row `in-transit --mark-failed` marked: it is paid by hand on the new network.
 Rows left `claimed` or `in_flight` need no action: startup re-queues them.
 
 ### systemd service management

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `bridge-orchestrator in-transit` lists each transfer the old network still holds before a migration's close, and `--mark-failed` fails its deposits for payment by hand.
+
 ### Fixed
 
 - bridge-orchestrator credits both deposits when one Ethereum transaction locks twice, for deposits it records from this release on.
