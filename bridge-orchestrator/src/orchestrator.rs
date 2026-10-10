@@ -663,12 +663,12 @@ impl BridgeOrchestrator {
     /// 3. S1: `create_parked_link` (CL EA) packing proofs from rows at
     ///    `step='new'` up to the link-tag cap.
     /// 4. S2: `execute_rave` (CL EA) over the refetched live set; advances
-    ///    rows whose `cl_link_hash` was in the consumed set.
+    ///    rows whose `cl_link_hash` it consumed carrying their own proof.
     /// 5. S3: `create_parked_spend` (bridging EA) packing proofs from rows
     ///    at `step='cl_rave_executed'` up to the tag cap.
     /// 6. S4: `execute_rave` (bridging EA) over the refetched live set
-    ///    plus withdrawal coupons; advances rows whose `br_spend_hash` was
-    ///    in the consumed set to `state='succeeded'`.
+    ///    plus withdrawal coupons; advances rows whose `br_spend_hash` it
+    ///    consumed carrying their own proof to `state='succeeded'`.
     async fn run_bridge_cycle(&self, ham: &Ham) -> Result<()> {
         let started = std::time::Instant::now();
 
@@ -808,10 +808,7 @@ impl BridgeOrchestrator {
         //
         // Re-fetch the live CL link set so the RAVE sees exactly the links
         // it will consume — including any link we wrote in S1 plus
-        // orphaned links from earlier cycles. Advancement for rows at
-        // `step='cl_link_created'` is then driven by hash membership in
-        // this consumed set: if `cl_link_hash ∈ cl_links`, the RAVE
-        // consumed it.
+        // orphaned links from earlier cycles.
         let cl_links_fetched = conductor.parked_links(&credit_limit_ea_id).await?;
         // Apply the optional per-cycle RAVE link cap. Deferred links stay
         // live server-side and are picked up by the next cycle via the
@@ -820,10 +817,8 @@ impl BridgeOrchestrator {
         let cl_fetched_count = cl_links_fetched.len();
         let (cl_links, deferred_cl_links) =
             apply_rave_link_cap(cl_links_fetched, self.cfg.rave_max_links);
-        // Consumed-set MUST be derived from the capped slice so we never
-        // advance a DB row whose `cl_link_hash` wasn't actually sent to
-        // `execute_rave` this cycle.
-        let consumed_cl_ids: HashSet<String> = cl_links.iter().map(|t| t.id.to_string()).collect();
+        // From the capped slice: a link the cap deferred was not consumed.
+        let consumed_cl = links_by_lock(&cl_links);
         let mut cl_rave_advanced = 0usize;
         if !cl_links.is_empty() {
             if deferred_cl_links > 0 {
@@ -862,18 +857,10 @@ impl BridgeOrchestrator {
             .await?;
             let cl_rave_hash = rave_result.1.to_string();
             info!("[bridge/s2] RAVE executed action_hash={}", rave_result.1);
-            let cl_created_rows =
-                self.db
-                    .list_pending_by_step("lock", WorkStep::ClLinkCreated, 5000)?;
-            for row in cl_created_rows {
-                if let Some(hash) = &row.cl_link_hash {
-                    if consumed_cl_ids.contains(hash) {
-                        self.db
-                            .advance_to_cl_rave_executed(row.id, Some(&cl_rave_hash))?;
-                        cl_rave_advanced += 1;
-                    }
-                }
-            }
+            cl_rave_advanced =
+                self.advance_consumed(WorkStep::ClLinkCreated, &consumed_cl, |id| {
+                    self.db.advance_to_cl_rave_executed(id, Some(&cl_rave_hash))
+                })?;
             // Always log after the RAVE ran, even when 0 rows advanced.
             // A zero here is the diagnostic signal for "RAVE fired but
             // no stored cl_link_hash matched the consumed set" — i.e.
@@ -1066,7 +1053,7 @@ impl BridgeOrchestrator {
             deferred_withdrawals
         );
 
-        let consumed_deposit_spend_ids: HashSet<String> = retained_deposit_ids;
+        let consumed_deposits = links_by_lock(&rave_links);
 
         let mut succeeded_locks = 0usize;
         if !rave_links.is_empty() {
@@ -1097,18 +1084,10 @@ impl BridgeOrchestrator {
             .await?;
             let br_rave_hash = rave_result.1.to_string();
             info!("[bridge/s4] RAVE executed action_hash={}", rave_result.1,);
-            let br_spend_rows =
-                self.db
-                    .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?;
-            for row in br_spend_rows {
-                if let Some(hash) = &row.br_spend_hash {
-                    if consumed_deposit_spend_ids.contains(hash) {
-                        self.db
-                            .advance_to_br_rave_executed(row.id, Some(&br_rave_hash))?;
-                        succeeded_locks += 1;
-                    }
-                }
-            }
+            succeeded_locks =
+                self.advance_consumed(WorkStep::BrSpendCreated, &consumed_deposits, |id| {
+                    self.db.advance_to_br_rave_executed(id, Some(&br_rave_hash))
+                })?;
             // Same rationale as S2: always log after the bridging
             // RAVE ran. A zero here means the RAVE consumed nothing
             // stored by us, which is an orphaned-spend warning sign.
@@ -1151,16 +1130,16 @@ impl BridgeOrchestrator {
     /// evidence at multiple steps gets cascaded forward each time we
     /// re-query its step after advancing):
     ///
-    /// * `step='new'` and the lock's `tx_hash` is present in a live CL
-    ///   parked-link payload → advance to `cl_link_created` with that
-    ///   link's ActionHash.
+    /// * `step='new'` and the lock's own proof, by lock ID and transaction
+    ///   hash, is in a live CL parked link → advance to `cl_link_created`
+    ///   with that link's ActionHash.
     /// * `step='cl_link_created'` and `cl_link_hash` has left the agreement
     ///   it was parked on → that agreement's RAVE consumed the link. Advance
     ///   to `cl_rave_executed` with `cl_rave_hash=NULL` (we can't recover the
     ///   actual RAVE hash after the fact).
-    /// * `step='cl_rave_executed'` and the lock's `tx_hash` is present in
-    ///   a live bridging parked-spend payload → advance to
-    ///   `br_spend_created` with that spend's ActionHash.
+    /// * `step='cl_rave_executed'` and the lock's own proof is in a live
+    ///   bridging parked spend → advance to `br_spend_created` with that
+    ///   spend's ActionHash.
     /// * `step='br_spend_created'` and `br_spend_hash` has left the
     ///   agreement it was parked on → that agreement's RAVE consumed the
     ///   spend. Advance to `br_rave_executed` (simultaneously
@@ -1173,22 +1152,20 @@ impl BridgeOrchestrator {
     ) -> Result<ReconcileCounts> {
         let credit_limit: ActionHash = context.credit_limit_adjustment.clone().into();
         let bridging: ActionHash = context.bridging_agreement.clone().into();
-        let cl_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, &credit_limit).await?);
-        let br_by_tx_hash = build_tx_hash_to_link_id(live.on(conductor, &bridging).await?);
+        let cl_by_lock = links_by_lock(live.on(conductor, &credit_limit).await?);
+        let br_by_lock = links_by_lock(live.on(conductor, &bridging).await?);
         let mut counts = ReconcileCounts::default();
 
         for row in self.db.list_pending_by_step("lock", WorkStep::New, 5000)? {
-            let Some(tx_hash) = self.lock_tx_hash(&row) else {
+            let Some(link_id) = self.lock_key(&row).and_then(|lock| cl_by_lock.get(&lock)) else {
                 continue;
             };
-            if let Some(link_id) = cl_by_tx_hash.get(&tx_hash) {
-                debug!(
-                    "[bridge/reconcile] lock={} new → cl_link_created (tx_hash matched live CL link {})",
-                    row.item_id, link_id
-                );
-                self.record_cl_link(row.id, link_id, context)?;
-                counts.s1_advanced += 1;
-            }
+            debug!(
+                "[bridge/reconcile] lock={} new → cl_link_created (its proof is in live CL link {})",
+                row.item_id, link_id
+            );
+            self.record_cl_link(row.id, link_id, context)?;
+            counts.s1_advanced += 1;
         }
 
         for row in self
@@ -1208,17 +1185,15 @@ impl BridgeOrchestrator {
             .db
             .list_pending_by_step("lock", WorkStep::ClRaveExecuted, 5000)?
         {
-            let Some(tx_hash) = self.lock_tx_hash(&row) else {
+            let Some(spend_id) = self.lock_key(&row).and_then(|lock| br_by_lock.get(&lock)) else {
                 continue;
             };
-            if let Some(spend_id) = br_by_tx_hash.get(&tx_hash) {
-                debug!(
-                    "[bridge/reconcile] lock={} cl_rave_executed → br_spend_created (tx_hash matched live bridging spend {})",
-                    row.item_id, spend_id
-                );
-                self.record_br_spend(row.id, spend_id, context)?;
-                counts.s3_advanced += 1;
-            }
+            debug!(
+                "[bridge/reconcile] lock={} cl_rave_executed → br_spend_created (its proof is in live bridging spend {})",
+                row.item_id, spend_id
+            );
+            self.record_br_spend(row.id, spend_id, context)?;
+            counts.s3_advanced += 1;
         }
 
         for row in self
@@ -1316,13 +1291,44 @@ impl BridgeOrchestrator {
         Ok(false)
     }
 
-    /// The `tx_hash` [`BridgeOrchestrator::extract_lock_proof`] writes into the row's proof.
-    fn lock_tx_hash(&self, item: &WorkItem) -> Option<String> {
+    /// Advances each row at `step` whose recorded link the RAVE consumed with the row's own
+    /// proof in it, through `advance`, and returns how many it advanced.
+    fn advance_consumed(
+        &self,
+        step: WorkStep,
+        consumed: &HashMap<LockKey, String>,
+        advance: impl Fn(i64) -> Result<()>,
+    ) -> Result<usize> {
+        let consumed_links: HashSet<&str> = consumed.values().map(String::as_str).collect();
+        let mut advanced = 0;
+        for row in self.db.list_pending_by_step("lock", step, 5000)? {
+            let Some((link, _)) = row.parked_link() else {
+                continue;
+            };
+            let carried_in = self.lock_key(&row).and_then(|lock| consumed.get(&lock));
+            if carried_in.map(String::as_str) == Some(link) {
+                advance(row.id)?;
+                advanced += 1;
+            } else if consumed_links.contains(link) {
+                error!(
+                    event = "bridge.rave.proof_missing",
+                    "[bridge/rave] lock={} stays at {}: the RAVE consumed its link {} without its proof",
+                    row.item_id,
+                    row.step,
+                    link
+                );
+            }
+        }
+        Ok(advanced)
+    }
+
+    /// The lock [`BridgeOrchestrator::extract_lock_proof`] writes into the row's proof.
+    fn lock_key(&self, item: &WorkItem) -> Option<LockKey> {
         match LockPayload::deserialize(item.payload_json.clone()) {
-            Ok(payload) => Some(normalize_tx_hash(&payload.tx_hash)),
+            Ok(payload) => Some(LockKey::new(&payload.lock_id, &payload.tx_hash)),
             Err(e) => {
                 warn!(
-                    "[bridge/reconcile] lock={} unable to read tx_hash for reconcile: {}",
+                    "[bridge/reconcile] lock={} unable to read its lock for reconcile: {}",
                     item.item_id, e
                 );
                 None
@@ -1568,17 +1574,15 @@ impl BridgeOrchestrator {
         let depositor = decode_holochain_agent_as_pubkey_string(&payload.holochain_agent)?;
         let normalized = payload.normalized_amounts()?;
         let amount = normalized.amount_hot.clone();
+        let lock = LockKey::new(&payload.lock_id, &payload.tx_hash);
 
-        // Normalize tx_hash to lowercase at the proof boundary so the
-        // reconciler's string-keyed lookup is robust to any upstream caller
-        // or migrated row that ever stored it mixed-case.
         let proof = json!({
             "method": "deposit",
             "contract_address": format!("0x{}", contract_hex.to_lowercase()),
             "amount": amount,
             "depositor_wallet_address": depositor,
-            "lock_id": payload.lock_id,
-            "tx_hash": normalize_tx_hash(&payload.tx_hash),
+            "lock_id": lock.lock_id,
+            "tx_hash": lock.tx_hash,
         });
 
         debug!(
@@ -2142,23 +2146,37 @@ fn widest_amounts(units: impl IntoIterator<Item = String>) -> UnitMap {
     )
 }
 
-/// Canonical form for every `tx_hash` compared across the Ethereum and
-/// Holochain boundary: proof emission, reconciler probe and live-parked index
-/// all route through this, so the equality check is symmetric.
 fn normalize_tx_hash(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-/// Build a `tx_hash -> parked-link ActionHash` index from a live
-/// `get_parked_links_by_ea` result. Used by the reconciler to advance a
-/// `step='new'` / `step='cl_rave_executed'` row the moment it sees its
-/// proof's `tx_hash` inside a live parked payload, without having to
-/// inspect RAVE history.
-///
-/// Keys are normalised via [`normalize_tx_hash`] so mixed-case or
-/// whitespace-padded writers on either side of the comparison still
-/// match.
-fn build_tx_hash_to_link_id(parked: &[Transaction]) -> HashMap<String, String> {
+/// The lock a deposit proof stands for. Its ID is unique per vault; its
+/// transaction is not, since one transaction can lock twice.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LockKey {
+    lock_id: String,
+    tx_hash: String,
+}
+
+impl LockKey {
+    fn new(lock_id: &str, tx_hash: &str) -> Self {
+        Self {
+            lock_id: lock_id.to_string(),
+            tx_hash: normalize_tx_hash(tx_hash),
+        }
+    }
+
+    fn of_proof(proof: &Value) -> Option<Self> {
+        Some(Self::new(
+            proof.get("lock_id")?.as_str()?,
+            proof.get("tx_hash")?.as_str()?,
+        ))
+    }
+}
+
+/// Each deposit proof the given parked links carry, by its lock, with the
+/// ActionHash of the link carrying it.
+fn links_by_lock(parked: &[Transaction]) -> HashMap<LockKey, String> {
     let mut out = HashMap::new();
     for tx in parked {
         let payload = match &tx.details {
@@ -2173,10 +2191,8 @@ fn build_tx_hash_to_link_id(parked: &[Transaction]) -> HashMap<String, String> {
         let Some(Value::Array(proofs)) = payload.get("proof_of_deposit") else {
             continue;
         };
-        for proof in proofs {
-            if let Some(h) = proof.get("tx_hash").and_then(|v| v.as_str()) {
-                out.insert(normalize_tx_hash(h), tx.id.to_string());
-            }
+        for lock in proofs.iter().filter_map(LockKey::of_proof) {
+            out.insert(lock, tx.id.to_string());
         }
     }
     out
@@ -2376,10 +2392,14 @@ mod tests {
         action_hash(seed).to_string()
     }
 
-    /// Build a synthetic `TransactionDetails::Parked` fixture with the
-    /// given `tx_hash` embedded in the attached proof payload, keyed
-    /// under a parked-link ActionHash derived from `seed`.
-    fn parked_tx(seed: u8, tx_hash: &str) -> Transaction {
+    /// The proof S1 and S3 write for lock `lock_id`, made in `tx_hash`.
+    fn proof(lock_id: &str, tx_hash: &str) -> Value {
+        json!({ "lock_id": lock_id, "tx_hash": tx_hash })
+    }
+
+    /// A link parked on the CL EA carrying `proofs`, its ActionHash derived
+    /// from `seed`.
+    fn parked_tx(seed: u8, proofs: &[Value]) -> Transaction {
         let id = action_hash(seed).into();
         let executor: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![2u8; 32]).into();
         let ea_id = action_hash(CL_EA).into();
@@ -2398,18 +2418,15 @@ mod tests {
                 executor,
                 ct_role_id: "role".to_string(),
                 role_display_name: "Role".to_string(),
-                attached_payload: json!({
-                    "proof_of_deposit": [{ "tx_hash": tx_hash }]
-                }),
+                attached_payload: json!({ "proof_of_deposit": proofs }),
                 consumed_link: false,
             },
         }
     }
 
-    /// Build a synthetic `TransactionDetails::ParkedSpend` fixture the
-    /// same way. The reconciler uses the same proof-walker for both,
-    /// so S3 recovery is symmetric with S1 recovery.
-    fn parked_spend_tx(seed: u8, tx_hash: &str) -> Transaction {
+    /// A spend parked on the bridging EA carrying `proofs`, as for
+    /// [`parked_tx`].
+    fn parked_spend_tx(seed: u8, proofs: &[Value]) -> Transaction {
         let id = action_hash(seed).into();
         let spender: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![3u8; 32]).into();
         let executor: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![4u8; 32]).into();
@@ -2436,19 +2453,14 @@ mod tests {
                 new_balance: UnitMap::new(),
                 fees_owed: UnitMap::new(),
                 proposed_balance: UnitMap::new(),
-                attached_payload: json!({
-                    "proof_of_deposit": [{ "tx_hash": tx_hash }]
-                }),
+                attached_payload: json!({ "proof_of_deposit": proofs }),
             },
         }
     }
 
-    /// Enqueue a minimal lock row with a well-formed payload that
-    /// `extract_lock_proof` can parse. The `tx_hash` field is what the
-    /// reconciler matches against the live-parked map.
+    /// Enqueue a lock row `extract_lock_proof` can read, with `item_id` as
+    /// its lock ID, so its proof is `proof(item_id, tx_hash)`.
     fn enqueue_lock(orch: &BridgeOrchestrator, item_id: &str, tx_hash: &str) -> i64 {
-        // A valid 32-byte hex agent (64 hex chars) so
-        // `decode_holochain_agent_as_pubkey_string` succeeds.
         let agent_hex = "00".repeat(32);
         let payload = serde_json::json!({
             "lock_id": item_id,
@@ -3869,7 +3881,7 @@ mod tests {
 
     #[test]
     fn apply_rave_link_cap_no_cap_returns_input_unchanged() {
-        let links = vec![parked_tx(1, "0x01"), parked_tx(2, "0x02")];
+        let links = vec![parked_tx(1, &[]), parked_tx(2, &[])];
         let original_ids: Vec<String> = links.iter().map(|t| t.id.to_string()).collect();
 
         let (unchanged, deferred) = apply_rave_link_cap(links.clone(), None);
@@ -3898,7 +3910,7 @@ mod tests {
 
     #[test]
     fn apply_rave_link_cap_cap_ge_len_returns_input_unchanged() {
-        let links = vec![parked_tx(1, "0x01"), parked_tx(2, "0x02")];
+        let links = vec![parked_tx(1, &[]), parked_tx(2, &[])];
         let original_len = links.len();
 
         let (out, deferred) = apply_rave_link_cap(links.clone(), Some(original_len));
@@ -3913,11 +3925,11 @@ mod tests {
     #[test]
     fn apply_rave_link_cap_cap_lt_len_truncates_and_reports_deferred() {
         let links = vec![
-            parked_tx(1, "0x01"),
-            parked_tx(2, "0x02"),
-            parked_tx(3, "0x03"),
-            parked_tx(4, "0x04"),
-            parked_tx(5, "0x05"),
+            parked_tx(1, &[]),
+            parked_tx(2, &[]),
+            parked_tx(3, &[]),
+            parked_tx(4, &[]),
+            parked_tx(5, &[]),
         ];
 
         let (out, deferred) = apply_rave_link_cap(links, Some(2));
@@ -3930,8 +3942,8 @@ mod tests {
         // Mirrors the S4 ordering contract: deposits are pushed first,
         // withdrawals second. A cap below total should keep deposits and
         // drop withdrawals, not re-order anything.
-        let deposits = vec![parked_spend_tx(10, "0x0A"), parked_spend_tx(11, "0x0B")];
-        let withdrawals = vec![parked_spend_tx(20, "0x14"), parked_spend_tx(21, "0x15")];
+        let deposits = vec![parked_spend_tx(10, &[]), parked_spend_tx(11, &[])];
+        let withdrawals = vec![parked_spend_tx(20, &[]), parked_spend_tx(21, &[])];
         let deposit_ids: Vec<String> = deposits.iter().map(|t| t.id.to_string()).collect();
 
         let mut pooled = deposits.clone();
@@ -3982,43 +3994,50 @@ mod tests {
     }
 
     #[test]
-    fn build_tx_hash_to_link_id_lowercases_mixed_case_hashes() {
-        // Guards the invariant that a past writer storing an uppercase
-        // `0xABC...` tx_hash in a parked payload still matches a queued
-        // lock whose proof carries the same hash lowercased. This is
-        // the only tx_hash-based lookup that survives the chain-history
-        // walker removal — make sure it stays robust against upstream
-        // case inconsistency.
-        let tx = parked_tx(0x11, "0xABCDEF0123456789");
+    fn links_by_lock_lowercases_mixed_case_hashes() {
+        let tx = parked_tx(0x11, &[proof("7", "0xABCDEF0123456789")]);
         let expected_id = tx.id.to_string();
-        let map = build_tx_hash_to_link_id(&[tx]);
+        let map = links_by_lock(&[tx]);
         assert_eq!(
-            map.get("0xabcdef0123456789").map(String::as_str),
+            map.get(&LockKey::new("7", "0xabcdef0123456789"))
+                .map(String::as_str),
             Some(expected_id.as_str()),
             "uppercase tx_hash in the live parked payload must be normalised to lowercase"
         );
     }
 
     #[test]
-    fn build_tx_hash_to_link_id_indexes_parked_spend_payloads_too() {
-        // S3 recovery uses the same index against bridging-EA links,
-        // which show up as `TransactionDetails::ParkedSpend`. Confirm
-        // the walker covers both variants.
-        let tx_spend = parked_spend_tx(0x22, "0xdeadbeef");
+    fn links_by_lock_indexes_parked_spend_payloads_too() {
+        let tx_spend = parked_spend_tx(0x22, &[proof("8", "0xdeadbeef")]);
         let expected = tx_spend.id.to_string();
-        let map = build_tx_hash_to_link_id(&[tx_spend]);
+        let map = links_by_lock(&[tx_spend]);
         assert_eq!(
-            map.get("0xdeadbeef").map(String::as_str),
+            map.get(&LockKey::new("8", "0xdeadbeef"))
+                .map(String::as_str),
             Some(expected.as_str())
         );
     }
 
     #[test]
-    fn build_tx_hash_to_link_id_skips_non_parked_and_missing_hashes() {
+    fn links_by_lock_keys_each_proof_by_its_lock_id_as_well_as_its_transaction() {
+        let tx = parked_tx(0x23, &[proof("1", "0xab"), proof("2", "0xab")]);
+        let map = links_by_lock(std::slice::from_ref(&tx));
+        assert_eq!(map.len(), 2);
+        for lock_id in ["1", "2"] {
+            assert_eq!(
+                map.get(&LockKey::new(lock_id, "0xab")),
+                Some(&tx.id.to_string())
+            );
+        }
+        assert_eq!(map.get(&LockKey::new("3", "0xab")), None);
+    }
+
+    #[test]
+    fn links_by_lock_skips_non_parked_and_missing_hashes() {
         // A RAVE or any payload without a `proof_of_deposit` array must
         // not pollute the reconciler's index — otherwise a row could be
         // advanced against a live link that has nothing to do with it.
-        let mut rave_tx = parked_tx(0x33, "0xshouldbeignored");
+        let mut rave_tx = parked_tx(0x33, &[]);
         rave_tx.tx_type = TransactionType::RAVE;
         rave_tx.details = TransactionDetails::Parked {
             ea_id: action_hash(0xEA).into(),
@@ -4029,7 +4048,7 @@ mod tests {
             attached_payload: json!({ "something_else": [] }),
             consumed_link: false,
         };
-        let map = build_tx_hash_to_link_id(&[rave_tx]);
+        let map = links_by_lock(&[rave_tx]);
         assert!(
             map.is_empty(),
             "payloads missing proof_of_deposit must not be indexed"
@@ -4037,14 +4056,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_advances_new_row_when_tx_hash_matches_live_cl_link() {
-        // S1 recovery: a row at step='new' whose tx_hash appears in a
-        // live CL parked link means `create_parked_link` silently
-        // succeeded on a previous cycle. Advance to cl_link_created
-        // with the observed link hash so S2 picks it up.
+    async fn reconcile_advances_new_row_when_its_proof_is_in_a_live_cl_link() {
+        // S1 recovery: a row at step='new' whose proof is in a live CL
+        // parked link means `create_parked_link` silently succeeded on a
+        // previous cycle. Advance to cl_link_created with the observed
+        // link hash so S2 picks it up.
         let orch = test_orchestrator("reconcile-s1-advance");
         let row_id = enqueue_lock(&orch, "lock:r:1", "0xabc123");
-        let live_link = parked_tx(0x10, "0xabc123");
+        let live_link = parked_tx(0x10, &[proof("lock:r:1", "0xabc123")]);
         let expected_hash = live_link.id.to_string();
 
         reconcile(&orch, &[live_link], &[]).await;
@@ -4065,20 +4084,25 @@ mod tests {
         let orch = test_orchestrator("reconcile-s1-mixed-case");
         enqueue_lock(&orch, "lock:r:case", " 0xABC123");
 
-        let counts = reconcile(&orch, &[parked_tx(0x12, "0xabc123")], &[]).await;
+        let counts = reconcile(
+            &orch,
+            &[parked_tx(0x12, &[proof("lock:r:case", "0xabc123")])],
+            &[],
+        )
+        .await;
 
         assert_eq!(counts.s1_advanced, 1);
     }
 
     #[tokio::test]
-    async fn reconcile_leaves_new_row_untouched_when_tx_hash_absent_from_live_cl() {
-        // Negative case: if the live CL set doesn't include a matching
-        // tx_hash, the row stays at step='new' and S1 will re-issue
-        // the batch on this cycle. This is the branch that prevents
-        // silent advancement on unrelated links.
+    async fn reconcile_leaves_new_row_untouched_when_its_proof_is_absent_from_live_cl() {
+        // Negative case: if no live CL link carries the row's proof, the
+        // row stays at step='new' and S1 will re-issue the batch on this
+        // cycle. This is the branch that prevents silent advancement on
+        // unrelated links.
         let orch = test_orchestrator("reconcile-s1-noop");
         let row_id = enqueue_lock(&orch, "lock:r:2", "0xabc999");
-        let unrelated = parked_tx(0x20, "0xdeadbeef");
+        let unrelated = parked_tx(0x20, &[proof("lock:r:other", "0xdeadbeef")]);
 
         reconcile(&orch, &[unrelated], &[]).await;
 
@@ -4134,7 +4158,7 @@ mod tests {
             .unwrap();
 
         // Build a live CL set that contains our stored hash.
-        let live = parked_tx(0x40, "0xfeedface");
+        let live = parked_tx(0x40, &[proof("lock:r:4", "0xfeedface")]);
         assert_eq!(live.id.to_string(), stored_hash);
 
         reconcile(&orch, &[live], &[]).await;
@@ -4150,10 +4174,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_advances_cl_rave_executed_when_tx_hash_matches_live_bridging_spend() {
+    async fn reconcile_advances_cl_rave_executed_when_its_proof_is_in_a_live_bridging_spend() {
         // S3 recovery: `create_parked_spend` silently succeeded on a
         // previous cycle; the bridging-EA live set now carries our
-        // tx_hash as a parked spend. Advance to br_spend_created.
+        // proof in a parked spend. Advance to br_spend_created.
         let orch = test_orchestrator("reconcile-s3-advance");
         let row_id = enqueue_lock(&orch, "lock:r:5", "0xcafef00d");
         orch.db
@@ -4161,7 +4185,7 @@ mod tests {
             .unwrap();
         orch.db.advance_to_cl_rave_executed(row_id, None).unwrap();
 
-        let live_spend = parked_spend_tx(0x51, "0xcafef00d");
+        let live_spend = parked_spend_tx(0x51, &[proof("lock:r:5", "0xcafef00d")]);
         let expected = live_spend.id.to_string();
 
         reconcile(&orch, &[], &[live_spend]).await;
@@ -4289,7 +4313,7 @@ mod tests {
 
         // S1: step='new', tx_hash matches a live CL link.
         let id_s1 = enqueue_lock(&orch, "lock:counts:s1", "0xa1");
-        let s1_live = parked_tx(0x81, "0xa1");
+        let s1_live = parked_tx(0x81, &[proof("lock:counts:s1", "0xa1")]);
 
         // S2: step='cl_link_created' with hash that is NOT in live CL
         // set (RAVE consumed it).
@@ -4306,7 +4330,7 @@ mod tests {
             .advance_to_cl_link_created(id_s3, &action_hash(0x83).to_string(), &ea(CL_EA))
             .unwrap();
         orch.db.advance_to_cl_rave_executed(id_s3, None).unwrap();
-        let s3_live_spend = parked_spend_tx(0x84, "0xa3");
+        let s3_live_spend = parked_spend_tx(0x84, &[proof("lock:counts:s3", "0xa3")]);
 
         // S4: step='br_spend_created' with hash that is NOT in live
         // bridging set (bridging RAVE consumed it).
@@ -4378,7 +4402,7 @@ mod tests {
         let orch = test_orchestrator("reconcile-idempotent");
         let a = enqueue_lock(&orch, "lock:r:a", "0xaaaa");
         let b = enqueue_lock(&orch, "lock:r:b", "0xbbbb");
-        let live_a = parked_tx(0x70, "0xaaaa");
+        let live_a = parked_tx(0x70, &[proof("lock:r:a", "0xaaaa")]);
 
         reconcile(&orch, std::slice::from_ref(&live_a), &[]).await;
         reconcile(&orch, std::slice::from_ref(&live_a), &[]).await;
@@ -4393,6 +4417,188 @@ mod tests {
             .list_pending_by_step("lock", WorkStep::New, 10)
             .unwrap();
         assert!(new.iter().any(|r| r.id == b));
+    }
+
+    fn enqueue_at_cl_rave_executed(orch: &BridgeOrchestrator, item_id: &str, tx_hash: &str) -> i64 {
+        let id = enqueue_lock(orch, item_id, tx_hash);
+        orch.db
+            .advance_to_cl_link_created(id, &action_hash(0x5F).to_string(), &ea(CL_EA))
+            .unwrap();
+        orch.db.advance_to_cl_rave_executed(id, None).unwrap();
+        id
+    }
+
+    fn rows_at(orch: &BridgeOrchestrator, step: WorkStep) -> Vec<WorkItem> {
+        orch.db.list_pending_by_step("lock", step, 100).unwrap()
+    }
+
+    fn s4_consumes(orch: &BridgeOrchestrator, spends: &[Transaction]) -> usize {
+        orch.advance_consumed(WorkStep::BrSpendCreated, &links_by_lock(spends), |id| {
+            orch.db.advance_to_br_rave_executed(id, Some("s4"))
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn of_two_locks_in_one_transaction_reconcile_records_only_the_one_s1_wrote() {
+        let orch = test_orchestrator("one-tx-two-locks-s1");
+        let first = enqueue_lock(&orch, "lock:twice:1", "0x7a");
+        let second = enqueue_lock(&orch, "lock:twice:2", "0x7a");
+        let written = parked_tx(0x90, &[proof("lock:twice:1", "0x7a")]);
+
+        let counts = reconcile(&orch, std::slice::from_ref(&written), &[]).await;
+
+        assert_eq!(counts.s1_advanced, 1);
+        let recorded = lock_row(&orch, first);
+        assert_eq!(recorded.step, WorkStep::ClLinkCreated);
+        assert_eq!(recorded.cl_link_hash, Some(written.id.to_string()));
+        assert_eq!(lock_row(&orch, second).step, WorkStep::New);
+        let next = orch
+            .build_cl_batch(
+                VAULT,
+                &rows_at(&orch, WorkStep::New),
+                orch.cfg.max_link_tag_bytes,
+            )
+            .unwrap();
+        assert_eq!(
+            next.ids,
+            vec![second],
+            "the next S1 batch writes the second lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn of_two_locks_in_one_transaction_reconcile_records_only_the_one_s3_wrote() {
+        let orch = test_orchestrator("one-tx-two-locks-s3");
+        let first = enqueue_at_cl_rave_executed(&orch, "lock:twice:1", "0x7b");
+        let second = enqueue_at_cl_rave_executed(&orch, "lock:twice:2", "0x7b");
+        let written = parked_spend_tx(0x91, &[proof("lock:twice:1", "0x7b")]);
+
+        let counts = reconcile(&orch, &[], std::slice::from_ref(&written)).await;
+
+        assert_eq!(counts.s3_advanced, 1);
+        let recorded = lock_row(&orch, first);
+        assert_eq!(recorded.step, WorkStep::BrSpendCreated);
+        assert_eq!(recorded.br_spend_hash, Some(written.id.to_string()));
+        assert_eq!(lock_row(&orch, second).step, WorkStep::ClRaveExecuted);
+        let next = orch
+            .build_spend_batch(
+                VAULT,
+                &rows_at(&orch, WorkStep::ClRaveExecuted),
+                orch.cfg.max_link_tag_bytes,
+                &tag_context(Ledger::empty(), &[]),
+            )
+            .unwrap();
+        assert_eq!(
+            next.ids,
+            vec![second],
+            "the next S3 batch writes the second lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn of_two_locks_in_one_transaction_each_succeeds_only_once_its_own_spend_is_consumed() {
+        let orch = test_orchestrator("one-tx-two-locks-s4");
+        let context = in_force(CL_EA, BR_EA);
+        let first = enqueue_at_cl_rave_executed(&orch, "lock:twice:1", "0x7c");
+        let second = enqueue_at_cl_rave_executed(&orch, "lock:twice:2", "0x7c");
+        let first_spend = parked_spend_tx(0x92, &[proof("lock:twice:1", "0x7c")]);
+        orch.record_br_spend(first, &first_spend.id.to_string(), &context)
+            .unwrap();
+
+        reconcile(&orch, &[], std::slice::from_ref(&first_spend)).await;
+        assert_eq!(s4_consumes(&orch, std::slice::from_ref(&first_spend)), 1);
+
+        assert_eq!(
+            lock_row(&orch, first).state,
+            crate::state::WorkState::Succeeded
+        );
+        let waiting = lock_row(&orch, second);
+        assert_eq!(
+            (waiting.state, waiting.step),
+            (crate::state::WorkState::Queued, WorkStep::ClRaveExecuted),
+            "the second depositor is not credited by the first lock's spend"
+        );
+
+        let second_spend = parked_spend_tx(0x93, &[proof("lock:twice:2", "0x7c")]);
+        orch.record_br_spend(second, &second_spend.id.to_string(), &context)
+            .unwrap();
+        reconcile(&orch, &[], std::slice::from_ref(&second_spend)).await;
+        assert_eq!(lock_row(&orch, second).step, WorkStep::BrSpendCreated);
+        assert_eq!(s4_consumes(&orch, &[second_spend]), 1);
+        assert_eq!(
+            lock_row(&orch, second).state,
+            crate::state::WorkState::Succeeded
+        );
+    }
+
+    #[test]
+    fn a_rave_advances_only_the_rows_whose_own_proof_its_consumed_link_carried() {
+        let orch = test_orchestrator("rave-own-proof");
+        let link = parked_tx(0x94, &[proof("lock:own:1", "0x7d")]);
+        let carried = enqueue_lock(&orch, "lock:own:1", "0x7d");
+        let missing = enqueue_lock(&orch, "lock:own:2", "0x7d");
+        for id in [carried, missing] {
+            orch.db
+                .advance_to_cl_link_created(id, &link.id.to_string(), &ea(CL_EA))
+                .unwrap();
+        }
+
+        let advanced = orch
+            .advance_consumed(WorkStep::ClLinkCreated, &links_by_lock(&[link]), |id| {
+                orch.db.advance_to_cl_rave_executed(id, Some("s2"))
+            })
+            .unwrap();
+
+        assert_eq!(advanced, 1);
+        assert_eq!(lock_row(&orch, carried).step, WorkStep::ClRaveExecuted);
+        assert_eq!(lock_row(&orch, missing).step, WorkStep::ClLinkCreated);
+
+        let spend = parked_spend_tx(0x95, &[proof("lock:own:1", "0x7d")]);
+        for id in [carried, missing] {
+            orch.db
+                .advance_to_br_spend_created(id, &spend.id.to_string(), &ea(BR_EA))
+                .unwrap();
+        }
+        assert_eq!(s4_consumes(&orch, &[spend]), 1);
+        assert_eq!(
+            lock_row(&orch, carried).state,
+            crate::state::WorkState::Succeeded
+        );
+        assert_eq!(
+            lock_row(&orch, missing).state,
+            crate::state::WorkState::Queued,
+            "a spend that did not carry the row's proof did not credit its depositor"
+        );
+    }
+
+    #[test]
+    fn a_rave_advances_every_row_of_a_batch_its_consumed_link_carried() {
+        let orch = test_orchestrator("rave-batch");
+        let link = parked_tx(
+            0x96,
+            &[proof("lock:batch:1", "0x7e"), proof("lock:batch:2", "0x7f")],
+        );
+        let rows = [
+            enqueue_lock(&orch, "lock:batch:1", "0x7e"),
+            enqueue_lock(&orch, "lock:batch:2", "0x7f"),
+        ];
+        for id in rows {
+            orch.db
+                .advance_to_cl_link_created(id, &link.id.to_string(), &ea(CL_EA))
+                .unwrap();
+        }
+
+        let advanced = orch
+            .advance_consumed(WorkStep::ClLinkCreated, &links_by_lock(&[link]), |id| {
+                orch.db.advance_to_cl_rave_executed(id, Some("s2"))
+            })
+            .unwrap();
+
+        assert_eq!(advanced, 2);
+        for id in rows {
+            assert_eq!(lock_row(&orch, id).step, WorkStep::ClRaveExecuted);
+        }
     }
 
     #[tokio::test]
@@ -4417,11 +4623,11 @@ mod tests {
         );
         assert_ne!(before.bridging_agreement, after.bridging_agreement);
 
-        let link = parked_tx(0x31, "0xc1");
+        let link = parked_tx(0x31, &[proof("lock:replaced:cl", "0xc1")]);
         let on_link = enqueue_lock(&orch, "lock:replaced:cl", "0xc1");
         orch.record_cl_link(on_link, &link.id.to_string(), &before)
             .unwrap();
-        let spend = parked_spend_tx(0x32, "0xc2");
+        let spend = parked_spend_tx(0x32, &[proof("lock:replaced:br", "0xc2")]);
         let on_spend = enqueue_lock(&orch, "lock:replaced:br", "0xc2");
         orch.record_cl_link(on_spend, &action_hash(0x33).to_string(), &before)
             .unwrap();
@@ -4469,7 +4675,7 @@ mod tests {
     #[tokio::test]
     async fn rows_parked_on_the_agreements_in_force_read_only_those() {
         let orch = test_orchestrator("in-force-reads");
-        let link = parked_tx(0x34, "0xc4");
+        let link = parked_tx(0x34, &[proof("lock:in-force:cl", "0xc4")]);
         let waiting = enqueue_lock(&orch, "lock:in-force:cl", "0xc4");
         orch.db
             .advance_to_cl_link_created(waiting, &link.id.to_string(), &ea(CL_EA))
@@ -4504,12 +4710,12 @@ mod tests {
     async fn a_row_that_names_no_agreement_learns_it_from_its_link() {
         const REPLACED_CL_EA: u8 = 0xE0;
         let orch = test_orchestrator("unnamed-agreement");
-        let link = parked_tx(0x37, "0xc7");
+        let link = parked_tx(0x37, &[proof("lock:unnamed:cl", "0xc7")]);
         let on_link = enqueue_lock(&orch, "lock:unnamed:cl", "0xc7");
         orch.db
             .advance_to_cl_link_created(on_link, &link.id.to_string(), &ea(REPLACED_CL_EA))
             .unwrap();
-        let spend = parked_spend_tx(0x38, "0xc8");
+        let spend = parked_spend_tx(0x38, &[proof("lock:unnamed:br", "0xc8")]);
         let on_spend = enqueue_lock(&orch, "lock:unnamed:br", "0xc8");
         orch.db
             .advance_to_cl_link_created(on_spend, &action_hash(0x39).to_string(), &ea(CL_EA))
@@ -4674,7 +4880,7 @@ mod tests {
     async fn rows_sharing_a_link_read_its_agreement_once() {
         const REPLACED_CL_EA: u8 = 0xE3;
         let orch = test_orchestrator("shared-link");
-        let known = parked_tx(0x55, "0xe4");
+        let known = parked_tx(0x55, &[proof("lock:shared-link:0xe4", "0xe4")]);
         let unknown = action_hash(0x56);
         let batch = |link: &str, txs: &[&str]| -> Vec<i64> {
             txs.iter()
@@ -4711,7 +4917,7 @@ mod tests {
     #[tokio::test]
     async fn an_agreement_the_state_db_refuses_to_record_fails_the_cycle() {
         let orch = test_orchestrator("refused-record");
-        let link = parked_tx(0x54, "0xe3");
+        let link = parked_tx(0x54, &[proof("lock:refused-record", "0xe3")]);
         let waiting = enqueue_lock(&orch, "lock:refused-record", "0xe3");
         orch.db
             .advance_to_cl_link_created(waiting, &link.id.to_string(), &ea(CL_EA))
@@ -5088,7 +5294,7 @@ mod tests {
         let payload = RAVEExecuteInputs {
             ea_id: action_hash(0xEA),
             executor_inputs: Value::Null,
-            links: vec![parked_tx(1, "0xfeed")],
+            links: vec![parked_tx(1, &[])],
             global_definition: action_hash(0xAA),
             lane_definitions: vec![action_hash(0xAB)],
             strategy: GetStrategy::Local,
@@ -5172,7 +5378,7 @@ mod tests {
     }
 
     fn parked_withdrawal_tx(seed: u8) -> Transaction {
-        let mut tx = parked_spend_tx(seed, "");
+        let mut tx = parked_spend_tx(seed, &[]);
         tx.amount = UnitMap::from(vec![(1, "5")]);
         if let TransactionDetails::ParkedSpend {
             attached_payload, ..
@@ -5190,7 +5396,7 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_signer_deposits_go_and_every_withdrawal_stays_parked() {
-        let deposit = parked_spend_tx(0x60, "0xd0");
+        let deposit = parked_spend_tx(0x60, &[proof("lock:d", "0xd0")]);
         let links = [
             parked_withdrawal_tx(0x61),
             deposit.clone(),
@@ -5210,7 +5416,7 @@ mod tests {
     #[tokio::test]
     async fn with_a_signer_each_withdrawal_goes_with_its_coupon() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
-        let deposit = parked_spend_tx(0x60, "0xd0");
+        let deposit = parked_spend_tx(0x60, &[proof("lock:d", "0xd0")]);
         let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
         let links = [
             withdrawals[0].clone(),
@@ -5278,7 +5484,7 @@ mod tests {
         };
         let to = "0x1111111111111111111111111111111111111111";
         let payable = paid_to(0x60, to, &[(1, "5")]);
-        let deposit = parked_spend_tx(0x61, "0xd0");
+        let deposit = parked_spend_tx(0x61, &[proof("lock:d", "0xd0")]);
         let links = [
             paid_to(0x62, to, &[(2, "5")]),
             paid_to(0x63, to, &[(1, "0")]),
@@ -5327,8 +5533,8 @@ mod tests {
 
         let counts = reconcile(
             &orch,
-            &[parked_tx(0x74, "0xa1")],
-            &[parked_spend_tx(0x75, "0xa3")],
+            &[parked_tx(0x74, &[proof("lock:off:1", "0xa1")])],
+            &[parked_spend_tx(0x75, &[proof("lock:off:3", "0xa3")])],
         )
         .await;
 
