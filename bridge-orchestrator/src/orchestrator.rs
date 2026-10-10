@@ -21,6 +21,7 @@ use rave_engine::types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use zfuel::fuel::ZFuel;
@@ -36,7 +37,7 @@ pub struct BridgeOrchestrator {
     db: StateStore,
     reporter: ReporterState,
     ethereum: Option<EthereumSide>,
-    deferred: std::sync::Mutex<HashMap<&'static str, HashSet<String>>>,
+    flagged: Mutex<HashMap<&'static str, HashSet<String>>>,
 }
 
 pub struct EthereumSide {
@@ -105,6 +106,7 @@ struct BridgingSelection {
     coupons: serde_json::Map<String, Value>,
     coupon_bytes: usize,
     withdrawals_found: usize,
+    skipped: Vec<(Transaction, String)>,
 }
 
 async fn select_bridging_links(
@@ -120,6 +122,7 @@ async fn select_bridging_links(
         coupons: serde_json::Map::new(),
         coupon_bytes: 0,
         withdrawals_found: 0,
+        skipped: Vec::new(),
     };
     let mut withdrawal_capped = false;
 
@@ -131,12 +134,7 @@ async fn select_bridging_links(
                 continue;
             }
             Some(BridgingSpend::Other(role)) => {
-                warn!(
-                    event = "bridge.spend_skipped",
-                    "[bridge/withdrawals] spend {:?} by {} in role {role} is neither the bridging agent's deposit nor a withdrawal, and stays parked",
-                    tx.id,
-                    tx.creator
-                );
+                selection.skipped.push((tx.clone(), role.to_string()));
                 continue;
             }
             Some(BridgingSpend::Withdrawal(None)) => continue,
@@ -257,7 +255,7 @@ impl BridgeOrchestrator {
             db,
             reporter,
             ethereum,
-            deferred: Default::default(),
+            flagged: Default::default(),
         })
     }
 
@@ -297,6 +295,38 @@ impl BridgeOrchestrator {
         self.reporter.update(|h| {
             h.stage_ejections_total = h.stage_ejections_total.saturating_add(1);
         });
+    }
+
+    /// The items of `now` that `check` did not flag on its last run. `now`
+    /// becomes its last run, so an item is told of again only once it has gone
+    /// and come back.
+    fn newly_flagged<'a, T>(
+        &self,
+        check: &'static str,
+        now: &'a [T],
+        id: impl Fn(&T) -> String,
+    ) -> Vec<&'a T> {
+        let before = self
+            .flagged
+            .lock()
+            .expect("flagged mutex poisoned")
+            .insert(check, now.iter().map(&id).collect())
+            .unwrap_or_default();
+        now.iter()
+            .filter(|item| !before.contains(&id(item)))
+            .collect()
+    }
+
+    fn log_skipped_spends(&self, skipped: &[(Transaction, String)]) {
+        for (tx, role) in self.newly_flagged("spend_skipped", skipped, |(tx, _)| tx.id.to_string())
+        {
+            warn!(
+                event = "bridge.spend_skipped",
+                "[bridge/withdrawals] spend {:?} by {} in role {role} is neither the bridging agent's deposit nor a withdrawal, and stays parked",
+                tx.id,
+                tx.creator
+            );
+        }
     }
 
     fn ends_cycle(
@@ -1033,6 +1063,7 @@ impl BridgeOrchestrator {
             coupons: mut coupons_map,
             coupon_bytes: coupon_cumulative_bytes,
             withdrawals_found: total_withdrawals_found,
+            skipped,
         } = select_bridging_links(
             self.ethereum.as_ref().map(|side| &side.signer),
             &self.cfg.bridging_agent_pubkey,
@@ -1041,6 +1072,7 @@ impl BridgeOrchestrator {
             self.cfg.hot_unit_index,
         )
         .await?;
+        self.log_skipped_spends(&skipped);
 
         let deposit_ids: HashSet<String> = deposit_rave_links
             .iter()
@@ -1539,9 +1571,9 @@ impl BridgeOrchestrator {
                 Some((self.lock_key(row)?, link))
             })
             .collect();
-        let mut deferred = self.deferred.lock().expect("deferred mutex poisoned");
-        let deferred_before = deferred.remove(stage).unwrap_or_default();
-        let deferring = deferred.entry(stage).or_default();
+        let mut flagged = self.flagged.lock().expect("flagged mutex poisoned");
+        let deferred_before = flagged.remove(stage).unwrap_or_default();
+        let deferring = flagged.entry(stage).or_default();
         let mut accounted = Vec::new();
         for link in links {
             let id = link.id.to_string();
@@ -3086,7 +3118,7 @@ mod tests {
         let path = test_db_path(name);
         let db = StateStore::open(&path).unwrap();
         BridgeOrchestrator {
-            deferred: Default::default(),
+            flagged: Default::default(),
             cfg: test_config(path),
             db,
             reporter: ReporterState::new(),
@@ -5560,28 +5592,45 @@ mod tests {
         orch.db.list_pending_by_step("lock", step, 100).unwrap()
     }
 
-    fn errors_logged(run: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Lines {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
         }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Lines {
+        fn at(&self, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
+            let writer = self.clone();
+            tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish()
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    fn errors_logged(run: impl FnOnce()) -> String {
         let lines = Lines::default();
-        let writer = lines.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::ERROR)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, run);
-        let logged = lines.0.lock().unwrap().clone();
-        String::from_utf8(logged).unwrap()
+        tracing::subscriber::with_default(lines.at(tracing::Level::ERROR), run);
+        lines.text()
+    }
+
+    async fn warnings_logged(run: impl std::future::Future) -> String {
+        use tracing::instrument::WithSubscriber;
+        let lines = Lines::default();
+        run.with_subscriber(lines.at(tracing::Level::WARN)).await;
+        lines.text()
     }
 
     #[test]
@@ -5831,14 +5880,63 @@ mod tests {
             *ct_role_id = BRIDGING_AGENT_ROLE.to_string();
         }
 
-        let selection =
-            select_bridging_links(Some(&signer), &bridging_agent(), &[forged], usize::MAX, 1)
-                .await
-                .unwrap();
+        let selection = select_bridging_links(
+            Some(&signer),
+            &bridging_agent(),
+            std::slice::from_ref(&forged),
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert!(selection.deposits.is_empty());
         assert!(selection.withdrawals.is_empty());
         assert!(selection.coupons.is_empty(), "it stays parked, unpaid");
+        assert_eq!(
+            selection.skipped,
+            [(forged, BRIDGING_AGENT_ROLE.to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spend_left_parked_is_logged_once_while_it_stays_parked() {
+        let orch = test_orchestrator("skipped-once");
+        let conductor = bridging_conductor();
+        let [a, b] = [0xAF, 0xB0].map(|seed| signed_by_another(parked_spend_tx(seed, &[])));
+        let both = [a.clone(), b.clone()];
+        let cycle = async |parked: &[Transaction]| {
+            conductor
+                .parked
+                .borrow_mut()
+                .insert(action_hash(BR_EA), parked.to_vec());
+            let logged = warnings_logged(async {
+                orch.run_bridge_cycle(&conductor, &running()).await.unwrap()
+            })
+            .await;
+            told_of(&logged, "bridge.spend_skipped", &both)
+        };
+
+        assert_eq!(cycle(&both).await, ids(&both));
+        assert_eq!(cycle(&both).await, ids(&[]), "both are still parked");
+        assert_eq!(cycle(std::slice::from_ref(&b)).await, ids(&[]));
+        assert_eq!(
+            cycle(&both).await,
+            ids(&[a]),
+            "it left, and is parked again"
+        );
+    }
+
+    fn told_of(logged: &str, event: &str, links: &[Transaction]) -> Vec<String> {
+        logged
+            .lines()
+            .filter(|line| line.contains(event))
+            .flat_map(|line| {
+                ids(links)
+                    .into_iter()
+                    .filter(move |link| line.contains(link))
+            })
+            .collect()
     }
 
     #[test]
