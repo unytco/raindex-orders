@@ -20,6 +20,7 @@
 		waitForTransaction
 	} from '$lib/ethereum'
 	import { isHolochainKey, holochainKeyTo32ByteHex, errorMessage } from '$lib/utils'
+	import { PAUSED_CONTACT, PAUSED_LEAD, readPaused } from '$lib/pause'
 
 	let amount = ''
 	let agentInput = ''
@@ -27,6 +28,7 @@
 	let agentPrefilledFromUrl = false
 	let isLoading = false
 	let error = ''
+	let paused = false
 	// Replaces the form once a lock confirms, until the page is reloaded.
 	let lockReceipt: { amount: string; hash: string } | undefined
 
@@ -135,8 +137,19 @@
 	})
 
 	const MAX_DECIMAL_PLACES = 6
+	const STATUS_FAILED = 'Could not check that the bridge is open. Please try again.'
 
-	// Handle lock (runs approve first if needed, then lock — single action for the user)
+	async function bridgeOpen(): Promise<boolean> {
+		try {
+			paused = await readPaused()
+			return !paused
+		} catch (e) {
+			console.error('Error reading the bridge status:', e)
+			error = STATUS_FAILED
+			return false
+		}
+	}
+
 	async function handleLock() {
 		if (!amount || !agentHex) return
 
@@ -147,7 +160,13 @@
 		}
 
 		error = ''
+		paused = false
 		isLoading = true
+
+		if (!(await bridgeOpen())) {
+			isLoading = false
+			return
+		}
 
 		try {
 			const amountWei = parseUnits(amount, tokenDecimals)
@@ -317,7 +336,12 @@
 					{/if}
 				</div>
 
-				{#if error}
+				{#if paused}
+					<Alert color="yellow">
+						{PAUSED_LEAD}
+						<a href="mailto:{PAUSED_CONTACT}" class="font-medium underline">{PAUSED_CONTACT}</a>.
+					</Alert>
+				{:else if error}
 					<Alert color="red">{error}</Alert>
 				{/if}
 
