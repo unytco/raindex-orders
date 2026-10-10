@@ -208,22 +208,29 @@ const OUTCOME_MESSAGES: Record<TransactionOutcome, string> = {
 		"The transaction was sent, but its result could not be read. Check your wallet's activity before you try again."
 }
 
+export type MinedDetails = {
+	blockNumber: bigint
+	gasUsed: bigint
+	gasLimit?: bigint
+	effectiveGasPrice: bigint
+}
+
 /** A sent transaction that did not end in success. `hash` is the one that landed, if another did. */
 export class TransactionOutcomeError extends Error {
 	readonly outcome: TransactionOutcome
-	readonly hash: string
 	readonly sentHash: string
+	readonly hash: string
+	readonly mined?: MinedDetails
 
 	constructor(
 		outcome: TransactionOutcome,
-		sentHash: string,
-		hash = sentHash,
-		options?: ErrorOptions
+		init: { sentHash: string; hash?: string; mined?: MinedDetails; cause?: unknown }
 	) {
-		super(OUTCOME_MESSAGES[outcome], options)
+		super(OUTCOME_MESSAGES[outcome], { cause: init.cause })
 		this.outcome = outcome
-		this.sentHash = sentHash
-		this.hash = hash
+		this.sentHash = init.sentHash
+		this.hash = init.hash ?? init.sentHash
+		this.mined = init.mined
 	}
 
 	get unconfirmed() {
@@ -231,34 +238,73 @@ export class TransactionOutcomeError extends Error {
 	}
 }
 
+const POLLING_INTERVAL_MS = 2_000
+
+/** `eth`'s requests while it is on this build's chain: another chain's block numbers derail the wait. */
+function onBridgeChain(eth: Eip1193Provider) {
+	return async (args: { method: string; params?: unknown[] }) => {
+		await requireBridgeChain(eth)
+		const result = await eth.request(args)
+		await requireBridgeChain(eth)
+		return result
+	}
+}
+
 /** The receipt of `sentHash`, or of the transaction the wallet sped it up with. */
 export async function waitForTransaction(sentHash: string): Promise<TransactionReceipt> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
-	const client = createPublicClient({ transport: custom(eth) })
+	const client = createPublicClient({
+		chain: bridge.chain,
+		transport: custom({ request: onBridgeChain(eth) })
+	})
+	const deadline = Date.now() + CONFIRMATION_TIMEOUT_MS
+	let lastFailure: { error: unknown; at: number } | undefined
+	const stillFailing = () =>
+		lastFailure && Date.now() - lastFailure.at < 3 * POLLING_INTERVAL_MS ? lastFailure : undefined
 
-	let replacement: ReplacementReason | undefined
-	let receipt: TransactionReceipt
-	try {
-		receipt = await client.waitForTransactionReceipt({
-			hash: sentHash as Hex,
-			pollingInterval: 2_000,
-			timeout: CONFIRMATION_TIMEOUT_MS,
-			onReplaced: replaced => {
-				replacement = replaced.reason
+	for (;;) {
+		let replacement: ReplacementReason | undefined
+		let receipt: TransactionReceipt
+		try {
+			receipt = await client.waitForTransactionReceipt({
+				hash: sentHash as Hex,
+				pollingInterval: POLLING_INTERVAL_MS,
+				timeout: Math.max(deadline - Date.now(), 1),
+				onReplaced: replaced => {
+					replacement = replaced.reason
+				}
+			})
+		} catch (err) {
+			if (err instanceof WaitForTransactionReceiptTimeoutError) {
+				const failing = stillFailing()
+				throw new TransactionOutcomeError(failing ? 'unreadable' : 'pending', {
+					sentHash,
+					cause: failing?.error ?? err
+				})
 			}
-		})
-	} catch (err) {
-		const outcome = err instanceof WaitForTransactionReceiptTimeoutError ? 'pending' : 'unreadable'
-		throw new TransactionOutcomeError(outcome, sentHash, sentHash, { cause: err })
-	}
+			lastFailure = { error: err, at: Date.now() }
+			if (Date.now() + POLLING_INTERVAL_MS >= deadline) {
+				throw new TransactionOutcomeError('unreadable', { sentHash, cause: err })
+			}
+			await new Promise(resolve => setTimeout(resolve, POLLING_INTERVAL_MS))
+			continue
+		}
 
-	const landed = receipt.transactionHash
-	if (replacement === 'cancelled' || replacement === 'replaced') {
-		throw new TransactionOutcomeError(replacement, sentHash, landed)
+		if (receipt.status === 'success' && (!replacement || replacement === 'repriced')) {
+			return receipt
+		}
+		const landed = await client.getTransaction({ hash: receipt.transactionHash }).catch(() => null)
+		const mined = {
+			blockNumber: receipt.blockNumber,
+			gasUsed: receipt.gasUsed,
+			gasLimit: landed?.gas,
+			effectiveGasPrice: receipt.effectiveGasPrice
+		}
+		const outcome =
+			replacement === 'cancelled' || replacement === 'replaced' ? replacement : 'reverted'
+		throw new TransactionOutcomeError(outcome, { sentHash, hash: receipt.transactionHash, mined })
 	}
-	if (receipt.status !== 'success') throw new TransactionOutcomeError('reverted', sentHash, landed)
-	return receipt
 }
 
 // Contract interaction helpers using raw ethereum calls

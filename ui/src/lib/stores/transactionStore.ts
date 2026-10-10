@@ -33,39 +33,34 @@ const initialState = {
 	hash: '',
 	message: '',
 	data: null,
-	isLockTransaction: false
+	isLockTransaction: false,
+	dismissed: false
 }
 
 export const createTransactionStore = () => {
 	const { subscribe, set, update } = writable(initialState)
 	const reset = () => set(initialState)
+	const dismiss = () => update(state => ({ ...state, dismissed: true }))
+	const enter = (step: Partial<typeof initialState>) =>
+		update(state => ({ ...state, ...step, dismissed: false }))
 	const awaitCheck = () => set({ ...initialState, status: TransactionStatus.CHECKING })
 	const awaitWalletConfirmation = (isLockTransaction = false) =>
-		update(state => ({
-			...state,
-			status: TransactionStatus.PENDING_WALLET,
-			isLockTransaction,
-			hash: ''
-		}))
-	const awaitTxReceipt = (txHash: string) =>
-		update(state => ({ ...state, status: TransactionStatus.PENDING_TX, hash: txHash }))
-	const transactionSuccess = (hash: string) =>
-		update(state => ({
-			...state,
-			status: TransactionStatus.SUCCESS,
-			hash: hash
-		}))
+		enter({ status: TransactionStatus.PENDING_WALLET, isLockTransaction, hash: '' })
+	const awaitTxReceipt = (hash: string) => enter({ status: TransactionStatus.PENDING_TX, hash })
+	const transactionSuccess = (hash: string) => enter({ status: TransactionStatus.SUCCESS, hash })
 	const transactionError = (txError: TxError) =>
 		update(state => ({
 			...state,
 			status: txError.unconfirmed ? TransactionStatus.UNCONFIRMED : TransactionStatus.ERROR,
 			error: { message: txError.message },
-			hash: txError.hash ?? state.hash
+			hash: txError.hash ?? state.hash,
+			dismissed: false
 		}))
 
 	return {
 		subscribe,
 		reset,
+		dismiss,
 		awaitCheck,
 		awaitWalletConfirmation,
 		awaitTxReceipt,

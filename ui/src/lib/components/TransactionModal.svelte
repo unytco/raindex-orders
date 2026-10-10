@@ -12,11 +12,17 @@
 		$transactionStore.status === TransactionStatus.SUCCESS && $transactionStore.isLockTransaction
 
 	$: isUnconfirmed = $transactionStore.status === TransactionStatus.UNCONFIRMED
+
+	$: isPending = [
+		TransactionStatus.CHECKING,
+		TransactionStatus.PENDING_WALLET,
+		TransactionStatus.PENDING_TX
+	].includes($transactionStore.status)
 </script>
 
 <Modal
-	on:close={() => transactionStore.reset()}
-	open={$transactionStore.status !== TransactionStatus.IDLE}
+	on:close={() => (isPending ? transactionStore.dismiss() : transactionStore.reset())}
+	open={$transactionStore.status !== TransactionStatus.IDLE && !$transactionStore.dismissed}
 	placement="center"
 >
 	<div class="p-4">

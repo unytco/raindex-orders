@@ -20,6 +20,7 @@ import {
 	SWITCH_NETWORK,
 	TransactionOutcomeError,
 	userRejected,
+	type MinedDetails,
 	waitForTransaction,
 	walletChainId,
 	writeContract,
@@ -27,6 +28,7 @@ import {
 } from './ethereum'
 import { claimOrderStruct } from './network'
 import { transactionStore } from './stores/transactionStore'
+import { errorMessage } from './utils'
 
 const CLAIM_REVERTED = `Your claim did not go through, so no ${bridge.tokenName} was paid and your coupon was not used. Claim again.`
 
@@ -51,6 +53,9 @@ const CLAIM_FAILED =
 
 const REISSUE = 'Contact Unyt support to have the withdrawal re-issued.'
 const REISSUE_IF_UNPAID = `If you have not received its ${bridge.tokenName}, contact Unyt support to have the withdrawal re-issued.`
+
+const CLAIM_NOT_CONNECTED =
+	'Your wallet is not connected, so nothing was sent. Connect it and claim again.'
 
 const CLAIM_NOT_SENT =
 	"Your wallet did not send the claim. If your wallet's activity shows no claim, claim again."
@@ -158,10 +163,11 @@ type ClaimTrace = {
 	account?: Address
 	chainId?: number
 	couponNonce?: Hex
-	couponExpiry?: string
+	couponExpiry?: number
 	sentHash?: string
 	hash?: string
 	outcome?: string
+	mined?: MinedDetails
 	revert?: Revert
 	recheck?: 'would pay' | Revert | { error: unknown }
 }
@@ -175,20 +181,27 @@ class ClaimError extends Error {
 	}
 }
 
+function sendFailure(err: unknown, coupon: CouponConfig): { message: string; revert?: Revert } {
+	if (userRejected(err)) return { message: CLAIM_DECLINED }
+	if (errorMessage(err, '') === SWITCH_NETWORK) return { message: SWITCH_NETWORK }
+	const revert = revertIn(err)
+	return { message: revert ? refusalMessage(revert.reason, coupon) : CLAIM_NOT_SENT, revert }
+}
+
 async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): Promise<string> {
 	const eth = getEthereum()
-	if (!eth) throw new Error('No ethereum provider')
 	const account = get(ethereumStore).account as Address | null
-	if (!account) throw new Error('Not connected')
+	if (!eth || !account) throw new ClaimError(CLAIM_NOT_CONNECTED)
 	trace.account = account
 
 	trace.step = 'checking the network'
 	trace.chainId = await walletChainId(eth)
 	if (trace.chainId !== bridge.chain.id) throw new ClaimError(SWITCH_NETWORK)
 
+	trace.step = 'reading the coupon'
 	const coupon = parseCoupon(signedContext)
 	trace.couponNonce = numberToHex(coupon.nonce)
-	trace.couponExpiry = new Date(coupon.expiryTimestamp * 1000).toISOString()
+	trace.couponExpiry = coupon.expiryTimestamp
 	const args = [takeOrdersConfig(signedContext)] as const
 	const data = encodeFunctionData({ abi: orderbookAbi, functionName: 'takeOrders', args })
 	const check = () => refusalOf(eth, account, data, coupon.withdrawAmount)
@@ -211,7 +224,9 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 		args,
 		from: account
 	}).catch(err => {
-		throw new ClaimError(userRejected(err) ? CLAIM_DECLINED : CLAIM_NOT_SENT, { cause: err })
+		const { message, revert } = sendFailure(err, coupon)
+		trace.revert = revert
+		throw new ClaimError(message, { cause: err })
 	})
 	trace.sentHash = trace.hash = sentHash
 
@@ -224,6 +239,7 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 		if (!(err instanceof TransactionOutcomeError)) throw err
 		trace.hash = err.hash
 		trace.outcome = err.outcome
+		trace.mined = err.mined
 		switch (err.outcome) {
 			case 'pending':
 				throw new ClaimError(CLAIM_PENDING, { cause: err, unconfirmed: true })
@@ -238,7 +254,7 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 			return undefined
 		})
 		if (refusalAfter) {
-			trace.recheck = trace.revert = refusalAfter.revert
+			trace.recheck = refusalAfter.revert
 			throw new ClaimError(refusalMessage(refusalAfter.revert.reason, coupon), { cause: err })
 		}
 		if (refusalAfter === null) trace.recheck = 'would pay'

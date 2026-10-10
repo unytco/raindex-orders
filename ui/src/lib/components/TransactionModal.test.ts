@@ -142,6 +142,18 @@ describe.each(['sepolia', 'mainnet'] as const)('TransactionModal on %s', network
 		expect(hasX(html)).toBe(true)
 	})
 
+	it('a pending step the user hides comes back at the next step, still a lock', () => {
+		transactionStore.awaitWalletConfirmation(true)
+		transactionStore.dismiss()
+		expect(render()).not.toContain('role="dialog"')
+
+		transactionStore.awaitTxReceipt(HASH)
+		expect(render()).toContain('role="dialog"')
+
+		transactionStore.transactionSuccess(HASH)
+		expect(render()).toContain('Lock almost complete')
+	})
+
 	it('renders nothing while idle', () => {
 		expect(render()).not.toContain('role="dialog"')
 	})

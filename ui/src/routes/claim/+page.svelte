@@ -103,6 +103,7 @@
 
 	let isLoading = false
 	let error = ''
+	let errorUnconfirmed = false
 	let success = false
 	let successTxHash = ''
 
@@ -121,6 +122,7 @@
 			await getVaultBalance()
 		} catch (e) {
 			error = errorMessage(e, 'Claim failed')
+			errorUnconfirmed = (e as { unconfirmed?: boolean }).unconfirmed === true
 		} finally {
 			isLoading = false
 		}
@@ -238,7 +240,7 @@
 					{/if}
 
 					{#if error}
-						<Alert color="red" class="break-words">{error}</Alert>
+						<Alert color={errorUnconfirmed ? 'yellow' : 'red'} class="break-words">{error}</Alert>
 					{/if}
 
 					<Button
