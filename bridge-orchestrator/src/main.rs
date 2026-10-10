@@ -55,8 +55,7 @@ enum Command {
         all: bool,
         /// Only with `--non-in-progress`: delete terminal rows whose
         /// `updated_at` is older than this many seconds. Applied to
-        /// both `succeeded` and `failed` rows. When omitted the flag
-        /// behaves like the previous (unbounded) `--non-in-progress`.
+        /// both `succeeded` and `failed` rows.
         #[arg(long, conflicts_with = "all")]
         older_than_s: Option<u64>,
     },
