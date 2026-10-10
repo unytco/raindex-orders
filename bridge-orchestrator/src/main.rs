@@ -179,3 +179,21 @@ fn init_logging() {
         .with_target(false)
         .init();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_still_takes_the_detected_state() {
+        let args =
+            Args::try_parse_from(["bridge-orchestrator", "status", "--state", "detected"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Command::Status {
+                state: Some(WorkState::Detected),
+                ..
+            }
+        ));
+    }
+}

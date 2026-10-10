@@ -1,6 +1,6 @@
 use crate::config::Ethereum;
 use crate::preflight::{rpc_failure, RPC_TIMEOUT};
-use crate::state::StateStore;
+use crate::state::{StateStore, LOCK_CHECKPOINT_KEY};
 use crate::stop::ensure_running;
 use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
@@ -27,7 +27,6 @@ sol! {
 }
 
 const MAX_BLOCK_RANGE: u64 = 10;
-const LOCK_CHECKPOINT_KEY: &str = "lock.last_processed_block";
 
 pub struct LockFlow {
     cfg: Ethereum,
@@ -48,18 +47,17 @@ impl LockFlow {
 
     pub async fn run_cycle(&self) -> Result<()> {
         let provider = self.provider()?;
-        let current_block = self
+        let confirmed = self
             .request("eth_blockNumber", || provider.get_block_number())
-            .await?;
-        let mut from_block = self.db.get_checkpoint_u64(LOCK_CHECKPOINT_KEY)?;
-        if from_block.is_none() {
-            self.db
-                .set_checkpoint_u64(LOCK_CHECKPOINT_KEY, current_block)?;
+            .await?
+            .saturating_sub(self.cfg.confirmations);
+        let Some(read_to) = self.db.get_checkpoint_u64(LOCK_CHECKPOINT_KEY)? else {
+            self.db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, confirmed)?;
             return Ok(());
-        }
-        let mut cursor = from_block.take().unwrap_or(current_block) + 1;
-        while cursor <= current_block {
-            let end = (cursor + MAX_BLOCK_RANGE - 1).min(current_block);
+        };
+        let mut cursor = read_to + 1;
+        while cursor <= confirmed {
+            let end = (cursor + MAX_BLOCK_RANGE - 1).min(confirmed);
             let filter = Filter::new()
                 .address(self.cfg.lock_vault_address)
                 .event_signature(Lock::SIGNATURE_HASH)
@@ -74,8 +72,6 @@ impl LockFlow {
             self.db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, end)?;
             cursor = end + 1;
         }
-
-        self.promote_confirmed(current_block)?;
         Ok(())
     }
 
@@ -145,7 +141,7 @@ impl LockFlow {
             "timestamp": block.header.timestamp,
             "required_confirmations": self.cfg.confirmations,
         });
-        self.db.enqueue_detected(
+        self.db.enqueue_queued(
             "lock",
             "create_parked_link",
             &item_id,
@@ -153,57 +149,13 @@ impl LockFlow {
             &payload,
         )?;
         info!(
-            "[lock-flow] lock detected id={} amount={} agent={} tx={} block={}",
+            "[lock-flow] lock queued id={} amount={} agent={} tx={} block={}",
             item_id,
             payload["amount_hot"].as_str().unwrap_or("0"),
             payload["holochain_agent"].as_str().unwrap_or("unknown"),
             payload["tx_hash"].as_str().unwrap_or("unknown"),
             block_number
         );
-        Ok(())
-    }
-
-    fn promote_confirmed(&self, current_block: u64) -> Result<()> {
-        let candidates =
-            self.db
-                .list_work_items("lock", crate::state::WorkState::Detected, 5000)?;
-        for item in candidates {
-            let payload = item.payload_json;
-            let block_number = payload
-                .get("block_number")
-                .and_then(|v| v.as_u64())
-                .unwrap_or_default();
-            let confirmations = current_block.saturating_sub(block_number);
-            if confirmations >= self.cfg.confirmations {
-                let idempotency_key = self.row_key(
-                    payload
-                        .get("lock_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown"),
-                );
-                if self.db.move_detected_to_queued(&idempotency_key)? {
-                    let amount = payload
-                        .get("amount_hot")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                        .or_else(|| {
-                            payload
-                                .get("amount_raw_wei")
-                                .and_then(|v| v.as_str())
-                                .map(format_amount)
-                        })
-                        .unwrap_or_else(|| "0".to_string());
-                    let agent = payload
-                        .get("holochain_agent")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    info!(
-                        "[lock-flow] lock queued id={} confirmations={} amount={} agent={}",
-                        item.item_id, confirmations, amount, agent
-                    );
-                }
-            }
-        }
         Ok(())
     }
 }
@@ -223,7 +175,7 @@ pub fn format_amount(amount: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Network;
+    use crate::config::{ethereum_settings, test_settings, Network};
     use crate::fake_rpc::serve;
     use crate::state::WorkState;
     use crate::stop::is_stopped;
@@ -238,12 +190,23 @@ mod tests {
     }
 
     fn lock_flow(rpc_url: String, db: StateStore, stop: ShutdownRx) -> LockFlow {
-        let chain = Ethereum {
-            network: Network::Sepolia,
-            rpc_url,
-            lock_vault_address: vault(),
-            confirmations: 5,
-        };
+        lock_flow_on(Network::Sepolia, rpc_url, db, stop)
+    }
+
+    fn lock_flow_on(
+        network: Network,
+        rpc_url: String,
+        db: StateStore,
+        stop: ShutdownRx,
+    ) -> LockFlow {
+        let vault = format!("{:#x}", vault());
+        let chain = ethereum_settings(test_settings(&[
+            ("NETWORK", network.name()),
+            (network.rpc_url_var(), &rpc_url),
+            (network.lock_vault_var(), &vault),
+        ]))
+        .unwrap()
+        .unwrap();
         LockFlow::new(chain, db, stop)
     }
 
@@ -251,13 +214,13 @@ mod tests {
         StateStore::open(dir.path().join("locks.db")).unwrap()
     }
 
-    /// The `Lock` log for lock 7, made in block `block`.
-    fn lock_log(block: u64) -> Value {
+    /// The `Lock` log for lock `id`, made in block `block`.
+    fn lock_log(id: u64, block: u64) -> Value {
         let event = Lock {
             sender: Address::repeat_byte(0x11),
             amount: U256::from(10).pow(U256::from(18)),
             holochainAgent: B256::repeat_byte(0x22),
-            lockId: U256::from(7),
+            lockId: U256::from(id),
         };
         serde_json::to_value(Log {
             inner: alloy::primitives::Log {
@@ -265,7 +228,7 @@ mod tests {
                 data: event.encode_log_data(),
             },
             block_number: Some(block),
-            transaction_hash: Some(B256::repeat_byte(0x33)),
+            transaction_hash: Some(B256::with_last_byte(id as u8)),
             ..Default::default()
         })
         .unwrap()
@@ -290,8 +253,8 @@ mod tests {
             seen.push(method.to_string());
             let windows = seen.iter().filter(|m| *m == "eth_getLogs").count();
             match method {
-                "eth_blockNumber" => Ok(json!("0x19")),
-                "eth_getLogs" if windows == 1 => Ok(json!([lock_log(5)])),
+                "eth_blockNumber" => Ok(json!("0x1e")),
+                "eth_getLogs" if windows == 1 => Ok(json!([lock_log(7, 5)])),
                 "eth_getLogs" => {
                     stop.send_replace(true);
                     Ok(json!([]))
@@ -321,9 +284,9 @@ mod tests {
             db.get_checkpoint_u64(LOCK_CHECKPOINT_KEY).unwrap(),
             Some(20)
         );
-        let detected = db.list_work_items("lock", WorkState::Detected, 10).unwrap();
+        let queued = db.list_work_items("lock", WorkState::Queued, 10).unwrap();
         assert_eq!(
-            detected
+            queued
                 .iter()
                 .map(|row| row.item_id.as_str())
                 .collect::<Vec<_>>(),
@@ -331,15 +294,34 @@ mod tests {
         );
     }
 
-    /// An RPC whose chain holds lock 7 in block 5, with its head at block 9.
-    async fn chain_with_lock_seven() -> String {
-        serve(|method, _| match method {
-            "eth_blockNumber" => Ok(json!("0x9")),
-            "eth_getLogs" => Ok(json!([lock_log(5)])),
-            "eth_getBlockByNumber" => Ok(block(5)),
+    type Windows = Arc<Mutex<Vec<(u64, u64)>>>;
+
+    /// An RPC for a chain with its head at `head` and each `(lock id, block)` of
+    /// `locks`, and the block range of each `eth_getLogs` it answered.
+    async fn chain(head: u64, locks: &[(u64, u64)]) -> (String, Windows) {
+        let locks = locks.to_vec();
+        let windows = Windows::default();
+        let asked = Arc::clone(&windows);
+        let url = serve(move |method, params| match method {
+            "eth_blockNumber" => Ok(json!(format!("{head:#x}"))),
+            "eth_getLogs" => {
+                let range = quantity(&params[0]["fromBlock"])..=quantity(&params[0]["toBlock"]);
+                asked.lock().unwrap().push((*range.start(), *range.end()));
+                Ok(locks
+                    .iter()
+                    .filter(|(_, block)| range.contains(block))
+                    .map(|&(id, block)| lock_log(id, block))
+                    .collect())
+            }
+            "eth_getBlockByNumber" => Ok(block(quantity(&params[0]))),
             other => Err(json!({ "code": -32601, "message": format!("no {other}") })),
         })
-        .await
+        .await;
+        (url, windows)
+    }
+
+    fn quantity(hex: &Value) -> u64 {
+        u64::from_str_radix(hex.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
     }
 
     fn lock_rows(db: &StateStore) -> Vec<crate::state::WorkItem> {
@@ -349,12 +331,130 @@ mod tests {
             .collect()
     }
 
+    fn lock_ids(db: &StateStore) -> Vec<String> {
+        db.list_work_items("lock", WorkState::Queued, 10)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item_id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_read_goes_no_further_than_five_blocks_below_the_head_on_both_networks() {
+        for network in [Network::Sepolia, Network::Mainnet] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = store(&dir);
+            db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 80).unwrap();
+            let (url, windows) = chain(100, &[(7, 95), (8, 96)]).await;
+
+            lock_flow_on(network, url, db.clone(), watch::channel(false).1)
+                .run_cycle()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                *windows.lock().unwrap(),
+                [(81, 90), (91, 95)],
+                "{network:?}"
+            );
+            assert_eq!(
+                db.get_checkpoint_u64(LOCK_CHECKPOINT_KEY).unwrap(),
+                Some(95)
+            );
+            assert_eq!(lock_ids(&db), ["lock:7"], "{network:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lock_is_recorded_queued_once_its_block_has_its_confirmations_and_not_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(&dir);
+        db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 0).unwrap();
+        for (head, recorded) in [(9, vec![]), (10, vec!["lock:7"])] {
+            let (url, _) = chain(head, &[(7, 5)]).await;
+            lock_flow(url, db.clone(), watch::channel(false).1)
+                .run_cycle()
+                .await
+                .unwrap();
+
+            assert_eq!(lock_rows(&db).len(), recorded.len(), "head {head}");
+            assert_eq!(lock_ids(&db), recorded, "head {head}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_database_starts_at_the_newest_confirmed_block_on_both_networks() {
+        for network in [Network::Sepolia, Network::Mainnet] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = store(&dir);
+            let (url, windows) = chain(100, &[(6, 95)]).await;
+            lock_flow_on(network, url, db.clone(), watch::channel(false).1)
+                .run_cycle()
+                .await
+                .unwrap();
+            assert_eq!(
+                db.get_checkpoint_u64(LOCK_CHECKPOINT_KEY).unwrap(),
+                Some(95)
+            );
+            assert!(windows.lock().unwrap().is_empty(), "{network:?}");
+
+            let (url, _) = chain(101, &[(6, 95), (7, 96)]).await;
+            lock_flow_on(network, url, db.clone(), watch::channel(false).1)
+                .run_cycle()
+                .await
+                .unwrap();
+            assert_eq!(lock_ids(&db), ["lock:7"], "{network:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn locks_an_earlier_binary_left_detected_are_read_again_from_the_chain() {
+        for version in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = store(&dir);
+            db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 100).unwrap();
+            let earlier = rusqlite::Connection::open(dir.path().join("locks.db")).unwrap();
+            for (id, block) in [(7, 90), (8, 92)] {
+                earlier
+                    .execute(
+                        "INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state)
+                         VALUES ('lock', 'create_parked_link', ?1, ?2, ?3, 'detected')",
+                        rusqlite::params![
+                            format!("lock:{id}"),
+                            format!("lock:{id}:create_parked_link"),
+                            json!({ "lock_id": id.to_string(), "block_number": block }).to_string()
+                        ],
+                    )
+                    .unwrap();
+            }
+            earlier
+                .execute("UPDATE schema_meta SET version = ?1", [version])
+                .unwrap();
+            drop(db);
+
+            let db = store(&dir);
+            assert!(lock_rows(&db).is_empty(), "version {version}");
+            assert_eq!(
+                db.get_checkpoint_u64(LOCK_CHECKPOINT_KEY).unwrap(),
+                Some(89),
+                "version {version}"
+            );
+
+            let (url, _) = chain(100, &[(7, 90)]).await;
+            lock_flow(url, db.clone(), watch::channel(false).1)
+                .run_cycle()
+                .await
+                .unwrap();
+            assert_eq!(lock_ids(&db), ["lock:7"], "version {version}");
+        }
+    }
+
     #[tokio::test]
     async fn a_lock_read_twice_is_one_row_keyed_by_its_vault() {
         let dir = tempfile::tempdir().unwrap();
         let db = store(&dir);
         let flow = lock_flow(
-            chain_with_lock_seven().await,
+            chain(10, &[(7, 5)]).await.0,
             db.clone(),
             watch::channel(false).1,
         );
@@ -389,7 +489,7 @@ mod tests {
         db.bind_vault(&format!("{:#x}", vault())).unwrap();
         db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 0).unwrap();
         lock_flow(
-            chain_with_lock_seven().await,
+            chain(10, &[(7, 5)]).await.0,
             db.clone(),
             watch::channel(false).1,
         )
