@@ -1396,10 +1396,7 @@ impl BridgeOrchestrator {
                             link,
                             &format!("has a tag that does not decode: {e:#}"),
                         ),
-                        // Neither advanced nor written again: whether this deposit was
-                        // credited cannot be told from here, so a person resolves it
-                        // (workshop `documentation/specs/bridge-stop/README.md`
-                        // § Operating assumptions and limits).
+                        // Whether it was credited cannot be told here: never advance or rewrite it.
                         RecordedWrite::Misrecorded(why) => {
                             self.for_a_person(row, "bridge.rave.proof_missing", link, &why)
                         }
@@ -2206,11 +2203,8 @@ async fn read_once<'a, T>(
     reads[hash].as_ref().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// The conductor a cycle calls, which sends no call once a stop is signalled.
-/// A call it refuses can leave a batch `in_flight`, for startup recovery to
-/// settle (workshop
-/// `documentation/specs/bridge-stop/README.md` § Operating assumptions and
-/// limits).
+/// A call refused after a stop can leave a batch `in_flight`, for startup
+/// recovery to settle.
 struct Gated<'a, C> {
     conductor: &'a C,
     stop: &'a ShutdownRx,

@@ -164,8 +164,7 @@
 		isLoading = true
 
 		try {
-			// A lock already in the wallet's prompt when the pause lands can still be confirmed
-			// (workshop documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
+			// A lock already in the wallet's prompt when the pause lands can still be confirmed.
 			if (!(await bridgeOpen())) return
 
 			const amountWei = parseUnits(amount, tokenDecimals)
