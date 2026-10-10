@@ -4,6 +4,7 @@ import {
 	decodeFunctionResult,
 	encodeFunctionData,
 	isHex,
+	numberToHex,
 	size,
 	slice,
 	type Abi,
@@ -16,16 +17,16 @@ import { parseCoupon, type CouponConfig, type SignedContextV1Struct } from './co
 import {
 	ethereumStore,
 	getEthereum,
-	requireBridgeChain,
-	TransactionRevertedError,
+	SWITCH_NETWORK,
+	TransactionOutcomeError,
 	userRejected,
 	waitForTransaction,
+	walletChainId,
 	writeContract,
 	type Eip1193Provider
 } from './ethereum'
 import { claimOrderStruct } from './network'
 import { transactionStore } from './stores/transactionStore'
-import { errorMessage } from './utils'
 
 const CLAIM_REVERTED = `Your claim did not go through, so no ${bridge.tokenName} was paid and your coupon was not used. Claim again.`
 
@@ -37,11 +38,22 @@ const CLAIM_UNCONFIRMED =
 
 const CLAIM_DECLINED = 'You declined the claim in your wallet, so nothing was sent.'
 
+const CLAIM_CANCELLED =
+	'You cancelled the claim in your wallet, so nothing was paid and your coupon was not used.'
+
+const CLAIM_REPLACED = `Your wallet replaced the claim with another transaction, so no ${bridge.tokenName} was paid and your coupon was not used. Claim again.`
+
+const CLAIM_PENDING =
+	"Your claim is still waiting to be confirmed. Check your wallet's activity before you claim again."
+
+const CLAIM_FAILED =
+	"Something went wrong with your claim. Check your wallet's activity before you claim again, and contact Unyt support if it keeps failing."
+
 const REISSUE = 'Contact Unyt support to have the withdrawal re-issued.'
 const REISSUE_IF_UNPAID = `If you have not received its ${bridge.tokenName}, contact Unyt support to have the withdrawal re-issued.`
 
-const notSent = (reason: string) =>
-	`Your wallet did not send the claim (${reason.replace(/\.$/, '')}). If your wallet's activity shows no claim, claim again.`
+const CLAIM_NOT_SENT =
+	"Your wallet did not send the claim. If your wallet's activity shows no claim, claim again."
 
 function refusalMessage(reason: string, coupon: CouponConfig) {
 	switch (reason) {
@@ -65,7 +77,7 @@ function refusalMessage(reason: string, coupon: CouponConfig) {
 		case 'MinimumInput':
 			return 'The bridge cannot pay this claim right now, and your coupon was not used. Try again later, and contact Unyt support if it keeps failing.'
 		default:
-			return `The bridge refused this claim${reason ? ` (${reason})` : ''}, and your coupon was not used. Contact Unyt support.`
+			return 'The bridge refused this claim, and your coupon was not used. Contact Unyt support.'
 	}
 }
 
@@ -79,25 +91,27 @@ function nestedErrors(err: unknown, depth = 0): WalletError[] {
 	return [fields, ...inner.flatMap(e => nestedErrors(e, depth + 1))]
 }
 
-function decodedReason(data: Hex) {
+type Revert = { reason: string; errorName?: string; args?: readonly unknown[]; data?: Hex }
+
+function decodedRevert(data: Hex): Revert {
 	try {
 		const { errorName, args } = decodeErrorResult({ abi: orderbookAbi as Abi, data })
-		return errorName === 'Error' ? String(args?.[0]) : errorName
+		return { reason: errorName === 'Error' ? String(args?.[0]) : errorName, errorName, args, data }
 	} catch {
-		return slice(data, 0, 4)
+		return { reason: slice(data, 0, 4), data }
 	}
 }
 
-function revertReason(err: unknown): string | undefined {
+function revertIn(err: unknown): Revert | undefined {
 	const errors = nestedErrors(err)
 	const data = errors
 		.map(e => e.data)
 		.find((d): d is Hex => typeof d === 'string' && isHex(d, { strict: true }) && size(d) >= 4)
-	if (data) return decodedReason(data)
+	if (data) return decodedRevert(data)
 	const reverted = errors
 		.map(e => /execution reverted(?::\s*(.*\S))?/is.exec(String(e.message)))
 		.find(match => match !== null)
-	return reverted ? (reverted[1] ?? '') : undefined
+	return reverted ? { reason: reverted[1] ?? '' } : undefined
 }
 
 async function refusalOf(eth: Eip1193Provider, account: Address, data: Hex, amount: bigint) {
@@ -108,9 +122,9 @@ async function refusalOf(eth: Eip1193Provider, account: Address, data: Hex, amou
 			params: [{ from: account, to: bridge.orderbookAddress, data }, 'latest']
 		})
 	} catch (err) {
-		const reason = revertReason(err)
-		if (reason === undefined) throw err
-		return { reason, cause: err }
+		const revert = revertIn(err)
+		if (revert === undefined) throw err
+		return { revert, cause: err }
 	}
 	const [paid] = decodeFunctionResult({
 		abi: orderbookAbi,
@@ -139,62 +153,127 @@ function takeOrdersConfig(signedContext: SignedContextV1Struct) {
 	}
 }
 
-async function claim(signedContext: SignedContextV1Struct): Promise<string> {
+type ClaimTrace = {
+	step: string
+	account?: Address
+	chainId?: number
+	couponNonce?: Hex
+	couponExpiry?: string
+	sentHash?: string
+	hash?: string
+	outcome?: string
+	revert?: Revert
+	recheck?: 'would pay' | Revert | { error: unknown }
+}
+
+class ClaimError extends Error {
+	readonly unconfirmed: boolean
+
+	constructor(message: string, options: ErrorOptions & { unconfirmed?: boolean } = {}) {
+		super(message, options)
+		this.unconfirmed = options.unconfirmed ?? false
+	}
+}
+
+async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): Promise<string> {
 	const eth = getEthereum()
 	if (!eth) throw new Error('No ethereum provider')
 	const account = get(ethereumStore).account as Address | null
 	if (!account) throw new Error('Not connected')
-	await requireBridgeChain(eth)
+	trace.account = account
+
+	trace.step = 'checking the network'
+	trace.chainId = await walletChainId(eth)
+	if (trace.chainId !== bridge.chain.id) throw new ClaimError(SWITCH_NETWORK)
 
 	const coupon = parseCoupon(signedContext)
+	trace.couponNonce = numberToHex(coupon.nonce)
+	trace.couponExpiry = new Date(coupon.expiryTimestamp * 1000).toISOString()
 	const args = [takeOrdersConfig(signedContext)] as const
 	const data = encodeFunctionData({ abi: orderbookAbi, functionName: 'takeOrders', args })
 	const check = () => refusalOf(eth, account, data, coupon.withdrawAmount)
 
+	trace.step = 'checking the coupon'
 	const refusal = await check().catch(err => {
-		throw new Error(CLAIM_UNCHECKED, { cause: err })
+		throw new ClaimError(CLAIM_UNCHECKED, { cause: err })
 	})
-	if (refusal) throw new Error(refusalMessage(refusal.reason, coupon), { cause: refusal.cause })
+	if (refusal) {
+		trace.revert = refusal.revert
+		throw new ClaimError(refusalMessage(refusal.revert.reason, coupon), { cause: refusal.cause })
+	}
 
-	const hash = await writeContract({
+	trace.step = 'asking the wallet to send'
+	transactionStore.awaitWalletConfirmation()
+	const sentHash = await writeContract({
 		address: bridge.orderbookAddress,
 		abi: orderbookAbi,
 		functionName: 'takeOrders',
 		args,
 		from: account
 	}).catch(err => {
-		const message = userRejected(err)
-			? CLAIM_DECLINED
-			: notSent(errorMessage(err, 'no reason given'))
-		throw new Error(message, { cause: err })
+		throw new ClaimError(userRejected(err) ? CLAIM_DECLINED : CLAIM_NOT_SENT, { cause: err })
 	})
-	transactionStore.awaitTxReceipt(hash)
+	trace.sentHash = trace.hash = sentHash
 
+	trace.step = 'waiting for confirmation'
+	transactionStore.awaitTxReceipt(sentHash)
 	try {
-		await waitForTransaction(hash)
+		const receipt = await waitForTransaction(sentHash)
+		return receipt.transactionHash
 	} catch (err) {
-		if (!(err instanceof TransactionRevertedError)) {
-			throw new Error(CLAIM_UNCONFIRMED, { cause: err })
+		if (!(err instanceof TransactionOutcomeError)) throw err
+		trace.hash = err.hash
+		trace.outcome = err.outcome
+		switch (err.outcome) {
+			case 'pending':
+				throw new ClaimError(CLAIM_PENDING, { cause: err, unconfirmed: true })
+			case 'unreadable':
+				throw new ClaimError(CLAIM_UNCONFIRMED, { cause: err, unconfirmed: true })
+			case 'cancelled':
+				throw new ClaimError(CLAIM_CANCELLED, { cause: err })
 		}
+
 		const refusalAfter = await check().catch(readErr => {
-			console.error('Could not read why the claim reverted:', readErr)
-			return null
+			trace.recheck = { error: readErr }
+			return undefined
 		})
-		throw new Error(refusalAfter ? refusalMessage(refusalAfter.reason, coupon) : CLAIM_REVERTED, {
+		if (refusalAfter) {
+			trace.recheck = trace.revert = refusalAfter.revert
+			throw new ClaimError(refusalMessage(refusalAfter.revert.reason, coupon), { cause: err })
+		}
+		if (refusalAfter === null) trace.recheck = 'would pay'
+		throw new ClaimError(err.outcome === 'replaced' ? CLAIM_REPLACED : CLAIM_REVERTED, {
 			cause: err
 		})
 	}
-	return hash
+}
+
+function causeChain(err: unknown): unknown[] {
+	const chain: unknown[] = []
+	for (let link = err; link != null && chain.length < 10; link = (link as Error).cause) {
+		chain.push(link)
+	}
+	return chain
 }
 
 export async function claimCoupon(signedContext: SignedContextV1Struct): Promise<string> {
-	transactionStore.awaitWalletConfirmation()
+	const trace: ClaimTrace = { step: 'starting' }
+	transactionStore.awaitCheck()
 	try {
-		const hash = await claim(signedContext)
+		const hash = await claim(signedContext, trace)
 		transactionStore.transactionSuccess(hash)
 		return hash
 	} catch (err) {
-		transactionStore.transactionError({ message: errorMessage(err, 'Claim failed') })
-		throw err
+		const failure = err instanceof ClaimError ? err : new ClaimError(CLAIM_FAILED, { cause: err })
+		console.error(`Claim failed while ${trace.step}: ${failure.message}`, {
+			...trace,
+			causes: causeChain(failure)
+		})
+		transactionStore.transactionError({
+			message: failure.message,
+			hash: trace.hash,
+			unconfirmed: failure.unconfirmed
+		})
+		throw failure
 	}
 }

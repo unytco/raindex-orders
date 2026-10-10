@@ -121,7 +121,6 @@
 			await getVaultBalance()
 		} catch (e) {
 			error = errorMessage(e, 'Claim failed')
-			console.error(e)
 		} finally {
 			isLoading = false
 		}

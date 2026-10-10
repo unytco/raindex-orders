@@ -90,7 +90,42 @@ describe.each(['sepolia', 'mainnet'] as const)('TransactionModal on %s', network
 		expect(html).not.toContain('View transaction on Etherscan')
 	})
 
+	it('shows the coupon check as its own step', () => {
+		transactionStore.awaitCheck()
+		const html = render()
+
+		expect(html).toContain('Checking your coupon…')
+		expect(html).not.toContain('Waiting for your manual confirmation')
+	})
+
+	it('a claim not confirmed in time says so with its link, apart from a failure', () => {
+		transactionStore.awaitCheck()
+		transactionStore.awaitTxReceipt(HASH)
+		transactionStore.transactionError({
+			message: 'Your claim is still waiting to be confirmed.',
+			unconfirmed: true
+		})
+		const html = render()
+
+		expect(html).toContain('>Your claim is still waiting to be confirmed.</p>')
+		expect(html).toContain('⏳')
+		expect(html).not.toContain('❌')
+		expect(html).toContain(ETHERSCAN)
+		expect(hasCloseButton(html)).toBe(true)
+	})
+
+	it('a failure keeps the link of a transaction even after the modal was closed', () => {
+		transactionStore.awaitCheck()
+		transactionStore.reset()
+		transactionStore.transactionError({ message: 'Your claim did not go through.', hash: HASH })
+		const html = render()
+
+		expect(html).toContain('❌')
+		expect(html).toContain(ETHERSCAN)
+	})
+
 	it.each([
+		['checking the coupon', () => transactionStore.awaitCheck()],
 		['waiting for the wallet', () => transactionStore.awaitWalletConfirmation(true)],
 		[
 			'confirming on-chain',
@@ -99,13 +134,12 @@ describe.each(['sepolia', 'mainnet'] as const)('TransactionModal on %s', network
 				transactionStore.awaitTxReceipt(HASH)
 			}
 		]
-	])('cannot be dismissed while %s', (_state, enter) => {
+	])('can be closed while %s', (_state, enter) => {
 		enter()
 		const html = render()
 
 		expect(html).toContain('role="dialog"')
-		expect(hasX(html)).toBe(false)
-		expect(hasCloseButton(html)).toBe(false)
+		expect(hasX(html)).toBe(true)
 	})
 
 	it('renders nothing while idle', () => {

@@ -17,7 +17,8 @@
 		connectWallet,
 		readContract,
 		writeContract,
-		waitForTransaction
+		waitForTransaction,
+		TransactionOutcomeError
 	} from '$lib/ethereum'
 	import { isHolochainKey, holochainKeyTo32ByteHex, errorMessage } from '$lib/utils'
 
@@ -184,13 +185,21 @@
 			})
 
 			transactionStore.awaitTxReceipt(hash)
-			await waitForTransaction(hash)
-			transactionStore.transactionSuccess(hash)
-			lockReceipt = { amount: `${formatToken(amountWei, tokenDecimals)} ${tokenSymbol}`, hash }
+			const { transactionHash } = await waitForTransaction(hash)
+			transactionStore.transactionSuccess(transactionHash)
+			lockReceipt = {
+				amount: `${formatToken(amountWei, tokenDecimals)} ${tokenSymbol}`,
+				hash: transactionHash
+			}
 			await fetchContractData()
 		} catch (e) {
 			error = errorMessage(e, 'Transaction failed')
-			transactionStore.transactionError({ message: error })
+			const outcome = e instanceof TransactionOutcomeError ? e : undefined
+			transactionStore.transactionError({
+				message: error,
+				hash: outcome?.hash,
+				unconfirmed: outcome?.unconfirmed
+			})
 			console.error(e)
 		} finally {
 			isLoading = false

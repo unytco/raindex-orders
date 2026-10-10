@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
-import { encodeErrorResult, encodeFunctionResult, parseAbi, type Hex } from 'viem'
+import { encodeErrorResult, encodeFunctionResult, parseAbi, type Address, type Hex } from 'viem'
 import { orderbookAbi } from '../generated'
 import { deserializeSignedContext, parseCoupon } from './coupon'
 import { TransactionStatus } from './stores/transactionStore'
 import { asBuild, BUILDS } from './testing/builds'
+import { chainAnswers, REPLACEMENT_HASH, type Fate } from './testing/chain'
 
 // The coupon of HASH, a claim that ran out of gas on Sepolia.
 const COUPON = deserializeSignedContext(
@@ -45,14 +46,34 @@ const OTHER_BRIDGE =
 	'This coupon does not match this bridge, so it cannot be claimed here. Contact Unyt support to have the withdrawal re-issued.'
 const VAULT_SHORT =
 	'The bridge cannot pay this claim right now, and your coupon was not used. Try again later, and contact Unyt support if it keeps failing.'
-const NO_REASON =
-	'The bridge refused this claim, and your coupon was not used. Contact Unyt support.'
+const REFUSED = 'The bridge refused this claim, and your coupon was not used. Contact Unyt support.'
 const REVERTED =
 	'Your claim did not go through, so no mock HOT was paid and your coupon was not used. Claim again.'
 const UNCHECKED =
 	'Could not check your coupon through your wallet, so nothing was sent. Check your connection and claim again.'
 const UNCONFIRMED =
 	"Your claim was sent, but its result could not be read. Check your wallet's activity to see whether it went through before you claim again."
+const DECLINED = 'You declined the claim in your wallet, so nothing was sent.'
+const NOT_SENT =
+	"Your wallet did not send the claim. If your wallet's activity shows no claim, claim again."
+const CANCELLED =
+	'You cancelled the claim in your wallet, so nothing was paid and your coupon was not used.'
+const REPLACED =
+	'Your wallet replaced the claim with another transaction, so no mock HOT was paid and your coupon was not used. Claim again.'
+const PENDING =
+	"Your claim is still waiting to be confirmed. Check your wallet's activity before you claim again."
+const FAILED =
+	"Something went wrong with your claim. Check your wallet's activity before you claim again, and contact Unyt support if it keeps failing."
+
+const {
+	IDLE,
+	CHECKING,
+	PENDING_WALLET,
+	PENDING_TX,
+	SUCCESS,
+	ERROR,
+	UNCONFIRMED: NOT_CONFIRMED
+} = TransactionStatus
 
 const PAYS = encodeFunctionResult({
 	abi: orderbookAbi,
@@ -76,49 +97,66 @@ const REVERT_SHAPES = {
 	'-32000 with data': (data: Hex) => ({ code: -32000, message: 'Execution reverted', data })
 }
 
+// The coupon's nonce and expiry, as a developer reads them in the console.
+const COUPON_LOG = {
+	couponNonce: '0x4e95f122036e7d6cf3baca9b6e95820c751d1ee3db4eb2125409b87ad6028119',
+	couponExpiry: '2026-10-15T15:58:21.000Z'
+}
+
 type Answer = Hex | object
 type Request = { method: string; params?: unknown[] }
 type Wallet = {
 	ethCallAnswers: Answer[]
-	receipt?: Answer
+	fate?: Fate
 	send?: Answer
 	network?: 'sepolia' | 'mainnet'
 	walletChain?: Hex
-	account?: string
+	account?: string | null
 	accountDuringCheck?: string
 }
 
 async function wallet({
 	ethCallAnswers,
-	receipt = { status: '0x1' },
+	fate = { mined: '0x1' },
 	send = HASH,
 	network = 'sepolia',
 	walletChain = network === 'sepolia' ? '0xaa36a7' : '0x1',
 	account = RECIPIENT,
 	accountDuringCheck
 }: Wallet) {
+	vi.useFakeTimers()
 	const asked: string[] = []
 	const params: Record<string, unknown> = {}
 	const modalWhen: Record<string, unknown> = {}
 	let modal = (): { status?: unknown } => ({})
 	let switchAccount: (to: string) => void = () => {}
+	const chain = chainAnswers(
+		{
+			hash: HASH,
+			from: RECIPIENT,
+			to: BUILDS[network].PUBLIC_ORDERBOOK_ADDRESS as Address,
+			input: TAKE_ORDERS
+		},
+		fate
+	)
 	const answer = (value: Answer | undefined) => {
 		if (value === undefined) throw new Error('unexpected request')
-		if (typeof value === 'string' || 'status' in value) return value
+		if (typeof value === 'string') return value
 		throw value
 	}
-	const request = vi.fn(async ({ method, params: [first] = [] }: Request) => {
+	const request = vi.fn(async ({ method, params: all = [] }: Request) => {
 		asked.push(method)
-		params[method] = first
-		modalWhen[method] = modal().status
+		params[method] = all[0]
+		modalWhen[method] ??= modal().status
 		if (method === 'eth_chainId') return walletChain
 		if (method === 'eth_call') {
 			if (accountDuringCheck) switchAccount(accountDuringCheck)
 			return answer(ethCallAnswers.shift())
 		}
 		if (method === 'eth_sendTransaction') return answer(send)
-		if (method === 'eth_getTransactionReceipt') return answer(receipt)
-		throw new Error(`unexpected ${method}`)
+		const fromChain = chain(method, all)
+		if (fromChain === undefined) throw new Error(`unexpected ${method}`)
+		return fromChain
 	})
 	vi.stubGlobal('window', { ethereum: { request, on: vi.fn() } })
 	const { claim, ethereum, store } = await asBuild(BUILDS[network], async () => ({
@@ -135,13 +173,30 @@ async function wallet({
 	})
 	modal = () => get(store.transactionStore)
 	switchAccount = to => ethereum.ethereumStore.update(s => ({ ...s, account: to }))
-	return { asked, params, modalWhen, modal, claim: () => claim.claimCoupon(COUPON) }
+	const statuses: string[] = []
+	store.transactionStore.subscribe(({ status }) => {
+		if (statuses.at(-1) !== status) statuses.push(status)
+	})
+	const claimed = async () => {
+		let settled = false
+		const claiming = claim.claimCoupon(COUPON)
+		claiming.then(
+			() => (settled = true),
+			() => (settled = true)
+		)
+		const limit = Date.now() + ethereum.CONFIRMATION_TIMEOUT_MS + 60_000
+		while (!settled && Date.now() < limit) await vi.advanceTimersByTimeAsync(1_000)
+		return claiming
+	}
+	const logs = () => vi.mocked(console.error).mock.calls
+	return { asked, params, modalWhen, modal, statuses, logs, claim: claimed }
 }
 
 beforeEach(() => {
 	vi.spyOn(console, 'error').mockImplementation(() => {})
 })
 afterEach(() => {
+	vi.useRealTimers()
 	vi.unstubAllGlobals()
 	vi.restoreAllMocks()
 })
@@ -181,33 +236,49 @@ describe.each(Object.entries(REVERT_SHAPES))(
 				}),
 				VAULT_SHORT
 			],
-			[
-				'for a reason the site does not know',
-				ensure('Something new'),
-				'The bridge refused this claim (Something new), and your coupon was not used. Contact Unyt support.'
-			],
-			['with an empty reason', ensure(''), NO_REASON],
-			[
-				'with an error the site cannot decode',
-				'0xdeadbeef',
-				'The bridge refused this claim (0xdeadbeef), and your coupon was not used. Contact Unyt support.'
-			]
-		] as const)('%s is not sent, and says why', async (_case, data, message) => {
-			const refusal = revert(data)
-			const { asked, claim, modal } = await wallet({ ethCallAnswers: [refusal] })
+			['for a reason the site does not know', ensure('Something new'), REFUSED],
+			['with an empty reason', ensure(''), REFUSED],
+			['with an error the site cannot decode', '0xdeadbeef', REFUSED]
+		] as const)(
+			'%s is not sent, and goes from checking to its reason',
+			async (_case, data, message) => {
+				const refusal = revert(data)
+				const { asked, statuses, modal, claim } = await wallet({ ethCallAnswers: [refusal] })
 
-			await expect(claim()).rejects.toMatchObject({ message, cause: refusal })
-			expect(asked).not.toContain('eth_sendTransaction')
-			expect(modal()).toMatchObject({
-				status: TransactionStatus.ERROR,
-				error: { message },
-				hash: ''
-			})
-		})
+				await expect(claim()).rejects.toMatchObject({ message, cause: refusal })
+				expect(asked).not.toContain('eth_sendTransaction')
+				expect(statuses).toEqual([IDLE, CHECKING, ERROR])
+				expect(modal()).toMatchObject({ error: { message }, hash: '' })
+			}
+		)
 	}
 )
 
 describe('a claim the order refuses', () => {
+	it('logs the step, the decoded revert, the raw data and the coupon once', async () => {
+		const refusal = metaMaskRevert(SEPOLIA.nonceUsed)
+		const { claim, logs } = await wallet({ ethCallAnswers: [refusal] })
+
+		await expect(claim()).rejects.toThrow()
+		expect(logs()).toHaveLength(1)
+		const [summary, details] = logs()[0]
+		expect(summary).toBe(`Claim failed while checking the coupon: ${ALREADY_CLAIMED('mock HOT')}`)
+		expect(details).toMatchObject({
+			step: 'checking the coupon',
+			account: RECIPIENT,
+			chainId: 11155111,
+			...COUPON_LOG,
+			revert: {
+				reason: 'Nonce already used',
+				errorName: 'Error',
+				args: ['Nonce already used'],
+				data: SEPOLIA.nonceUsed
+			},
+			causes: [expect.objectContaining({ message: ALREADY_CLAIMED('mock HOT') }), refusal]
+		})
+		expect(details).not.toHaveProperty('hash')
+	})
+
 	it('for another wallet names the wallet the coupon pays', async () => {
 		const { params, claim } = await wallet({
 			ethCallAnswers: [nodeRevert(SEPOLIA.wrongRecipient)],
@@ -232,7 +303,7 @@ describe('a claim the order refuses', () => {
 	it.each([
 		['execution reverted: Nonce already used', ALREADY_CLAIMED('mock HOT')],
 		['execution reverted: Nonce already used\n', ALREADY_CLAIMED('mock HOT')],
-		['Execution reverted', NO_REASON]
+		['Execution reverted', REFUSED]
 	])('told only as "%s" is not sent, and says why', async (reverted, message) => {
 		const { asked, claim } = await wallet({
 			ethCallAnswers: [{ code: 3, message: reverted, data: '0x' }]
@@ -244,82 +315,170 @@ describe('a claim the order refuses', () => {
 })
 
 describe('a claim the order would pay', () => {
-	it('is sent as checked, and shows success with its hash once mined', async () => {
-		const { asked, params, modalWhen, claim, modal } = await wallet({ ethCallAnswers: [PAYS] })
+	it('shows each step, is sent as checked, and succeeds without a log', async () => {
+		const { asked, params, modalWhen, statuses, logs, claim, modal } = await wallet({
+			ethCallAnswers: [PAYS],
+			fate: { mined: '0x1', afterPolls: 2 }
+		})
 
 		await expect(claim()).resolves.toBe(HASH)
 		const call = { from: RECIPIENT, to: BUILDS.sepolia.PUBLIC_ORDERBOOK_ADDRESS, data: TAKE_ORDERS }
 		expect(params.eth_call).toMatchObject(call)
 		expect(params.eth_sendTransaction).toMatchObject(call)
 		expect(asked.filter(m => m === 'eth_sendTransaction')).toHaveLength(1)
+		expect(statuses).toEqual([IDLE, CHECKING, PENDING_WALLET, PENDING_TX, SUCCESS])
 		expect(modalWhen).toMatchObject({
-			eth_call: TransactionStatus.PENDING_WALLET,
-			eth_sendTransaction: TransactionStatus.PENDING_WALLET,
-			eth_getTransactionReceipt: TransactionStatus.PENDING_TX
+			eth_call: CHECKING,
+			eth_sendTransaction: PENDING_WALLET,
+			eth_getTransactionReceipt: PENDING_TX
 		})
-		expect(modal()).toMatchObject({ status: TransactionStatus.SUCCESS, hash: HASH })
+		expect(modal()).toMatchObject({ status: SUCCESS, hash: HASH })
+		expect(logs()).toHaveLength(0)
 	})
 
-	it('that reverts on chain, and would still pay, says it did not go through', async () => {
+	it('that the wallet speeds up succeeds under its new hash', async () => {
 		const { claim, modal } = await wallet({
+			ethCallAnswers: [PAYS],
+			fate: { replacedBy: 'repriced' }
+		})
+
+		await expect(claim()).resolves.toBe(REPLACEMENT_HASH)
+		expect(modal()).toMatchObject({ status: SUCCESS, hash: REPLACEMENT_HASH })
+	})
+
+	it('that reverts on chain, and would still pay, says it did not go through and logs why', async () => {
+		const { statuses, logs, claim, modal } = await wallet({
 			ethCallAnswers: [PAYS, PAYS],
-			receipt: { status: '0x0' }
+			fate: { mined: '0x0' }
 		})
 
 		await expect(claim()).rejects.toMatchObject({ message: REVERTED })
+		expect(statuses).toEqual([IDLE, CHECKING, PENDING_WALLET, PENDING_TX, ERROR])
 		expect(modal()).toMatchObject({ error: { message: REVERTED }, hash: HASH })
+		expect(logs()).toHaveLength(1)
+		const [summary, details] = logs()[0]
+		expect(summary).toBe(`Claim failed while waiting for confirmation: ${REVERTED}`)
+		expect(details).toMatchObject({
+			step: 'waiting for confirmation',
+			outcome: 'reverted',
+			sentHash: HASH,
+			hash: HASH,
+			recheck: 'would pay',
+			account: RECIPIENT,
+			chainId: 11155111,
+			...COUPON_LOG,
+			causes: [
+				expect.objectContaining({ message: REVERTED }),
+				expect.objectContaining({ outcome: 'reverted', hash: HASH })
+			]
+		})
 	})
 
-	it('that reverts because the coupon was claimed meanwhile says so', async () => {
+	it('that the wallet speeds up and then reverts says it did not go through', async () => {
 		const { claim, modal } = await wallet({
+			ethCallAnswers: [PAYS, PAYS],
+			fate: { replacedBy: 'repriced', status: '0x0' }
+		})
+
+		await expect(claim()).rejects.toMatchObject({ message: REVERTED })
+		expect(modal()).toMatchObject({ hash: REPLACEMENT_HASH })
+	})
+
+	it('that reverts because the coupon was claimed meanwhile says so, and logs the reason', async () => {
+		const { claim, modal, logs } = await wallet({
 			ethCallAnswers: [PAYS, nodeRevert(SEPOLIA.nonceUsed)],
-			receipt: { status: '0x0' }
+			fate: { mined: '0x0' }
 		})
 
 		await expect(claim()).rejects.toMatchObject({ message: ALREADY_CLAIMED('mock HOT') })
 		expect(modal()).toMatchObject({ hash: HASH })
+		expect(logs()[0][1]).toMatchObject({
+			outcome: 'reverted',
+			revert: { reason: 'Nonce already used', data: SEPOLIA.nonceUsed },
+			recheck: { reason: 'Nonce already used' }
+		})
 	})
 
 	it('that reverts, when the reason cannot be read, still says it did not go through', async () => {
-		const { claim } = await wallet({
-			ethCallAnswers: [PAYS, new Error('Failed to fetch')],
-			receipt: { status: '0x0' }
+		const readError = new Error('Failed to fetch')
+		const { claim, logs } = await wallet({
+			ethCallAnswers: [PAYS, readError],
+			fate: { mined: '0x0' }
 		})
 
 		await expect(claim()).rejects.toMatchObject({ message: REVERTED })
+		expect(logs()).toHaveLength(1)
+		expect(logs()[0][1]).toMatchObject({ recheck: { error: readError } })
+	})
+
+	it('that the user cancels in the wallet says so, without checking again', async () => {
+		const { asked, claim, modal } = await wallet({
+			ethCallAnswers: [PAYS],
+			fate: { replacedBy: 'cancelled' }
+		})
+
+		await expect(claim()).rejects.toMatchObject({ message: CANCELLED })
+		expect(asked.filter(m => m === 'eth_call')).toHaveLength(1)
+		expect(modal()).toMatchObject({ status: ERROR, hash: REPLACEMENT_HASH })
+	})
+
+	it.each([
+		['would still pay', PAYS, REPLACED],
+		['was claimed by it', nodeRevert(SEPOLIA.nonceUsed), ALREADY_CLAIMED('mock HOT')]
+	])(
+		'that the wallet replaces with another transaction, and %s, says so',
+		async (_case, recheck, message) => {
+			const { claim } = await wallet({
+				ethCallAnswers: [PAYS, recheck],
+				fate: { replacedBy: 'replaced' }
+			})
+
+			await expect(claim()).rejects.toMatchObject({ message })
+		}
+	)
+
+	it('that is not confirmed in time says it is still pending, and links it', async () => {
+		const { statuses, claim, modal, logs } = await wallet({
+			ethCallAnswers: [PAYS],
+			fate: { dropped: true }
+		})
+
+		await expect(claim()).rejects.toMatchObject({ message: PENDING })
+		expect(statuses).toEqual([IDLE, CHECKING, PENDING_WALLET, PENDING_TX, NOT_CONFIRMED])
+		expect(modal()).toMatchObject({ error: { message: PENDING }, hash: HASH })
+		expect(logs()[0][1]).toMatchObject({ step: 'waiting for confirmation', outcome: 'pending' })
 	})
 
 	it('whose receipt cannot be read says to look before claiming again', async () => {
 		const { asked, claim, modal } = await wallet({
 			ethCallAnswers: [PAYS],
-			receipt: { code: -32603, message: 'Internal JSON-RPC error.' }
+			fate: { receiptFails: true }
 		})
 
 		await expect(claim()).rejects.toMatchObject({ message: UNCONFIRMED })
 		expect(asked.filter(m => m === 'eth_call')).toHaveLength(1)
-		expect(modal()).toMatchObject({ error: { message: UNCONFIRMED }, hash: HASH })
+		expect(modal()).toMatchObject({ status: NOT_CONFIRMED, hash: HASH })
 	})
 
 	it('that the user declines in the wallet says nothing was sent', async () => {
-		const { claim, modal } = await wallet({
+		const { statuses, claim, modal } = await wallet({
 			ethCallAnswers: [PAYS],
 			send: { code: 4001, message: 'MetaMask Tx Signature: User denied transaction signature.' }
 		})
 
-		const message = 'You declined the claim in your wallet, so nothing was sent.'
-		await expect(claim()).rejects.toMatchObject({ message })
-		expect(modal()).toMatchObject({ error: { message }, hash: '' })
+		await expect(claim()).rejects.toMatchObject({ message: DECLINED })
+		expect(statuses).toEqual([IDLE, CHECKING, PENDING_WALLET, ERROR])
+		expect(modal()).toMatchObject({ error: { message: DECLINED }, hash: '' })
 	})
 
-	it('that the wallet fails to send says to look before claiming again', async () => {
-		const { claim } = await wallet({
-			ethCallAnswers: [PAYS],
-			send: { code: -32603, message: 'Internal JSON-RPC error.' }
-		})
+	it('that the wallet fails to send says so, without the wallet text', async () => {
+		const failure = { code: -32603, message: 'Internal JSON-RPC error.' }
+		const { claim, logs } = await wallet({ ethCallAnswers: [PAYS], send: failure })
 
-		await expect(claim()).rejects.toMatchObject({
-			message:
-				"Your wallet did not send the claim (Internal JSON-RPC error). If your wallet's activity shows no claim, claim again."
+		await expect(claim()).rejects.toMatchObject({ message: NOT_SENT })
+		expect(logs()[0][1]).toMatchObject({
+			step: 'asking the wallet to send',
+			causes: [expect.anything(), failure]
 		})
 	})
 
@@ -350,12 +509,22 @@ describe('a claim the wallet cannot check', () => {
 	})
 
 	it('is not checked or sent while the wallet is on another network', async () => {
-		const { asked, claim } = await wallet({ ethCallAnswers: [PAYS], walletChain: '0x1' })
+		const { asked, claim, logs } = await wallet({ ethCallAnswers: [PAYS], walletChain: '0x1' })
 
 		await expect(claim()).rejects.toMatchObject({
 			message: 'Switch your wallet to Sepolia Testnet first'
 		})
 		expect(asked).not.toContain('eth_call')
 		expect(asked).not.toContain('eth_sendTransaction')
+		expect(logs()[0][1]).toMatchObject({ step: 'checking the network', chainId: 1 })
+	})
+
+	it('for a cause the site does not know says so in general terms, and logs the cause', async () => {
+		const { claim, logs } = await wallet({ ethCallAnswers: [PAYS], account: null })
+
+		await expect(claim()).rejects.toMatchObject({ message: FAILED })
+		expect(logs()[0][1]).toMatchObject({
+			causes: [expect.anything(), expect.objectContaining({ message: 'Not connected' })]
+		})
 	})
 })
