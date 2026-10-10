@@ -34,6 +34,7 @@ pub struct BridgeOrchestrator {
     db: StateStore,
     reporter: ReporterState,
     ethereum: Option<EthereumSide>,
+    deferred: std::sync::Mutex<HashMap<&'static str, HashSet<String>>>,
 }
 
 pub struct EthereumSide {
@@ -226,6 +227,7 @@ impl BridgeOrchestrator {
             db,
             reporter,
             ethereum,
+            deferred: Default::default(),
         })
     }
 
@@ -1455,7 +1457,7 @@ impl BridgeOrchestrator {
     /// whatever the row's step or state.
     fn accounted_links(
         &self,
-        stage: &str,
+        stage: &'static str,
         links: Vec<Transaction>,
         recorded: impl Fn(&WorkItem) -> Option<&str>,
     ) -> Result<Vec<Transaction>> {
@@ -1464,13 +1466,28 @@ impl BridgeOrchestrator {
             .iter()
             .filter_map(|row| Some((self.lock_key(row)?, recorded(row))))
             .collect();
+        let mut deferred = self.deferred.lock().expect("deferred mutex poisoned");
+        let deferred_before = deferred.remove(stage).unwrap_or_default();
+        let deferring = deferred.entry(stage).or_default();
         let mut accounted = Vec::new();
         for link in links {
             let id = link.id.to_string();
-            let Some(why) = unaccounted(&link, &id, &self.cfg.bridging_agent_pubkey, &by_lock)
-            else {
-                accounted.push(link);
-                continue;
+            let why = match unaccounted(&link, &id, &self.cfg.bridging_agent_pubkey, &by_lock) {
+                None => {
+                    accounted.push(link);
+                    continue;
+                }
+                Some(Gap::Unrecorded(why)) if !deferred_before.contains(&id) => {
+                    warn!(
+                        event = "bridge.rave.link_deferred",
+                        link = id,
+                        reason = why,
+                        "[bridge/{stage}] link {id} waits a cycle for its rows to record it: {why}"
+                    );
+                    deferring.insert(id);
+                    continue;
+                }
+                Some(Gap::Unrecorded(why) | Gap::Conflict(why)) => why,
             };
             error!(
                 event = "bridge.rave.link_withheld",
@@ -2753,37 +2770,55 @@ fn deposit_proofs(tx: &Transaction) -> Option<&Value> {
     }
 }
 
+/// Why a deposit link's rows do not account for it: only rows that have not
+/// recorded it yet, as when its write landed after reconcile, or anything else.
+enum Gap {
+    Unrecorded(String),
+    Conflict(String),
+}
+
 fn unaccounted(
     link: &Transaction,
     id: &str,
     bridging_agent: &AgentPubKeyB64,
     recorded: &HashMap<LockKey, Option<&str>>,
-) -> Option<String> {
+) -> Option<Gap> {
+    let conflict = |why: String| Some(Gap::Conflict(why));
     if link.creator != *bridging_agent {
-        return Some(format!("it was parked by {}", link.creator));
+        return conflict(format!("it was parked by {}", link.creator));
     }
     let Some(proofs) = deposit_proofs(link).and_then(Value::as_array) else {
-        return Some("it carries no list of deposit proofs".to_string());
+        return conflict("it carries no list of deposit proofs".to_string());
     };
     let Some(locks) = proofs
         .iter()
         .map(LockKey::of_proof)
         .collect::<Option<Vec<_>>>()
     else {
-        return Some("a deposit proof it carries names no lock".to_string());
+        return conflict("a deposit proof it carries names no lock".to_string());
     };
     if locks.is_empty() {
-        return Some("it carries no deposit proof".to_string());
+        return conflict("it carries no deposit proof".to_string());
     }
-    locks.iter().find_map(|lock| match recorded.get(lock) {
-        None => Some(format!("lock {} has no row", lock.lock_id)),
-        Some(None) => Some(format!("the row of lock {} records no link", lock.lock_id)),
-        Some(Some(other)) if *other != id => Some(format!(
-            "the row of lock {} records link {other}",
-            lock.lock_id
-        )),
-        Some(Some(_)) => None,
-    })
+    let mut unrecorded = None;
+    for lock in &locks {
+        match recorded.get(lock) {
+            None => return conflict(format!("lock {} has no row", lock.lock_id)),
+            Some(Some(other)) if *other != id => {
+                return conflict(format!(
+                    "the row of lock {} records link {other}",
+                    lock.lock_id
+                ))
+            }
+            Some(None) => {
+                unrecorded.get_or_insert_with(|| {
+                    format!("the row of lock {} records no link", lock.lock_id)
+                });
+            }
+            Some(Some(_)) => {}
+        }
+    }
+    unrecorded.map(Gap::Unrecorded)
 }
 
 /// Each deposit proof the bridging agent's own parked links carry, by its
@@ -2961,6 +2996,7 @@ mod tests {
         let path = test_db_path(name);
         let db = StateStore::open(&path).unwrap();
         BridgeOrchestrator {
+            deferred: Default::default(),
             cfg: test_config(path),
             db,
             reporter: ReporterState::new(),
@@ -6127,14 +6163,75 @@ mod tests {
             let late = [link_at(&step, 0x4B, &lock), link_at(&step, 0x4C, &lock)];
             let conductor = bridging_conductor().parking(action_hash(agreement), &late);
 
-            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+            for _ in 0..2 {
+                orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+            }
 
             assert_eq!(
                 ids(&conductor.parked.borrow()[&action_hash(agreement)]),
                 ids(&late),
                 "no late write pays a row that records none"
             );
-            assert_eq!(failed_row(&orch, id).step, before);
+            let row = failed_row(&orch, id);
+            assert_eq!(
+                (row.step, row.last_error.as_deref()),
+                (before, Some("out of attempts"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_link_one_of_whose_rows_records_no_link_yet_waits_one_cycle() {
+        for (step, agreement) in RAVE_STAGES {
+            for recorded_in_time in [true, false] {
+                let orch = test_orchestrator("link-half-recorded");
+                let (first, second) = ("lock:half:1", "lock:half:2");
+                let shared = link_at(&step, 0x51, &[proof(first, "0xa4"), proof(second, "0xa5")]);
+                let rows = [(first, "0xa4"), (second, "0xa5")].map(|(lock, tx)| match step {
+                    WorkStep::ClLinkCreated => enqueue_lock(&orch, lock, tx),
+                    _ => enqueue_at_cl_rave_executed(&orch, lock, tx),
+                });
+                let context = in_force(CL_EA, BR_EA);
+                let (stage, recorded): (&'static str, fn(&WorkItem) -> Option<&str>) = match step {
+                    WorkStep::ClLinkCreated => {
+                        orch.record_cl_link(rows[0], &shared.id.to_string(), &context)
+                            .unwrap();
+                        ("s2", |row| row.cl_link_hash.as_deref())
+                    }
+                    _ => {
+                        orch.record_br_spend(rows[0], &shared.id.to_string(), &context)
+                            .unwrap();
+                        ("s4", |row| row.br_spend_hash.as_deref())
+                    }
+                };
+                if !recorded_in_time {
+                    orch.db
+                        .mark_failed_permanent(rows[1], "out of attempts")
+                        .unwrap();
+                }
+
+                let given = orch
+                    .accounted_links(stage, vec![shared.clone()], recorded)
+                    .unwrap();
+
+                assert!(given.is_empty(), "deferred a cycle");
+                assert_eq!(lock_row(&orch, rows[0]).step, step, "no row changes");
+
+                let conductor = bridging_conductor()
+                    .parking(action_hash(agreement), std::slice::from_ref(&shared));
+                orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+                let parked = ids(&conductor.parked.borrow()[&action_hash(agreement)]);
+                if recorded_in_time {
+                    assert!(parked.is_empty(), "the RAVE was given it");
+                    assert_ne!(lock_row(&orch, rows[0]).step, step);
+                } else {
+                    assert_eq!(parked, ids(std::slice::from_ref(&shared)));
+                    let reason = failed_row(&orch, rows[0]).last_error.unwrap();
+                    assert!(reason.contains(&shared.id.to_string()), "{reason}");
+                    assert!(reason.contains(second), "{reason}");
+                }
+            }
         }
     }
 
@@ -6156,7 +6253,10 @@ mod tests {
         let lock_key = LockKey::of_proof(&lock()).unwrap();
         let recording = |link| HashMap::from([(lock_key.clone(), link)]);
         let why = |link: &Transaction, recorded: &HashMap<LockKey, Option<&str>>| {
-            unaccounted(link, &id, &bridging_agent(), recorded)
+            unaccounted(link, &id, &bridging_agent(), recorded).map(|gap| match gap {
+                Gap::Unrecorded(why) => format!("unrecorded: {why}"),
+                Gap::Conflict(why) => format!("conflict: {why}"),
+            })
         };
 
         assert_eq!(why(&own, &recording(Some(id.as_str()))), None);
@@ -6164,29 +6264,37 @@ mod tests {
             (
                 signed_by_another(own.clone()),
                 recording(Some(id.as_str())),
-                "parked by",
+                "conflict: it was parked by",
             ),
             (
                 with_proofs(json!("lock")),
                 recording(Some(id.as_str())),
-                "no list",
+                "conflict: it carries no list",
             ),
             (
                 with_proofs(json!([{}])),
                 recording(Some(id.as_str())),
-                "names no lock",
+                "conflict: a deposit proof it carries names no lock",
             ),
             (
                 with_proofs(json!([])),
                 recording(Some(id.as_str())),
-                "no deposit proof",
+                "conflict: it carries no deposit proof",
             ),
-            (own.clone(), HashMap::new(), "has no row"),
-            (own.clone(), recording(None), "records no link"),
+            (
+                own.clone(),
+                HashMap::new(),
+                "conflict: lock lock:accounted:1 has no row",
+            ),
+            (
+                own.clone(),
+                recording(None),
+                "unrecorded: the row of lock lock:accounted:1 records no link",
+            ),
             (
                 own.clone(),
                 recording(Some("uhCkkOTHER")),
-                "records link uhCkkOTHER",
+                "conflict: the row of lock lock:accounted:1 records link uhCkkOTHER",
             ),
         ] {
             let why = why(&link, &recorded).expect("unaccounted");

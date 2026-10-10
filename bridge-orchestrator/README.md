@@ -424,6 +424,8 @@ back to `queued` with its attempts unchanged. Only a failed cycle counts an
 attempt, against the items it had in flight.
 
 S2 and S4 give the RAVE a deposit link only when the row of every lock it
-carries records exactly that link. Any other deposit link stays parked,
-`bridge.rave.link_withheld` logs it with the reason, and each row that records
-it is failed for a person.
+carries records exactly that link. A link whose only gap is rows that record
+no link yet waits one cycle for reconcile to record them
+(`bridge.rave.link_deferred`). Any other deposit link, or one still short a
+cycle later, stays parked, `bridge.rave.link_withheld` logs it with the reason,
+and each row that records it is failed for a person.
