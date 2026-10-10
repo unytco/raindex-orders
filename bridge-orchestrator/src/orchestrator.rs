@@ -4164,7 +4164,7 @@ mod tests {
         rave_redacts: HashSet<ActionHash>,
         rave_delay_ms: u64,
         stops_during: Option<(usize, tokio::sync::watch::Sender<bool>)>,
-        parks_during: Option<(usize, ActionHash, Transaction)>,
+        parks_during: RefCell<Option<(&'static str, ActionHash, Transaction)>>,
         parked_reads: RefCell<Vec<ActionHash>>,
         link_reads: RefCell<Vec<ActionHash>>,
         fails_on: Option<(ActionHash, &'static str)>,
@@ -4290,10 +4290,12 @@ mod tests {
                     stop.send_replace(true);
                 }
             }
-            if let Some((call, agreement, link)) = &self.parks_during {
-                if self.calls.borrow().len() == *call {
-                    self.park(agreement, link.clone());
-                }
+            let parking = self
+                .parks_during
+                .borrow_mut()
+                .take_if(|(at, ..)| *at == name);
+            if let Some((_, agreement, link)) = parking {
+                self.park(&agreement, link);
             }
         }
 
@@ -5905,9 +5907,12 @@ mod tests {
         let orch = test_orchestrator("foreign-proof-in-cycle");
         enqueue_lock(&orch, "lock:cycle:2", "0x94");
         let copy = withdrawal_carrying(0xBB, proof("lock:cycle:2", "0x94"));
-        let after_s1_writes = 5;
         let conductor = FakeConductor {
-            parks_during: Some((after_s1_writes, action_hash(BR_EA), copy.clone())),
+            parks_during: RefCell::new(Some((
+                "create_parked_link",
+                action_hash(BR_EA),
+                copy.clone(),
+            ))),
             ..bridging_conductor()
         };
 
