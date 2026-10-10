@@ -22,6 +22,7 @@ export const MAINNET_BUILD = {
 }
 
 export const BUILDS = { sepolia: SEPOLIA_BUILD, mainnet: MAINNET_BUILD }
+export type Network = keyof typeof BUILDS
 
 /** `load`'s modules, imported afresh as a build with these build variables. */
 export async function asBuild<T>(build: Record<string, string>, load: () => Promise<T>) {

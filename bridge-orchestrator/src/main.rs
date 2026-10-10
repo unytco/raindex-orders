@@ -1,10 +1,13 @@
 mod config;
+#[cfg(test)]
+mod fake_rpc;
 mod lock_flow;
 mod orchestrator;
 mod preflight;
 mod retention;
 mod signer;
 mod state;
+mod stop;
 mod watchtower_reporter;
 
 use anyhow::Result;
@@ -52,10 +55,17 @@ enum Command {
         all: bool,
         /// Only with `--non-in-progress`: delete terminal rows whose
         /// `updated_at` is older than this many seconds. Applied to
-        /// both `succeeded` and `failed` rows. When omitted the flag
-        /// behaves like the previous (unbounded) `--non-in-progress`.
+        /// both `succeeded` and `failed` rows.
         #[arg(long, conflicts_with = "all")]
         older_than_s: Option<u64>,
+    },
+    /// List each transfer the bridging agent's network still holds, for a migration's close.
+    /// Run it with the orchestrator stopped.
+    InTransit {
+        /// After listing, mark failed each pending row in transit or carried by a listed link, all
+        /// or none, to be paid by hand on the new network. Exits 0 once they are marked.
+        #[arg(long)]
+        mark_failed: bool,
     },
 }
 
@@ -71,6 +81,7 @@ async fn main() -> Result<()> {
     match args.command {
         Command::Run => {
             info!("bridge-orchestrator starting");
+            config::require_durable_conductor(&config.conductor_config)?;
             let ethereum = match ethereum {
                 Some(chain) => {
                     let signer = CouponSigner::from_env(chain.network)?;
@@ -162,6 +173,9 @@ async fn main() -> Result<()> {
             };
             println!("{}", serde_json::to_string(&output)?);
         }
+        Command::InTransit { mark_failed } => {
+            orchestrator::in_transit::run(config, ethereum, mark_failed).await?;
+        }
     }
 
     Ok(())
@@ -174,4 +188,22 @@ fn init_logging() {
         .with_ansi(false)
         .with_target(false)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_still_takes_the_detected_state() {
+        let args =
+            Args::try_parse_from(["bridge-orchestrator", "status", "--state", "detected"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Command::Status {
+                state: Some(WorkState::Detected),
+                ..
+            }
+        ));
+    }
 }

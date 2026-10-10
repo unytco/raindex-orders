@@ -7,11 +7,10 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
+pub const LOCK_CHECKPOINT_KEY: &str = "lock.last_processed_block";
 /// In the order [`row_to_work_item`] reads them.
 const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id";
-#[cfg(test)]
-const DEFAULT_MAX_ATTEMPTS: i64 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -373,7 +372,6 @@ impl StateStore {
             path: path_buf,
         };
         store.init_schema()?;
-        store.recover_stale_items()?;
         Ok(store)
     }
 
@@ -413,7 +411,7 @@ impl StateStore {
                     [SCHEMA_VERSION],
                 )?;
             }
-            Some(v) if v == SCHEMA_VERSION => {}
+            Some(v) if (1..=SCHEMA_VERSION).contains(&v) => {}
             Some(v) if v > SCHEMA_VERSION => {
                 anyhow::bail!(
                     "database schema version {} is newer than binary version {}",
@@ -451,6 +449,13 @@ impl StateStore {
             [],
         )?;
         self.ensure_work_item_columns(&conn)?;
+        let meta_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(schema_meta)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        if !meta_columns.iter().any(|column| column == "vault") {
+            conn.execute("ALTER TABLE schema_meta ADD COLUMN vault TEXT", [])?;
+        }
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_work_items_state_created ON work_items(state, created_at)",
             [],
@@ -467,22 +472,30 @@ impl StateStore {
             )",
             [],
         )?;
+        let tx = conn.unchecked_transaction()?;
+        if version.is_some_and(|version| version < 3) {
+            forget_unconfirmed_locks(&tx)?;
+        }
+        tx.execute(
+            "UPDATE schema_meta SET version = ?1 WHERE id = 1",
+            [SCHEMA_VERSION],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    fn recover_stale_items(&self) -> Result<()> {
+    /// A stop or a crash is not an attempt, so the rows it left in progress go
+    /// back to `queued` with their attempts unchanged. Returns their item IDs.
+    pub fn recover_stale_items(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        // Bump attempts for every row we recover so a subsequent cycle can
-        // detect the retry and run the source-chain dedup. Must happen before
-        // the max_attempts check so rows that just crossed the threshold this
-        // recovery are correctly promoted to 'failed'.
-        conn.execute(
-            "UPDATE work_items
-             SET attempts = attempts + 1,
-                 updated_at = strftime('%s', 'now')
-             WHERE state IN ('claimed', 'in_flight')",
-            [],
-        )?;
+        let recovered = conn
+            .prepare(
+                "SELECT item_id FROM work_items
+                 WHERE state IN ('claimed', 'in_flight')
+                 ORDER BY id",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
         conn.execute(
             "UPDATE work_items
              SET state = 'queued',
@@ -490,25 +503,40 @@ impl StateStore {
                  error_class = 'transient',
                  last_error = coalesce(last_error || '; ', '') || 'Recovered from stale in-progress state on startup',
                  updated_at = strftime('%s', 'now')
-             WHERE state IN ('claimed', 'in_flight')
-               AND attempts < max_attempts",
+             WHERE state IN ('claimed', 'in_flight')",
             [],
         )?;
-        conn.execute(
-            "UPDATE work_items
-             SET state = 'failed',
-                 error_class = 'permanent',
-                 next_retry_at = NULL,
-                 last_error = coalesce(last_error || '; ', '') || 'Exceeded max attempts during startup recovery',
-                 updated_at = strftime('%s', 'now')
-             WHERE state IN ('claimed', 'in_flight')
-               AND attempts >= max_attempts",
-            [],
-        )?;
+        Ok(recovered)
+    }
+
+    pub fn bind_vault(&self, vault: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let bound: Option<String> =
+            tx.query_row("SELECT vault FROM schema_meta WHERE id = 1", [], |row| {
+                row.get(0)
+            })?;
+        match bound {
+            Some(bound) if bound == vault => {}
+            Some(bound) => anyhow::bail!(
+                "{} serves vault {bound}, and vault {vault} is configured",
+                self.path.display()
+            ),
+            None => {
+                tx.execute(
+                    "UPDATE work_items
+                     SET idempotency_key = 'lock:' || ?1 || ':' || substr(idempotency_key, 6)
+                     WHERE flow = 'lock' AND idempotency_key NOT LIKE 'lock:0x%'",
+                    [vault],
+                )?;
+                tx.execute("UPDATE schema_meta SET vault = ?1 WHERE id = 1", [vault])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn enqueue_detected(
+    pub fn enqueue_queued(
         &self,
         flow: &str,
         task_type: &str,
@@ -519,7 +547,7 @@ impl StateStore {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
             "INSERT OR IGNORE INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'detected')",
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued')",
             params![
                 flow,
                 task_type,
@@ -529,17 +557,6 @@ impl StateStore {
             ],
         )?;
         Ok(())
-    }
-
-    pub fn move_detected_to_queued(&self, idempotency_key: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let changed = conn.execute(
-            "UPDATE work_items
-             SET state='queued', updated_at=strftime('%s', 'now')
-             WHERE idempotency_key = ?1 AND state = 'detected'",
-            [idempotency_key],
-        )?;
-        Ok(changed > 0)
     }
 
     pub fn mark_in_flight(&self, id: i64) -> Result<()> {
@@ -570,14 +587,7 @@ impl StateStore {
 
     pub fn set_checkpoint_u64(&self, key: &str, value: u64) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "INSERT INTO checkpoints (checkpoint_key, checkpoint_value, updated_at)
-             VALUES (?1, ?2, strftime('%s', 'now'))
-             ON CONFLICT(checkpoint_key) DO UPDATE
-               SET checkpoint_value=excluded.checkpoint_value, updated_at=excluded.updated_at",
-            params![key, value.to_string()],
-        )?;
-        Ok(())
+        write_checkpoint(&conn, key, value)
     }
 
     pub fn status(&self, filter: StateFilter) -> Result<Vec<StatusRow>> {
@@ -706,32 +716,7 @@ impl StateStore {
         compute_aggregate_stats(&conn)
     }
 
-    pub fn list_work_items(
-        &self,
-        flow: &str,
-        state: WorkState,
-        limit: usize,
-    ) -> Result<Vec<WorkItem>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {WORK_ITEM_COLUMNS}
-             FROM work_items
-             WHERE flow = ?1 AND state = ?2
-             ORDER BY created_at ASC, id ASC
-             LIMIT ?3"
-        ))?;
-        let rows = stmt.query_map(
-            params![flow, state.to_string(), limit as i64],
-            row_to_work_item,
-        )?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    /// List all non-terminal rows (state IN `queued` or `in_flight`) for the
-    /// given flow at the given pipeline step, ordered oldest-first. This is
-    /// the core query used by the step-driven bridge cycle: each stage
-    /// (S1..S4) selects its input by `step` value rather than by a
-    /// dedup-derived decision.
+    /// Rows of `flow` at `step` that are `queued` or `in_flight`, oldest first.
     pub fn list_pending_by_step(
         &self,
         flow: &str,
@@ -751,6 +736,46 @@ impl StateStore {
             row_to_work_item,
         )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_flow(&self, flow: &str) -> Result<Vec<WorkItem>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE flow = ?1"
+        ))?;
+        let rows = stmt.query_map(params![flow], row_to_work_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Item IDs of the rows whose state or step `list_flow` reads as another.
+    pub fn unreadable_rows(&self, flow: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt =
+            conn.prepare("SELECT item_id, state, step FROM work_items WHERE flow = ?1")?;
+        let rows = stmt.query_map(params![flow], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut unreadable = Vec::new();
+        for row in rows {
+            let (item_id, state, step) = row?;
+            if state.parse::<WorkState>().is_err() || step.parse::<WorkStep>().is_err() {
+                unreadable.push(item_id);
+            }
+        }
+        Ok(unreadable)
+    }
+
+    pub fn vault(&self) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(
+            conn.query_row("SELECT vault FROM schema_meta WHERE id = 1", [], |row| {
+                row.get(0)
+            })?,
+        )
     }
 
     pub fn advance_to_cl_link_created(
@@ -859,30 +884,34 @@ impl StateStore {
         Ok(())
     }
 
-    /// Terminally fail a single row with `error_class='permanent'`. Used
-    /// by the cycle for per-lock failure modes that cannot possibly succeed
-    /// on retry (malformed payload, tag-size estimation bug, or a single
-    /// proof that is structurally larger than the link tag cap).
     pub fn mark_failed_permanent(&self, id: i64, error: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "UPDATE work_items
-             SET state='failed',
-                 error_class='permanent',
-                 last_error=?2,
-                 next_retry_at=NULL,
-                 updated_at=strftime('%s', 'now')
-             WHERE id=?1",
-            params![id, error],
-        )?;
+        fail_permanently(&conn, id, error, None)?;
+        Ok(())
+    }
+
+    /// All or none, each row as it was read: one whose state or step another
+    /// writer changed since, or deleted, fails the whole mark.
+    pub fn mark_all_failed_permanent(&self, rows: &[&WorkItem], error: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        for row in rows {
+            anyhow::ensure!(
+                fail_permanently(&tx, row.id, error, Some((&row.state, &row.step)))? == 1,
+                "row {} is no longer {} at {}, or no longer in the database, so no row is marked",
+                row.item_id,
+                row.state,
+                row.step
+            );
+        }
+        tx.commit()?;
         Ok(())
     }
 
     /// Promote any `queued` rows that have already exhausted their retry
     /// budget to `failed` with `error_class='permanent'`. Intended to be
     /// called at the top of each cycle so a broken lock cannot loop
-    /// forever in a long-running session (the `recover_stale_items`
-    /// equivalent only runs on startup).
+    /// forever in a long-running session.
     pub fn fail_exhausted_queued(&self, flow: &str) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let updated = conn.execute(
@@ -900,9 +929,6 @@ impl StateStore {
 
     pub fn reset_in_flight_to_queued(&self, flow: &str, error: &str) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        // Bump attempts so the next cycle knows this lock has been tried at
-        // least once; the bridge orchestrator uses attempts > 0 as the gate
-        // for the expensive RAVE-history dedup scan.
         let updated = conn.execute(
             "UPDATE work_items
              SET state='queued',
@@ -916,6 +942,52 @@ impl StateStore {
         )?;
         Ok(updated)
     }
+}
+
+fn forget_unconfirmed_locks(conn: &Connection) -> Result<()> {
+    let earliest: Option<u64> = conn.query_row(
+        "SELECT MIN(json_extract(payload_json, '$.block_number'))
+         FROM work_items WHERE state = 'detected'",
+        [],
+        |row| row.get(0),
+    )?;
+    conn.execute("DELETE FROM work_items WHERE state = 'detected'", [])?;
+    if let Some(earliest) = earliest {
+        write_checkpoint(conn, LOCK_CHECKPOINT_KEY, earliest.saturating_sub(1))?;
+    }
+    Ok(())
+}
+
+fn fail_permanently(
+    conn: &Connection,
+    id: i64,
+    error: &str,
+    read_as: Option<(&WorkState, &WorkStep)>,
+) -> Result<usize> {
+    let (state, step) = read_as
+        .map(|(state, step)| (state.to_string(), step.to_string()))
+        .unzip();
+    Ok(conn.execute(
+        "UPDATE work_items
+         SET state='failed',
+             error_class='permanent',
+             last_error=?2,
+             next_retry_at=NULL,
+             updated_at=strftime('%s', 'now')
+         WHERE id=?1 AND (?3 IS NULL OR (state=?3 AND step=?4))",
+        params![id, error, state, step],
+    )?)
+}
+
+fn write_checkpoint(conn: &Connection, key: &str, value: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO checkpoints (checkpoint_key, checkpoint_value, updated_at)
+         VALUES (?1, ?2, strftime('%s', 'now'))
+         ON CONFLICT(checkpoint_key) DO UPDATE
+           SET checkpoint_value=excluded.checkpoint_value, updated_at=excluded.updated_at",
+        params![key, value.to_string()],
+    )?;
+    Ok(())
 }
 
 fn json_value_to_string(value: Option<&Value>) -> Option<String> {
@@ -1024,28 +1096,25 @@ fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
 
 #[cfg(test)]
 impl StateStore {
-    pub fn enqueue_queued(
+    pub fn list_work_items(
         &self,
         flow: &str,
-        task_type: &str,
-        item_id: &str,
-        idempotency_key: &str,
-        payload_json: &Value,
-    ) -> Result<()> {
+        state: WorkState,
+        limit: usize,
+    ) -> Result<Vec<WorkItem>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "INSERT OR IGNORE INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state, next_retry_at, max_attempts)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', NULL, ?6)",
-            params![
-                flow,
-                task_type,
-                item_id,
-                idempotency_key,
-                serde_json::to_string(payload_json)?,
-                DEFAULT_MAX_ATTEMPTS
-            ],
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORK_ITEM_COLUMNS}
+             FROM work_items
+             WHERE flow = ?1 AND state = ?2
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![flow, state.to_string(), limit as i64],
+            row_to_work_item,
         )?;
-        Ok(())
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn claim_next(&self, preferred_flow: Option<&str>) -> Result<Option<WorkItem>> {
@@ -1136,7 +1205,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("/tmp/bridge-orchestrator-{}-{}.db", name, ts)
+        std::env::temp_dir()
+            .join(format!("bridge-orchestrator-{name}-{ts}.db"))
+            .display()
+            .to_string()
     }
 
     fn insert_work_item_with_state(path: &str, item_id: &str, state: WorkState) {
@@ -1199,6 +1271,15 @@ mod tests {
             store.mark_in_flight(item.id).unwrap();
         }
         let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .list_work_items("lock", WorkState::InFlight, 10)
+                .unwrap()
+                .len(),
+            1,
+            "opening the store, as `status` and `clear` do, leaves a running bridge's rows alone"
+        );
+        assert_eq!(store.recover_stale_items().unwrap(), ["lock:1"]);
         let items = store
             .list_work_items("lock", WorkState::Queued, 10)
             .unwrap();
@@ -1211,53 +1292,31 @@ mod tests {
     }
 
     #[test]
-    fn recover_stale_items_bumps_attempts() {
-        // Guards the invariant that `attempts > 0` reliably means "this lock
-        // has been tried before", which is the gate the bridge orchestrator
-        // uses to decide whether to run the expensive RAVE-history dedup
-        // scan. Historically the prod binary never incremented `attempts`
-        // because the only caller lived inside `#[cfg(test)] claim_next`,
-        // so every row read 0 forever.
-        let path = test_db_path("recover-bumps-attempts");
-        let item_id = {
-            let store = StateStore::open(&path).unwrap();
-            store
-                .enqueue_queued(
-                    "lock",
-                    "create_parked_link",
-                    "lock:1",
-                    "lock:1:create_parked_link",
-                    &serde_json::json!({"lock_id":"1"}),
-                )
-                .unwrap();
-            let item = store.claim_next(Some("lock")).unwrap().unwrap();
-            assert_eq!(item.attempts, 1, "claim_next should bump attempts to 1");
-            store.mark_in_flight(item.id).unwrap();
-            item.id
-        };
+    fn a_row_a_stop_leaves_in_flight_is_queued_again_with_no_attempt_counted() {
+        let path = test_db_path("recover-counts-no-attempt");
+        StateStore::open(&path).unwrap();
+        insert_work_item_with_attempts(&path, "lock:stopped", WorkState::InFlight, 7, 8);
 
+        for _ in 0..3 {
+            let store = StateStore::open(&path).unwrap();
+            assert_eq!(store.recover_stale_items().unwrap(), ["lock:stopped"]);
+            let queued = store
+                .list_work_items("lock", WorkState::Queued, 10)
+                .unwrap();
+            assert_eq!(queued.len(), 1);
+            assert_eq!(queued[0].attempts, 7, "a stop is not an attempt");
+            assert_eq!(store.fail_exhausted_queued("lock").unwrap(), 0);
+            store.mark_in_flight(queued[0].id).unwrap();
+        }
         let store = StateStore::open(&path).unwrap();
-        let items = store
-            .list_work_items("lock", WorkState::Queued, 10)
-            .unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(
-            items[0].id, item_id,
-            "recovered item should be the same row we stashed"
-        );
-        assert_eq!(
-            items[0].attempts, 2,
-            "recover_stale_items must bump attempts so retry gate can fire"
-        );
+        assert!(store
+            .list_work_items("lock", WorkState::Failed, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn reset_in_flight_to_queued_bumps_attempts() {
-        // Per-cycle error path (as opposed to startup crash-recovery). The
-        // bridge orchestrator calls `reset_in_flight_to_queued` when a cycle
-        // fails mid-write; the next cycle uses `attempts > 0` to decide it
-        // needs to scan applied RAVE history before issuing any
-        // `create_parked_*` call, so the bump *must* happen here.
         let path = test_db_path("reset-bumps-attempts");
         let store = StateStore::open(&path).unwrap();
         store
@@ -1284,7 +1343,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(
             items[0].attempts, 2,
-            "reset_in_flight_to_queued must bump attempts so retry gate can fire"
+            "a failed cycle counts an attempt against the rows it had in flight"
         );
         assert_eq!(
             items[0].last_error.as_deref(),
@@ -1334,10 +1393,25 @@ mod tests {
     }
 
     #[test]
+    fn the_cycles_mark_takes_a_row_by_its_id_alone() {
+        let path = test_db_path("mark-failed-by-id");
+        let store = StateStore::open(&path).unwrap();
+        insert_work_item_with_state(&path, "lock:1", WorkState::Failed);
+        let id = store
+            .list_work_items("lock", WorkState::Failed, 10)
+            .unwrap()[0]
+            .id;
+
+        store.mark_failed_permanent(id, "a second reason").unwrap();
+
+        let failed = store
+            .list_work_items("lock", WorkState::Failed, 10)
+            .unwrap();
+        assert_eq!(failed[0].last_error.as_deref(), Some("a second reason"));
+    }
+
+    #[test]
     fn fail_exhausted_queued_promotes_rows_over_cap() {
-        // Per-cycle safety valve: queued rows whose `attempts` have already
-        // reached `max_attempts` must be promoted to `failed` so they don't
-        // keep re-entering the deep dedup scan every cycle.
         let path = test_db_path("fail-exhausted-over-cap");
         let store = StateStore::open(&path).unwrap();
 
@@ -1431,49 +1505,6 @@ mod tests {
             .unwrap();
         assert!(scheduled);
         assert!(store.claim_next(Some("lock")).unwrap().is_none());
-    }
-
-    #[test]
-    fn startup_recovery_marks_exhausted_as_failed() {
-        let path = test_db_path("recover-exhausted");
-        {
-            let store = StateStore::open(&path).unwrap();
-            store
-                .enqueue_queued(
-                    "lock",
-                    "create_parked_link",
-                    "lock:1",
-                    "lock:1:create_parked_link",
-                    &serde_json::json!({"lock_id":"1"}),
-                )
-                .unwrap();
-
-            for _ in 0..7 {
-                let item = store.claim_next(Some("lock")).unwrap().unwrap();
-                store.mark_in_flight(item.id).unwrap();
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
-                assert!(store.schedule_retry(item.id, "temporary", now - 1).unwrap());
-            }
-
-            let item = store.claim_next(Some("lock")).unwrap().unwrap();
-            assert_eq!(item.attempts, 8);
-            store.mark_in_flight(item.id).unwrap();
-        }
-
-        let reopened = StateStore::open(&path).unwrap();
-        let failed = reopened
-            .list_work_items("lock", WorkState::Failed, 10)
-            .unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].error_class.as_deref(), Some("permanent"));
-        assert!(failed[0]
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Exceeded max attempts during startup recovery"));
     }
 
     #[test]
@@ -2080,6 +2111,100 @@ mod tests {
     }
 
     #[test]
+    fn a_state_db_of_no_known_version_or_from_a_newer_binary_is_refused() {
+        for (version, refusal) in [
+            (0, "unsupported"),
+            (SCHEMA_VERSION + 1, "newer than binary"),
+        ] {
+            let path = test_db_path("schema-refused");
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+                     INSERT INTO schema_meta (id, version) VALUES (1, {version});"
+                ))
+                .unwrap();
+            let err = format!("{:#}", StateStore::open(&path).err().unwrap());
+            assert!(err.contains(refusal), "{err}");
+        }
+    }
+
+    const VAULT_A: &str = "0x00000000000000000000000000000000000000aa";
+    const VAULT_B: &str = "0x00000000000000000000000000000000000000bb";
+
+    #[test]
+    fn a_database_bound_to_one_vault_refuses_another() {
+        let path = test_db_path("vault-bound");
+        let store = StateStore::open(&path).unwrap();
+        store.bind_vault(VAULT_A).unwrap();
+        store.bind_vault(VAULT_A).unwrap();
+
+        let err = format!("{:#}", store.bind_vault(VAULT_B).unwrap_err());
+
+        assert!(err.contains(VAULT_A) && err.contains(VAULT_B), "{err}");
+    }
+
+    #[test]
+    fn a_bind_that_fails_leaves_every_key_and_the_database_unbound() {
+        let path = test_db_path("vault-bind-fails");
+        let store = StateStore::open(&path).unwrap();
+        insert_work_item_with_state(&path, "lock:3", WorkState::Queued);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse BEFORE UPDATE ON schema_meta
+             BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;",
+        )
+        .unwrap();
+
+        store.bind_vault(VAULT_A).unwrap_err();
+
+        let key: String = conn
+            .query_row("SELECT idempotency_key FROM work_items", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(key, "lock:3:key");
+        conn.execute_batch("DROP TRIGGER refuse").unwrap();
+        store
+            .bind_vault(VAULT_B)
+            .expect("the failed bind bound nothing");
+    }
+
+    #[test]
+    fn an_upgrade_that_cannot_move_the_checkpoint_keeps_the_detected_rows() {
+        let path = test_db_path("forget-fails");
+        let store = StateStore::open(&path).unwrap();
+        store.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 100).unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state)
+               VALUES ('lock', 'create_parked_link', 'lock:3', 'lock:3:key', '{"block_number": 90}', 'detected');
+               UPDATE schema_meta SET version = 2;
+               CREATE TRIGGER refuse BEFORE UPDATE ON checkpoints
+               BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;"#,
+        )
+        .unwrap();
+
+        assert!(StateStore::open(&path).is_err());
+
+        let detected: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_items WHERE state = 'detected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detected, 1);
+        conn.execute_batch("DROP TRIGGER refuse").unwrap();
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_checkpoint_u64(LOCK_CHECKPOINT_KEY).unwrap(),
+            Some(89)
+        );
+    }
+
+    #[test]
     fn a_state_db_whose_rows_name_no_agreement_opens_with_its_parked_rows_intact() {
         let path = test_db_path("agreement-migration");
         {
@@ -2132,6 +2257,11 @@ mod tests {
         let on_spend = pending(WorkStep::BrSpendCreated);
         assert_eq!(on_link.parked_link(), Some(("uhCkkLINK", None)));
         assert_eq!(on_spend.parked_link(), Some(("uhCkkSPEND", None)));
+        let version: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
 
         store.record_parked_agreement(on_link.id, CL_EA).unwrap();
         store.record_parked_agreement(on_spend.id, BR_EA).unwrap();

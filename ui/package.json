@@ -26,6 +26,7 @@
 		"eslint-plugin-svelte": "^2.35.1",
 		"flowbite": "^2.3.0",
 		"flowbite-svelte": "^0.45.0",
+		"jsdom": "^26.1.0",
 		"postcss": "^8.4.32",
 		"postcss-load-config": "^5.0.2",
 		"prettier": "^3.1.1",
