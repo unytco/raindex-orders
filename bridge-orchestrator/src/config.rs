@@ -688,11 +688,6 @@ fn hot_unit_index(setting: impl Fn(&str) -> Option<String>) -> Result<u32> {
         .context("Invalid HOT_UNIT_INDEX")
 }
 
-/// Strip a single leading `u` multibase prefix (base64url) so the reporter's
-/// stored DNA matches the 52-char form the Holochain observer uses across
-/// the rest of the Watchtower schema. Both forms encode the same hash;
-/// normalizing here keeps wire payloads, D1 rows, and URLs aligned
-/// regardless of what the operator pastes into `WATCHTOWER_DNA_B64`.
 pub fn require_durable_conductor(conductor_config: &str) -> Result<()> {
     let level = ConductorConfig::load_yaml(Path::new(conductor_config))
         .map_err(|_| {
@@ -708,6 +703,11 @@ pub fn require_durable_conductor(conductor_config: &str) -> Result<()> {
     Ok(())
 }
 
+/// Strip a single leading `u` multibase prefix (base64url) so the reporter's
+/// stored DNA matches the 52-char form the Holochain observer uses across
+/// the rest of the Watchtower schema. Both forms encode the same hash;
+/// normalizing here keeps wire payloads, D1 rows, and URLs aligned
+/// regardless of what the operator pastes into `WATCHTOWER_DNA_B64`.
 fn normalize_dna_b64(raw: &str) -> String {
     raw.strip_prefix('u').unwrap_or(raw).to_string()
 }
