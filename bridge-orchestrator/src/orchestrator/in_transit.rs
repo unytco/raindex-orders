@@ -24,6 +24,7 @@ enum InTransit {
     Row {
         item_id: String,
         lock_id: Option<String>,
+        state: WorkState,
         step: WorkStep,
         link: Option<String>,
     },
@@ -218,18 +219,19 @@ impl BridgeOrchestrator {
         let mut unmarked = Vec::new();
         let mut unmatchable = Vec::new();
         for (row, lock) in pending {
-            let waits_on_its_link =
-                matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated);
-            if waits_on_its_link {
+            let in_transit = matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated)
+                || matches!(row.state, WorkState::InFlight | WorkState::Claimed);
+            if in_transit {
                 listed.push(InTransit::Row {
                     item_id: row.item_id.clone(),
                     lock_id: lock.as_ref().map(|lock| lock.lock_id.clone()),
+                    state: row.state.clone(),
                     step: row.step.clone(),
                     link: row.parked_link().map(|(link, _)| link.to_string()),
                 });
             }
             match lock {
-                _ if waits_on_its_link => {
+                _ if in_transit => {
                     rows.insert(row.id, row.item_id);
                 }
                 Some(lock) if carried.contains(&lock) => {

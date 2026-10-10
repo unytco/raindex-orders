@@ -115,13 +115,15 @@ It prints one JSON object per line:
 
 | `kind` | What is in transit | Fields |
 |--------|--------------------|--------|
-| `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created` | `item_id`, `lock_id`, `step`, `link` |
+| `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created`, or a row `in_flight` or `claimed` at any step | `item_id`, `lock_id`, `state`, `step`, `link` |
 | `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the credit-limit adjustment agreement or the bridging agreement of its lane in force | `agreement`, `link`, `lock_ids` |
 | `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address` |
 
 `lock_id` is `null` for a row whose payload cannot be read, `link` for one that
 records none, and `withdraw_to_address` for a withdrawal that names none, which
-no coupon can pay. `amount` is the spend's unit map, its HOT under
+no coupon can pay. A row `in_flight` or `claimed` had a write that may or may
+not have reached the conductor: a start of the orchestrator queues it again,
+and its reconcile settles it. `amount` is the spend's unit map, its HOT under
 `HOT_UNIT_INDEX`. A `failed` row is not listed, and nor is another agent's spend
 in the `bridging_agent` role or a spend in any other role: no cycle takes them.
 Log lines go to stdout too, and never start with `{`.
@@ -139,8 +141,9 @@ all of them in one transaction, or none, and changes no other row. It exits 0
 only when it read the database and the conductor and marked them. It marks none,
 and fails, when it cannot tell which rows a listed link carries: when a proof in
 it names the lock ID or the transaction of a row it would not otherwise mark,
-neither `succeeded` nor `failed`, without naming both, or when a row at `new` or
-`cl_rave_executed` has a lock it cannot read while a listed link carries any.
+neither `succeeded` nor `failed`, without naming both, or when a `queued` row at
+`new` or `cl_rave_executed` has a lock it cannot read while a listed link
+carries any.
 The next cycle of `run` fails such a row for a person. A lock in a
 listed link whose row is already `succeeded` or `failed`, a lock with no row,
 and a withdrawal are recorded only in what it prints.

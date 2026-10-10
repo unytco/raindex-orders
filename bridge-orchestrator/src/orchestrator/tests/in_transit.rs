@@ -103,12 +103,17 @@ fn spend_as(mut spend: Transaction, role: &str, payload: Value) -> Transaction {
 }
 
 fn listed_row(lock: &str, step: &str, link: u8) -> Value {
+    listed_row_in("queued", lock, step, Some(link))
+}
+
+fn listed_row_in(state: &str, lock: &str, step: &str, link: Option<u8>) -> Value {
     json!({
         "kind": "row",
         "item_id": lock,
         "lock_id": lock,
+        "state": state,
         "step": step,
-        "link": action_hash(link).to_string(),
+        "link": link.map(|link| action_hash(link).to_string()),
     })
 }
 
@@ -198,8 +203,8 @@ async fn a_row_waiting_on_its_link_is_in_transit_in_any_pending_state_until_it_i
         &[
             listed_row("lock:waits:1", "cl_link_created", 0x61),
             listed_row("lock:waits:2", "br_spend_created", 0x62),
-            listed_row("lock:waits:3", "cl_link_created", 0x63),
-            listed_row("lock:waits:4", "br_spend_created", 0x64),
+            listed_row_in("in_flight", "lock:waits:3", "cl_link_created", Some(0x63)),
+            listed_row_in("claimed", "lock:waits:4", "br_spend_created", Some(0x64)),
         ],
     );
     checked.exit.expect_err("rows in transit");
@@ -212,6 +217,37 @@ async fn a_row_waiting_on_its_link_is_in_transit_in_any_pending_state_until_it_i
     let checked = check(&orch, &bridging_conductor(), false).await.unwrap();
     assert_lists(&checked.listed, &[]);
     checked.exit.unwrap();
+}
+
+#[tokio::test]
+async fn a_row_a_write_was_in_flight_for_is_in_transit_at_any_step() {
+    let orch = test_orchestrator("in-transit-interrupted");
+    let rows = [
+        enqueue_lock(&orch, "lock:interrupted:1", "0xee"),
+        enqueue_at_cl_rave_executed(&orch, "lock:interrupted:2", "0xef"),
+    ];
+    set_state(&orch, rows[0], "in_flight");
+    set_state(&orch, rows[1], "claimed");
+    let expected = [
+        listed_row_in("in_flight", "lock:interrupted:1", "new", None),
+        listed_row_in("claimed", "lock:interrupted:2", "cl_rave_executed", None),
+    ];
+
+    let checked = check(&orch, &bridging_conductor(), false).await.unwrap();
+    assert_lists(&checked.listed, &expected);
+    checked
+        .exit
+        .expect_err("a write may have reached the conductor");
+
+    let checked = check(&orch, &bridging_conductor(), true).await.unwrap();
+    assert_lists(&checked.listed, &expected);
+    checked.exit.unwrap();
+    for id in rows {
+        assert_eq!(
+            failed_row(&orch, id).last_error.as_deref(),
+            Some(PAID_BY_HAND)
+        );
+    }
 }
 
 #[tokio::test]
@@ -405,6 +441,7 @@ async fn mark_failed_fails_each_row_in_transit_and_changes_no_other() {
     let rows = [
         listed_row("lock:mark:1", "cl_link_created", 0x70),
         listed_row("lock:mark:2", "br_spend_created", 0x71),
+        listed_row_in("in_flight", "lock:mark:3", "new", None),
     ];
     assert_lists(&checked.listed, &[&rows[..], &links].concat());
     checked.exit.unwrap();
