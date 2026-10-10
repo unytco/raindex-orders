@@ -24,6 +24,17 @@ const READS: Record<string, unknown> = {
 const PAUSED: Answer = async () => Response.json({ paused: true })
 const OPEN: Answer = async () => Response.json({ paused: false })
 const UNREACHABLE: Answer = async () => Promise.reject(new TypeError('fetch failed'))
+const FAILURES: [string, Answer][] = [
+	['cannot be reached', UNREACHABLE],
+	[
+		'answers an error, even one reading not paused',
+		async () => Response.json({ paused: false }, { status: 502 })
+	],
+	['answers no JSON', async () => new Response('<html>', { status: 200 })],
+	['answers null', async () => Response.json(null)],
+	['answers no status', async () => Response.json({})],
+	['answers something else', async () => Response.json({ paused: 'no' })]
+]
 
 let reads: Record<string, unknown>
 const wallet = {
@@ -40,6 +51,7 @@ beforeEach(() => {
 	target = document.body.appendChild(document.createElement('div'))
 })
 afterEach(() => {
+	vi.useRealTimers()
 	page?.$destroy()
 	target.remove()
 	vi.unstubAllGlobals()
@@ -79,8 +91,11 @@ function type(selector: string, value: string) {
 const button = (label: string) =>
 	[...target.querySelectorAll('button')].find(b => b.textContent?.includes(label))
 
+// Each page is imported afresh, which a loaded machine can slow past waitFor's 1 s default.
+const until = (assertion: () => void) => vi.waitFor(assertion, { timeout: 5_000 })
+
 async function click(label: string) {
-	await vi.waitFor(() => {
+	await until(() => {
 		expect(button(label)?.disabled).toBe(false)
 		button(label)!.click()
 	})
@@ -103,49 +118,66 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network =>
 
 		await lock(network)
 
-		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
+		await until(() => expect(shown()).toContain(PAUSED_TEXT))
 		expect(target.querySelector('a[href="mailto:info@unyt.co"]')).not.toBeNull()
 		expect(fetch).toHaveBeenCalledWith('/api/status', expect.anything())
 		expect(wallet.writeContract).not.toHaveBeenCalled()
 	})
 
-	it.each([
-		['cannot be reached', UNREACHABLE],
-		[
-			'answers an error, even one reading not paused',
-			async () => Response.json({ paused: false }, { status: 502 })
-		],
-		['answers no JSON', async () => new Response('<html>', { status: 200 })],
-		['answers null', async () => Response.json(null)],
-		['answers no status', async () => Response.json({})],
-		['answers something else', async () => Response.json({ paused: 'no' })]
-	])('sends nothing, and shows an error, when /api/status %s', async (_, answer) => {
-		stubFetch(answer as Answer)
+	it.each(FAILURES)('sends nothing, and shows an error, when /api/status %s', async (_, answer) => {
+		stubFetch(answer)
 
 		await lock(network)
 
-		await vi.waitFor(() => expect(shown()).toContain(STATUS_FAILED))
+		await until(() => expect(shown()).toContain(STATUS_FAILED))
 		expect(shown()).not.toContain(PAUSED_TEXT)
 		expect(button('Lock')?.disabled).toBe(false)
 		expect(wallet.writeContract).not.toHaveBeenCalled()
 	})
 
+	it.each(FAILURES)(
+		'sends no lock after its approve, and shows an error, when /api/status then %s',
+		async (_, answer) => {
+			reads.allowance = 0n
+			stubFetch(OPEN, answer)
+
+			await lock(network)
+
+			await until(() => expect(shown()).toContain(STATUS_FAILED))
+			expect(written()).toEqual(['approve'])
+			expect(button('Lock')?.disabled).toBe(false)
+		}
+	)
+
 	it('gives up on a read that never answers, and sends nothing', async () => {
-		const timeout = new AbortController()
-		const timer = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal)
 		const fetch = stubFetch(
 			(_, init) =>
 				new Promise((_, reject) =>
-					init.signal!.addEventListener('abort', () => reject(init.signal!.reason))
+					init.signal?.addEventListener('abort', () =>
+						reject(new DOMException('Aborted', 'AbortError'))
+					)
 				)
 		)
+		await mount(network, './lock/+page.svelte')
+		type('#amount', '5')
+		type('#agent', AGENT)
+		await until(() => expect(button('Lock')?.disabled).toBe(false))
+		// Fake timers make waitFor advance the clock on each poll, so the clock moves by hand.
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
 
-		await lock(network)
-		await vi.waitFor(() => expect(fetch).toHaveBeenCalled())
-		timeout.abort(new DOMException('The operation timed out.', 'TimeoutError'))
+		button('Lock')!.click()
+		await vi.advanceTimersByTimeAsync(STATUS_TIMEOUT_MS - 1)
 
-		await vi.waitFor(() => expect(shown()).toContain(STATUS_FAILED))
-		expect(timer).toHaveBeenCalledWith(STATUS_TIMEOUT_MS)
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/status',
+			expect.objectContaining({ signal: expect.any(AbortSignal) })
+		)
+		expect(shown()).not.toContain(STATUS_FAILED)
+		expect(button('Lock')?.disabled).toBe(true)
+
+		await vi.advanceTimersByTimeAsync(1)
+
+		await until(() => expect(shown()).toContain(STATUS_FAILED))
 		expect(button('Lock')?.disabled).toBe(false)
 		expect(wallet.writeContract).not.toHaveBeenCalled()
 	})
@@ -155,7 +187,7 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network =>
 
 		await lock(network)
 
-		await vi.waitFor(() => expect(written()).toEqual(['lock']))
+		await until(() => expect(written()).toEqual(['lock']))
 		expect(order(fetch)[0]).toBeLessThan(order(wallet.writeContract)[0])
 	})
 
@@ -165,7 +197,7 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network =>
 
 		await lock(network)
 
-		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
+		await until(() => expect(shown()).toContain(PAUSED_TEXT))
 		expect(wallet.writeContract).not.toHaveBeenCalled()
 	})
 
@@ -175,33 +207,48 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network =>
 
 		await lock(network)
 
-		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
+		await until(() => expect(shown()).toContain(PAUSED_TEXT))
 		expect(written()).toEqual(['approve'])
 		expect(order(fetch)[0]).toBeLessThan(order(wallet.writeContract)[0])
-		expect(order(fetch)[1]).toBeGreaterThan(order(wallet.writeContract)[0])
+		expect(order(fetch)[1]).toBeGreaterThan(order(wallet.waitForTransaction)[0])
+		expect(shown()).not.toContain('Confirming transaction')
+		expect(shown()).not.toContain('Waiting for your manual confirmation')
+		expect(button('Lock')?.disabled).toBe(false)
 	})
 
 	it('shows an error, not the stop text, when a retry after a pause cannot read the status', async () => {
 		stubFetch(PAUSED, UNREACHABLE)
 		await lock(network)
-		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
+		await until(() => expect(shown()).toContain(PAUSED_TEXT))
 
 		await click('Lock')
 
-		await vi.waitFor(() => expect(shown()).toContain(STATUS_FAILED))
+		await until(() => expect(shown()).toContain(STATUS_FAILED))
 		expect(shown()).not.toContain(PAUSED_TEXT)
 		expect(wallet.writeContract).not.toHaveBeenCalled()
+	})
+
+	it('clears an old error once a retry reads the bridge open', async () => {
+		stubFetch(UNREACHABLE, OPEN)
+		wallet.writeContract.mockImplementationOnce(() => new Promise<string>(() => {}))
+		await lock(network)
+		await until(() => expect(shown()).toContain(STATUS_FAILED))
+
+		await click('Lock')
+
+		await until(() => expect(written()).toEqual(['lock']))
+		expect(shown()).not.toContain(STATUS_FAILED)
 	})
 
 	it('shows a later input error in place of the stop text', async () => {
 		stubFetch(PAUSED)
 		await lock(network)
-		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
+		await until(() => expect(shown()).toContain(PAUSED_TEXT))
 
 		type('#amount', '1.1234567')
 		await click('Lock')
 
-		await vi.waitFor(() => expect(shown()).toContain('at most 6 decimal places'))
+		await until(() => expect(shown()).toContain('at most 6 decimal places'))
 		expect(shown()).not.toContain(PAUSED_TEXT)
 	})
 })
@@ -214,7 +261,7 @@ describe('Claim', () => {
 		type('#coupon', SEPOLIA_REDEEMED[0].coupon)
 		await click('Claim')
 
-		await vi.waitFor(() => expect(written()).toEqual(['takeOrders']))
+		await until(() => expect(written()).toEqual(['takeOrders']))
 		expect(fetch).not.toHaveBeenCalled()
 	})
 })
