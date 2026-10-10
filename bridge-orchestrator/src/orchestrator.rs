@@ -1472,17 +1472,20 @@ impl BridgeOrchestrator {
                     accounted.push(link);
                     continue;
                 }
-                Some(Gap::Unrecorded(why)) if !deferred_before.contains(&id) => {
-                    warn!(
-                        event = "bridge.rave.link_deferred",
-                        link = id,
-                        reason = why,
-                        "[bridge/{stage}] link {id} waits a cycle for its rows to record it: {why}"
-                    );
-                    deferring.insert(id);
-                    continue;
+                Some(Gap::Unrecorded(why)) => {
+                    deferring.insert(id.clone());
+                    if !deferred_before.contains(&id) {
+                        warn!(
+                            event = "bridge.rave.link_deferred",
+                            link = id,
+                            reason = why,
+                            "[bridge/{stage}] link {id} waits a cycle for its rows to record it: {why}"
+                        );
+                        continue;
+                    }
+                    why
                 }
-                Some(Gap::Unrecorded(why) | Gap::Conflict(why)) => why,
+                Some(Gap::Conflict(why)) => why,
             };
             error!(
                 event = "bridge.rave.link_withheld",
@@ -6213,6 +6216,19 @@ mod tests {
                     let reason = failed_row(&orch, rows[0]).last_error.unwrap();
                     assert!(reason.contains(&shared.id.to_string()), "{reason}");
                     assert!(reason.contains(second), "{reason}");
+
+                    rusqlite::Connection::open(&orch.cfg.db_path)
+                        .unwrap()
+                        .execute(
+                            "UPDATE work_items SET state = 'queued', last_error = NULL WHERE id = ?1",
+                            [rows[0]],
+                        )
+                        .unwrap();
+                    orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+                    assert!(
+                        failed_row(&orch, rows[0]).last_error.is_some(),
+                        "a link still short a cycle later is withheld on every cycle after"
+                    );
                 }
             }
         }
