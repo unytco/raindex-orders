@@ -20,18 +20,21 @@ use rave_engine::types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use zfuel::fuel::ZFuel;
 
 const BRIDGING_AGENT_ROLE: &str = "bridging_agent";
 const ORACLE_ROLE: &str = "oracle";
+const WITHDRAWER_ROLE: &str = "withdrawer";
 
 pub struct BridgeOrchestrator {
     cfg: Config,
     db: StateStore,
     reporter: ReporterState,
     ethereum: Option<EthereumSide>,
+    skipped_spends_logged: Mutex<HashSet<String>>,
 }
 
 pub struct EthereumSide {
@@ -100,6 +103,7 @@ struct BridgingSelection {
     coupons: serde_json::Map<String, Value>,
     coupon_bytes: usize,
     withdrawals_found: usize,
+    skipped: Vec<Transaction>,
 }
 
 /// Lock proofs are public, and any agent may park a link carrying a copy of one
@@ -122,18 +126,27 @@ async fn select_bridging_links(
         coupons: serde_json::Map::new(),
         coupon_bytes: 0,
         withdrawals_found: 0,
+        skipped: Vec::new(),
     };
     let mut withdrawal_capped = false;
 
     for tx in bridging_links {
         let TransactionDetails::ParkedSpend {
-            attached_payload, ..
+            ct_role_id,
+            attached_payload,
+            ..
         } = &tx.details
         else {
             continue;
         };
         if parked_by(tx, bridging_agent) && attached_payload.get("proof_of_deposit").is_some() {
             selection.deposits.push(tx.clone());
+            continue;
+        }
+        // The template pays only `withdrawer` links as withdrawals, so a coupon
+        // for any other role would be published without its spend being taken.
+        if ct_role_id != WITHDRAWER_ROLE {
+            selection.skipped.push(tx.clone());
             continue;
         }
         let Some(withdraw_to) = attached_payload
@@ -198,6 +211,20 @@ async fn select_bridging_links(
     Ok(selection)
 }
 
+/// The skipped spends not logged before. Those no longer parked are forgotten,
+/// so the set never outgrows what is parked.
+fn first_seen<'a>(
+    logged: &mut HashSet<String>,
+    skipped: &'a [Transaction],
+) -> Vec<&'a Transaction> {
+    let parked: HashSet<String> = skipped.iter().map(|tx| tx.id.to_string()).collect();
+    logged.retain(|id| parked.contains(id));
+    skipped
+        .iter()
+        .filter(|tx| logged.insert(tx.id.to_string()))
+        .collect()
+}
+
 impl BridgeOrchestrator {
     pub fn new(cfg: Config, ethereum: Option<EthereumSide>) -> Result<Self> {
         let db = StateStore::open(&cfg.db_path)?;
@@ -207,6 +234,7 @@ impl BridgeOrchestrator {
             db,
             reporter,
             ethereum,
+            skipped_spends_logged: Mutex::default(),
         })
     }
 
@@ -246,6 +274,21 @@ impl BridgeOrchestrator {
         self.reporter.update(|h| {
             h.stage_ejections_total = h.stage_ejections_total.saturating_add(1);
         });
+    }
+
+    fn log_skipped_spends(&self, skipped: &[Transaction]) {
+        let mut logged = self
+            .skipped_spends_logged
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for tx in first_seen(&mut logged, skipped) {
+            warn!(
+                event = "bridge.spend_skipped",
+                "[bridge/s4] spend {} parked by {} stays parked: it is neither the bridging agent's deposit nor a withdrawer's withdrawal",
+                tx.id,
+                tx.creator
+            );
+        }
     }
 
     /// `None` means the read was slow enough to eject the stage before the
@@ -997,6 +1040,7 @@ impl BridgeOrchestrator {
             coupons: mut coupons_map,
             coupon_bytes: coupon_cumulative_bytes,
             withdrawals_found: total_withdrawals_found,
+            skipped: skipped_spends,
         } = select_bridging_links(
             self.ethereum.as_ref().map(|side| &side.signer),
             &self.cfg.bridging_agent_pubkey,
@@ -1005,6 +1049,7 @@ impl BridgeOrchestrator {
             self.cfg.hot_unit_index,
         )
         .await?;
+        self.log_skipped_spends(&skipped_spends);
 
         // Build the pooled RAVE link Vec (deposits first, then selected
         // withdrawals) before applying the optional per-cycle cap. The
@@ -2300,6 +2345,7 @@ mod tests {
             cfg: test_config(path),
             db,
             reporter: ReporterState::new(),
+            skipped_spends_logged: Mutex::default(),
             ethereum: Some(EthereumSide {
                 chain: Ethereum {
                     network: Network::Sepolia,
@@ -4249,14 +4295,10 @@ mod tests {
             *ct_role_id = BRIDGING_AGENT_ROLE.to_string();
         }
 
-        let counts = reconcile(&orch, &[], std::slice::from_ref(&spoof)).await;
-        let selection = select_bridging_links(None, &agent_key(BRIDGE), &[spoof], usize::MAX, 1)
-            .await
-            .unwrap();
+        let counts = reconcile(&orch, &[], &[spoof]).await;
 
         assert_eq!(counts.s3_advanced, 0);
         assert_eq!(lock_row(&orch, victim).br_spend_hash, None);
-        assert!(selection.deposits.is_empty());
     }
 
     #[tokio::test]
@@ -5398,6 +5440,63 @@ mod tests {
         assert_eq!(ids(&selection.deposits), ids(&[own]));
         assert_eq!(ids(&selection.withdrawals), ids(&foreign));
         assert_eq!(selection.coupons.len(), foreign.len());
+    }
+
+    #[tokio::test]
+    async fn a_foreign_bridging_agent_spend_crediting_itself_gets_no_coupon_and_is_no_deposit() {
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
+        let mut spoof = foreign_spend_tx(0xA1, "0xd7");
+        if let TransactionDetails::ParkedSpend {
+            ct_role_id,
+            attached_payload,
+            ..
+        } = &mut spoof.details
+        {
+            *ct_role_id = BRIDGING_AGENT_ROLE.to_string();
+            *attached_payload = json!({
+                "withdraw_to_address": format!("{:#x}", Address::repeat_byte(0xA1)),
+                "proof_of_deposit": [{
+                    "method": "deposit",
+                    "contract_address": format!("{VAULT:#x}"),
+                    "amount": "5",
+                    "depositor_wallet_address": agent_key(STRANGER).to_string(),
+                    "lock_id": "lock:forged",
+                    "tx_hash": "0xd7",
+                }],
+            });
+        }
+
+        let selection = select_bridging_links(
+            Some(&signer),
+            &agent_key(BRIDGE),
+            std::slice::from_ref(&spoof),
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert!(selection.deposits.is_empty());
+        assert!(selection.withdrawals.is_empty());
+        assert!(selection.coupons.is_empty());
+        assert_eq!(ids(&selection.skipped), ids(&[spoof]));
+    }
+
+    #[test]
+    fn a_skipped_spend_is_logged_once_while_it_stays_parked() {
+        let (a, b) = (foreign_spend_tx(0xA2, ""), foreign_spend_tx(0xA3, ""));
+        let mut logged = HashSet::new();
+        let mut cycle = |skipped: &[Transaction]| -> Vec<String> {
+            first_seen(&mut logged, skipped)
+                .into_iter()
+                .map(|tx| tx.id.to_string())
+                .collect()
+        };
+
+        assert_eq!(cycle(&[a.clone(), b.clone()]), ids(&[a.clone(), b.clone()]));
+        assert_eq!(cycle(&[a.clone(), b.clone()]), Vec::<String>::new());
+        assert_eq!(cycle(std::slice::from_ref(&b)), Vec::<String>::new());
+        assert_eq!(cycle(&[a.clone(), b]), ids(&[a]));
     }
 
     #[tokio::test]

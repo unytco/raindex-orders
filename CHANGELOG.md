@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- bridge-orchestrator keeps bridging deposits when another agent parks a link carrying a copy of a deposit's proof.
+- bridge-orchestrator keeps bridging deposits when another agent parks a link carrying a copy of a deposit's proof, and pays only `withdrawer` spends as withdrawals.
 
 ## [0.3.0] - 2026-10-06
 
