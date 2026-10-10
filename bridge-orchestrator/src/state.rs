@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 /// In the order [`row_to_work_item`] reads them.
 const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id";
 #[cfg(test)]
@@ -412,7 +412,7 @@ impl StateStore {
                     [SCHEMA_VERSION],
                 )?;
             }
-            Some(v) if v == SCHEMA_VERSION => {}
+            Some(v) if (1..=SCHEMA_VERSION).contains(&v) => {}
             Some(v) if v > SCHEMA_VERSION => {
                 anyhow::bail!(
                     "database schema version {} is newer than binary version {}",
@@ -450,6 +450,17 @@ impl StateStore {
             [],
         )?;
         self.ensure_work_item_columns(&conn)?;
+        let meta_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(schema_meta)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        if !meta_columns.iter().any(|column| column == "vault") {
+            conn.execute("ALTER TABLE schema_meta ADD COLUMN vault TEXT", [])?;
+        }
+        conn.execute(
+            "UPDATE schema_meta SET version = ?1 WHERE id = 1",
+            [SCHEMA_VERSION],
+        )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_work_items_state_created ON work_items(state, created_at)",
             [],
@@ -492,6 +503,33 @@ impl StateStore {
             [],
         )?;
         Ok(recovered)
+    }
+
+    pub fn bind_vault(&self, vault: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let bound: Option<String> =
+            tx.query_row("SELECT vault FROM schema_meta WHERE id = 1", [], |row| {
+                row.get(0)
+            })?;
+        match bound {
+            Some(bound) if bound == vault => {}
+            Some(bound) => anyhow::bail!(
+                "{} serves vault {bound}, and vault {vault} is configured",
+                self.path.display()
+            ),
+            None => {
+                tx.execute(
+                    "UPDATE work_items
+                     SET idempotency_key = 'lock:' || ?1 || ':' || substr(idempotency_key, 6)
+                     WHERE flow = 'lock' AND idempotency_key NOT LIKE 'lock:0x%'",
+                    [vault],
+                )?;
+                tx.execute("UPDATE schema_meta SET vault = ?1 WHERE id = 1", [vault])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn enqueue_detected(
@@ -2011,6 +2049,66 @@ mod tests {
     }
 
     #[test]
+    fn a_state_db_of_no_known_version_or_from_a_newer_binary_is_refused() {
+        for (version, refusal) in [
+            (0, "unsupported"),
+            (SCHEMA_VERSION + 1, "newer than binary"),
+        ] {
+            let path = test_db_path("schema-refused");
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+                     INSERT INTO schema_meta (id, version) VALUES (1, {version});"
+                ))
+                .unwrap();
+            let err = format!("{:#}", StateStore::open(&path).err().unwrap());
+            assert!(err.contains(refusal), "{err}");
+        }
+    }
+
+    const VAULT_A: &str = "0x00000000000000000000000000000000000000aa";
+    const VAULT_B: &str = "0x00000000000000000000000000000000000000bb";
+
+    #[test]
+    fn a_database_bound_to_one_vault_refuses_another() {
+        let path = test_db_path("vault-bound");
+        let store = StateStore::open(&path).unwrap();
+        store.bind_vault(VAULT_A).unwrap();
+        store.bind_vault(VAULT_A).unwrap();
+
+        let err = format!("{:#}", store.bind_vault(VAULT_B).unwrap_err());
+
+        assert!(err.contains(VAULT_A) && err.contains(VAULT_B), "{err}");
+    }
+
+    #[test]
+    fn a_bind_that_fails_leaves_every_key_and_the_database_unbound() {
+        let path = test_db_path("vault-bind-fails");
+        let store = StateStore::open(&path).unwrap();
+        insert_work_item_with_state(&path, "lock:3", WorkState::Queued);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse BEFORE UPDATE ON schema_meta
+             BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;",
+        )
+        .unwrap();
+
+        store.bind_vault(VAULT_A).unwrap_err();
+
+        let key: String = conn
+            .query_row("SELECT idempotency_key FROM work_items", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(key, "lock:3:key");
+        conn.execute_batch("DROP TRIGGER refuse").unwrap();
+        store
+            .bind_vault(VAULT_B)
+            .expect("the failed bind bound nothing");
+    }
+
+    #[test]
     fn a_state_db_whose_rows_name_no_agreement_opens_with_its_parked_rows_intact() {
         let path = test_db_path("agreement-migration");
         {
@@ -2063,6 +2161,11 @@ mod tests {
         let on_spend = pending(WorkStep::BrSpendCreated);
         assert_eq!(on_link.parked_link(), Some(("uhCkkLINK", None)));
         assert_eq!(on_spend.parked_link(), Some(("uhCkkSPEND", None)));
+        let version: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
 
         store.record_parked_agreement(on_link.id, CL_EA).unwrap();
         store.record_parked_agreement(on_spend.id, BR_EA).unwrap();
