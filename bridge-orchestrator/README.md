@@ -42,7 +42,10 @@ refuses to start, naming each variable at fault, when:
   `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
 
 An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
-its supervisor restarts it. Once the checks pass it logs
+its supervisor restarts it. So does a conductor config, at `CONDUCTOR_CONFIG`,
+that does not set `db_sync_level: Full`, which `run` checks first, with
+Ethereum on or off: without it a power loss can roll back the conductor's
+latest writes behind what the bridge has recorded. Once the checks pass it logs
 `startup checks passed`.
 
 `NETWORK=none` turns Ethereum off, for a node with no chain such as a local
@@ -351,8 +354,10 @@ systemctl start bridge-orchestrator
 ```
 
 Add `AND id IN (...)` to target specific rows. `attempts` must be under
-`max_attempts` or the cycle skips the row. Rows left `claimed` or `in_flight`
-need no action — startup re-queues those on its own.
+`max_attempts` or the next cycle fails it again. Leave a row whose `last_error`
+ends `resolve by hand` failed: re-queued unchanged it fails again.
+Check by hand whether its depositor was credited, and credit it by hand if not.
+Rows left `claimed` or `in_flight` need no action: startup re-queues them.
 
 ### systemd service management
 
@@ -417,3 +422,10 @@ detected ─> queued ─> claimed ─> in_flight ─┬─> succeeded
 On startup, every item a stop or a crash left `claimed` or `in_flight` goes
 back to `queued` with its attempts unchanged. Only a failed cycle counts an
 attempt, against the items it had in flight.
+
+S2 and S4 give the RAVE a deposit link only when the row of every lock it
+carries records exactly that link. A link whose only gap is rows that record
+no link yet waits one cycle for reconcile to record them
+(`bridge.rave.link_deferred`). Any other deposit link, or one still short a
+cycle later, stays parked, `bridge.rave.link_withheld` logs it with the reason,
+and each row that records it is failed for a person.

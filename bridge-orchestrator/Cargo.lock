@@ -1203,6 +1203,7 @@ dependencies = [
  "hmac",
  "holo_hash",
  "holochain_client",
+ "holochain_conductor_api",
  "holochain_zome_types",
  "rave_engine",
  "reqwest",

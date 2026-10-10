@@ -735,6 +735,16 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Every row of `flow`, in any state.
+    pub fn list_flow(&self, flow: &str) -> Result<Vec<WorkItem>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE flow = ?1"
+        ))?;
+        let rows = stmt.query_map(params![flow], row_to_work_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn advance_to_cl_link_created(
         &self,
         id: i64,

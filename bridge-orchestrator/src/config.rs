@@ -1,7 +1,9 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use holo_hash::AgentPubKeyB64;
+use holochain_conductor_api::config::conductor::{ConductorConfig, DbSyncLevel};
 use std::env;
+use std::path::Path;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -686,6 +688,21 @@ fn hot_unit_index(setting: impl Fn(&str) -> Option<String>) -> Result<u32> {
         .context("Invalid HOT_UNIT_INDEX")
 }
 
+pub fn require_durable_conductor(conductor_config: &str) -> Result<()> {
+    let level = ConductorConfig::load_yaml(Path::new(conductor_config))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "CONDUCTOR_CONFIG {conductor_config} is not a conductor config this build can read"
+            )
+        })?
+        .db_sync_level;
+    anyhow::ensure!(
+        level == DbSyncLevel::Full,
+        "CONDUCTOR_CONFIG {conductor_config} sets db_sync_level {level:?}: the bridging node's conductor must set `db_sync_level: Full`, or a power loss can roll back writes the bridge has recorded"
+    );
+    Ok(())
+}
+
 /// Strip a single leading `u` multibase prefix (base64url) so the reporter's
 /// stored DNA matches the 52-char form the Holochain observer uses across
 /// the rest of the Watchtower schema. Both forms encode the same hash;
@@ -977,6 +994,39 @@ mod tests {
             normalize_dna_b64("hC0kYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj"),
             "hC0kYoBhEs3GyOWslej78VfMRmSSdc2TXsRQmqFn5b3v8jl58Kkj"
         );
+    }
+
+    fn conductor_config(text: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conductor-config.yaml");
+        std::fs::write(&path, text).unwrap();
+        (dir, path.display().to_string())
+    }
+
+    const LAIR: &str = "keystore:\n  type: lair_server\n  connection_url: unix:///x/socket?k=abc\n";
+
+    #[test]
+    fn a_conductor_that_syncs_every_write_is_durable() {
+        let (_dir, path) = conductor_config(&format!("{LAIR}db_sync_level: Full\n"));
+        require_durable_conductor(&path).expect("Full survives a power loss");
+    }
+
+    #[test]
+    fn a_conductor_at_holochains_default_sync_level_is_refused() {
+        for level in ["", "db_sync_level: Normal\n", "db_sync_level: Off\n"] {
+            let (_dir, path) = conductor_config(&format!("{LAIR}{level}"));
+            let err = format!("{:#}", require_durable_conductor(&path).unwrap_err());
+            assert!(err.contains("must set `db_sync_level: Full`"), "{err}");
+            assert!(err.contains(&path), "{err}");
+        }
+    }
+
+    #[test]
+    fn what_is_not_a_conductor_config_is_refused_without_its_content() {
+        let (_dir, path) = conductor_config("s3cr3t: x\n");
+        let err = format!("{:#}", require_durable_conductor(&path).unwrap_err());
+        assert!(err.contains("is not a conductor config"), "{err}");
+        assert!(!err.contains("s3cr3t"), "{err}");
     }
 
     #[test]
