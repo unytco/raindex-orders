@@ -239,11 +239,20 @@ dropped socket cannot cause a write to be replayed mid-cycle.
 
 ### Graceful shutdown
 
-`bridge-orchestrator run` installs handlers for `SIGINT` and `SIGTERM`. On
-signal, the currently running bridge cycle is allowed to finish
-(interrupting mid-write would leave state ambiguous), and the main loop
-then exits cleanly between iterations. systemd `Restart=` and rolling
-deploys are safe.
+`bridge-orchestrator run` installs handlers for `SIGINT` and `SIGTERM`. On a
+signal:
+
+- the request in flight to Holochain or Ethereum finishes, and the link or
+  spend a write returns is recorded on its rows;
+- no other request starts: no next stage, no next window of the lock read, no
+  next cycle;
+- the process exits 0.
+
+The cycle ends before its next call, each row at the step it reached. The next
+start returns a row left `in_flight` to `queued`, and its reconcile records the
+rows a RAVE took when the stop came. A stop waits for at most one request: a
+Holochain call, bounded by `HAM_REQUEST_TIMEOUT_SECS`, or an Ethereum request,
+which the lock read gives up on after 30 s.
 
 ### Signer (run only)
 
@@ -397,13 +406,14 @@ detected ─> queued ─> claimed ─> in_flight ─┬─> succeeded
                                              └─> failed (after max_attempts)
 ```
 
-- **detected** -- lock event seen on-chain, waiting for confirmations
-- **queued** -- ready to be processed in the next bridge cycle
-- **claimed** -- picked up by the single-writer executor
-- **in_flight** -- actively being processed (Holochain call or on-chain tx)
-- **succeeded** -- completed successfully
-- **failed** -- exhausted all retry attempts (`max_attempts` = 8)
+- **detected**: lock event seen on-chain, waiting for confirmations
+- **queued**: ready to be processed in the next bridge cycle
+- **claimed**: picked up by the single-writer executor
+- **in_flight**: actively being processed (Holochain call or on-chain tx)
+- **succeeded**: completed successfully
+- **failed**: used up its attempts (`max_attempts` = 8), or cannot be processed
+  and needs a person (`last_error` says why)
 
-On startup, any items left in `claimed` or `in_flight` (from a previous crash)
-are automatically recovered back to `queued` if attempts remain, or marked
-`failed` if `max_attempts` has been reached.
+On startup, every item a stop or a crash left `claimed` or `in_flight` goes
+back to `queued` with its attempts unchanged. Only a failed cycle counts an
+attempt, against the items it had in flight.

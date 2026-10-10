@@ -1,10 +1,13 @@
 mod config;
+#[cfg(test)]
+mod fake_rpc;
 mod lock_flow;
 mod orchestrator;
 mod preflight;
 mod retention;
 mod signer;
 mod state;
+mod stop;
 mod watchtower_reporter;
 
 use anyhow::Result;
