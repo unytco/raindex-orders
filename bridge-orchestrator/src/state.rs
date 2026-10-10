@@ -7,9 +7,9 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 1;
 /// In the order [`row_to_work_item`] reads them.
-const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id, cl_link_own, br_spend_own";
+const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id";
 #[cfg(test)]
 const DEFAULT_MAX_ATTEMPTS: i64 = 8;
 
@@ -136,11 +136,6 @@ pub struct WorkItem {
     pub cl_ea_id: Option<String>,
     /// The agreement `br_spend_hash` was parked on, `None` as for `cl_ea_id`.
     pub br_ea_id: Option<String>,
-    /// Whether this release recorded `cl_link_hash`, which makes it a link the
-    /// bridging agent signed.
-    pub cl_link_own: bool,
-    /// Whether this release recorded `br_spend_hash`, as for `cl_link_own`.
-    pub br_spend_own: bool,
 }
 
 impl WorkItem {
@@ -153,15 +148,6 @@ impl WorkItem {
             _ => return None,
         };
         Some((link.as_deref()?, agreement.as_deref()))
-    }
-
-    /// Whether [`WorkItem::parked_link`] is provably the bridging agent's own.
-    pub fn parked_link_own(&self) -> bool {
-        match self.step {
-            WorkStep::ClLinkCreated => self.cl_link_own,
-            WorkStep::BrSpendCreated => self.br_spend_own,
-            _ => false,
-        }
     }
 }
 
@@ -427,7 +413,6 @@ impl StateStore {
                 )?;
             }
             Some(v) if v == SCHEMA_VERSION => {}
-            Some(v) if v == SCHEMA_VERSION - 1 => {}
             Some(v) if v > SCHEMA_VERSION => {
                 anyhow::bail!(
                     "database schema version {} is newer than binary version {}",
@@ -465,10 +450,6 @@ impl StateStore {
             [],
         )?;
         self.ensure_work_item_columns(&conn)?;
-        conn.execute(
-            "UPDATE schema_meta SET version = ?1 WHERE id = 1",
-            [SCHEMA_VERSION],
-        )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_work_items_state_created ON work_items(state, created_at)",
             [],
@@ -778,7 +759,6 @@ impl StateStore {
              SET step='cl_link_created',
                  cl_link_hash=?2,
                  cl_ea_id=?3,
-                 cl_link_own=1,
                  state='queued',
                  attempts=0,
                  error_class=NULL,
@@ -825,7 +805,6 @@ impl StateStore {
              SET step='br_spend_created',
                  br_spend_hash=?2,
                  br_ea_id=?3,
-                 br_spend_own=1,
                  state='queued',
                  attempts=0,
                  error_class=NULL,
@@ -849,27 +828,6 @@ impl StateStore {
                  updated_at=strftime('%s', 'now')
              WHERE id=?1",
             params![id, agreement],
-        )?;
-        Ok(())
-    }
-
-    pub fn return_to_writing_step(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "UPDATE work_items
-             SET step = CASE step
-                     WHEN 'cl_link_created' THEN 'new'
-                     WHEN 'br_spend_created' THEN 'cl_rave_executed'
-                     ELSE step END,
-                 cl_link_hash = CASE step WHEN 'cl_link_created' THEN NULL ELSE cl_link_hash END,
-                 cl_ea_id = CASE step WHEN 'cl_link_created' THEN NULL ELSE cl_ea_id END,
-                 br_spend_hash = CASE step WHEN 'br_spend_created' THEN NULL ELSE br_spend_hash END,
-                 br_ea_id = CASE step WHEN 'br_spend_created' THEN NULL ELSE br_ea_id END,
-                 cl_link_own = CASE step WHEN 'cl_link_created' THEN NULL ELSE cl_link_own END,
-                 br_spend_own = CASE step WHEN 'br_spend_created' THEN NULL ELSE br_spend_own END,
-                 updated_at = strftime('%s', 'now')
-             WHERE id = ?1",
-            [id],
         )?;
         Ok(())
     }
@@ -1012,8 +970,6 @@ impl StateStore {
             ("br_rave_hash", "TEXT"),
             ("cl_ea_id", "TEXT"),
             ("br_ea_id", "TEXT"),
-            ("cl_link_own", "INTEGER"),
-            ("br_spend_own", "INTEGER"),
         ] {
             if !cols.iter().any(|c| c == column) {
                 conn.execute(
@@ -1053,8 +1009,6 @@ fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
         br_rave_hash: row.get(19)?,
         cl_ea_id: row.get(20)?,
         br_ea_id: row.get(21)?,
-        cl_link_own: row.get::<_, Option<bool>>(22)?.unwrap_or(false),
-        br_spend_own: row.get::<_, Option<bool>>(23)?.unwrap_or(false),
     })
 }
 
@@ -1917,64 +1871,6 @@ mod tests {
     }
 
     #[test]
-    fn a_row_returns_to_the_step_that_writes_the_link_it_lost() {
-        let path = test_db_path("return-to-writing-step");
-        let store = StateStore::open(&path).unwrap();
-        let on_link = enqueue_one(&store, "lock:lost:link");
-        store
-            .advance_to_cl_link_created(on_link, "uhCkkLINK", CL_EA)
-            .unwrap();
-        let on_spend = enqueue_one(&store, "lock:lost:spend");
-        store
-            .advance_to_cl_link_created(on_spend, "uhCkkLINK2", CL_EA)
-            .unwrap();
-        store
-            .advance_to_cl_rave_executed(on_spend, Some("uhCkkRAVE"))
-            .unwrap();
-        store
-            .advance_to_br_spend_created(on_spend, "uhCkkSPEND", BR_EA)
-            .unwrap();
-
-        let marked = store
-            .list_pending_by_step("lock", WorkStep::BrSpendCreated, 10)
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert!(
-            marked.cl_link_own && marked.br_spend_own,
-            "this release recorded both"
-        );
-
-        store.return_to_writing_step(on_link).unwrap();
-        store.return_to_writing_step(on_spend).unwrap();
-
-        let row = |step| {
-            store
-                .list_pending_by_step("lock", step, 10)
-                .unwrap()
-                .pop()
-                .unwrap()
-        };
-        let link = row(WorkStep::New);
-        assert_eq!(link.id, on_link);
-        assert_eq!((link.cl_link_hash, link.cl_ea_id), (None, None));
-        let spend = row(WorkStep::ClRaveExecuted);
-        assert_eq!(spend.id, on_spend);
-        assert_eq!((spend.br_spend_hash, spend.br_ea_id), (None, None));
-        assert!(!link.cl_link_own && !spend.br_spend_own);
-        assert!(spend.cl_link_own, "the credit limit stage keeps its mark");
-        assert_eq!(
-            (
-                spend.cl_link_hash.as_deref(),
-                spend.cl_ea_id.as_deref(),
-                spend.cl_rave_hash.as_deref()
-            ),
-            (Some("uhCkkLINK2"), Some(CL_EA), Some("uhCkkRAVE")),
-            "the credit limit stage it passed stays recorded"
-        );
-    }
-
-    #[test]
     fn advance_to_cl_rave_executed_accepts_optional_hash() {
         // The reconciler advances rows whose link is no longer live
         // WITHOUT knowing the triggering RAVE's ActionHash, so the
@@ -2118,22 +2014,6 @@ mod tests {
     }
 
     #[test]
-    fn a_state_db_two_versions_back_or_from_a_newer_binary_is_refused() {
-        for (version, refusal) in [(0, "unsupported"), (3, "newer than binary")] {
-            let path = test_db_path("schema-refused");
-            rusqlite::Connection::open(&path)
-                .unwrap()
-                .execute_batch(&format!(
-                    "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
-                     INSERT INTO schema_meta (id, version) VALUES (1, {version});"
-                ))
-                .unwrap();
-            let err = format!("{:#}", StateStore::open(&path).err().unwrap());
-            assert!(err.contains(refusal), "{err}");
-        }
-    }
-
-    #[test]
     fn a_state_db_whose_rows_name_no_agreement_opens_with_its_parked_rows_intact() {
         let path = test_db_path("agreement-migration");
         {
@@ -2186,15 +2066,6 @@ mod tests {
         let on_spend = pending(WorkStep::BrSpendCreated);
         assert_eq!(on_link.parked_link(), Some(("uhCkkLINK", None)));
         assert_eq!(on_spend.parked_link(), Some(("uhCkkSPEND", None)));
-        assert!(
-            !on_link.parked_link_own() && !on_spend.parked_link_own(),
-            "no row an earlier binary recorded is proven the bridging agent's"
-        );
-        let version: i64 = rusqlite::Connection::open(&path)
-            .unwrap()
-            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 2);
 
         store.record_parked_agreement(on_link.id, CL_EA).unwrap();
         store.record_parked_agreement(on_spend.id, BR_EA).unwrap();

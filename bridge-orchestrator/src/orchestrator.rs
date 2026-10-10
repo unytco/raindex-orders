@@ -1241,8 +1241,8 @@ impl BridgeOrchestrator {
     /// Whether a RAVE consumed the link a row waits on: it has left the
     /// agreement it was parked on, the bridging agent's conductor still holds
     /// it as the row's own write, and one of the bridging agent's own RAVEs
-    /// records it consumed. A link it no longer holds was rolled back, and its
-    /// row goes back to the step that writes it.
+    /// records it consumed. A link it no longer holds sends its row to a
+    /// person.
     async fn link_consumed(
         &self,
         conductor: &impl ConductorReads,
@@ -1360,29 +1360,13 @@ impl BridgeOrchestrator {
         })
     }
 
-    /// A row whose recorded link the conductor does not hold.
     fn lost(&self, row: &WorkItem, link: &str) -> Result<bool> {
-        // Only a link this release recorded is provably the bridging agent's, so
-        // only that one is written again (workshop
-        // `documentation/specs/bridge-stop/README.md` § Operating assumptions and
-        // limits).
-        if !row.parked_link_own() {
-            return self.for_a_person(
-                row,
-                "bridge.reconcile.link_not_held",
-                link,
-                "is not held by this node, and an older release recorded it",
-            );
-        }
-        self.db.return_to_writing_step(row.id)?;
-        warn!(
-            event = "bridge.reconcile.write_lost",
-            "[bridge/reconcile] lock={} at {}: the bridging agent's conductor no longer holds link {}, so it is written again",
-            row.item_id,
-            row.step,
-            link
-        );
-        Ok(false)
+        self.for_a_person(
+            row,
+            "bridge.reconcile.link_not_held",
+            link,
+            "is not held by the bridging agent's conductor",
+        )
     }
 
     /// Fails `row` with `why` for a person to resolve.
@@ -4335,7 +4319,7 @@ mod tests {
         let db = rusqlite::Connection::open(&orch.cfg.db_path).unwrap();
         for id in ids {
             db.execute(
-                "UPDATE work_items SET cl_ea_id = NULL, br_ea_id = NULL, cl_link_own = NULL, br_spend_own = NULL WHERE id = ?1",
+                "UPDATE work_items SET cl_ea_id = NULL, br_ea_id = NULL WHERE id = ?1",
                 [id],
             )
             .unwrap();
@@ -6283,41 +6267,23 @@ mod tests {
         assert_eq!(lock_row(&orch, waiting).step, WorkStep::ClLinkCreated);
     }
 
-    /// The step a row whose link the chain lost goes back to.
-    fn written_at(step: &WorkStep) -> WorkStep {
-        match step {
-            WorkStep::ClLinkCreated => WorkStep::New,
-            _ => WorkStep::ClRaveExecuted,
-        }
-    }
-
     #[tokio::test]
-    async fn a_link_the_chain_lost_goes_back_to_be_written_again() {
+    async fn a_link_the_chain_does_not_hold_sends_its_row_to_a_person() {
         for (step, _) in RAVE_STAGES {
             let orch = test_orchestrator("lost-write");
             let ([lost, held], links) = two_parked_deposits(&orch, step.clone());
             let conductor = bridging_conductor().holding(&links).rolled_back(&links[0]);
 
-            reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
-
-            let row = lock_row(&orch, lost);
-            assert_eq!(row.step, written_at(&step));
-            let (link, agreement) = match step {
-                WorkStep::ClLinkCreated => (row.cl_link_hash, row.cl_ea_id),
-                _ => (row.br_spend_hash, row.br_ea_id),
-            };
-            assert_eq!((link, agreement), (None, None), "its lost link is cleared");
-            assert_eq!(lock_row(&orch, held).step, taken_at(&step));
-
             orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
+            let row = failed_row(&orch, lost);
+            assert_eq!(row.step, step);
+            let reason = row.last_error.unwrap();
+            assert!(reason.contains(&links[0].id.to_string()), "{reason}");
+            assert!(reason.contains("is not held"), "{reason}");
+            assert_ne!(lock_row(&orch, held).step, step);
             let writes = conductor.calls.take();
-            assert!(writes.contains(&rewrite_at(&step)), "{writes:?}");
-            assert_eq!(
-                lock_row(&orch, lost).state,
-                crate::state::WorkState::Succeeded,
-                "the next batch writes it again, and it bridges"
-            );
+            assert!(!writes.contains(&rewrite_at(&step)), "{writes:?}");
         }
     }
 
@@ -6400,30 +6366,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_link_an_older_release_recorded_and_the_node_does_not_hold_goes_to_a_person() {
-        for names_its_agreement in [true, false] {
-            let orch = test_orchestrator("lost-write-legacy");
-            let ([legacy, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
-            let unmark = if names_its_agreement {
-                "UPDATE work_items SET br_spend_own = NULL WHERE id = ?1"
-            } else {
-                "UPDATE work_items SET br_ea_id = NULL, br_spend_own = NULL WHERE id = ?1"
-            };
-            rusqlite::Connection::open(&orch.cfg.db_path)
-                .unwrap()
-                .execute(unmark, [legacy])
-                .unwrap();
-            let conductor = bridging_conductor().holding(&links).rolled_back(&links[0]);
+    async fn a_link_not_held_on_a_row_that_names_no_agreement_goes_to_a_person() {
+        let orch = test_orchestrator("lost-write-legacy");
+        let ([legacy, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        forget_agreements(&orch, &[legacy]);
+        let conductor = bridging_conductor().holding(&links).rolled_back(&links[0]);
 
-            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
-            let reason = failed_row(&orch, legacy).last_error.unwrap();
-            assert!(reason.contains("an older release recorded it"), "{reason}");
-            assert!(
-                !conductor.calls.take().contains(&"create_parked_spend"),
-                "it is not written again"
-            );
-        }
+        let reason = failed_row(&orch, legacy).last_error.unwrap();
+        assert!(reason.contains("is not held"), "{reason}");
+        assert!(
+            !conductor.calls.take().contains(&"create_parked_spend"),
+            "it is not written again"
+        );
     }
 
     #[tokio::test]
