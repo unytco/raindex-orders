@@ -320,7 +320,7 @@ fn take_one(order: &ClaimOrder, probe: SignedCoupon) -> TakeOrdersConfigV2 {
 /// API key, reqwest names the URL in its message, and the provider's own answer can
 /// echo either. Only reqwest's underlying causes, the HTTP status and the JSON-RPC
 /// error code are kept.
-fn rpc_failure(rpc_var: &str, what: &str, err: &TransportError) -> anyhow::Error {
+pub(crate) fn rpc_failure(rpc_var: &str, what: &str, err: &TransportError) -> anyhow::Error {
     let cause = match err {
         RpcError::Transport(TransportErrorKind::Custom(inner)) => {
             match inner.downcast_ref::<reqwest::Error>() {

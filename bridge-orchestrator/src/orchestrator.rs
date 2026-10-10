@@ -2,7 +2,7 @@ use crate::config::{Config, Ethereum, LINK_TAG_BYTES_CEILING};
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{CouponSigner, Payout};
 use crate::state::{StateStore, WorkItem, WorkStep};
-use crate::stop::{ensure_running, is_stopped};
+use crate::stop::{ensure_running, is_stopped, Stopped};
 use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -207,6 +207,16 @@ async fn select_bridging_links(
 impl BridgeOrchestrator {
     pub fn new(cfg: Config, ethereum: Option<EthereumSide>) -> Result<Self> {
         let db = StateStore::open(&cfg.db_path)?;
+        let recovered = db.recover_stale_items()?;
+        if !recovered.is_empty() {
+            warn!(
+                event = "bridge.recovered_in_flight",
+                count = recovered.len(),
+                "[bridge] re-queued {} row(s) a stop or crash left in progress: {}",
+                recovered.len(),
+                recovered.join(", ")
+            );
+        }
         let reporter = ReporterState::new();
         Ok(Self {
             cfg,
@@ -254,7 +264,13 @@ impl BridgeOrchestrator {
         });
     }
 
-    fn ends_cycle(&self, stage: &str, fn_name: &str, elapsed_ms: u128, stop: &ShutdownRx) -> bool {
+    fn ends_cycle(
+        &self,
+        stage: &str,
+        fn_name: &str,
+        elapsed_ms: u128,
+        stop: &ShutdownRx,
+    ) -> Result<bool> {
         if *stop.borrow() {
             info!(
                 event = "bridge.stage_stopped",
@@ -262,13 +278,13 @@ impl BridgeOrchestrator {
                 fn_name,
                 "[bridge/cycle] stop signalled, ending the cycle after {stage} {fn_name}"
             );
-            return true;
+            return Err(Stopped.into());
         }
         if self.should_eject(elapsed_ms) {
             self.log_stage_ejected(stage, fn_name, elapsed_ms);
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 
     /// `None` means the cycle ends before the spend.
@@ -280,7 +296,7 @@ impl BridgeOrchestrator {
         let (ledger, elapsed_ms) = timed_call("s3", "get_ledger", read)
             .await
             .context("failed to read the bridging agent's ledger")?;
-        if self.ends_cycle("s3", "get_ledger", elapsed_ms, stop) {
+        if self.ends_cycle("s3", "get_ledger", elapsed_ms, stop)? {
             return Ok(None);
         }
         Ok(Some(ledger))
@@ -418,7 +434,10 @@ impl BridgeOrchestrator {
             if let Some(lock_flow) = &lock_flow {
                 if let Err(e) = lock_flow.run_cycle().await {
                     if !is_stopped(&e) {
-                        error!("[lock-flow] cycle failed: {}", e);
+                        error!(
+                            event = "bridge.lock_read_failed",
+                            "[lock-flow] cycle failed: {e:#}"
+                        );
                     }
                 }
             }
@@ -480,7 +499,7 @@ impl BridgeOrchestrator {
                                 }
                             }
                             Err(e) => {
-                                let Some(action) = self.cycle_failed(&e) else {
+                                let Some(action) = self.cycle_failed(&e, &shutdown) else {
                                     info!("[bridge] shutdown signal received, exiting cleanly");
                                     return Ok(());
                                 };
@@ -668,10 +687,11 @@ impl BridgeOrchestrator {
     }
 
     /// Records a cycle that ended in `e` as failed, counting an attempt against
-    /// the rows it had in flight, and returns how the loop goes on. `None` for
-    /// a stop, which is no failure: its rows wait for startup recovery.
-    fn cycle_failed(&self, e: &anyhow::Error) -> Option<CycleFailureAction> {
-        if is_stopped(e) {
+    /// the rows it had in flight, and returns how the loop goes on. `None` once
+    /// a stop is signalled, which is no failure even when the conductor stopped
+    /// with it: its rows wait for startup recovery.
+    fn cycle_failed(&self, e: &anyhow::Error, stop: &ShutdownRx) -> Option<CycleFailureAction> {
+        if is_stopped(e) || *stop.borrow() {
             return None;
         }
         // `{:#}` and not `{}`: an `anyhow` chain prints only its outermost
@@ -828,7 +848,7 @@ impl BridgeOrchestrator {
             for id in &s1_batch.ids {
                 self.record_cl_link(*id, &cl_link_hash, &context)?;
             }
-            if self.ends_cycle("s1", "create_parked_link", s1_elapsed_ms, stop) {
+            if self.ends_cycle("s1", "create_parked_link", s1_elapsed_ms, stop)? {
                 return Ok(());
             }
         }
@@ -877,7 +897,7 @@ impl BridgeOrchestrator {
             .await?;
             let cl_rave_hash = cl_rave_hash.to_string();
             info!("[bridge/s2] RAVE executed action_hash={}", cl_rave_hash);
-            if self.ends_cycle("s2", "execute_rave", s2_elapsed_ms, stop) {
+            if self.ends_cycle("s2", "execute_rave", s2_elapsed_ms, stop)? {
                 return Ok(());
             }
             let outcome = self
@@ -964,7 +984,7 @@ impl BridgeOrchestrator {
                     self.record_br_spend(*id, &spend_hash_str, &context)?;
                 }
                 s3_written = s3_batch.ids.len();
-                if self.ends_cycle("s3", "create_parked_spend", s3_elapsed_ms, stop) {
+                if self.ends_cycle("s3", "create_parked_spend", s3_elapsed_ms, stop)? {
                     return Ok(());
                 }
             } else {
@@ -1084,7 +1104,7 @@ impl BridgeOrchestrator {
             .await?;
             let br_rave_hash = br_rave_hash.to_string();
             info!("[bridge/s4] RAVE executed action_hash={}", br_rave_hash);
-            if self.ends_cycle("s4", "execute_rave", s4_elapsed_ms, stop) {
+            if self.ends_cycle("s4", "execute_rave", s4_elapsed_ms, stop)? {
                 return Ok(());
             }
             let outcome = self
@@ -2446,6 +2466,10 @@ where
             fn_name,
             elapsed_ms = elapsed_ms as u64,
             "zome call completed"
+        ),
+        Err(e) if is_stopped(e) => info!(
+            event = "bridge.zome_call_not_sent",
+            stage, fn_name, "zome call not sent: a stop was signalled"
         ),
         Err(e) => warn!(
             event = "bridge.zome_call_failed",
@@ -5300,7 +5324,8 @@ mod tests {
         let id = enqueue_lock(&orch, "lock:stop:1", "0x81");
         let (conductor, stop) = stopping_during(5, bridging_conductor());
 
-        orch.run_bridge_cycle(&conductor, &stop).await.unwrap();
+        let e = orch.run_bridge_cycle(&conductor, &stop).await.unwrap_err();
+        assert!(is_stopped(&e), "{e:#}");
 
         let row = lock_row(&orch, id);
         assert_eq!(
@@ -5318,7 +5343,8 @@ mod tests {
         let id = enqueue_at_cl_rave_executed(&orch, "lock:stop:3", "0x83");
         let (conductor, stop) = stopping_during(7, bridging_conductor());
 
-        orch.run_bridge_cycle(&conductor, &stop).await.unwrap();
+        let e = orch.run_bridge_cycle(&conductor, &stop).await.unwrap_err();
+        assert!(is_stopped(&e), "{e:#}");
 
         let row = lock_row(&orch, id);
         assert_eq!(
@@ -5348,7 +5374,8 @@ mod tests {
         let (conductor, stop) =
             stopping_during(6, bridging_conductor().parking(action_hash(CL_EA), &links));
 
-        orch.run_bridge_cycle(&conductor, &stop).await.unwrap();
+        let e = orch.run_bridge_cycle(&conductor, &stop).await.unwrap_err();
+        assert!(is_stopped(&e), "{e:#}");
 
         assert_eq!(conductor.calls.take().last(), Some(&"execute_rave"));
         for id in rows {
@@ -5366,7 +5393,8 @@ mod tests {
         let id = enqueue_at_cl_rave_executed(&orch, "lock:stop:l", "0x84");
         let (conductor, stop) = stopping_during(6, bridging_conductor());
 
-        orch.run_bridge_cycle(&conductor, &stop).await.unwrap();
+        let e = orch.run_bridge_cycle(&conductor, &stop).await.unwrap_err();
+        assert!(is_stopped(&e), "{e:#}");
 
         let row = lock_row(&orch, id);
         assert_eq!(
@@ -5432,7 +5460,7 @@ mod tests {
         let (conductor, stop) = stopping_during(4, bridging_conductor());
         let stopped = orch.run_bridge_cycle(&conductor, &stop).await.unwrap_err();
 
-        assert_eq!(orch.cycle_failed(&stopped), None);
+        assert_eq!(orch.cycle_failed(&stopped, &running()), None);
 
         let row = &rows_at(&orch, WorkStep::New)[0];
         assert_eq!(
@@ -5443,7 +5471,13 @@ mod tests {
 
         let dropped = anyhow::anyhow!("Failed to call zome: Websocket error: Websocket closed");
         assert_eq!(
-            orch.cycle_failed(&dropped),
+            orch.cycle_failed(&dropped, &stop),
+            None,
+            "a conductor that stopped with the bridge is no failure"
+        );
+        assert_eq!(rows_at(&orch, WorkStep::New)[0].attempts, 0);
+        assert_eq!(
+            orch.cycle_failed(&dropped, &running()),
             Some(CycleFailureAction::Reconnect)
         );
         let row = lock_row(&orch, id);

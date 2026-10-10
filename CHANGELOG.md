@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bridge-orchestrator signs a withdrawal coupon only for a spend in the withdrawer role.
 - bridge-orchestrator stops on SIGTERM or SIGINT once the request in flight returns, and gives up on an Ethereum request after 30 s.
 - bridge-orchestrator counts no attempt against a deposit when it stops or restarts, so a stop never fails one.
+- bridge-orchestrator logs a failed Ethereum request of its lock read with its cause, and without the RPC URL or its key.
+- `bridge-orchestrator status` and `clear` leave a running bridge's in-progress rows as they are.
 
 ## [0.3.0] - 2026-10-06
 

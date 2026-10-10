@@ -1,5 +1,5 @@
 use crate::config::Ethereum;
-use crate::preflight::RPC_TIMEOUT;
+use crate::preflight::{rpc_failure, RPC_TIMEOUT};
 use crate::state::StateStore;
 use crate::stop::ensure_running;
 use alloy::primitives::U256;
@@ -8,6 +8,7 @@ use alloy::rpc::types::{BlockTransactionsKind, Filter, Log};
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use alloy::transports::http::{Client, Http};
+use alloy::transports::TransportResult;
 use anyhow::{anyhow, Context, Result};
 use ham::ShutdownRx;
 use serde_json::json;
@@ -82,22 +83,21 @@ impl LockFlow {
         Ok(ProviderBuilder::new().on_http(self.cfg.rpc_url.parse()?))
     }
 
-    async fn request<T, E, F>(&self, method: &str, send: impl FnOnce() -> F) -> Result<T>
+    async fn request<T, F>(&self, method: &str, send: impl FnOnce() -> F) -> Result<T>
     where
-        F: IntoFuture<Output = Result<T, E>>,
-        E: std::error::Error + Send + Sync + 'static,
+        F: IntoFuture<Output = TransportResult<T>>,
     {
         ensure_running(&self.stop)?;
-        let answer = tokio::time::timeout(self.rpc_timeout, send())
+        let rpc = self.cfg.network.rpc_url_var();
+        tokio::time::timeout(self.rpc_timeout, send())
             .await
             .map_err(|_| {
                 anyhow!(
-                    "{} did not answer {method} within {:?}",
-                    self.cfg.network.rpc_url_var(),
+                    "{rpc} did not answer {method} within {:?}",
                     self.rpc_timeout
                 )
-            })?;
-        Ok(answer?)
+            })?
+            .map_err(|e| rpc_failure(rpc, method, &e))
     }
 
     async fn process_lock_log(
@@ -323,6 +323,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["lock:7"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_names_its_variable_and_cause_but_not_the_rpc_key() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v3/secret-api-key", closed.local_addr().unwrap());
+        drop(closed);
+        let dir = tempfile::tempdir().unwrap();
+
+        let e = lock_flow(url, store(&dir), watch::channel(false).1)
+            .run_cycle()
+            .await
+            .expect_err("a closed port answered");
+
+        let message = format!("{e:#}");
+        assert!(
+            message.starts_with("SEPOLIA_RPC_URL: eth_blockNumber failed: "),
+            "{message}"
+        );
+        assert!(!message.contains("secret-api-key"), "{message}");
     }
 
     #[tokio::test]

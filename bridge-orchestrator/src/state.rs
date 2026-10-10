@@ -373,7 +373,6 @@ impl StateStore {
             path: path_buf,
         };
         store.init_schema()?;
-        store.recover_stale_items()?;
         Ok(store)
     }
 
@@ -471,9 +470,17 @@ impl StateStore {
     }
 
     /// A stop or a crash is not an attempt, so the rows it left in progress go
-    /// back to `queued` with their attempts unchanged.
-    fn recover_stale_items(&self) -> Result<()> {
+    /// back to `queued` with their attempts unchanged. Returns their item IDs.
+    pub fn recover_stale_items(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
+        let recovered = conn
+            .prepare(
+                "SELECT item_id FROM work_items
+                 WHERE state IN ('claimed', 'in_flight')
+                 ORDER BY id",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
         conn.execute(
             "UPDATE work_items
              SET state = 'queued',
@@ -484,7 +491,7 @@ impl StateStore {
              WHERE state IN ('claimed', 'in_flight')",
             [],
         )?;
-        Ok(())
+        Ok(recovered)
     }
 
     pub fn enqueue_detected(
@@ -1170,6 +1177,15 @@ mod tests {
             store.mark_in_flight(item.id).unwrap();
         }
         let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .list_work_items("lock", WorkState::InFlight, 10)
+                .unwrap()
+                .len(),
+            1,
+            "opening the store, as `status` and `clear` do, leaves a running bridge's rows alone"
+        );
+        assert_eq!(store.recover_stale_items().unwrap(), ["lock:1"]);
         let items = store
             .list_work_items("lock", WorkState::Queued, 10)
             .unwrap();
@@ -1189,6 +1205,7 @@ mod tests {
 
         for _ in 0..3 {
             let store = StateStore::open(&path).unwrap();
+            assert_eq!(store.recover_stale_items().unwrap(), ["lock:stopped"]);
             let queued = store
                 .list_work_items("lock", WorkState::Queued, 10)
                 .unwrap();
