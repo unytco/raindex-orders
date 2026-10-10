@@ -1012,6 +1012,23 @@ impl BridgeOrchestrator {
         )
         .await?;
 
+        let deposit_ids: HashSet<String> = deposit_rave_links
+            .iter()
+            .map(|t| t.id.to_string())
+            .collect();
+        let rows = self.db.list_flow("lock")?;
+        for spend in bridging_links
+            .iter()
+            .filter(|t| !deposit_ids.contains(&t.id.to_string()))
+        {
+            self.send_rows_recording_to_a_person(
+                &rows,
+                |row| row.br_spend_hash.as_deref(),
+                &spend.id.to_string(),
+                "is no deposit spend of the bridging agent",
+            )?;
+        }
+
         // Build the pooled RAVE link Vec (deposits first, then selected
         // withdrawals) before applying the optional per-cycle cap. The
         // deposits-first ordering makes `apply_rave_link_cap` preferentially
@@ -1149,7 +1166,7 @@ impl BridgeOrchestrator {
     /// * `step='new'` and the lock's own proof is in a live CL parked link →
     ///   advance to `cl_link_created` with that link's ActionHash.
     /// * `step='cl_link_created'` and [`Self::link_consumed`] → advance to
-    ///   `cl_rave_executed` with `cl_rave_hash=NULL`.
+    ///   `cl_rave_executed` with the hash of the RAVE that consumed it.
     /// * `step='cl_rave_executed'` and the lock's own proof is in a live
     ///   bridging parked spend → advance to `br_spend_created` with that
     ///   spend's ActionHash.
@@ -1183,11 +1200,12 @@ impl BridgeOrchestrator {
             .db
             .list_pending_by_step("lock", WorkStep::ClLinkCreated, 5000)?
         {
-            if self
+            if let Some(rave) = self
                 .link_consumed(conductor, live, &row, &credit_limit)
                 .await?
             {
-                self.db.advance_to_cl_rave_executed(row.id, None)?;
+                self.db
+                    .advance_to_cl_rave_executed(row.id, Some(&rave.to_string()))?;
                 counts.s2_advanced += 1;
             }
         }
@@ -1211,8 +1229,9 @@ impl BridgeOrchestrator {
             .db
             .list_pending_by_step("lock", WorkStep::BrSpendCreated, 5000)?
         {
-            if self.link_consumed(conductor, live, &row, &bridging).await? {
-                self.db.advance_to_br_rave_executed(row.id, None)?;
+            if let Some(rave) = self.link_consumed(conductor, live, &row, &bridging).await? {
+                self.db
+                    .advance_to_br_rave_executed(row.id, Some(&rave.to_string()))?;
                 counts.s4_advanced += 1;
             }
         }
@@ -1250,19 +1269,20 @@ impl BridgeOrchestrator {
         live: &mut LiveLinks,
         row: &WorkItem,
         in_force: &ActionHash,
-    ) -> Result<bool> {
+    ) -> Result<Option<ActionHash>> {
         let Some((link, recorded)) = row.parked_link() else {
-            return Ok(false);
+            return Ok(None);
         };
         let (agreement, parked) = match parked_on(conductor, live, link, recorded).await {
             Ok(checked) => checked,
-            Err(e) if recorded.is_some() => return Self::unresolved(row, link, e),
+            Err(e) if recorded.is_some() => return Self::unresolved(row, link, e).map(|()| None),
             Err(e) => {
                 return match held_link(conductor, live, link).await {
                     Ok(None) => self.lost(row, link),
                     Ok(Some(_)) => Self::unresolved(row, link, e),
                     Err(held) => Self::unresolved(row, link, held),
                 }
+                .map(|()| None)
             }
         };
         if recorded.is_none() {
@@ -1280,34 +1300,36 @@ impl BridgeOrchestrator {
             match held_link(conductor, live, link).await {
                 Ok(Some(record)) => {
                     let link_seq = record.action().action_seq();
-                    return match self.recorded_write(record, row) {
+                    let consumer = match self.recorded_write(record, row) {
                         RecordedWrite::Own => match live.consumer(conductor, link, link_seq).await {
                             Ok(Some(rave)) => {
-                                debug!(
+                                info!(
+                                    event = "bridge.reconcile.consumed",
+                                    link,
+                                    rave = %rave,
                                     "[bridge/reconcile] lock={} at {}: RAVE {} consumed link {} off agreement {}",
-                                    row.item_id, row.step, rave, link, agreement
+                                    row.item_id,
+                                    row.step,
+                                    rave,
+                                    link,
+                                    agreement
                                 );
-                                Ok(true)
+                                return Ok(Some(rave));
                             }
                             Ok(None) => self.for_a_person(
                                 row,
                                 "bridge.reconcile.link_not_consumed",
                                 link,
-                                &format!("left agreement {agreement}, and no RAVE of the bridging agent consumed it"),
+                                &format!("left agreement {agreement}, and no RAVE in the bridging agent's chain history records it consumed"),
                             ),
                             Err(e) => Self::unresolved(row, link, e),
                         },
-                        RecordedWrite::Unreadable(e) => {
-                            error!(
-                                event = "bridge.reconcile.unresolved",
-                                "[bridge/reconcile] lock={} at {} stays pending, the record of its link {} cannot be read: {:#}",
-                                row.item_id,
-                                row.step,
-                                link,
-                                e
-                            );
-                            Ok(false)
-                        }
+                        RecordedWrite::Unreadable(e) => self.for_a_person(
+                            row,
+                            "bridge.reconcile.tag_unreadable",
+                            link,
+                            &format!("has a tag that does not decode: {e:#}"),
+                        ),
                         // Neither advanced nor written again: whether this deposit was
                         // credited cannot be told from here, so a person resolves it
                         // (workshop `documentation/specs/bridge-stop/README.md`
@@ -1316,9 +1338,10 @@ impl BridgeOrchestrator {
                             self.for_a_person(row, "bridge.rave.proof_missing", link, &why)
                         }
                     };
+                    return consumer.map(|()| None);
                 }
-                Ok(None) => return self.lost(row, link),
-                Err(e) => return Self::unresolved(row, link, e),
+                Ok(None) => return self.lost(row, link).map(|()| None),
+                Err(e) => return Self::unresolved(row, link, e).map(|()| None),
             }
         }
         if agreement != *in_force {
@@ -1330,7 +1353,7 @@ impl BridgeOrchestrator {
                 link
             );
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn recorded_write(&self, record: &Record, row: &WorkItem) -> RecordedWrite {
@@ -1347,6 +1370,12 @@ impl BridgeOrchestrator {
             Ok(proofs) => proofs,
             Err(e) => return RecordedWrite::Unreadable(e),
         };
+        let Some(proofs) = proofs.as_array() else {
+            return RecordedWrite::Misrecorded(match proofs {
+                Value::Null => "carries no proof_of_deposit".to_string(),
+                other => format!("carries a proof_of_deposit that is not a list: {other}"),
+            });
+        };
         let locks: Vec<LockKey> = proofs.iter().filter_map(LockKey::of_proof).collect();
         if locks.contains(&lock) {
             return RecordedWrite::Own;
@@ -1359,7 +1388,7 @@ impl BridgeOrchestrator {
         })
     }
 
-    fn lost(&self, row: &WorkItem, link: &str) -> Result<bool> {
+    fn lost(&self, row: &WorkItem, link: &str) -> Result<()> {
         self.for_a_person(
             row,
             "bridge.reconcile.link_not_held",
@@ -1368,7 +1397,7 @@ impl BridgeOrchestrator {
         )
     }
 
-    fn for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<bool> {
+    fn for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<()> {
         let lock = self.lock_key(row);
         error!(
             event,
@@ -1385,10 +1414,10 @@ impl BridgeOrchestrator {
             row.id,
             &format!("its recorded link {link} {why}; resolve by hand"),
         )?;
-        Ok(false)
+        Ok(())
     }
 
-    fn unresolved(row: &WorkItem, link: &str, e: anyhow::Error) -> Result<bool> {
+    fn unresolved(row: &WorkItem, link: &str, e: anyhow::Error) -> Result<()> {
         if is_stopped(&e) {
             return Err(e);
         }
@@ -1406,7 +1435,7 @@ impl BridgeOrchestrator {
             link,
             e
         );
-        Ok(false)
+        Ok(())
     }
 
     /// Advances, through `advance`, each row at `step` whose own proof is in
@@ -1512,19 +1541,30 @@ impl BridgeOrchestrator {
                 reason = why,
                 "[bridge/{stage}] link {id} is withheld from the RAVE: {why}"
             );
-            let recording = rows
-                .iter()
-                .filter(|row| recorded(row) == Some(id.as_str()) && row.state != WorkState::Failed);
-            for row in recording {
-                self.for_a_person(
-                    row,
-                    "bridge.rave.link_withheld",
-                    &id,
-                    &format!("is withheld from the RAVE: {why}"),
-                )?;
-            }
+            self.send_rows_recording_to_a_person(
+                &rows,
+                &recorded,
+                &id,
+                &format!("is withheld from the RAVE: {why}"),
+            )?;
         }
         Ok(accounted)
+    }
+
+    fn send_rows_recording_to_a_person(
+        &self,
+        rows: &[WorkItem],
+        recorded: impl Fn(&WorkItem) -> Option<&str>,
+        link: &str,
+        why: &str,
+    ) -> Result<()> {
+        for row in rows
+            .iter()
+            .filter(|row| recorded(row) == Some(link) && row.state != WorkState::Failed)
+        {
+            self.for_a_person(row, "bridge.rave.link_withheld", link, why)?;
+        }
+        Ok(())
     }
 
     /// The links among `sent` that the RAVE on `agreement` consumed, as its own
@@ -2318,7 +2358,7 @@ enum RecordedWrite {
     Unreadable(anyhow::Error),
 }
 
-fn tag_proofs(record: &Record, step: &WorkStep) -> Result<Vec<Value>> {
+fn tag_proofs(record: &Record, step: &WorkStep) -> Result<Value> {
     let ActionData::CreateLink(link) = &record.action().data else {
         anyhow::bail!("{} is not a link", record.action_address());
     };
@@ -2334,13 +2374,7 @@ fn tag_proofs(record: &Record, step: &WorkStep) -> Result<Vec<Value>> {
             record.action_address()
         )
     })?;
-    let proofs = &payload["proof_of_deposit"];
-    proofs.as_array().cloned().with_context(|| {
-        format!(
-            "the tag of link {} carries a proof_of_deposit that is not a list: {proofs}",
-            record.action_address()
-        )
-    })
+    Ok(payload["proof_of_deposit"].clone())
 }
 
 /// The input of the transactor's `hdk_get`, whose fields are named unlike
@@ -5155,9 +5189,10 @@ mod tests {
             .into_iter()
             .find(|r| r.id == row_id)
             .expect("row must have advanced to cl_rave_executed");
-        assert!(
-            row.cl_rave_hash.is_none(),
-            "inferred advancement must leave cl_rave_hash NULL"
+        assert_eq!(
+            row.cl_rave_hash,
+            Some(action_hash(0xE8).to_string()),
+            "the advance records the RAVE that consumed the link"
         );
     }
 
@@ -5248,9 +5283,10 @@ mod tests {
             .expect("row must be succeeded");
         assert_eq!(row.step, WorkStep::BrRaveExecuted);
         assert_eq!(row.br_spend_hash.as_deref(), Some(spend_hash.as_str()));
-        assert!(
-            row.br_rave_hash.is_none(),
-            "inferred S4 advancement must leave br_rave_hash NULL"
+        assert_eq!(
+            row.br_rave_hash,
+            Some(action_hash(0xE8).to_string()),
+            "the advance records the RAVE that consumed the spend"
         );
     }
 
@@ -6025,7 +6061,17 @@ mod tests {
 
             reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
-            assert_eq!(lock_row(&orch, rows[0]).step, taken_at(&step));
+            let advanced = lock_row(&orch, rows[0]);
+            assert_eq!(advanced.step, taken_at(&step));
+            let rave = match step {
+                WorkStep::ClLinkCreated => advanced.cl_rave_hash,
+                _ => advanced.br_rave_hash,
+            };
+            assert_eq!(
+                rave,
+                Some(action_hash(0xEA).to_string()),
+                "the RAVE that consumed it"
+            );
             assert_eq!(failed_row(&orch, rows[1]).step, step);
             assert_eq!(
                 *conductor.chain_reads.borrow(),
@@ -6901,6 +6947,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_row_recording_a_live_spend_s4_takes_no_deposit_from_goes_to_a_person() {
+        let mut withdrawer = parked_spend_tx(0x55, &[proof("lock:no-deposit:2", "0xaa")]);
+        if let TransactionDetails::ParkedSpend { ct_role_id, .. } = &mut withdrawer.details {
+            *ct_role_id = WITHDRAWER_ROLE.to_string();
+        }
+        let foreign =
+            signed_by_another(parked_spend_tx(0x54, &[proof("lock:no-deposit:1", "0xa9")]));
+        for (spend, lock, tx) in [
+            (foreign, "lock:no-deposit:1", "0xa9"),
+            (withdrawer, "lock:no-deposit:2", "0xaa"),
+        ] {
+            let orch = test_orchestrator("no-deposit-spend");
+            let id = enqueue_at_cl_rave_executed(&orch, lock, tx);
+            orch.record_br_spend(id, &spend.id.to_string(), &in_force(CL_EA, BR_EA))
+                .unwrap();
+            let conductor =
+                bridging_conductor().parking(action_hash(BR_EA), std::slice::from_ref(&spend));
+
+            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+            let reason = failed_row(&orch, id).last_error.unwrap();
+            assert!(reason.contains(&spend.id.to_string()), "{reason}");
+            assert!(reason.contains("no deposit spend"), "{reason}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_row_recorded_on_another_agents_copy_of_its_proof_is_left_for_a_person() {
         let orch = test_orchestrator("legacy-foreign");
         let id = enqueue_at_cl_rave_executed(&orch, "lock:legacy:3", "0x96");
@@ -6934,8 +7007,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_held_link_whose_proofs_are_not_a_list_leaves_its_row_where_it_is() {
-        for (step, _) in RAVE_STAGES {
+    async fn a_held_link_whose_proofs_are_missing_or_not_a_list_goes_to_a_person() {
+        for ((step, _), proofs) in RAVE_STAGES
+            .into_iter()
+            .flat_map(|stage| [(stage.clone(), json!("lock:rave:1")), (stage, Value::Null)])
+        {
             let orch = test_orchestrator("held-proofs-not-a-list");
             let ([unread, _], mut links) = two_parked_deposits(&orch, step.clone());
             if let TransactionDetails::Parked {
@@ -6945,29 +7021,36 @@ mod tests {
                 attached_payload, ..
             } = &mut links[0].details
             {
-                attached_payload["proof_of_deposit"] = json!("lock:rave:1");
+                attached_payload["proof_of_deposit"] = proofs.clone();
             }
             let conductor = bridging_conductor().holding(&links);
 
             reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
-            let row = lock_row(&orch, unread);
-            assert_eq!(
-                (row.state, row.step),
-                (crate::state::WorkState::Queued, step)
-            );
+            let row = failed_row(&orch, unread);
+            assert_eq!(row.step, step);
+            let reason = row.last_error.unwrap();
+            let expected = match proofs {
+                Value::Null => "carries no proof_of_deposit",
+                _ => "carries a proof_of_deposit that is not a list",
+            };
+            assert!(reason.contains(expected), "{reason}");
         }
     }
 
     #[tokio::test]
-    async fn a_record_whose_tag_does_not_decode_leaves_its_row_and_holds_up_no_other() {
+    async fn a_record_whose_tag_does_not_decode_goes_to_a_person_and_holds_up_no_other() {
         let orch = test_orchestrator("held-undecodable");
         let ([unread, held], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
         let conductor = bridging_conductor().holding(&links).garbling(&links[0]);
 
         reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
-        assert_eq!(lock_row(&orch, unread).step, WorkStep::BrSpendCreated);
+        let row = failed_row(&orch, unread);
+        assert_eq!(row.step, WorkStep::BrSpendCreated);
+        let reason = row.last_error.unwrap();
+        assert!(reason.contains("tag that does not decode"), "{reason}");
+        assert!(reason.contains(&links[0].id.to_string()), "{reason}");
         assert_eq!(
             lock_row(&orch, held).state,
             crate::state::WorkState::Succeeded
