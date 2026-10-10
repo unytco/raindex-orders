@@ -137,9 +137,10 @@ step it cannot read.
 row, neither `succeeded` nor `failed`, whose lock is in a listed link. Each
 gets `last_error` `in transit at the old network's close; it is paid by hand on
 the new network`, so the new network's orchestrator pays none of them. It marks
-all of them in one transaction, or none, and changes no other row. A row it
-read as neither `succeeded` nor `failed` that is settled or gone by the time it
-marks, as a still running orchestrator can leave it, fails the whole mark. It
+all of them in one transaction, or none, and changes no other row. Each is
+marked only in the state and at the step it was read in: a row whose state or
+step has changed by then, even to another pending step, or that is gone, as a
+still running orchestrator can leave it, fails the whole mark. It
 exits 0 only when it read the database and the conductor and marked them. It marks none,
 and fails, when it cannot tell which rows a listed link carries: when a proof in
 it names the lock ID or the transaction of a row it would not otherwise mark,

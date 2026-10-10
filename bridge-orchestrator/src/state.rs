@@ -886,19 +886,22 @@ impl StateStore {
 
     pub fn mark_failed_permanent(&self, id: i64, error: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        fail_permanently(&conn, id, error, false)?;
+        fail_permanently(&conn, id, error, None)?;
         Ok(())
     }
 
-    /// All or none: a row another writer settled or deleted since it was read
-    /// fails the whole mark.
-    pub fn mark_all_failed_permanent(&self, ids: &[i64], error: &str) -> Result<()> {
+    /// All or none, each row as it was read: one whose state or step another
+    /// writer changed since, or deleted, fails the whole mark.
+    pub fn mark_all_failed_permanent(&self, rows: &[&WorkItem], error: &str) -> Result<()> {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
-        for &id in ids {
+        for row in rows {
             anyhow::ensure!(
-                fail_permanently(&tx, id, error, true)? == 1,
-                "row {id} is no longer pending or no longer in the database, so no row is marked"
+                fail_permanently(&tx, row.id, error, Some((&row.state, &row.step)))? == 1,
+                "row {} is no longer {} at {}, or no longer in the database, so no row is marked",
+                row.item_id,
+                row.state,
+                row.step
             );
         }
         tx.commit()?;
@@ -959,8 +962,11 @@ fn fail_permanently(
     conn: &Connection,
     id: i64,
     error: &str,
-    only_if_pending: bool,
+    read_as: Option<(&WorkState, &WorkStep)>,
 ) -> Result<usize> {
+    let (state, step) = read_as
+        .map(|(state, step)| (state.to_string(), step.to_string()))
+        .unzip();
     Ok(conn.execute(
         "UPDATE work_items
          SET state='failed',
@@ -968,8 +974,8 @@ fn fail_permanently(
              last_error=?2,
              next_retry_at=NULL,
              updated_at=strftime('%s', 'now')
-         WHERE id=?1 AND (NOT ?3 OR state NOT IN ('succeeded', 'failed'))",
-        params![id, error, only_if_pending],
+         WHERE id=?1 AND (?3 IS NULL OR (state=?3 AND step=?4))",
+        params![id, error, state, step],
     )?)
 }
 

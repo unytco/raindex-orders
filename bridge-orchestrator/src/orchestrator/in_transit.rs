@@ -44,7 +44,7 @@ enum InTransit {
 
 pub(super) struct Found {
     listed: Vec<InTransit>,
-    rows: BTreeMap<i64, String>,
+    rows: BTreeMap<i64, WorkItem>,
     unmatchable: Vec<String>,
 }
 
@@ -79,9 +79,9 @@ impl Found {
             self.unmatchable.is_empty(),
             "marks no row, as {cannot_tell}"
         );
-        let ids: Vec<i64> = self.rows.keys().copied().collect();
-        db.mark_all_failed_permanent(&ids, PAID_BY_HAND)?;
-        let items: Vec<&str> = self.rows.values().map(String::as_str).collect();
+        let rows: Vec<&WorkItem> = self.rows.values().collect();
+        db.mark_all_failed_permanent(&rows, PAID_BY_HAND)?;
+        let items: Vec<&str> = rows.iter().map(|row| row.item_id.as_str()).collect();
         info!(
             event = "bridge.in_transit.marked_failed",
             "[bridge/in-transit] marked {} row(s) failed, to be paid by hand on the new network: {}",
@@ -232,10 +232,10 @@ impl BridgeOrchestrator {
             }
             match lock {
                 _ if in_transit => {
-                    rows.insert(row.id, row.item_id);
+                    rows.insert(row.id, row);
                 }
                 Some(lock) if carried.contains(&lock) => {
-                    rows.insert(row.id, row.item_id);
+                    rows.insert(row.id, row);
                 }
                 Some(lock) => unmarked.push((row.item_id, lock)),
                 None if !carried.is_empty() => unmatchable.push(format!(
