@@ -1419,13 +1419,15 @@ impl BridgeOrchestrator {
         advance: impl Fn(i64) -> Result<()>,
     ) -> Result<usize> {
         let taken_links: HashSet<&str> = taken.values().map(String::as_str).collect();
+        let mut unadvanced: HashMap<&LockKey, &String> = taken.iter().collect();
         let mut advanced = 0;
-        for row in self.db.list_pending_by_step("lock", step, 5000)? {
+        for row in self.db.list_pending_by_step("lock", step.clone(), 5000)? {
             let (Some((link, _)), Some(lock)) = (row.parked_link(), self.lock_key(&row)) else {
                 continue;
             };
             if taken.contains_key(&lock) {
                 advance(row.id)?;
+                unadvanced.remove(&lock);
                 advanced += 1;
             } else if taken_links.contains(link) {
                 error!(
@@ -1439,6 +1441,16 @@ impl BridgeOrchestrator {
                     link
                 );
             }
+        }
+        for (lock, link) in unadvanced {
+            error!(
+                event = "bridge.rave.took_unpending_row",
+                lock_id = lock.lock_id,
+                tx_hash = lock.tx_hash,
+                link,
+                "[bridge/rave] a RAVE took link {link} carrying lock {}, whose row is not pending at {step}",
+                lock.lock_id
+            );
         }
         Ok(advanced)
     }
@@ -5411,6 +5423,47 @@ mod tests {
 
     fn rows_at(orch: &BridgeOrchestrator, step: WorkStep) -> Vec<WorkItem> {
         orch.db.list_pending_by_step("lock", step, 100).unwrap()
+    }
+
+    fn errors_logged(run: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let logged = lines.0.lock().unwrap().clone();
+        String::from_utf8(logged).unwrap()
+    }
+
+    #[test]
+    fn a_rave_taking_a_lock_whose_row_is_not_pending_at_its_step_is_logged() {
+        let orch = test_orchestrator("taken-unpending");
+        let id = enqueue_lock(&orch, "lock:unpending:1", "0xa8");
+        let spend = parked_spend_tx(0x53, &[proof("lock:unpending:1", "0xa8")]);
+
+        let logged =
+            errors_logged(|| assert_eq!(s4_consumes(&orch, std::slice::from_ref(&spend)), 0));
+
+        assert!(
+            logged.contains("bridge.rave.took_unpending_row"),
+            "{logged}"
+        );
+        assert!(logged.contains(&spend.id.to_string()), "{logged}");
+        assert_eq!(lock_row(&orch, id).step, WorkStep::New);
     }
 
     fn s4_consumes(orch: &BridgeOrchestrator, spends: &[Transaction]) -> usize {
