@@ -2,10 +2,11 @@ import { json } from '@sveltejs/kit'
 import { env } from '$env/dynamic/private'
 import { PAUSED_CONTACT, PAUSED_LEAD, PAUSED_TEXT } from '$lib/pause'
 
-/** Whether the Worker's `BRIDGE_PAUSED` secret pauses Lock and the faucet. */
+// Exactly `true`, as the spec fixes it: `True` or `1` leaves the bridge open
+// (documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
 export const bridgePaused = () => env.BRIDGE_PAUSED === 'true'
 
-// Loads no script of the site, so the real page cannot render behind it.
+// Loads no script of the site: the SvelteKit client would render the real page in its place.
 const STOP_PAGE = `<!doctype html>
 <html lang="en">
 	<head>
@@ -64,13 +65,11 @@ const STOP_PAGE = `<!doctype html>
 </html>
 `
 
-/** The answer of the Lock and faucet pages while paused. */
 export const stopPage = () =>
 	new Response(STOP_PAGE, {
 		status: 503,
 		headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
 	})
 
-/** The answer of the faucet's API while paused. */
 export const stopApi = () =>
 	json({ error: PAUSED_TEXT }, { status: 503, headers: { 'Access-Control-Allow-Origin': '*' } })

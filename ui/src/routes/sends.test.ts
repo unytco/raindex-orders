@@ -2,16 +2,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { maxUint256 } from 'viem'
 import type { SvelteComponent } from 'svelte'
-import { asBuild, BUILDS } from '$lib/testing/builds'
-import { PAUSED_TEXT } from '$lib/pause'
+import { asBuild, BUILDS, type Network } from '$lib/testing/builds'
+import { CHAIN, connected } from '$lib/testing/wallet'
+import { PAUSED_TEXT, STATUS_TIMEOUT_MS } from '$lib/pause'
 import { SEPOLIA_REDEEMED } from './api/coupon-status/fixtures'
 
-type Network = 'sepolia' | 'mainnet'
 type Page = new (options: { target: Element }) => SvelteComponent
+type Answer = (url: string, init: RequestInit) => Promise<Response>
 
-const CHAIN = { sepolia: 11155111, mainnet: 1 }
-const ACCOUNT = '0x1111111111111111111111111111111111111111'
 const AGENT = 'u' + btoa(String.fromCharCode(0x84, 0x20, 0x24, ...Array(36).fill(7)))
+const STATUS_FAILED = 'Could not check that the bridge is open.'
 const READS: Record<string, unknown> = {
 	balanceOf: 10n ** 21n,
 	allowance: maxUint256,
@@ -21,16 +21,21 @@ const READS: Record<string, unknown> = {
 	orderExists: true,
 	vaultBalance: 10n ** 21n
 }
+const PAUSED: Answer = async () => Response.json({ paused: true })
+const OPEN: Answer = async () => Response.json({ paused: false })
+const UNREACHABLE: Answer = async () => Promise.reject(new TypeError('fetch failed'))
 
+let reads: Record<string, unknown>
 const wallet = {
-	readContract: vi.fn(async ({ functionName }: { functionName: string }) => READS[functionName]),
-	writeContract: vi.fn(async () => '0xabc'),
+	readContract: vi.fn(async ({ functionName }: { functionName: string }) => reads[functionName]),
+	writeContract: vi.fn<[{ functionName: string }], Promise<string>>(async () => '0xabc'),
 	waitForTransaction: vi.fn(async () => ({ status: '0x1' }))
 }
 let target: HTMLElement
 let page: SvelteComponent | undefined
 
 beforeEach(() => {
+	reads = { ...READS }
 	vi.spyOn(console, 'error').mockImplementation(() => {})
 	target = document.body.appendChild(document.createElement('div'))
 })
@@ -42,7 +47,6 @@ afterEach(() => {
 	vi.clearAllMocks()
 })
 
-/** The page at `path`, mounted on a `network` build with the wallet connected on its chain. */
 async function mount(network: Network, path: './lock/+page.svelte' | './claim/+page.svelte') {
 	const Page = await asBuild(BUILDS[network], async () => {
 		vi.doMock('$lib/ethereum', async original => ({
@@ -50,21 +54,18 @@ async function mount(network: Network, path: './lock/+page.svelte' | './claim/+p
 			...wallet
 		}))
 		const { ethereumStore } = await import('$lib/ethereum')
-		ethereumStore.set({
-			isConnected: true,
-			account: ACCOUNT,
-			chainId: CHAIN[network],
-			isLoading: false,
-			error: null
-		})
+		ethereumStore.set(connected(CHAIN[network]))
 		return (await import(path)).default as Page
 	})
 	page = new Page({ target })
 }
 
-/** The site's `fetch`, answering `/api/status` with `answer`. */
-function status(answer: () => Promise<Response>) {
-	const fetch = vi.fn(answer)
+/** Stubs every `fetch`: each call takes the next answer, and the last repeats. */
+function stubFetch(...answers: Answer[]) {
+	let calls = 0
+	const fetch = vi.fn((url: string, init: RequestInit) =>
+		answers[Math.min(calls++, answers.length - 1)](url, init)
+	)
 	vi.stubGlobal('fetch', fetch)
 	return fetch
 }
@@ -75,15 +76,19 @@ function type(selector: string, value: string) {
 	input.dispatchEvent(new Event('input'))
 }
 
+const button = (label: string) =>
+	[...target.querySelectorAll('button')].find(b => b.textContent?.includes(label))
+
 async function click(label: string) {
 	await vi.waitFor(() => {
-		const button = [...target.querySelectorAll('button')].find(b => b.textContent?.includes(label))
-		expect(button?.disabled).toBe(false)
-		button!.click()
+		expect(button(label)?.disabled).toBe(false)
+		button(label)!.click()
 	})
 }
 
 const shown = () => target.textContent!.replace(/\s+/g, ' ')
+const written = () => wallet.writeContract.mock.calls.map(([call]) => call.functionName)
+const order = (mock: { mock: { invocationCallOrder: number[] } }) => mock.mock.invocationCallOrder
 
 async function lock(network: Network) {
 	await mount(network, './lock/+page.svelte')
@@ -94,59 +99,122 @@ async function lock(network: Network) {
 
 describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network => {
 	it('sends nothing, and shows the stop text, while the bridge is paused', async () => {
-		const fetch = status(async () => Response.json({ paused: true }))
+		const fetch = stubFetch(PAUSED)
 
 		await lock(network)
 
 		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
 		expect(target.querySelector('a[href="mailto:info@unyt.co"]')).not.toBeNull()
-		expect(fetch).toHaveBeenCalledWith('/api/status')
+		expect(fetch).toHaveBeenCalledWith('/api/status', expect.anything())
 		expect(wallet.writeContract).not.toHaveBeenCalled()
 	})
 
 	it.each([
-		['cannot be reached', async () => Promise.reject(new TypeError('fetch failed'))],
-		['answers an error', async () => new Response('Bad gateway', { status: 502 })],
+		['cannot be reached', UNREACHABLE],
+		[
+			'answers an error, even one reading not paused',
+			async () => Response.json({ paused: false }, { status: 502 })
+		],
+		['answers no JSON', async () => new Response('<html>', { status: 200 })],
+		['answers null', async () => Response.json(null)],
+		['answers no status', async () => Response.json({})],
 		['answers something else', async () => Response.json({ paused: 'no' })]
 	])('sends nothing, and shows an error, when /api/status %s', async (_, answer) => {
-		status(answer)
+		stubFetch(answer as Answer)
 
 		await lock(network)
 
-		await vi.waitFor(() => expect(shown()).toContain('Could not check that the bridge is open.'))
+		await vi.waitFor(() => expect(shown()).toContain(STATUS_FAILED))
 		expect(shown()).not.toContain(PAUSED_TEXT)
+		expect(button('Lock')?.disabled).toBe(false)
+		expect(wallet.writeContract).not.toHaveBeenCalled()
+	})
+
+	it('gives up on a read that never answers, and sends nothing', async () => {
+		const timeout = new AbortController()
+		const timer = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(timeout.signal)
+		const fetch = stubFetch(
+			(_, init) =>
+				new Promise((_, reject) =>
+					init.signal!.addEventListener('abort', () => reject(init.signal!.reason))
+				)
+		)
+
+		await lock(network)
+		await vi.waitFor(() => expect(fetch).toHaveBeenCalled())
+		timeout.abort(new DOMException('The operation timed out.', 'TimeoutError'))
+
+		await vi.waitFor(() => expect(shown()).toContain(STATUS_FAILED))
+		expect(timer).toHaveBeenCalledWith(STATUS_TIMEOUT_MS)
+		expect(button('Lock')?.disabled).toBe(false)
 		expect(wallet.writeContract).not.toHaveBeenCalled()
 	})
 
 	it('locks once /api/status reads not paused', async () => {
-		const fetch = status(async () => Response.json({ paused: false }))
+		const fetch = stubFetch(OPEN)
 
 		await lock(network)
 
-		await vi.waitFor(() =>
-			expect(wallet.writeContract).toHaveBeenCalledWith(
-				expect.objectContaining({ functionName: 'lock' })
-			)
-		)
-		expect(fetch.mock.invocationCallOrder[0]).toBeLessThan(
-			wallet.writeContract.mock.invocationCallOrder[0]
-		)
+		await vi.waitFor(() => expect(written()).toEqual(['lock']))
+		expect(order(fetch)[0]).toBeLessThan(order(wallet.writeContract)[0])
+	})
+
+	it('reads /api/status before the approve, and sends neither while paused', async () => {
+		reads.allowance = 0n
+		stubFetch(PAUSED)
+
+		await lock(network)
+
+		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
+		expect(wallet.writeContract).not.toHaveBeenCalled()
+	})
+
+	it('sends no lock when the bridge pauses while its approve is mined', async () => {
+		reads.allowance = 0n
+		const fetch = stubFetch(OPEN, PAUSED)
+
+		await lock(network)
+
+		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
+		expect(written()).toEqual(['approve'])
+		expect(order(fetch)[0]).toBeLessThan(order(wallet.writeContract)[0])
+		expect(order(fetch)[1]).toBeGreaterThan(order(wallet.writeContract)[0])
+	})
+
+	it('shows an error, not the stop text, when a retry after a pause cannot read the status', async () => {
+		stubFetch(PAUSED, UNREACHABLE)
+		await lock(network)
+		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
+
+		await click('Lock')
+
+		await vi.waitFor(() => expect(shown()).toContain(STATUS_FAILED))
+		expect(shown()).not.toContain(PAUSED_TEXT)
+		expect(wallet.writeContract).not.toHaveBeenCalled()
+	})
+
+	it('shows a later input error in place of the stop text', async () => {
+		stubFetch(PAUSED)
+		await lock(network)
+		await vi.waitFor(() => expect(shown()).toContain(PAUSED_TEXT))
+
+		type('#amount', '1.1234567')
+		await click('Lock')
+
+		await vi.waitFor(() => expect(shown()).toContain('at most 6 decimal places'))
+		expect(shown()).not.toContain(PAUSED_TEXT)
 	})
 })
 
 describe('Claim', () => {
 	it('sends with no status request, paused or not', async () => {
-		const fetch = status(async () => Response.json({ paused: true }))
+		const fetch = stubFetch(PAUSED)
 		await mount('sepolia', './claim/+page.svelte')
 
 		type('#coupon', SEPOLIA_REDEEMED[0].coupon)
 		await click('Claim')
 
-		await vi.waitFor(() =>
-			expect(wallet.writeContract).toHaveBeenCalledWith(
-				expect.objectContaining({ functionName: 'takeOrders' })
-			)
-		)
+		await vi.waitFor(() => expect(written()).toEqual(['takeOrders']))
 		expect(fetch).not.toHaveBeenCalled()
 	})
 })

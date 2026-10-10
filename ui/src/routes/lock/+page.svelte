@@ -131,7 +131,6 @@
 				}
 			} catch (e) {
 				console.error('Error reading URL parameters:', e)
-				// Page continues to work normally even if URL parsing fails
 			}
 		}
 	})
@@ -153,22 +152,22 @@
 	async function handleLock() {
 		if (!amount || !agentHex) return
 
+		error = ''
+		paused = false
+
 		const parts = amount.split('.')
 		if (parts.length === 2 && parts[1].length > MAX_DECIMAL_PLACES) {
 			error = `Amount can have at most ${MAX_DECIMAL_PLACES} decimal places.`
 			return
 		}
 
-		error = ''
-		paused = false
 		isLoading = true
 
-		if (!(await bridgeOpen())) {
-			isLoading = false
-			return
-		}
-
 		try {
+			// A lock already in the wallet's prompt when the pause lands can still be confirmed
+			// (documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
+			if (!(await bridgeOpen())) return
+
 			const amountWei = parseUnits(amount, tokenDecimals)
 
 			if (amountWei < minLockAmount) {
@@ -178,8 +177,7 @@
 				return
 			}
 
-			// If allowance is insufficient, approve unlimited once (one confirmation), then lock (one confirmation).
-			// After first time, only lock is needed (single confirmation).
+			// An unlimited approve, so later locks need one confirmation.
 			if (tokenAllowance < amountWei) {
 				transactionStore.awaitWalletConfirmation()
 				const approveHash = await writeContract({
@@ -192,6 +190,7 @@
 				await waitForTransaction(approveHash)
 				transactionStore.reset()
 				await fetchContractData()
+				if (!(await bridgeOpen())) return
 			}
 
 			transactionStore.awaitWalletConfirmation(true)
