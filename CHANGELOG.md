@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bridge-orchestrator marks a deposit bridged only once a RAVE has taken its link, so a deposit whose link the template refused waits instead.
 - bridge-orchestrator counts a deposit proof only on a link its bridging agent signed, so a copy in another agent's spend cannot mark a deposit bridged.
 - bridge-orchestrator stops on SIGTERM or SIGINT once the request in flight returns, and gives up on an Ethereum request after 30 s.
+- stopping or restarting bridge-orchestrator counts no attempt against a deposit, so it never fails one.
 
 ## [0.3.0] - 2026-10-06
 

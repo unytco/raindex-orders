@@ -413,6 +413,6 @@ detected ─> queued ─> claimed ─> in_flight ─┬─> succeeded
 - **succeeded** -- completed successfully
 - **failed** -- exhausted all retry attempts (`max_attempts` = 8)
 
-On startup, any items left in `claimed` or `in_flight` (from a previous crash)
-are automatically recovered back to `queued` if attempts remain, or marked
-`failed` if `max_attempts` has been reached.
+On startup, every item a stop or a crash left `claimed` or `in_flight` goes
+back to `queued` with its attempts unchanged. Only a failed cycle counts an
+attempt, against the items it had in flight.
