@@ -720,9 +720,8 @@ impl BridgeOrchestrator {
     /// and the rows behind them advance on their own.
     ///
     /// 1. Resolve context.
-    /// 2. Reconcile: promote rows through the pipeline based on what is
-    ///    still parked on the agreement each row was parked on, before any
-    ///    new write.
+    /// 2. Reconcile: settle each row against the chain before any new write
+    ///    ([`Self::reconcile_pipeline`]).
     /// 3. S1: `create_parked_link` (CL EA) packing proofs from rows at
     ///    `step='new'` up to the link-tag cap.
     /// 4. S2: `execute_rave` (CL EA) over the refetched live set; advances
@@ -1145,9 +1144,7 @@ impl BridgeOrchestrator {
     }
 
     /// Reconcile each lock against live chain truth before running the
-    /// pipeline's write stages. Every advancement here is driven by
-    /// observing the expected side-effect on `get_parked_links_by_ea` — we
-    /// never walk past RAVE history.
+    /// pipeline's write stages, never walking past RAVE history.
     ///
     /// Rules, applied in step-order (a single row that already has chain
     /// evidence at multiple steps gets cascaded forward each time we
@@ -1155,17 +1152,14 @@ impl BridgeOrchestrator {
     ///
     /// * `step='new'` and the lock's own proof is in a live CL parked link →
     ///   advance to `cl_link_created` with that link's ActionHash.
-    /// * `step='cl_link_created'` and `cl_link_hash` has left the agreement
-    ///   it was parked on → that agreement's RAVE consumed the link. Advance
-    ///   to `cl_rave_executed` with `cl_rave_hash=NULL` (we can't recover the
+    /// * `step='cl_link_created'` and [`Self::link_consumed`] → advance to
+    ///   `cl_rave_executed` with `cl_rave_hash=NULL` (we can't recover the
     ///   actual RAVE hash after the fact).
     /// * `step='cl_rave_executed'` and the lock's own proof is in a live
     ///   bridging parked spend → advance to `br_spend_created` with that
     ///   spend's ActionHash.
-    /// * `step='br_spend_created'` and `br_spend_hash` has left the
-    ///   agreement it was parked on → that agreement's RAVE consumed the
-    ///   spend. Advance to `br_rave_executed` (simultaneously
-    ///   `state='succeeded'`).
+    /// * `step='br_spend_created'` and [`Self::link_consumed`] → advance to
+    ///   `br_rave_executed` (simultaneously `state='succeeded'`).
     async fn reconcile_pipeline(
         &self,
         conductor: &impl ConductorReads,
@@ -1250,11 +1244,10 @@ impl BridgeOrchestrator {
         self.db.advance_to_br_spend_created(id, spend, &agreement)
     }
 
-    /// Whether the link a row waits on has left the agreement it was parked
-    /// on, and the bridging agent's chain still holds it. A link the chain no
-    /// longer holds was rolled back, and its row goes back to the step that
-    /// writes it. A read that fails for this row alone leaves it where it is,
-    /// holding up no other row. A failing conductor ends the cycle.
+    /// Whether a RAVE consumed the link a row waits on: it has left the
+    /// agreement it was parked on, and the bridging agent's conductor still
+    /// holds it as the row's own write. A link it no longer holds was rolled
+    /// back, and its row goes back to the step that writes it.
     async fn link_consumed(
         &self,
         conductor: &impl ConductorReads,
@@ -1267,7 +1260,14 @@ impl BridgeOrchestrator {
         };
         let (agreement, parked) = match parked_on(conductor, live, link, recorded).await {
             Ok(checked) => checked,
-            Err(e) => return Self::unresolved(row, link, e),
+            Err(e) if recorded.is_some() => return Self::unresolved(row, link, e),
+            Err(e) => {
+                return match held_link(conductor, live, link).await {
+                    Ok(None) => self.write_lost(row, link),
+                    Ok(Some(_)) => Self::unresolved(row, link, e),
+                    Err(held) => Self::unresolved(row, link, held),
+                }
+            }
         };
         if recorded.is_none() {
             self.db
@@ -1281,11 +1281,7 @@ impl BridgeOrchestrator {
             );
         }
         if !parked {
-            let held = match action_hash_from(link) {
-                Ok(hash) => live.held(conductor, hash).await,
-                Err(e) => Err(e),
-            };
-            match held {
+            match held_link(conductor, live, link).await {
                 Ok(Some(record)) => {
                     return match self.recorded_write(record, row) {
                         RecordedWrite::Own => {
@@ -1295,7 +1291,17 @@ impl BridgeOrchestrator {
                             );
                             Ok(true)
                         }
-                        RecordedWrite::Unreadable(e) => Self::unresolved(row, link, e),
+                        RecordedWrite::Unreadable(e) => {
+                            error!(
+                                event = "bridge.reconcile.unresolved",
+                                "[bridge/reconcile] lock={} at {} stays pending, the record of its link {} cannot be read: {:#}",
+                                row.item_id,
+                                row.step,
+                                link,
+                                e
+                            );
+                            Ok(false)
+                        }
                         // Neither advanced nor written again: whether this deposit was
                         // credited cannot be told from here, so a person resolves it
                         // (workshop `documentation/specs/bridge-stop/README.md`
@@ -1321,17 +1327,7 @@ impl BridgeOrchestrator {
                         }
                     };
                 }
-                Ok(None) => {
-                    self.db.return_to_writing_step(row.id)?;
-                    warn!(
-                        event = "bridge.reconcile.write_lost",
-                        "[bridge/reconcile] lock={} at {}: the bridging agent's chain no longer holds link {}, so it is written again",
-                        row.item_id,
-                        row.step,
-                        link
-                    );
-                    return Ok(false);
-                }
+                Ok(None) => return self.write_lost(row, link),
                 Err(e) => return Self::unresolved(row, link, e),
             }
         }
@@ -1355,20 +1351,36 @@ impl BridgeOrchestrator {
             return RecordedWrite::Misrecorded(format!("was signed by {author}"));
         }
         let Some(lock) = self.lock_key(row) else {
-            return RecordedWrite::Own;
+            return RecordedWrite::Misrecorded(
+                "cannot be checked: the row's payload names no lock".to_string(),
+            );
         };
-        match tag_proofs(record, &row.step) {
-            Ok(proofs)
-                if proofs
-                    .iter()
-                    .filter_map(LockKey::of_proof)
-                    .any(|proof| proof == lock) =>
-            {
-                RecordedWrite::Own
-            }
-            Ok(_) => RecordedWrite::Misrecorded("does not carry its proof".to_string()),
-            Err(e) => RecordedWrite::Unreadable(e),
+        let proofs = match tag_proofs(record, &row.step) {
+            Ok(proofs) => proofs,
+            Err(e) => return RecordedWrite::Unreadable(e),
+        };
+        let locks: Vec<LockKey> = proofs.iter().filter_map(LockKey::of_proof).collect();
+        if locks.contains(&lock) {
+            return RecordedWrite::Own;
         }
+        let unnamed = proofs.len() - locks.len();
+        RecordedWrite::Misrecorded(if unnamed == 0 {
+            "does not carry its proof".to_string()
+        } else {
+            format!("does not carry its proof, and {unnamed} of its proofs name no lock")
+        })
+    }
+
+    fn write_lost(&self, row: &WorkItem, link: &str) -> Result<bool> {
+        self.db.return_to_writing_step(row.id)?;
+        warn!(
+            event = "bridge.reconcile.write_lost",
+            "[bridge/reconcile] lock={} at {}: the bridging agent's conductor no longer holds link {}, so it is written again",
+            row.item_id,
+            row.step,
+            link
+        );
+        Ok(false)
     }
 
     /// A read for `row` that failed: a stop or a failing conductor ends the
@@ -1860,8 +1872,8 @@ trait ConductorReads {
     async fn parked_links(&self, agreement: &ActionHash) -> Result<Vec<Transaction>>;
     async fn agreement_of(&self, link: ActionHash) -> Result<ActionHash>;
     async fn ledger(&self) -> Result<Ledger>;
-    /// The link's record as the bridging agent's own chain holds it, `None`
-    /// once a rollback has taken it.
+    /// The link's record from the bridging agent's conductor's local
+    /// databases, `None` if it holds none.
     async fn held(&self, link: ActionHash) -> Result<Option<Record>>;
 }
 
@@ -2096,7 +2108,9 @@ impl ConductorReads for Conductor<'_> {
                 &held_input(link.clone()),
             )
             .await
-            .with_context(|| format!("failed to read link {link} from the bridging agent's chain"))
+            .with_context(|| {
+                format!("failed to read link {link} from the bridging agent's conductor")
+            })
     }
 }
 
@@ -2207,6 +2221,14 @@ async fn parked_on(
         .iter()
         .any(|t| t.id.to_string() == link);
     Ok((agreement, parked))
+}
+
+async fn held_link<'a>(
+    conductor: &impl ConductorReads,
+    live: &'a mut LiveLinks,
+    link: &str,
+) -> Result<&'a Option<Record>> {
+    live.held(conductor, action_hash_from(link)?).await
 }
 
 fn action_hash_from(b64: &str) -> Result<ActionHash> {
@@ -3784,9 +3806,29 @@ mod tests {
         fn rolled_back(self, link: &Transaction) -> Self {
             let link: ActionHash = link.id.clone().into();
             self.holds.borrow_mut().remove(&link);
+            self.parked_on.borrow_mut().remove(&link);
             for links in self.parked.borrow_mut().values_mut() {
                 links.retain(|parked| ActionHash::from(parked.id.clone()) != link);
             }
+            self
+        }
+
+        /// The conductor holds a record for `link` whose tag does not decode.
+        fn garbling(self, link: &Transaction) -> Self {
+            let hash: ActionHash = link.id.clone().into();
+            let garbled = signed_record(
+                link.creator.clone().into(),
+                hash.clone(),
+                ActionData::CreateLink(CreateLinkData {
+                    base_address: action_hash(BR_EA).into(),
+                    target_address: AgentPubKey::from_raw_32(vec![1u8; 32]).into(),
+                    zome_index: 0.into(),
+                    link_type: 0.into(),
+                    tag: LinkTag::new(vec![]),
+                }),
+                RecordEntry::NA,
+            );
+            self.holds.borrow_mut().insert(hash, garbled);
             self
         }
 
@@ -5859,11 +5901,7 @@ mod tests {
             orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
             let writes = conductor.calls.take();
-            let write = match step {
-                WorkStep::ClLinkCreated => "create_parked_link",
-                _ => "create_parked_spend",
-            };
-            assert!(writes.contains(&write), "{writes:?}");
+            assert!(writes.contains(&rewrite_at(&step)), "{writes:?}");
             assert_eq!(
                 lock_row(&orch, lost).state,
                 crate::state::WorkState::Succeeded,
@@ -5926,6 +5964,7 @@ mod tests {
             let reason = left.last_error.unwrap();
             assert!(reason.contains("mis-recorded legacy row"), "{reason}");
             assert!(reason.contains("does not carry its proof"), "{reason}");
+            assert!(reason.contains(&link.id.to_string()), "{reason}");
             assert!(
                 !conductor.calls.take().contains(&rewrite_at(&step)),
                 "nothing is written again for it"
@@ -5947,6 +5986,74 @@ mod tests {
         let reason = failed_row(&orch, id).last_error.unwrap();
         assert!(reason.contains("was signed by"), "{reason}");
         assert!(!conductor.calls.take().contains(&"create_parked_spend"));
+    }
+
+    #[tokio::test]
+    async fn a_lost_link_on_a_row_naming_no_agreement_is_written_again_too() {
+        let orch = test_orchestrator("lost-write-unnamed");
+        let ([lost, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        forget_agreements(&orch, &[lost]);
+        let conductor = bridging_conductor().holding(&links).rolled_back(&links[0]);
+
+        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+
+        let row = lock_row(&orch, lost);
+        assert_eq!(
+            (row.step, row.br_spend_hash),
+            (WorkStep::ClRaveExecuted, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_tag_does_not_decode_leaves_its_row_and_holds_up_no_other() {
+        let orch = test_orchestrator("held-undecodable");
+        let ([unread, held], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        let conductor = bridging_conductor().holding(&links).garbling(&links[0]);
+
+        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+
+        assert_eq!(lock_row(&orch, unread).step, WorkStep::BrSpendCreated);
+        assert_eq!(
+            lock_row(&orch, held).state,
+            crate::state::WorkState::Succeeded
+        );
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_payload_names_no_lock_is_left_for_a_person() {
+        let orch = test_orchestrator("payload-unreadable");
+        let ([unreadable, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        rusqlite::Connection::open(&orch.cfg.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE work_items SET payload_json = '{}' WHERE id = ?1",
+                [unreadable],
+            )
+            .unwrap();
+        let conductor = bridging_conductor().holding(&links);
+
+        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+
+        let reason = failed_row(&orch, unreadable).last_error.unwrap();
+        assert!(reason.contains("names no lock"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_conductor_that_drops_the_chain_read_fails_the_cycle() {
+        let orch = test_orchestrator("held-disconnected");
+        let ([waiting, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        let conductor = FakeConductor {
+            fails_on: Some((
+                links[0].id.clone().into(),
+                "Failed to call zome: Websocket error: Websocket closed",
+            )),
+            ..bridging_conductor().holding(&links)
+        };
+
+        let e = reconcile_fails(&orch, &conductor).await;
+
+        assert_eq!(classify_cycle_failure(&e), CycleFailureAction::Reconnect);
+        assert_eq!(lock_row(&orch, waiting).step, WorkStep::BrSpendCreated);
     }
 
     #[tokio::test]
@@ -6174,6 +6281,11 @@ mod tests {
                 0x44,
                 &[proof("lock:unreadable:0xd4", "0xd4")],
             )]);
+        let unknown = parked_spend_tx(0x43, &[proof("lock:unreadable:0xd3", "0xd3")]);
+        conductor.holds.borrow_mut().insert(
+            action_hash(0x43),
+            written_record(&unknown, action_hash(BR_EA)),
+        );
 
         let counts = reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 

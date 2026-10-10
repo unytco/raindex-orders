@@ -351,10 +351,10 @@ systemctl start bridge-orchestrator
 ```
 
 Add `AND id IN (...)` to target specific rows. `attempts` must be under
-`max_attempts` or the cycle skips the row. A row whose `last_error` says
-`mis-recorded legacy row` fails again if re-queued unchanged: first check by
-hand whether its depositor was credited. Rows left `claimed` or `in_flight`
-need no action — startup re-queues those on its own.
+`max_attempts` or the next cycle fails it again. Leave a row whose `last_error`
+says `mis-recorded legacy row` failed: re-queued unchanged it fails again.
+Check by hand whether its depositor was credited, and credit it by hand if not.
+Rows left `claimed` or `in_flight` need no action: startup re-queues them.
 
 ### systemd service management
 

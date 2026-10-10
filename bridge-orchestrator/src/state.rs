@@ -820,8 +820,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Return a row whose recorded link its conductor no longer holds to the
-    /// step that writes the link, with the link and its agreement cleared.
     pub fn return_to_writing_step(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
