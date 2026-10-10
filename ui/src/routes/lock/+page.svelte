@@ -20,6 +20,7 @@
 		waitForTransaction
 	} from '$lib/ethereum'
 	import { isHolochainKey, holochainKeyTo32ByteHex, errorMessage } from '$lib/utils'
+	import { PAUSED_CONTACT, PAUSED_LEAD, readPaused } from '$lib/pause'
 
 	let amount = ''
 	let agentInput = ''
@@ -27,6 +28,7 @@
 	let agentPrefilledFromUrl = false
 	let isLoading = false
 	let error = ''
+	let paused = false
 	// Replaces the form once a lock confirms, until the page is reloaded.
 	let lockReceipt: { amount: string; hash: string } | undefined
 
@@ -129,16 +131,29 @@
 				}
 			} catch (e) {
 				console.error('Error reading URL parameters:', e)
-				// Page continues to work normally even if URL parsing fails
 			}
 		}
 	})
 
 	const MAX_DECIMAL_PLACES = 6
+	const STATUS_FAILED = 'Could not check that the bridge is open. Please try again.'
 
-	// Handle lock (runs approve first if needed, then lock — single action for the user)
+	async function bridgeOpen(): Promise<boolean> {
+		try {
+			paused = await readPaused()
+			return !paused
+		} catch (e) {
+			console.error('Error reading the bridge status:', e)
+			error = STATUS_FAILED
+			return false
+		}
+	}
+
 	async function handleLock() {
 		if (!amount || !agentHex) return
+
+		error = ''
+		paused = false
 
 		const parts = amount.split('.')
 		if (parts.length === 2 && parts[1].length > MAX_DECIMAL_PLACES) {
@@ -146,10 +161,13 @@
 			return
 		}
 
-		error = ''
 		isLoading = true
 
 		try {
+			// A lock already in the wallet's prompt when the pause lands can still be confirmed
+			// (workshop documentation/specs/bridge-stop/README.md, "Operating assumptions and limits").
+			if (!(await bridgeOpen())) return
+
 			const amountWei = parseUnits(amount, tokenDecimals)
 
 			if (amountWei < minLockAmount) {
@@ -159,8 +177,7 @@
 				return
 			}
 
-			// If allowance is insufficient, approve unlimited once (one confirmation), then lock (one confirmation).
-			// After first time, only lock is needed (single confirmation).
+			// An unlimited approve, so later locks need one confirmation.
 			if (tokenAllowance < amountWei) {
 				transactionStore.awaitWalletConfirmation()
 				const approveHash = await writeContract({
@@ -173,6 +190,7 @@
 				await waitForTransaction(approveHash)
 				transactionStore.reset()
 				await fetchContractData()
+				if (!(await bridgeOpen())) return
 			}
 
 			transactionStore.awaitWalletConfirmation(true)
@@ -317,7 +335,12 @@
 					{/if}
 				</div>
 
-				{#if error}
+				{#if paused}
+					<Alert color="yellow">
+						{PAUSED_LEAD}
+						<a href="mailto:{PAUSED_CONTACT}" class="font-medium underline">{PAUSED_CONTACT}</a>.
+					</Alert>
+				{:else if error}
 					<Alert color="red">{error}</Alert>
 				{/if}
 
