@@ -410,7 +410,11 @@ impl BridgeOrchestrator {
                         self.reporter.update(|h| {
                             h.last_cycle_started_at_ms = Some(cycle_started_at_ms);
                         });
-                        match self.run_bridge_cycle(&ham).await {
+                        let conductor = Conductor {
+                            ham: &ham,
+                            role_name: &self.cfg.role_name,
+                        };
+                        match self.run_bridge_cycle(&conductor).await {
                             Ok(()) => {
                                 last_bridge_cycle = std::time::Instant::now();
                                 let duration_ms =
@@ -669,23 +673,15 @@ impl BridgeOrchestrator {
     /// 6. S4: `execute_rave` (bridging EA) over the refetched live set
     ///    plus withdrawal coupons; advances to `state='succeeded'` each row
     ///    at `br_spend_created` whose own proof it consumed.
-    async fn run_bridge_cycle(&self, ham: &Ham) -> Result<()> {
+    async fn run_bridge_cycle<C: ConductorReads + ConductorWrites>(
+        &self,
+        conductor: &C,
+    ) -> Result<()> {
         let started = std::time::Instant::now();
 
-        let global_definition: GlobalDefinitionExt = ham
-            .call_zome(
-                &self.cfg.role_name,
-                "transactor",
-                "get_current_global_definition",
-                &Some(GetStrategy::Local),
-            )
-            .await?;
-        let conductor = Conductor {
-            ham,
-            role_name: &self.cfg.role_name,
-        };
+        let global_definition = conductor.global_definition().await?;
         let context = Self::resolve_deposit_context(
-            &conductor,
+            conductor,
             &self.cfg.bridging_agent_pubkey,
             self.cfg.hot_unit_index,
             &global_definition,
@@ -712,10 +708,10 @@ impl BridgeOrchestrator {
 
         let mut live = LiveLinks::default();
         let reconcile = self
-            .reconcile_pipeline(&conductor, &mut live, &context)
+            .reconcile_pipeline(conductor, &mut live, &context)
             .await?;
-        let cl_parked_live = live.on(&conductor, &credit_limit_ea_id).await?.len();
-        let br_parked_live = live.on(&conductor, &bridging_ea_id).await?.len();
+        let cl_parked_live = live.on(conductor, &credit_limit_ea_id).await?.len();
+        let br_parked_live = live.on(conductor, &bridging_ea_id).await?.len();
 
         let vault = self
             .ethereum
@@ -770,26 +766,21 @@ impl BridgeOrchestrator {
                 &total_cl,
                 &json!({ "proof_of_deposit": s1_batch.proofs.clone() }),
             );
-            let (link_result, s1_elapsed_ms): ((ActionHashB64, AgentPubKey), u128) = timed_call(
+            let (cl_link_hash, s1_elapsed_ms) = timed_call(
                 "s1",
                 "create_parked_link",
-                ham.call_zome(
-                    &self.cfg.role_name,
-                    "transactor",
-                    "create_parked_link",
-                    &CreateParkedLinkInput {
-                        ea_id: credit_limit_ea_id.clone(),
-                        executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
-                        parked_link_type: ParkedLinkType::ParkedData((parked_data, true)),
-                    },
-                ),
+                conductor.create_parked_link(&CreateParkedLinkInput {
+                    ea_id: credit_limit_ea_id.clone(),
+                    executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
+                    parked_link_type: ParkedLinkType::ParkedData((parked_data, true)),
+                }),
             )
             .await?;
-            let cl_link_hash = link_result.0.to_string();
+            let cl_link_hash = cl_link_hash.to_string();
             info!(
                 "[bridge/s1] create_parked_link: {} proofs, action_hash={}",
                 s1_batch.proofs.len(),
-                link_result.0
+                cl_link_hash
             );
             // One ActionHash for the whole batch; every contributing row
             // stores it for future reconcile comparisons.
@@ -832,26 +823,21 @@ impl BridgeOrchestrator {
                 "[bridge/s2] RAVE: consuming {} explicit links",
                 cl_links.len()
             );
-            let (rave_result, s2_elapsed_ms): ((RAVE, ActionHash), u128) = timed_call(
+            let (cl_rave_hash, s2_elapsed_ms) = timed_call(
                 "s2",
                 "execute_rave",
-                ham.call_zome(
-                    &self.cfg.role_name,
-                    "transactor",
-                    "execute_rave",
-                    &RAVEExecuteInputs {
-                        ea_id: credit_limit_ea_id.clone(),
-                        executor_inputs: Value::Null,
-                        links: cl_links.clone(),
-                        global_definition: global_definition.id.clone().into(),
-                        lane_definitions: context.lane_definitions.clone(),
-                        strategy: GetStrategy::Local,
-                    },
-                ),
+                conductor.execute_rave(&RAVEExecuteInputs {
+                    ea_id: credit_limit_ea_id.clone(),
+                    executor_inputs: Value::Null,
+                    links: cl_links.clone(),
+                    global_definition: global_definition.id.clone().into(),
+                    lane_definitions: context.lane_definitions.clone(),
+                    strategy: GetStrategy::Local,
+                }),
             )
             .await?;
-            let cl_rave_hash = rave_result.1.to_string();
-            info!("[bridge/s2] RAVE executed action_hash={}", rave_result.1);
+            let cl_rave_hash = cl_rave_hash.to_string();
+            info!("[bridge/s2] RAVE executed action_hash={}", cl_rave_hash);
             cl_rave_advanced =
                 self.advance_consumed(WorkStep::ClLinkCreated, &consumed_cl, |id| {
                     self.db.advance_to_cl_rave_executed(id, Some(&cl_rave_hash))
@@ -881,15 +867,7 @@ impl BridgeOrchestrator {
                 // Read on the same connection as the write, and immediately before
                 // it: the tag carries this agent's ledger as it stands when the
                 // zome reads it, and every zome call in between would move it.
-                let Some(ledger) = self
-                    .spend_tag_ledger(ham.call_zome(
-                        &self.cfg.role_name,
-                        "transactor",
-                        "get_ledger",
-                        &(),
-                    ))
-                    .await?
-                else {
+                let Some(ledger) = self.spend_tag_ledger(conductor.ledger()).await? else {
                     return Ok(());
                 };
                 let tag_context = SpendTagContext {
@@ -914,24 +892,19 @@ impl BridgeOrchestrator {
                 for id in &s3_batch.ids {
                     self.db.mark_in_flight(*id)?;
                 }
-                let (spend_hash, s3_elapsed_ms): (ActionHashB64, u128) = timed_call(
+                let (spend_hash, s3_elapsed_ms) = timed_call(
                     "s3",
                     "create_parked_spend",
-                    ham.call_zome(
-                        &self.cfg.role_name,
-                        "transactor",
-                        "create_parked_spend",
-                        &CreateParkedSpendInput {
-                            ea_id: bridging_ea_id.clone(),
-                            executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
-                            ct_role_id: Some(BRIDGING_AGENT_ROLE.to_string()),
-                            amount: total_spend.clone(),
-                            spender_payload: json!({
-                                "proof_of_deposit": s3_batch.proofs.clone(),
-                            }),
-                            lane_definitions: context.lane_definitions.clone(),
-                        },
-                    ),
+                    conductor.create_parked_spend(&CreateParkedSpendInput {
+                        ea_id: bridging_ea_id.clone(),
+                        executor: Some(self.cfg.bridging_agent_pubkey.clone().into()),
+                        ct_role_id: Some(BRIDGING_AGENT_ROLE.to_string()),
+                        amount: total_spend.clone(),
+                        spender_payload: json!({
+                            "proof_of_deposit": s3_batch.proofs.clone(),
+                        }),
+                        lane_definitions: context.lane_definitions.clone(),
+                    }),
                 )
                 .await?;
                 let spend_hash_str = spend_hash.to_string();
@@ -1048,28 +1021,23 @@ impl BridgeOrchestrator {
                 retained_deposit_count, withdrawal_count
             );
 
-            let (rave_result, _s4_elapsed_ms): ((RAVE, ActionHash), u128) = timed_call(
+            let (br_rave_hash, _s4_elapsed_ms) = timed_call(
                 "s4",
                 "execute_rave",
-                ham.call_zome(
-                    &self.cfg.role_name,
-                    "transactor",
-                    "execute_rave",
-                    &RAVEExecuteInputs {
-                        ea_id: bridging_ea_id,
-                        executor_inputs: json!({
-                            "coupons": Value::Object(coupons_map)
-                        }),
-                        links: rave_links,
-                        global_definition: global_definition.id.clone().into(),
-                        lane_definitions: context.lane_definitions,
-                        strategy: GetStrategy::Local,
-                    },
-                ),
+                conductor.execute_rave(&RAVEExecuteInputs {
+                    ea_id: bridging_ea_id,
+                    executor_inputs: json!({
+                        "coupons": Value::Object(coupons_map)
+                    }),
+                    links: rave_links,
+                    global_definition: global_definition.id.clone().into(),
+                    lane_definitions: context.lane_definitions,
+                    strategy: GetStrategy::Local,
+                }),
             )
             .await?;
-            let br_rave_hash = rave_result.1.to_string();
-            info!("[bridge/s4] RAVE executed action_hash={}", rave_result.1,);
+            let br_rave_hash = br_rave_hash.to_string();
+            info!("[bridge/s4] RAVE executed action_hash={}", br_rave_hash);
             succeeded_locks =
                 self.advance_consumed(WorkStep::BrSpendCreated, &consumed_deposits, |id| {
                     self.db.advance_to_br_rave_executed(id, Some(&br_rave_hash))
@@ -1676,11 +1644,20 @@ impl CandidateLane {
 
 /// A trait so a test can stand in for the conductor.
 trait ConductorReads {
+    async fn global_definition(&self) -> Result<GlobalDefinitionExt>;
     async fn all_lanes(&self) -> Result<Vec<LaneExt>>;
     async fn version_in_force(&self, newest: ActionHash) -> Result<Option<ActionHash>>;
     async fn lane_definition(&self, version: ActionHash) -> Result<LaneDefinition>;
     async fn parked_links(&self, agreement: &ActionHash) -> Result<Vec<Transaction>>;
     async fn agreement_of(&self, link: ActionHash) -> Result<ActionHash>;
+    async fn ledger(&self) -> Result<Ledger>;
+}
+
+/// The writes a bridge cycle makes, each answering the ActionHash it wrote.
+trait ConductorWrites {
+    async fn create_parked_link(&self, input: &CreateParkedLinkInput) -> Result<ActionHashB64>;
+    async fn execute_rave(&self, input: &RAVEExecuteInputs) -> Result<ActionHash>;
+    async fn create_parked_spend(&self, input: &CreateParkedSpendInput) -> Result<ActionHashB64>;
 }
 
 /// Each agreement's parked links, and each link's agreement, as reconcile
@@ -1744,6 +1721,17 @@ impl Conductor<'_> {
 }
 
 impl ConductorReads for Conductor<'_> {
+    async fn global_definition(&self) -> Result<GlobalDefinitionExt> {
+        self.ham
+            .call_zome(
+                self.role_name,
+                "transactor",
+                "get_current_global_definition",
+                &Some(GetStrategy::Local),
+            )
+            .await
+    }
+
     async fn all_lanes(&self) -> Result<Vec<LaneExt>> {
         self.ham
             .call_zome(
@@ -1796,6 +1784,36 @@ impl ConductorReads for Conductor<'_> {
             .await
             .with_context(|| format!("failed to read parked link {link}"))?;
         agreement_parked_on(&record)
+    }
+
+    async fn ledger(&self) -> Result<Ledger> {
+        self.ham
+            .call_zome(self.role_name, "transactor", "get_ledger", &())
+            .await
+    }
+}
+
+impl ConductorWrites for Conductor<'_> {
+    async fn create_parked_link(&self, input: &CreateParkedLinkInput) -> Result<ActionHashB64> {
+        let (link, _executor): (ActionHashB64, AgentPubKey) = self
+            .ham
+            .call_zome(self.role_name, "transactor", "create_parked_link", input)
+            .await?;
+        Ok(link)
+    }
+
+    async fn execute_rave(&self, input: &RAVEExecuteInputs) -> Result<ActionHash> {
+        let (_rave, hash): (RAVE, ActionHash) = self
+            .ham
+            .call_zome(self.role_name, "transactor", "execute_rave", input)
+            .await?;
+        Ok(hash)
+    }
+
+    async fn create_parked_spend(&self, input: &CreateParkedSpendInput) -> Result<ActionHashB64> {
+        self.ham
+            .call_zome(self.role_name, "transactor", "create_parked_spend", input)
+            .await
     }
 }
 
@@ -2267,6 +2285,7 @@ mod tests {
         LaneDefinitionExt, TransactionType, UnitIndexMap,
     };
     use serde::de::IgnoredAny;
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::time::{SystemTime, UNIX_EPOCH};
     use zfuel::fraction::Fraction;
@@ -3289,14 +3308,40 @@ mod tests {
 
     #[derive(Default)]
     struct FakeConductor {
+        global: Option<GlobalDefinitionExt>,
         lanes: Vec<LaneExt>,
         in_force: HashMap<ActionHash, ActionHash>,
         versions: HashMap<ActionHash, LaneDefinition>,
-        parked: HashMap<ActionHash, Vec<Transaction>>,
-        parked_on: HashMap<ActionHash, ActionHash>,
-        parked_reads: std::cell::RefCell<Vec<ActionHash>>,
-        link_reads: std::cell::RefCell<Vec<ActionHash>>,
+        parked: RefCell<HashMap<ActionHash, Vec<Transaction>>>,
+        parked_on: RefCell<HashMap<ActionHash, ActionHash>>,
+        calls: RefCell<Vec<&'static str>>,
+        written: Cell<u8>,
+        parked_reads: RefCell<Vec<ActionHash>>,
+        link_reads: RefCell<Vec<ActionHash>>,
         fails_on: Option<(ActionHash, &'static str)>,
+    }
+
+    /// A conductor on which the global definition's lane bridges for the test
+    /// config's agent through `CL_EA` and `BR_EA`, with nothing parked on
+    /// either.
+    fn bridging_conductor() -> FakeConductor {
+        let mut global = global_bridged_by(1, &[HOT]);
+        let agreements = &mut global.lane_def.rave_agreements;
+        agreements.credit_limit_adjustment = Some(action_hash(CL_EA).into());
+        agreements.bridging_agreement = Some(action_hash(BR_EA).into());
+        FakeConductor {
+            global: Some(global),
+            ..FakeConductor::default()
+        }
+        .consumed(action_hash(CL_EA))
+        .consumed(action_hash(BR_EA))
+    }
+
+    fn proofs_in(payload: &Value) -> Vec<Value> {
+        payload["proof_of_deposit"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn basic_properties(origin: u8) -> LaneBasicPropertiesExt {
@@ -3315,10 +3360,37 @@ mod tests {
         fn parking(mut self, agreement: ActionHash, links: &[Transaction]) -> Self {
             for link in links {
                 self.parked_on
+                    .get_mut()
                     .insert(link.id.clone().into(), agreement.clone());
             }
-            self.parked.insert(agreement, links.to_vec());
+            self.parked.get_mut().insert(agreement, links.to_vec());
             self
+        }
+
+        fn call(&self, name: &'static str) {
+            self.calls.borrow_mut().push(name);
+        }
+
+        /// The ActionHash of the next write, which this conductor numbers from
+        /// `0xC0`.
+        fn write(&self, name: &'static str) -> ActionHash {
+            self.call(name);
+            let seed = 0xC0 + self.written.get();
+            self.written.set(self.written.get() + 1);
+            action_hash(seed)
+        }
+
+        fn park(&self, agreement: &ActionHash, link: Transaction) -> ActionHashB64 {
+            self.parked_on
+                .borrow_mut()
+                .insert(link.id.clone().into(), agreement.clone());
+            let id = link.id.clone();
+            self.parked
+                .borrow_mut()
+                .entry(agreement.clone())
+                .or_default()
+                .push(link);
+            id
         }
 
         fn consumed(self, agreement: ActionHash) -> Self {
@@ -3384,15 +3456,24 @@ mod tests {
     }
 
     impl ConductorReads for FakeConductor {
+        async fn global_definition(&self) -> Result<GlobalDefinitionExt> {
+            self.call("global_definition");
+            let global = self.global.as_ref().context("no global definition")?;
+            Ok(off_the_wire(global))
+        }
+
         async fn all_lanes(&self) -> Result<Vec<LaneExt>> {
+            self.call("all_lanes");
             Ok(off_the_wire(&self.lanes))
         }
 
         async fn version_in_force(&self, newest: ActionHash) -> Result<Option<ActionHash>> {
+            self.call("version_in_force");
             Ok(self.in_force.get(&newest).cloned())
         }
 
         async fn lane_definition(&self, version: ActionHash) -> Result<LaneDefinition> {
+            self.call("lane_definition");
             let definition = self
                 .versions
                 .get(&version)
@@ -3401,23 +3482,61 @@ mod tests {
         }
 
         async fn parked_links(&self, agreement: &ActionHash) -> Result<Vec<Transaction>> {
+            self.call("parked_links");
             self.parked_reads.borrow_mut().push(agreement.clone());
             self.check_fails_on(agreement)?;
-            let links = self
-                .parked
+            let parked = self.parked.borrow();
+            let links = parked
                 .get(agreement)
                 .with_context(|| format!("no agreement {agreement}"))?;
             Ok(off_the_wire(links))
         }
 
         async fn agreement_of(&self, link: ActionHash) -> Result<ActionHash> {
+            self.call("agreement_of");
             self.link_reads.borrow_mut().push(link.clone());
             self.check_fails_on(&link)?;
             let agreement = self
                 .parked_on
+                .borrow()
                 .get(&link)
+                .cloned()
                 .with_context(|| format!("no parked link {link}"))?;
-            agreement_parked_on(&off_the_wire(&parked_link_record(link, agreement.clone())))
+            agreement_parked_on(&off_the_wire(&parked_link_record(link, agreement)))
+        }
+
+        async fn ledger(&self) -> Result<Ledger> {
+            self.call("ledger");
+            Ok(Ledger::empty())
+        }
+    }
+
+    impl ConductorWrites for FakeConductor {
+        async fn create_parked_link(&self, input: &CreateParkedLinkInput) -> Result<ActionHashB64> {
+            let ParkedLinkType::ParkedData((data, _)) = &input.parked_link_type else {
+                anyhow::bail!("the bridge parks only data on the CL EA");
+            };
+            let seed = self.write("create_parked_link").get_raw_32()[0];
+            Ok(self.park(&input.ea_id, parked_tx(seed, &proofs_in(&data.payload))))
+        }
+
+        async fn execute_rave(&self, input: &RAVEExecuteInputs) -> Result<ActionHash> {
+            let rave = self.write("execute_rave");
+            let consumed: HashSet<String> = input.links.iter().map(|t| t.id.to_string()).collect();
+            if let Some(links) = self.parked.borrow_mut().get_mut(&input.ea_id) {
+                links.retain(|link| !consumed.contains(&link.id.to_string()));
+            }
+            Ok(rave)
+        }
+
+        async fn create_parked_spend(
+            &self,
+            input: &CreateParkedSpendInput,
+        ) -> Result<ActionHashB64> {
+            let seed = self.write("create_parked_spend").get_raw_32()[0];
+            let mut spend = parked_spend_tx(seed, &proofs_in(&input.spender_payload));
+            spend.amount = input.amount.clone();
+            Ok(self.park(&input.ea_id, spend))
         }
     }
 
@@ -4614,6 +4733,40 @@ mod tests {
         assert_eq!(advanced, 2);
         for id in rows {
             assert_eq!(lock_row(&orch, id).step, WorkStep::ClRaveExecuted);
+        }
+    }
+
+    /// Every call a cycle makes carrying one deposit from `new` to `succeeded`.
+    const ONE_DEPOSIT_CYCLE: [&str; 11] = [
+        "global_definition",
+        "all_lanes",
+        "parked_links",
+        "parked_links",
+        "create_parked_link",
+        "parked_links",
+        "execute_rave",
+        "ledger",
+        "create_parked_spend",
+        "parked_links",
+        "execute_rave",
+    ];
+
+    #[tokio::test]
+    async fn one_cycle_carries_a_deposit_through_all_four_stages() {
+        let orch = test_orchestrator("cycle-all-stages");
+        let id = enqueue_lock(&orch, "lock:cycle:1", "0x80");
+        let conductor = bridging_conductor();
+
+        orch.run_bridge_cycle(&conductor).await.unwrap();
+
+        let row = lock_row(&orch, id);
+        assert_eq!(
+            (row.state, row.step),
+            (crate::state::WorkState::Succeeded, WorkStep::BrRaveExecuted)
+        );
+        assert_eq!(conductor.calls.take(), ONE_DEPOSIT_CYCLE);
+        for agreement in [CL_EA, BR_EA] {
+            assert!(conductor.parked.borrow()[&action_hash(agreement)].is_empty());
         }
     }
 
