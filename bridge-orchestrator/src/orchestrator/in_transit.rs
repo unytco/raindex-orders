@@ -118,7 +118,8 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
         db,
         reporter: ReporterState::new(),
         ethereum: None,
-        flagged: Default::default(),
+        deferred: Default::default(),
+        told: Default::default(),
     };
     let found = orchestrator
         .in_transit(&Conductor {
