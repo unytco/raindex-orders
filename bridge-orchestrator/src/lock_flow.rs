@@ -79,6 +79,13 @@ impl LockFlow {
         Ok(())
     }
 
+    fn row_key(&self, lock_id: &str) -> String {
+        format!(
+            "lock:{:#x}:{lock_id}:create_parked_link",
+            self.cfg.lock_vault_address
+        )
+    }
+
     fn provider(&self) -> Result<RootProvider<Http<Client>>> {
         Ok(ProviderBuilder::new().on_http(self.cfg.rpc_url.parse()?))
     }
@@ -125,7 +132,7 @@ impl LockFlow {
         let holochain_agent = format!("0x{}", hex::encode(data.holochainAgent));
         let tx_hash_hex = format!("0x{}", hex::encode(tx_hash));
         let item_id = format!("lock:{}", data.lockId);
-        let idempotency_key = format!("lock:{}:create_parked_link", data.lockId);
+        let idempotency_key = self.row_key(&data.lockId.to_string());
         let payload = json!({
             "lock_id": data.lockId.to_string(),
             "sender": sender,
@@ -168,12 +175,11 @@ impl LockFlow {
                 .unwrap_or_default();
             let confirmations = current_block.saturating_sub(block_number);
             if confirmations >= self.cfg.confirmations {
-                let idempotency_key = format!(
-                    "lock:{}:create_parked_link",
+                let idempotency_key = self.row_key(
                     payload
                         .get("lock_id")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
+                        .unwrap_or("unknown"),
                 );
                 if self.db.move_detected_to_queued(&idempotency_key)? {
                     let amount = payload
@@ -322,6 +328,84 @@ mod tests {
                 .map(|row| row.item_id.as_str())
                 .collect::<Vec<_>>(),
             ["lock:7"]
+        );
+    }
+
+    /// An RPC whose chain holds lock 7 in block 5, with its head at block 9.
+    async fn chain_with_lock_seven() -> String {
+        serve(|method, _| match method {
+            "eth_blockNumber" => Ok(json!("0x9")),
+            "eth_getLogs" => Ok(json!([lock_log(5)])),
+            "eth_getBlockByNumber" => Ok(block(5)),
+            other => Err(json!({ "code": -32601, "message": format!("no {other}") })),
+        })
+        .await
+    }
+
+    fn lock_rows(db: &StateStore) -> Vec<crate::state::WorkItem> {
+        [WorkState::Detected, WorkState::Queued]
+            .into_iter()
+            .flat_map(|state| db.list_work_items("lock", state, 10).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_lock_read_twice_is_one_row_keyed_by_its_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(&dir);
+        let flow = lock_flow(
+            chain_with_lock_seven().await,
+            db.clone(),
+            watch::channel(false).1,
+        );
+
+        for _ in 0..2 {
+            db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 0).unwrap();
+            flow.run_cycle().await.unwrap();
+        }
+
+        let rows = lock_rows(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item_id, "lock:7");
+        assert_eq!(
+            rows[0].idempotency_key,
+            format!("lock:{:#x}:7:create_parked_link", vault())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lock_an_earlier_binary_recorded_is_not_recorded_again_once_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(&dir);
+        rusqlite::Connection::open(dir.path().join("locks.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state)
+                 VALUES ('lock', 'create_parked_link', 'lock:7', 'lock:7:create_parked_link', '{}', 'queued')",
+                [],
+            )
+            .unwrap();
+
+        db.bind_vault(&format!("{:#x}", vault())).unwrap();
+        db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 0).unwrap();
+        lock_flow(
+            chain_with_lock_seven().await,
+            db.clone(),
+            watch::channel(false).1,
+        )
+        .run_cycle()
+        .await
+        .unwrap();
+
+        let rows = lock_rows(&db);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the lock already recorded is not recorded again"
+        );
+        assert_eq!(
+            rows[0].idempotency_key,
+            format!("lock:{:#x}:7:create_parked_link", vault())
         );
     }
 

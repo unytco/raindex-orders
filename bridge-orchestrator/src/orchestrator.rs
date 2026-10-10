@@ -211,6 +211,9 @@ async fn select_bridging_links(
 impl BridgeOrchestrator {
     pub fn new(cfg: Config, ethereum: Option<EthereumSide>) -> Result<Self> {
         let db = StateStore::open(&cfg.db_path)?;
+        if let Some(side) = &ethereum {
+            db.bind_vault(&format!("{:#x}", side.chain.lock_vault_address))?;
+        }
         let recovered = db.recover_stale_items()?;
         if !recovered.is_empty() {
             warn!(
@@ -3096,6 +3099,44 @@ mod tests {
         cfg.conductor_config = node.path().join(conductor_config).display().to_string();
         cfg.lair_passphrase_file = node.path().join("lair-passphrase").display().to_string();
         cfg
+    }
+
+    #[test]
+    fn the_orchestrator_binds_its_database_to_its_vault_and_refuses_another() {
+        let path = test_db_path("bind-vault");
+        let side = |vault: Address| EthereumSide {
+            chain: Ethereum {
+                network: Network::Sepolia,
+                rpc_url: "http://localhost:0".to_string(),
+                lock_vault_address: vault,
+                confirmations: 5,
+            },
+            signer: CouponSigner::with_key(PrivateKeySigner::random()),
+        };
+        BridgeOrchestrator::new(test_config(path.clone()), None)
+            .expect("NETWORK=none binds nothing");
+        BridgeOrchestrator::new(
+            test_config(path.clone()),
+            Some(side(Address::repeat_byte(0xA1))),
+        )
+        .expect("the first vault binds the database");
+
+        let Err(e) = BridgeOrchestrator::new(
+            test_config(path.clone()),
+            Some(side(Address::repeat_byte(0xB2))),
+        ) else {
+            panic!("a database bound to one vault started with another");
+        };
+        let e = format!("{e:#}");
+        assert!(
+            e.contains(&format!("{:#x}", Address::repeat_byte(0xA1))),
+            "{e}"
+        );
+        assert!(
+            e.contains(&format!("{:#x}", Address::repeat_byte(0xB2))),
+            "{e}"
+        );
+        BridgeOrchestrator::new(test_config(path), None).expect("NETWORK=none checks nothing");
     }
 
     #[test]

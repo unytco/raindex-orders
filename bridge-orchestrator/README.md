@@ -45,7 +45,9 @@ An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
 its supervisor restarts it. So does a conductor config, at `CONDUCTOR_CONFIG`,
 that does not set `db_sync_level: Full`, which `run` checks first, with
 Ethereum on or off: without it a power loss can roll back the conductor's
-latest writes behind what the bridge has recorded. Once the checks pass it logs
+latest writes behind what the bridge has recorded. And so does a database that
+serves another vault: a `DB_PATH` serves the vault it first ran with, and names
+each lock by that vault and its lock ID. Once the checks pass it logs
 `startup checks passed`.
 
 `NETWORK=none` turns Ethereum off, for a node with no chain such as a local
