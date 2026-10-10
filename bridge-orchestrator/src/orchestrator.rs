@@ -1,7 +1,7 @@
 use crate::config::{Config, Ethereum, LINK_TAG_BYTES_CEILING};
 use crate::lock_flow::{format_amount, LockFlow};
 use crate::signer::{CouponSigner, Payout};
-use crate::state::{StateStore, WorkItem, WorkStep};
+use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
 use crate::stop::{ensure_running, is_stopped, Stopped};
 use crate::watchtower_reporter::{self, CycleClass, ReporterState};
 use alloy::primitives::Address;
@@ -1377,7 +1377,7 @@ impl BridgeOrchestrator {
             lock_id = lock.as_ref().map(|lock| lock.lock_id.as_str()),
             tx_hash = lock.as_ref().map(|lock| lock.tx_hash.as_str()),
             link,
-            "[bridge/reconcile] lock={} at {} is failed for manual resolution: its recorded link {} {}",
+            "[bridge] lock={} at {} is failed for manual resolution: its recorded link {} {}",
             row.item_id,
             row.step,
             link,
@@ -1461,27 +1461,37 @@ impl BridgeOrchestrator {
         recorded: impl Fn(&WorkItem) -> Option<&str>,
     ) -> Result<Vec<Transaction>> {
         let rows = self.db.list_flow("lock")?;
-        let recorded: HashMap<LockKey, Option<&str>> = rows
+        let by_lock: HashMap<LockKey, Option<&str>> = rows
             .iter()
             .filter_map(|row| Some((self.lock_key(row)?, recorded(row))))
             .collect();
-        Ok(links
-            .into_iter()
-            .filter(|link| {
-                let id = link.id.to_string();
-                let Some(why) = unaccounted(link, &id, &self.cfg.bridging_agent_pubkey, &recorded)
-                else {
-                    return true;
-                };
-                error!(
-                    event = "bridge.rave.link_withheld",
-                    link = id,
-                    reason = why,
-                    "[bridge/{stage}] link {id} is withheld from the RAVE: {why}"
-                );
-                false
-            })
-            .collect())
+        let mut accounted = Vec::new();
+        for link in links {
+            let id = link.id.to_string();
+            let Some(why) = unaccounted(&link, &id, &self.cfg.bridging_agent_pubkey, &by_lock)
+            else {
+                accounted.push(link);
+                continue;
+            };
+            error!(
+                event = "bridge.rave.link_withheld",
+                link = id,
+                reason = why,
+                "[bridge/{stage}] link {id} is withheld from the RAVE: {why}"
+            );
+            let recording = rows
+                .iter()
+                .filter(|row| recorded(row) == Some(id.as_str()) && row.state != WorkState::Failed);
+            for row in recording {
+                self.for_a_person(
+                    row,
+                    "bridge.rave.link_withheld",
+                    &id,
+                    &format!("is withheld from the RAVE: {why}"),
+                )?;
+            }
+        }
+        Ok(accounted)
     }
 
     /// The links among `sent` that the RAVE on `agreement` consumed, as its own
@@ -6175,6 +6185,48 @@ mod tests {
             lock_row(&orch, id).state,
             crate::state::WorkState::Succeeded
         );
+    }
+
+    #[tokio::test]
+    async fn a_row_recording_a_withheld_link_goes_to_a_person() {
+        for (step, agreement) in RAVE_STAGES {
+            let orch = test_orchestrator("withheld-row");
+            let (first, second) = ("lock:withheld:1", "lock:withheld:2");
+            let shared = link_at(&step, 0x4F, &[proof(first, "0xa2"), proof(second, "0xa3")]);
+            let own = link_at(&step, 0x50, &[proof(second, "0xa3")]);
+            let context = in_force(CL_EA, BR_EA);
+            let rows =
+                [(first, "0xa2", &shared), (second, "0xa3", &own)].map(|(lock, tx, link)| {
+                    let id = match step {
+                        WorkStep::ClLinkCreated => enqueue_lock(&orch, lock, tx),
+                        _ => enqueue_at_cl_rave_executed(&orch, lock, tx),
+                    };
+                    match step {
+                        WorkStep::ClLinkCreated => {
+                            orch.record_cl_link(id, &link.id.to_string(), &context)
+                        }
+                        _ => orch.record_br_spend(id, &link.id.to_string(), &context),
+                    }
+                    .unwrap();
+                    id
+                });
+            let conductor =
+                bridging_conductor().parking(action_hash(agreement), &[shared.clone(), own]);
+
+            orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+            assert_eq!(
+                ids(&conductor.parked.borrow()[&action_hash(agreement)]),
+                ids(std::slice::from_ref(&shared)),
+                "only the link both rows account for went to the RAVE"
+            );
+            let failed = failed_row(&orch, rows[0]);
+            assert_eq!(failed.step, step);
+            let reason = failed.last_error.unwrap();
+            assert!(reason.contains(&shared.id.to_string()), "{reason}");
+            assert!(reason.contains(second), "{reason}");
+            assert_ne!(lock_row(&orch, rows[1]).step, step, "its own link paid it");
+        }
     }
 
     #[tokio::test]
