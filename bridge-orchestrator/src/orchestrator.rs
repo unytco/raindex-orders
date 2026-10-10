@@ -1324,17 +1324,12 @@ impl BridgeOrchestrator {
                             ),
                             Err(e) => Self::unresolved(row, link, e),
                         },
-                        RecordedWrite::Unreadable(e) => {
-                            error!(
-                                event = "bridge.reconcile.unresolved",
-                                "[bridge/reconcile] lock={} at {} stays pending, the record of its link {} cannot be read: {:#}",
-                                row.item_id,
-                                row.step,
-                                link,
-                                e
-                            );
-                            Ok(())
-                        }
+                        RecordedWrite::Unreadable(e) => self.for_a_person(
+                            row,
+                            "bridge.reconcile.tag_unreadable",
+                            link,
+                            &format!("has a tag that does not decode: {e:#}"),
+                        ),
                         // Neither advanced nor written again: whether this deposit was
                         // credited cannot be told from here, so a person resolves it
                         // (workshop `documentation/specs/bridge-stop/README.md`
@@ -7044,14 +7039,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_record_whose_tag_does_not_decode_leaves_its_row_and_holds_up_no_other() {
+    async fn a_record_whose_tag_does_not_decode_goes_to_a_person_and_holds_up_no_other() {
         let orch = test_orchestrator("held-undecodable");
         let ([unread, held], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
         let conductor = bridging_conductor().holding(&links).garbling(&links[0]);
 
         reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
-        assert_eq!(lock_row(&orch, unread).step, WorkStep::BrSpendCreated);
+        let row = failed_row(&orch, unread);
+        assert_eq!(row.step, WorkStep::BrSpendCreated);
+        let reason = row.last_error.unwrap();
+        assert!(reason.contains("tag that does not decode"), "{reason}");
+        assert!(reason.contains(&links[0].id.to_string()), "{reason}");
         assert_eq!(
             lock_row(&orch, held).state,
             crate::state::WorkState::Succeeded
