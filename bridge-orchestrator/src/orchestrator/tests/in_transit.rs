@@ -277,6 +277,19 @@ async fn each_live_withdrawal_and_deposit_link_is_in_transit_on_its_own() {
         assert_lists(&checked.listed, &expected);
         checked.exit.expect_err("in transit");
     }
+
+    let conductor = bridging_conductor()
+        .parking(action_hash(CL_EA), std::slice::from_ref(&unrecorded))
+        .parking(action_hash(BR_EA), &[parked_withdrawal_tx(0x68)]);
+    let checked = check(&orch, &conductor, false).await.unwrap();
+    assert_lists(
+        &checked.listed,
+        &[
+            listed_link(CL_EA, &unrecorded, &["lock:no-row:1", "lock:no-row:2"]),
+            listed_withdrawal(0x68),
+        ],
+    );
+    checked.exit.expect_err("in transit");
 }
 
 #[tokio::test]
@@ -521,4 +534,80 @@ async fn mark_failed_changes_no_row_when_a_read_or_the_second_write_fails() {
             listed_row("lock:refused:2", "br_spend_created", 0x6C),
         ],
     );
+}
+
+fn with_proofs(mut link: Transaction, proofs: Value) -> Transaction {
+    if let TransactionDetails::Parked {
+        attached_payload, ..
+    } = &mut link.details
+    {
+        attached_payload["proof_of_deposit"] = proofs;
+    }
+    link
+}
+
+#[tokio::test]
+async fn mark_failed_marks_no_row_when_it_cannot_tell_which_rows_a_link_carries() {
+    let readable = parked_tx(0x75, &[proof("lock:no-row:5", "0xe4")]);
+    let cases = [
+        (
+            with_proofs(parked_tx(0x76, &[]), json!("not a list")),
+            None,
+            "it carries no list of deposit proofs",
+        ),
+        (
+            with_proofs(
+                parked_tx(0x77, &[]),
+                json!([proof("lock:blind:1", "0xe5"), {}]),
+            ),
+            None,
+            "a deposit proof it carries names no lock",
+        ),
+        (
+            readable,
+            Some("{}"),
+            "row lock:blind:1: its lock cannot be read",
+        ),
+    ];
+    for (link, payload, why) in cases {
+        let orch = test_orchestrator("in-transit-mark-blind");
+        let blind = enqueue_lock(&orch, "lock:blind:1", "0xe5");
+        waiting_at(&orch, WorkStep::ClLinkCreated, "lock:blind:2", "0xe6", 0x78);
+        if let Some(payload) = payload {
+            rusqlite::Connection::open(&orch.cfg.db_path)
+                .unwrap()
+                .execute(
+                    "UPDATE work_items SET payload_json = ?2 WHERE id = ?1",
+                    rusqlite::params![blind, payload],
+                )
+                .unwrap();
+        }
+        let conductor =
+            bridging_conductor().parking(action_hash(CL_EA), std::slice::from_ref(&link));
+        let before = snapshot(&orch);
+
+        let checked = check(&orch, &conductor, true).await.unwrap();
+
+        let e = format!("{:#}", checked.exit.expect_err("it cannot tell"));
+        assert!(e.contains(why), "{e}");
+        assert_eq!(snapshot(&orch), before);
+        assert_eq!(checked.listed.len(), 2, "{:#?}", checked.listed);
+    }
+}
+
+#[tokio::test]
+async fn mark_failed_marks_no_row_when_a_row_it_would_mark_is_gone() {
+    let orch = test_orchestrator("in-transit-mark-gone");
+    waiting_at(&orch, WorkStep::ClLinkCreated, "lock:gone:1", "0xe7", 0x79);
+    let gone = waiting_at(&orch, WorkStep::BrSpendCreated, "lock:gone:2", "0xe8", 0x7A);
+    let found = orch.in_transit(&bridging_conductor()).await.unwrap();
+    delete_rows(&orch, &[gone]);
+    let before = snapshot(&orch);
+
+    let e = found
+        .settle(&mut Vec::new(), &orch.db, true)
+        .expect_err("a row it would mark is gone");
+
+    assert!(format!("{e:#}").contains("is not in the database"), "{e:#}");
+    assert_eq!(snapshot(&orch), before);
 }

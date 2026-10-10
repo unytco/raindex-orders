@@ -885,23 +885,19 @@ impl StateStore {
     }
 
     pub fn mark_failed_permanent(&self, id: i64, error: &str) -> Result<()> {
-        self.mark_all_failed_permanent(&[id], error)
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        fail_permanently(&conn, id, error)?;
+        Ok(())
     }
 
     pub fn mark_all_failed_permanent(&self, ids: &[i64], error: &str) -> Result<()> {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
-        for id in ids {
-            tx.execute(
-                "UPDATE work_items
-                 SET state='failed',
-                     error_class='permanent',
-                     last_error=?2,
-                     next_retry_at=NULL,
-                     updated_at=strftime('%s', 'now')
-                 WHERE id=?1",
-                params![id, error],
-            )?;
+        for &id in ids {
+            anyhow::ensure!(
+                fail_permanently(&tx, id, error)? == 1,
+                "row {id} is not in the database"
+            );
         }
         tx.commit()?;
         Ok(())
@@ -955,6 +951,19 @@ fn forget_unconfirmed_locks(conn: &Connection) -> Result<()> {
         write_checkpoint(conn, LOCK_CHECKPOINT_KEY, earliest.saturating_sub(1))?;
     }
     Ok(())
+}
+
+fn fail_permanently(conn: &Connection, id: i64, error: &str) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE work_items
+         SET state='failed',
+             error_class='permanent',
+             last_error=?2,
+             next_retry_at=NULL,
+             updated_at=strftime('%s', 'now')
+         WHERE id=?1",
+        params![id, error],
+    )?)
 }
 
 fn write_checkpoint(conn: &Connection, key: &str, value: u64) -> Result<()> {

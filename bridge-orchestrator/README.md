@@ -127,24 +127,29 @@ in the `bridging_agent` role or a spend in any other role: no cycle takes them.
 Log lines go to stdout too, and never start with `{`.
 
 It exits 0 only when it read the database and the conductor and found nothing.
-It fails on a `DB_PATH` that does not exist, on one that serves another vault
-than the one configured when Ethereum is on, and on a row whose state or step it
-cannot read.
+It fails on a `DB_PATH` that does not exist, on one that serves no vault or
+another than the one configured when Ethereum is on, and on a row whose state or
+step it cannot read.
 
 `--mark-failed` lists the same, then marks `failed` each listed row and each
 row, neither `succeeded` nor `failed`, whose lock is in a listed link. Each
 gets `last_error` `in transit at the old network's close; it is paid by hand on
 the new network`, so the new network's orchestrator pays none of them. It marks
 all of them in one transaction, or none, and changes no other row. It exits 0
-only when it read the database and the conductor and marked them. A lock in a
-listed link whose row is already `succeeded` or `failed`, a lock with no row,
-and a withdrawal are recorded only in what it prints.
+only when it read the database and the conductor and marked them. It marks none,
+and fails, when it cannot tell which rows a listed link carries: a listed link
+whose proofs do not each name a lock, or a row whose lock cannot be read while a
+listed link carries any. A lock in a listed link whose row is already
+`succeeded` or `failed`, a lock with no row, and a withdrawal are recorded only
+in what it prints.
 
 What it lists is paid by hand on the new network, once the person who pays has
 checked that the old network did not pay it. Pay each lock ID once: a deposit
 waiting on its link shows both as its `row` and in the `lock_ids` of the link
 carrying it, and an earlier `failed` row may name it too. A lock whose row is
-`succeeded` was paid. Pay each withdrawal once, by its `spend`.
+`succeeded` was paid. A lock with no row may have been paid too, as retention
+deletes a `succeeded` row, and so may a `row` whose `link` is not listed live,
+as a RAVE may have taken it. Pay each withdrawal once, by its `spend`.
 
 ## Environment variables
 

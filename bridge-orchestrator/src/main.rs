@@ -60,6 +60,7 @@ enum Command {
         older_than_s: Option<u64>,
     },
     /// List each transfer the bridging agent's network still holds, for a migration's close.
+    /// Run it with the orchestrator stopped.
     InTransit {
         /// After listing, mark failed each pending row in transit or carried by a listed link, all
         /// or none, to be paid by hand on the new network. Exits 0 once they are marked.

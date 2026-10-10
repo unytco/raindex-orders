@@ -1,6 +1,6 @@
 use super::{
-    bridging_spend, connect_ham, own_deposit, BridgeOrchestrator, BridgingSpend, Conductor,
-    ConductorReads,
+    bridging_spend, connect_ham, link_locks, own_deposit, BridgeOrchestrator, BridgingSpend,
+    Conductor, ConductorReads,
 };
 use crate::config::{Config, Ethereum};
 use crate::state::{StateStore, WorkState, WorkStep};
@@ -43,6 +43,7 @@ enum InTransit {
 pub(super) struct Found {
     listed: Vec<InTransit>,
     rows: BTreeMap<i64, String>,
+    unmatchable: Vec<String>,
 }
 
 impl Found {
@@ -63,6 +64,11 @@ impl Found {
             );
             return Ok(());
         }
+        anyhow::ensure!(
+            self.unmatchable.is_empty(),
+            "marks no row, as it cannot tell which rows the listed links carry: {}",
+            self.unmatchable.join("; ")
+        );
         let ids: Vec<i64> = self.rows.keys().copied().collect();
         db.mark_all_failed_permanent(&ids, PAID_BY_HAND)?;
         let items: Vec<&str> = self.rows.values().map(String::as_str).collect();
@@ -143,11 +149,18 @@ impl BridgeOrchestrator {
             );
         let mut links = Vec::new();
         let mut carried = HashSet::new();
+        let mut unmatchable = Vec::new();
         for (agreement, link) in deposits {
-            let locks = self.links_by_lock(std::slice::from_ref(link));
-            let mut lock_ids: Vec<String> = locks.keys().map(|lock| lock.lock_id.clone()).collect();
+            let mut lock_ids = Vec::new();
+            match link_locks(link) {
+                Ok(locks) => {
+                    lock_ids.extend(locks.iter().map(|lock| lock.lock_id.clone()));
+                    carried.extend(locks);
+                }
+                Err(why) => unmatchable.push(format!("deposit link {}: {why}", link.id)),
+            }
             lock_ids.sort();
-            carried.extend(locks.into_keys());
+            lock_ids.dedup();
             links.push(InTransit::DepositLink {
                 agreement: agreement.to_string(),
                 link: link.id.to_string(),
@@ -190,12 +203,18 @@ impl BridgeOrchestrator {
                     link: row.parked_link().map(|(link, _)| link.to_string()),
                 });
             }
-            if waits_on_its_link || lock.is_some_and(|lock| carried.contains(&lock)) {
+            if waits_on_its_link || lock.as_ref().is_some_and(|lock| carried.contains(lock)) {
                 rows.insert(row.id, row.item_id);
+            } else if lock.is_none() && !carried.is_empty() {
+                unmatchable.push(format!("row {}: its lock cannot be read", row.item_id));
             }
         }
         listed.extend(links);
         listed.extend(withdrawals);
-        Ok(Found { listed, rows })
+        Ok(Found {
+            listed,
+            rows,
+            unmatchable,
+        })
     }
 }
