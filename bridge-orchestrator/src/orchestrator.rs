@@ -2029,14 +2029,14 @@ impl LiveLinks {
             if let Some(rave) = read.consumers.get(link) {
                 return Ok(Some(rave.clone()));
             }
-            if let Some(failed) = &read.failed {
-                anyhow::bail!("{failed}");
-            }
             let from = read.next;
             match from {
                 ChainRead::From(seq) if seq <= link_seq => return Ok(None),
                 ChainRead::Done => return Ok(None),
                 _ => {}
+            }
+            if let Some(failed) = &read.failed {
+                anyhow::bail!("{failed}");
             }
             let page = match conductor.raves(from).await {
                 Ok(page) => page,
@@ -4022,6 +4022,8 @@ mod tests {
         raves: RefCell<Vec<(ActionHash, Vec<ActionHashB64>)>>,
         chain_reads: RefCell<Vec<ChainRead>>,
         chain_stalls: bool,
+        chain_fails_below: Option<u32>,
+        seqs: HashMap<ActionHash, u32>,
     }
 
     const LINK_SEQ: u32 = 5;
@@ -4281,12 +4283,29 @@ mod tests {
         async fn held(&self, link: ActionHash) -> Result<Option<Record>> {
             self.call("held");
             self.check_fails_on(&link)?;
-            Ok(self.holds.borrow().get(&link).map(off_the_wire))
+            let held = self
+                .holds
+                .borrow()
+                .get(&link)
+                .map(|record| match self.seqs.get(&link) {
+                    Some(&seq) => signed_record_at(
+                        seq,
+                        record.action().author().clone(),
+                        link.clone(),
+                        record.action().data.clone(),
+                        record.entry().clone(),
+                    ),
+                    None => record.clone(),
+                });
+            Ok(held.as_ref().map(off_the_wire))
         }
 
         async fn raves(&self, from: ChainRead) -> Result<ChainPage> {
             self.call("raves");
             self.chain_reads.borrow_mut().push(from);
+            if let (Some(below), ChainRead::From(seq)) = (self.chain_fails_below, from) {
+                anyhow::ensure!(seq >= below, "the conductor is busy");
+            }
             if self.chain_stalls {
                 return Ok(ChainPage {
                     raves: vec![],
@@ -4459,11 +4478,21 @@ mod tests {
         data: ActionData,
         entry: RecordEntry,
     ) -> Record {
+        signed_record_at(LINK_SEQ, author, hash, data, entry)
+    }
+
+    fn signed_record_at(
+        action_seq: u32,
+        author: AgentPubKey,
+        hash: ActionHash,
+        data: ActionData,
+        entry: RecordEntry,
+    ) -> Record {
         let action = Action {
             header: ActionHeader {
                 author,
                 timestamp: Timestamp(0),
-                action_seq: LINK_SEQ,
+                action_seq,
                 prev_action: Some(action_hash(0x01)),
             },
             data,
@@ -6030,6 +6059,31 @@ mod tests {
             *conductor.chain_reads.borrow(),
             [ChainRead::Head, ChainRead::From(FIRST_RAVE_SEQ)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_chain_read_holds_up_no_row_whose_answer_is_already_read() {
+        let orch = test_orchestrator("chain-read-fails-deep");
+        let ([deep, shallow], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        let mut conductor = bridging_conductor().holding_unconsumed(&links);
+        for _ in 0..10 {
+            conductor = conductor.taken(&[]);
+        }
+        let conductor = FakeConductor {
+            chain_fails_below: Some(FIRST_RAVE_SEQ + 3),
+            seqs: HashMap::from([(links[1].id.clone().into(), FIRST_RAVE_SEQ + 6)]),
+            ..conductor
+        };
+
+        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+
+        assert_eq!(
+            lock_row(&orch, deep).step,
+            WorkStep::BrSpendCreated,
+            "the read its answer needs failed"
+        );
+        let reason = failed_row(&orch, shallow).last_error.unwrap();
+        assert!(reason.contains("no RAVE"), "{reason}");
     }
 
     #[test]
