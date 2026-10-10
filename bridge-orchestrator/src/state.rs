@@ -820,6 +820,27 @@ impl StateStore {
         Ok(())
     }
 
+    /// Return a row whose recorded link its conductor no longer holds to the
+    /// step that writes the link, with the link and its agreement cleared.
+    pub fn return_to_writing_step(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE work_items
+             SET step = CASE step
+                     WHEN 'cl_link_created' THEN 'new'
+                     WHEN 'br_spend_created' THEN 'cl_rave_executed'
+                     ELSE step END,
+                 cl_link_hash = CASE step WHEN 'cl_link_created' THEN NULL ELSE cl_link_hash END,
+                 cl_ea_id = CASE step WHEN 'cl_link_created' THEN NULL ELSE cl_ea_id END,
+                 br_spend_hash = CASE step WHEN 'br_spend_created' THEN NULL ELSE br_spend_hash END,
+                 br_ea_id = CASE step WHEN 'br_spend_created' THEN NULL ELSE br_ea_id END,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     /// Advance a row to `step='br_rave_executed'` and simultaneously mark it
     /// `state='succeeded'` — the bridging RAVE is the terminal stage of the
     /// lock pipeline.
@@ -1855,6 +1876,52 @@ mod tests {
         assert_eq!(
             row.attempts, 0,
             "br_rave_executed advance must reset attempts"
+        );
+    }
+
+    #[test]
+    fn a_row_returns_to_the_step_that_writes_the_link_it_lost() {
+        let path = test_db_path("return-to-writing-step");
+        let store = StateStore::open(&path).unwrap();
+        let on_link = enqueue_one(&store, "lock:lost:link");
+        store
+            .advance_to_cl_link_created(on_link, "uhCkkLINK", CL_EA)
+            .unwrap();
+        let on_spend = enqueue_one(&store, "lock:lost:spend");
+        store
+            .advance_to_cl_link_created(on_spend, "uhCkkLINK2", CL_EA)
+            .unwrap();
+        store
+            .advance_to_cl_rave_executed(on_spend, Some("uhCkkRAVE"))
+            .unwrap();
+        store
+            .advance_to_br_spend_created(on_spend, "uhCkkSPEND", BR_EA)
+            .unwrap();
+
+        store.return_to_writing_step(on_link).unwrap();
+        store.return_to_writing_step(on_spend).unwrap();
+
+        let row = |step| {
+            store
+                .list_pending_by_step("lock", step, 10)
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        let link = row(WorkStep::New);
+        assert_eq!(link.id, on_link);
+        assert_eq!((link.cl_link_hash, link.cl_ea_id), (None, None));
+        let spend = row(WorkStep::ClRaveExecuted);
+        assert_eq!(spend.id, on_spend);
+        assert_eq!((spend.br_spend_hash, spend.br_ea_id), (None, None));
+        assert_eq!(
+            (
+                spend.cl_link_hash.as_deref(),
+                spend.cl_ea_id.as_deref(),
+                spend.cl_rave_hash.as_deref()
+            ),
+            (Some("uhCkkLINK2"), Some(CL_EA), Some("uhCkkRAVE")),
+            "the credit limit stage it passed stays recorded"
         );
     }
 

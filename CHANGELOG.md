@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bridge-orchestrator logs a failed Ethereum request of its lock read with its cause, and without the RPC URL or its key.
 - `bridge-orchestrator status` and `clear` leave a running bridge's in-progress rows as they are.
 - bridge-orchestrator records a deposit whose write landed late, even on its last attempt.
+- bridge-orchestrator writes a deposit's link or spend again after a power loss rolls it back on the conductor.
 
 ## [0.3.0] - 2026-10-06
 
