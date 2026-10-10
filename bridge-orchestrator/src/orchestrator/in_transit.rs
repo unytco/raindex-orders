@@ -175,7 +175,7 @@ impl BridgeOrchestrator {
 
         let mut links = Vec::new();
         let mut carried = HashSet::new();
-        let mut unmatchable = Vec::new();
+        let mut nameless = Vec::new();
         for (agreement, link) in deposits {
             let proofs = match deposit_proofs(link) {
                 Some(Value::Array(proofs)) => proofs.as_slice(),
@@ -184,29 +184,12 @@ impl BridgeOrchestrator {
             };
             let mut lock_ids = Vec::new();
             for proof in proofs {
-                if let Some(lock) = LockKey::of_proof(proof) {
-                    lock_ids.push(lock.lock_id.clone());
-                    carried.insert(lock);
-                    continue;
-                }
-                let named = |field: &str| proof.get(field).and_then(Value::as_str);
-                let rows: Vec<&str> = pending
-                    .iter()
-                    .filter(|(_, lock)| {
-                        lock.as_ref().is_some_and(|lock| {
-                            named("lock_id") == Some(lock.lock_id.as_str())
-                                || named("tx_hash").map(normalize_tx_hash).as_ref()
-                                    == Some(&lock.tx_hash)
-                        })
-                    })
-                    .map(|(row, _)| row.item_id.as_str())
-                    .collect();
-                if !rows.is_empty() {
-                    unmatchable.push(format!(
-                        "deposit link {} carries proof {proof}, which names no lock but may be that of {}",
-                        link.id,
-                        rows.join(", ")
-                    ));
+                match LockKey::of_proof(proof) {
+                    Some(lock) => {
+                        lock_ids.push(lock.lock_id.clone());
+                        carried.insert(lock);
+                    }
+                    None => nameless.push((link, proof)),
                 }
             }
             lock_ids.sort();
@@ -232,6 +215,8 @@ impl BridgeOrchestrator {
 
         let mut listed = Vec::new();
         let mut rows = BTreeMap::new();
+        let mut unmarked = Vec::new();
+        let mut unmatchable = Vec::new();
         for (row, lock) in pending {
             let waits_on_its_link =
                 matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated);
@@ -243,12 +228,36 @@ impl BridgeOrchestrator {
                     link: row.parked_link().map(|(link, _)| link.to_string()),
                 });
             }
-            if waits_on_its_link || lock.as_ref().is_some_and(|lock| carried.contains(lock)) {
-                rows.insert(row.id, row.item_id);
-            } else if lock.is_none() && !carried.is_empty() {
-                unmatchable.push(format!(
+            match lock {
+                _ if waits_on_its_link => {
+                    rows.insert(row.id, row.item_id);
+                }
+                Some(lock) if carried.contains(&lock) => {
+                    rows.insert(row.id, row.item_id);
+                }
+                Some(lock) => unmarked.push((row.item_id, lock)),
+                None if !carried.is_empty() => unmatchable.push(format!(
                     "row {} has a lock that cannot be read, which the next cycle of `run` fails for a person",
                     row.item_id
+                )),
+                None => {}
+            }
+        }
+        for (link, proof) in nameless {
+            let named = |field: &str| proof.get(field).and_then(Value::as_str);
+            let may_be: Vec<&str> = unmarked
+                .iter()
+                .filter(|(_, lock)| {
+                    named("lock_id") == Some(lock.lock_id.as_str())
+                        || named("tx_hash").map(normalize_tx_hash).as_ref() == Some(&lock.tx_hash)
+                })
+                .map(|(item_id, _)| item_id.as_str())
+                .collect();
+            if !may_be.is_empty() {
+                unmatchable.push(format!(
+                    "deposit link {} carries proof {proof}, which names no lock but may be that of {}",
+                    link.id,
+                    may_be.join(", ")
                 ));
             }
         }

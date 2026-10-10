@@ -138,9 +138,10 @@ the new network`, so the new network's orchestrator pays none of them. It marks
 all of them in one transaction, or none, and changes no other row. It exits 0
 only when it read the database and the conductor and marked them. It marks none,
 and fails, when it cannot tell which rows a listed link carries: when a proof in
-it names a lock ID or a transaction of a row without naming both, or when a row
-at `new` or `cl_rave_executed` has a lock it cannot read while a listed link
-carries any. The next cycle of `run` fails such a row for a person. A lock in a
+it names the lock ID or the transaction of a row it would not otherwise mark,
+neither `succeeded` nor `failed`, without naming both, or when a row at `new` or
+`cl_rave_executed` has a lock it cannot read while a listed link carries any.
+The next cycle of `run` fails such a row for a person. A lock in a
 listed link whose row is already `succeeded` or `failed`, a lock with no row,
 and a withdrawal are recorded only in what it prints.
 

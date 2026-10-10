@@ -604,17 +604,28 @@ async fn mark_failed_marks_no_row_when_a_link_may_carry_a_row_it_cannot_match() 
 }
 
 #[tokio::test]
-async fn a_proof_that_can_be_no_rows_lock_stops_no_mark() {
+async fn a_proof_that_can_be_no_unmarked_rows_lock_stops_no_mark() {
     let orch = test_orchestrator("in-transit-mark-nameless");
     let carried = enqueue_lock(&orch, "lock:named:1", "0xea");
     let clear = enqueue_lock(&orch, "lock:named:2", "0xeb");
+    let waiting = waiting_at(&orch, WorkStep::ClLinkCreated, "lock:named:3", "0xec", 0x7D);
+    let carried_later = enqueue_lock(&orch, "lock:named:4", "0xed");
     let unlisted = with_proofs(parked_tx(0x7B, &[]), json!("not a list"));
     let partly = with_proofs(
         parked_tx(0x7C, &[]),
-        json!([proof("lock:named:1", "0xea"), {}, { "lock_id": "lock:elsewhere" }]),
+        json!([
+            proof("lock:named:1", "0xea"),
+            {},
+            { "lock_id": "lock:elsewhere" },
+            { "lock_id": "lock:named:3" },
+            { "tx_hash": "0xED" },
+        ]),
     );
-    let conductor =
-        bridging_conductor().parking(action_hash(CL_EA), &[unlisted.clone(), partly.clone()]);
+    let later = parked_tx(0x7E, &[proof("lock:named:4", "0xed")]);
+    let conductor = bridging_conductor().parking(
+        action_hash(CL_EA),
+        &[unlisted.clone(), partly.clone(), later.clone()],
+    );
     let before = snapshot(&orch);
 
     let checked = check(&orch, &conductor, true).await.unwrap();
@@ -623,14 +634,18 @@ async fn a_proof_that_can_be_no_rows_lock_stops_no_mark() {
     assert_lists(
         &checked.listed,
         &[
+            listed_row("lock:named:3", "cl_link_created", 0x7D),
             listed_link(CL_EA, &unlisted, &[]),
             listed_link(CL_EA, &partly, &["lock:named:1"]),
+            listed_link(CL_EA, &later, &["lock:named:4"]),
         ],
     );
-    assert_eq!(
-        failed_row(&orch, carried).last_error.as_deref(),
-        Some(PAID_BY_HAND)
-    );
+    for id in [carried, waiting, carried_later] {
+        assert_eq!(
+            failed_row(&orch, id).last_error.as_deref(),
+            Some(PAID_BY_HAND)
+        );
+    }
     assert_eq!(snapshot(&orch)[&clear], before[&clear]);
 }
 
