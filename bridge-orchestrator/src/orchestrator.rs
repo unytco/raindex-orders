@@ -368,7 +368,6 @@ impl BridgeOrchestrator {
         // still rebuild it per attempt, so a lair reset that rewrites the
         // conductor's connection_url is picked up without a restart.
         ham_config(&self.cfg)?;
-        crate::config::require_durable_conductor(&self.cfg.conductor_config)?;
 
         // The reporter runs detached: any failure inside it is logged and
         // swallowed by the task itself.

@@ -19,7 +19,18 @@ fn node(dir: &Path) -> Vec<(&'static str, String)> {
         ),
         ("HOLOCHAIN_BRIDGING_AGENT_PUBKEY", agent.to_string()),
         ("DB_PATH", db(dir).display().to_string()),
+        durable_conductor(dir),
     ]
+}
+
+fn durable_conductor(dir: &Path) -> (&'static str, String) {
+    let config = dir.join("conductor-config.yaml");
+    std::fs::write(
+        &config,
+        "keystore:\n  type: lair_server\n  connection_url: unix:///x/socket?k=abc\ndb_sync_level: Full\n",
+    )
+    .unwrap();
+    ("CONDUCTOR_CONFIG", config.display().to_string())
 }
 
 fn signer() -> Vec<(&'static str, String)> {
@@ -208,6 +219,7 @@ fn sepolia_node(dir: &Path, rpc: String) -> Vec<(&'static str, String)> {
         ("SEPOLIA_RPC_URL", rpc),
         ("HOLOCHAIN_BRIDGING_AGENT_PUBKEY", agent.to_string()),
         ("DB_PATH", db(dir).display().to_string()),
+        durable_conductor(dir),
         (
             "SIGNER_PRIVATE_KEY",
             "0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd".to_string(),
@@ -283,8 +295,8 @@ fn run_with_ethereum_off_checks_no_chain_takes_no_testnet_value_and_names_what_i
             format!("{:#x}", alloy::primitives::B256::ZERO),
         ),
         (
-            "CONDUCTOR_CONFIG",
-            dir.path().join("no-conductor.yaml").display().to_string(),
+            "LAIR_PASSPHRASE_FILE",
+            dir.path().join("no-passphrase").display().to_string(),
         ),
     ]);
 
@@ -305,7 +317,7 @@ fn run_with_ethereum_off_checks_no_chain_takes_no_testnet_value_and_names_what_i
         "{logged}"
     );
     assert!(!logged.contains("TestNet"), "{logged}");
-    assert!(logged.contains("no-conductor.yaml"), "{logged}");
+    assert!(logged.contains("no-passphrase"), "{logged}");
     assert!(
         matches!(rpc.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "NETWORK=none connected to the RPC"
@@ -361,5 +373,9 @@ fn run_refuses_a_conductor_a_power_loss_can_roll_back() {
     assert!(
         logged.contains("must set `db_sync_level: Full`"),
         "{logged}"
+    );
+    assert!(
+        !db(dir.path()).exists(),
+        "the refusal came before the database was opened"
     );
 }

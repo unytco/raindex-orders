@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
     match args.command {
         Command::Run => {
             info!("bridge-orchestrator starting");
+            config::require_durable_conductor(&config.conductor_config)?;
             let ethereum = match ethereum {
                 Some(chain) => {
                     let signer = CouponSigner::from_env(chain.network)?;
