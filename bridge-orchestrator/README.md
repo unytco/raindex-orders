@@ -421,3 +421,7 @@ detected ─> queued ─> claimed ─> in_flight ─┬─> succeeded
 On startup, every item a stop or a crash left `claimed` or `in_flight` goes
 back to `queued` with its attempts unchanged. Only a failed cycle counts an
 attempt, against the items it had in flight.
+
+S2 and S4 give the RAVE a deposit link only when the row of every lock it
+carries records exactly that link. Any other deposit link stays parked, and
+`bridge.rave.link_withheld` logs it with the reason.
