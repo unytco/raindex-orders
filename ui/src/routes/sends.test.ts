@@ -406,6 +406,59 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build, a Lock that fails
 		])
 	})
 
+	it('for more than the balance it reads at send says so, and sends neither the approve nor the lock', async () => {
+		await mount(network, './lock/+page.svelte')
+		await until(() => expect(shown()).toContain('1000 HOT'))
+		reads.balanceOf = 4_250_000_000_000_000_000n
+
+		await submitLock()
+
+		await until(() =>
+			expect(alerted()).toBe('You have 4.25 HOT, which is less than the 5 you entered.')
+		)
+		expect(wallet.writeContract).not.toHaveBeenCalled()
+		expect(dialog()).toBe('')
+		expect(logged()).toEqual([])
+		expect(button('Lock')?.disabled).toBe(false)
+	})
+
+	it('for more than the balance after its approve sends no lock', async () => {
+		wallet.waitForTransaction.mockImplementationOnce(async () => {
+			reads.balanceOf = 4_250_000_000_000_000_000n
+			return { status: 'success', transactionHash: '0xabc' }
+		})
+
+		await lock(network)
+
+		await until(() =>
+			expect(alerted()).toBe('You have 4.25 HOT, which is less than the 5 you entered.')
+		)
+		expect(written()).toEqual(['approve'])
+		expect(dialog()).toBe('')
+		expect(button('Lock')?.disabled).toBe(false)
+	})
+
+	it('for exactly the balance sends', async () => {
+		reads.balanceOf = 5n * 10n ** 18n
+
+		await lock(network)
+
+		await until(() => expect(written()).toEqual(['approve', 'lock']))
+		expect(alerted()).toBeUndefined()
+	})
+
+	it('whose balance cannot be read sends anyway, and logs the read error', async () => {
+		const failure = new Error('Failed to fetch')
+		await mount(network, './lock/+page.svelte')
+		await until(() => expect(shown()).toContain('1000 HOT'))
+		wallet.readContract.mockRejectedValueOnce(failure)
+
+		await submitLock()
+
+		await until(() => expect(written()).toEqual(['approve', 'lock']))
+		expect(logged()).toEqual([['Error reading the balance before the lock:', failure]])
+	})
+
 	it('for a cause it does not know says so in general terms, and logs the cause', async () => {
 		const failure = new Error('No ethereum provider')
 		wallet.waitForTransaction.mockRejectedValueOnce(failure)

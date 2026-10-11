@@ -47,16 +47,20 @@
 	$: isConnected = $ethereumStore.isConnected
 	$: account = $ethereumStore.account
 
+	async function readBalance(owner: string) {
+		return (await readContract({
+			address: tokenAddress,
+			abi: erc20Abi,
+			functionName: 'balanceOf',
+			args: [owner]
+		})) as bigint
+	}
+
 	async function fetchContractData() {
 		if (!isConnected || !account || $onWrongNetwork) return
 
 		try {
-			tokenBalance = (await readContract({
-				address: tokenAddress,
-				abi: erc20Abi,
-				functionName: 'balanceOf',
-				args: [account]
-			})) as bigint
+			tokenBalance = await readBalance(account)
 
 			tokenAllowance = (await readContract({
 				address: tokenAddress,
@@ -158,6 +162,19 @@
 		}
 	}
 
+	async function balanceCovers(amountWei: bigint): Promise<boolean> {
+		if (!account) return true
+		try {
+			tokenBalance = await readBalance(account)
+		} catch (e) {
+			console.error('Error reading the balance before the lock:', e)
+			return true
+		}
+		if (amountWei <= tokenBalance) return true
+		error = `You have ${formatToken(tokenBalance, tokenDecimals)} ${tokenSymbol}, which is less than the ${formatToken(amountWei, tokenDecimals)} you entered.`
+		return false
+	}
+
 	const send = (params: Parameters<typeof writeContract>[0]) =>
 		writeContract(params).catch(err => {
 			throw new UnsentError(whyUnsent(err, LOCK_DECLINED) ?? LOCK_NOT_SENT, err)
@@ -196,6 +213,8 @@
 				return
 			}
 
+			if (!(await balanceCovers(amountWei))) return
+
 			// An unlimited approve, so later locks need one confirmation.
 			if (tokenAllowance < amountWei) {
 				step = 'approve'
@@ -212,6 +231,7 @@
 				transactionStore.reset()
 				await fetchContractData()
 				if (!(await bridgeOpen())) return
+				if (!(await balanceCovers(amountWei))) return
 			}
 
 			transactionStore.awaitWalletConfirmation(true)

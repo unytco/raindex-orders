@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - the claim page says why a claim failed and what to do next, and sends no claim the bridge would refuse.
 - a claim or lock sped up, cancelled or replaced in the wallet ends with its real result, a transaction not confirmed within five minutes says it is still pending, and the transaction window can always be closed.
 - the Lock page says plainly when you decline a transaction in your wallet, or your wallet does not send it.
+- the Lock page says when the amount is more than your balance, before it asks your wallet.
 
 ## [0.3.0] - 2026-10-06
 
