@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { encodeFunctionResult, maxUint256 } from 'viem'
 import type { SvelteComponent } from 'svelte'
 import { asBuild, BUILDS, type Network } from '$lib/testing/builds'
-import { CHAIN, connected, injectWallet } from '$lib/testing/wallet'
+import { ACCOUNT, CHAIN, connected, injectWallet } from '$lib/testing/wallet'
 import { deserializeSignedContext } from '$lib/coupon'
 import { orderbookAbi } from '../generated'
 import { PAUSED_TEXT, STATUS_TIMEOUT_MS } from '$lib/pause'
@@ -61,17 +61,19 @@ afterEach(() => {
 	vi.clearAllMocks()
 })
 
+/** Returns the `$lib/ethereum` the page was built against, not the one a top-level import gives. */
 async function mount(network: Network, path: './lock/+page.svelte' | './claim/+page.svelte') {
-	const Page = await asBuild(BUILDS[network], async () => {
+	const { Page, ethereum } = await asBuild(BUILDS[network], async () => {
 		vi.doMock('$lib/ethereum', async original => ({
 			...(await original<typeof import('$lib/ethereum')>()),
 			...wallet
 		}))
-		const { ethereumStore } = await import('$lib/ethereum')
-		ethereumStore.set(connected(CHAIN[network]))
-		return (await import(path)).default as Page
+		const ethereum = await import('$lib/ethereum')
+		ethereum.ethereumStore.set(connected(CHAIN[network]))
+		return { Page: (await import(path)).default as Page, ethereum }
 	})
 	page = new Page({ target })
+	return ethereum
 }
 
 /** Stubs every `fetch`: each call takes the next answer, and the last repeats. */
@@ -104,14 +106,21 @@ async function click(label: string) {
 }
 
 const shown = () => target.textContent!.replace(/\s+/g, ' ')
+const alerted = () => target.querySelector('[role="alert"]')?.textContent?.trim()
+const dialog = () => target.querySelector('[role="dialog"]')?.textContent ?? ''
+const logged = () => vi.mocked(console.error).mock.calls
 const written = () => wallet.writeContract.mock.calls.map(([call]) => call.functionName)
 const order = (mock: { mock: { invocationCallOrder: number[] } }) => mock.mock.invocationCallOrder
 
-async function lock(network: Network) {
-	await mount(network, './lock/+page.svelte')
+async function submitLock() {
 	type('#amount', '5')
 	type('#agent', AGENT)
 	await click('Lock')
+}
+
+async function lock(network: Network) {
+	await mount(network, './lock/+page.svelte')
+	await submitLock()
 }
 
 describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network => {
@@ -252,6 +261,165 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network =>
 
 		await until(() => expect(shown()).toContain('at most 6 decimal places'))
 		expect(shown()).not.toContain(PAUSED_TEXT)
+	})
+
+	it('sends nothing, and says so, for an amount that is not a plain number', async () => {
+		const fetch = stubFetch(OPEN)
+		await mount(network, './lock/+page.svelte')
+		type('#amount', '1e5')
+		type('#agent', AGENT)
+		await click('Lock')
+
+		await until(() => expect(alerted()).toBe('Amount must be a plain number, such as 5 or 2.5.'))
+		expect(fetch).not.toHaveBeenCalled()
+		expect(wallet.writeContract).not.toHaveBeenCalled()
+		expect(logged()).toEqual([])
+	})
+})
+
+const TOKEN = { sepolia: 'mock HOT', mainnet: 'HOT' }
+const NOT_SENT =
+	"Your wallet did not send the transaction. If your wallet's activity shows no lock, try again."
+const LOCK_FAILED =
+	"Something went wrong with your lock. Check your wallet's activity before you lock again, and contact Unyt support if it keeps failing."
+const USER_DENIED = {
+	code: 4001,
+	message: 'MetaMask Tx Signature: User denied transaction signature.'
+}
+const RPC_FAILURE = { code: -32603, message: 'Internal JSON-RPC error.' }
+const VIEM_FAILURE = new Error(
+	'An internal error was received.\n\nURL: http://localhost\nRequest body: {"method":"eth_sendTransaction"}\n\nDetails: Internal JSON-RPC error.\nVersion: viem@2.45.0',
+	{ cause: RPC_FAILURE }
+)
+
+describe.each(['sepolia', 'mainnet'] as const)('on a %s build, a Lock that fails', network => {
+	const DECLINED = `You declined the lock in your wallet, so no ${TOKEN[network]} was locked.`
+
+	beforeEach(() => {
+		reads.allowance = 0n
+		stubFetch(OPEN)
+	})
+
+	describe.each(['approve', 'lock'] as const)('in its %s transaction', step => {
+		const sends = step === 'approve' ? ['approve'] : ['approve', 'lock']
+
+		it.each([
+			['declined in the wallet', USER_DENIED, DECLINED, [USER_DENIED]],
+			['not sent by the wallet', RPC_FAILURE, NOT_SENT, [RPC_FAILURE]],
+			['not sent, with a long error', VIEM_FAILURE, NOT_SENT, [VIEM_FAILURE, RPC_FAILURE]]
+		])('%s says so plainly, and logs the raw error once', async (_case, failure, message, raw) => {
+			wallet.writeContract.mockImplementation(async ({ functionName }) => {
+				if (functionName === step) throw failure
+				return '0xabc'
+			})
+
+			await lock(network)
+
+			await until(() => expect(alerted()).toBe(message))
+			expect(dialog()).toContain(message)
+			expect(shown()).not.toContain(failure.message.replace(/\s+/g, ' '))
+			expect(written()).toEqual(sends)
+			expect(button('Lock')?.disabled).toBe(false)
+			expect(logged()).toEqual([
+				[
+					`Lock failed in its ${step} transaction: ${message}`,
+					{
+						step,
+						account: ACCOUNT,
+						chainId: CHAIN[network],
+						causes: [expect.objectContaining({ message }), ...raw]
+					}
+				]
+			])
+			expect(logged()[0][1].causes[1]).toBe(failure)
+		})
+
+		it('sent while the wallet is on another network says to switch', async () => {
+			const ethereum = await mount(network, './lock/+page.svelte')
+			const wrongNetwork = new Error(ethereum.SWITCH_NETWORK)
+			wallet.writeContract.mockImplementation(async ({ functionName }) => {
+				if (functionName === step) throw wrongNetwork
+				return '0xabc'
+			})
+			await submitLock()
+
+			await until(() => expect(alerted()).toBe(ethereum.SWITCH_NETWORK))
+			expect(logged()[0][1]).toMatchObject({ step, causes: [expect.anything(), wrongNetwork] })
+		})
+
+		it.each([
+			['reverted', '❌'],
+			['replaced', '❌'],
+			['pending', '⏳']
+		] as const)(
+			'that ends %s keeps its outcome and its landed hash, and logs it',
+			async (outcome, mark) => {
+				const ethereum = await mount(network, './lock/+page.svelte')
+				const failure = new ethereum.TransactionOutcomeError(outcome, {
+					sentHash: '0xabc',
+					hash: '0xdef'
+				})
+				if (step === 'lock') {
+					wallet.waitForTransaction.mockResolvedValueOnce({
+						status: 'success',
+						transactionHash: '0xabc'
+					})
+				}
+				wallet.waitForTransaction.mockRejectedValueOnce(failure)
+				await submitLock()
+
+				await until(() => expect(alerted()).toBe(failure.message))
+				expect(dialog()).toContain(mark)
+				expect(target.querySelector('[role="dialog"] a[href$="/tx/0xdef"]')).not.toBeNull()
+				expect(written()).toEqual(sends)
+				expect(logged()).toEqual([
+					[
+						`Lock failed in its ${step} transaction: ${failure.message}`,
+						{ step, account: ACCOUNT, chainId: CHAIN[network], causes: [failure] }
+					]
+				])
+			}
+		)
+	})
+
+	it.each([
+		['declined in the wallet', USER_DENIED, DECLINED],
+		['not sent by the wallet', RPC_FAILURE, NOT_SENT]
+	])('with no approve needed, %s says so, and logs its lock', async (_case, failure, message) => {
+		reads.allowance = maxUint256
+		wallet.writeContract.mockRejectedValueOnce(failure)
+
+		await lock(network)
+
+		await until(() => expect(alerted()).toBe(message))
+		expect(written()).toEqual(['lock'])
+		expect(logged()).toEqual([
+			[
+				`Lock failed in its lock transaction: ${message}`,
+				{
+					step: 'lock',
+					account: ACCOUNT,
+					chainId: CHAIN[network],
+					causes: [expect.objectContaining({ message }), failure]
+				}
+			]
+		])
+	})
+
+	it('for a cause it does not know says so in general terms, and logs the cause', async () => {
+		const failure = new Error('No ethereum provider')
+		wallet.waitForTransaction.mockRejectedValueOnce(failure)
+
+		await lock(network)
+
+		await until(() => expect(alerted()).toBe(LOCK_FAILED))
+		expect(shown()).not.toContain(failure.message)
+		expect(logged()).toEqual([
+			[
+				`Lock failed in its approve transaction: ${LOCK_FAILED}`,
+				{ step: 'approve', account: ACCOUNT, chainId: CHAIN[network], causes: [failure] }
+			]
+		])
 	})
 })
 

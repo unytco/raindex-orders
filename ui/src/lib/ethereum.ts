@@ -63,7 +63,6 @@ export async function initEthereum(): Promise<boolean> {
 
 	ethereum = eth
 
-	// Check if already connected
 	try {
 		const accounts = (await eth.request({ method: 'eth_accounts' })) as string[]
 		const chainId = (await eth.request({ method: 'eth_chainId' })) as string
@@ -81,7 +80,6 @@ export async function initEthereum(): Promise<boolean> {
 		console.error('Error checking existing connection:', err)
 	}
 
-	// Set up event listeners
 	eth.on('accountsChanged', handleAccountsChanged)
 	eth.on('chainChanged', handleChainChanged)
 
@@ -127,7 +125,7 @@ function handleChainChanged(chainId: string) {
 	}))
 }
 
-export const userRejected = (err: unknown) => (err as { code?: number } | null)?.code === 4001
+const userRejected = (err: unknown) => (err as { code?: number } | null)?.code === 4001
 
 export async function connectWallet(): Promise<string | null> {
 	const eth = getEthereum()
@@ -307,7 +305,6 @@ export async function waitForTransaction(sentHash: string): Promise<TransactionR
 	}
 }
 
-// Contract interaction helpers using raw ethereum calls
 export async function readContract(params: {
 	address: string
 	abi: Abi
@@ -394,4 +391,15 @@ export async function writeContract(params: {
 	})) as string
 
 	return txHash
+}
+
+export function whyUnsent(err: unknown, declined: string): string | undefined {
+	if (userRejected(err)) return declined
+	return errorMessage(err, '') === SWITCH_NETWORK ? SWITCH_NETWORK : undefined
+}
+
+export class UnsentError extends Error {
+	constructor(message: string, cause: unknown) {
+		super(message, { cause })
+	}
 }

@@ -18,9 +18,11 @@
 		readContract,
 		writeContract,
 		waitForTransaction,
-		TransactionOutcomeError
+		TransactionOutcomeError,
+		UnsentError,
+		whyUnsent
 	} from '$lib/ethereum'
-	import { isHolochainKey, holochainKeyTo32ByteHex, errorMessage } from '$lib/utils'
+	import { isHolochainKey, holochainKeyTo32ByteHex, causeChain } from '$lib/utils'
 	import { PAUSED_CONTACT, PAUSED_LEAD, readPaused } from '$lib/pause'
 
 	let amount = ''
@@ -138,6 +140,12 @@
 
 	const MAX_DECIMAL_PLACES = 6
 	const STATUS_FAILED = 'Could not check that the bridge is open. Please try again.'
+	const NOT_A_NUMBER = 'Amount must be a plain number, such as 5 or 2.5.'
+	const LOCK_DECLINED = `You declined the lock in your wallet, so no ${bridge.tokenName} was locked.`
+	const LOCK_NOT_SENT =
+		"Your wallet did not send the transaction. If your wallet's activity shows no lock, try again."
+	const LOCK_FAILED =
+		"Something went wrong with your lock. Check your wallet's activity before you lock again, and contact Unyt support if it keeps failing."
 
 	async function bridgeOpen(): Promise<boolean> {
 		try {
@@ -150,6 +158,11 @@
 		}
 	}
 
+	const send = (params: Parameters<typeof writeContract>[0]) =>
+		writeContract(params).catch(err => {
+			throw new UnsentError(whyUnsent(err, LOCK_DECLINED) ?? LOCK_NOT_SENT, err)
+		})
+
 	async function handleLock() {
 		if (!amount || !agentHex) return
 
@@ -161,14 +174,20 @@
 			error = `Amount can have at most ${MAX_DECIMAL_PLACES} decimal places.`
 			return
 		}
+		let amountWei: bigint
+		try {
+			amountWei = parseUnits(amount, tokenDecimals)
+		} catch {
+			error = NOT_A_NUMBER
+			return
+		}
 
 		isLoading = true
+		let step: 'approve' | 'lock' = 'lock'
 
 		try {
 			// A lock already in the wallet's prompt when the pause lands can still be confirmed.
 			if (!(await bridgeOpen())) return
-
-			const amountWei = parseUnits(amount, tokenDecimals)
 
 			if (amountWei < minLockAmount) {
 				error = `Amount must be at least ${formatToken(minLockAmount, tokenDecimals)} ${tokenSymbol}`
@@ -179,8 +198,9 @@
 
 			// An unlimited approve, so later locks need one confirmation.
 			if (tokenAllowance < amountWei) {
+				step = 'approve'
 				transactionStore.awaitWalletConfirmation()
-				const approveHash = await writeContract({
+				const approveHash = await send({
 					address: tokenAddress,
 					abi: erc20Abi,
 					functionName: 'approve',
@@ -188,13 +208,14 @@
 				})
 				transactionStore.awaitTxReceipt(approveHash)
 				await waitForTransaction(approveHash)
+				step = 'lock'
 				transactionStore.reset()
 				await fetchContractData()
 				if (!(await bridgeOpen())) return
 			}
 
 			transactionStore.awaitWalletConfirmation(true)
-			const hash = await writeContract({
+			const hash = await send({
 				address: lockVaultAddress,
 				abi: holoLockVaultAbi,
 				functionName: 'lock',
@@ -210,14 +231,20 @@
 			}
 			await fetchContractData()
 		} catch (e) {
-			error = errorMessage(e, 'Transaction failed')
+			error =
+				e instanceof UnsentError || e instanceof TransactionOutcomeError ? e.message : LOCK_FAILED
 			const outcome = e instanceof TransactionOutcomeError ? e : undefined
 			transactionStore.transactionError({
 				message: error,
 				hash: outcome?.hash,
 				unconfirmed: outcome?.unconfirmed
 			})
-			console.error(e)
+			console.error(`Lock failed in its ${step} transaction: ${error}`, {
+				step,
+				account,
+				chainId: $ethereumStore.chainId,
+				causes: causeChain(e)
+			})
 		} finally {
 			isLoading = false
 		}
@@ -352,7 +379,6 @@
 					<Alert color="red">{error}</Alert>
 				{/if}
 
-				<!-- Single action: Lock (approve is done automatically first if needed) -->
 				<div class="flex flex-row gap-2">
 					<Button
 						class="w-fit disabled:!bg-primary-300 disabled:!opacity-100"

@@ -19,16 +19,16 @@ import {
 	getEthereum,
 	SWITCH_NETWORK,
 	TransactionOutcomeError,
-	userRejected,
 	type MinedDetails,
 	waitForTransaction,
 	walletChainId,
+	whyUnsent,
 	writeContract,
 	type Eip1193Provider
 } from './ethereum'
 import { claimOrderStruct } from './network'
 import { transactionStore } from './stores/transactionStore'
-import { errorMessage } from './utils'
+import { causeChain } from './utils'
 
 const CLAIM_REVERTED = `Your claim did not go through, so no ${bridge.tokenName} was paid and your coupon was not used. Claim again.`
 
@@ -182,8 +182,8 @@ class ClaimError extends Error {
 }
 
 function sendFailure(err: unknown, coupon: CouponConfig): { message: string; revert?: Revert } {
-	if (userRejected(err)) return { message: CLAIM_DECLINED }
-	if (errorMessage(err, '') === SWITCH_NETWORK) return { message: SWITCH_NETWORK }
+	const unsent = whyUnsent(err, CLAIM_DECLINED)
+	if (unsent) return { message: unsent }
 	const revert = revertIn(err)
 	return { message: revert ? refusalMessage(revert.reason, coupon) : CLAIM_NOT_SENT, revert }
 }
@@ -262,14 +262,6 @@ async function claim(signedContext: SignedContextV1Struct, trace: ClaimTrace): P
 			cause: err
 		})
 	}
-}
-
-function causeChain(err: unknown): unknown[] {
-	const chain: unknown[] = []
-	for (let link = err; link != null && chain.length < 10; link = (link as Error).cause) {
-		chain.push(link)
-	}
-	return chain
 }
 
 export async function claimCoupon(signedContext: SignedContextV1Struct): Promise<string> {
