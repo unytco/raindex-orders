@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { maxUint256 } from 'viem'
+import { encodeFunctionResult, maxUint256 } from 'viem'
 import type { SvelteComponent } from 'svelte'
 import { asBuild, BUILDS, type Network } from '$lib/testing/builds'
-import { CHAIN, connected } from '$lib/testing/wallet'
+import { CHAIN, connected, injectWallet } from '$lib/testing/wallet'
+import { deserializeSignedContext } from '$lib/coupon'
+import { orderbookAbi } from '../generated'
 import { PAUSED_TEXT, STATUS_TIMEOUT_MS } from '$lib/pause'
 import { SEPOLIA_REDEEMED } from './api/coupon-status/fixtures'
 
@@ -40,7 +42,7 @@ let reads: Record<string, unknown>
 const wallet = {
 	readContract: vi.fn(async ({ functionName }: { functionName: string }) => reads[functionName]),
 	writeContract: vi.fn<[{ functionName: string }], Promise<string>>(async () => '0xabc'),
-	waitForTransaction: vi.fn(async () => ({ status: '0x1' }))
+	waitForTransaction: vi.fn(async () => ({ status: 'success', transactionHash: '0xabc' }))
 }
 let target: HTMLElement
 let page: SvelteComponent | undefined
@@ -256,12 +258,21 @@ describe.each(['sepolia', 'mainnet'] as const)('on a %s build, Lock', network =>
 describe('Claim', () => {
 	it('sends with no status request, paused or not', async () => {
 		const fetch = stubFetch(PAUSED)
+		const { coupon } = SEPOLIA_REDEEMED[0]
+		const amount = deserializeSignedContext(coupon).context[1]
+		const pays = encodeFunctionResult({
+			abi: orderbookAbi,
+			functionName: 'takeOrders',
+			result: [amount, 0n]
+		})
+		const injected = injectWallet(CHAIN.sepolia, { eth_call: pays })
 		await mount('sepolia', './claim/+page.svelte')
 
-		type('#coupon', SEPOLIA_REDEEMED[0].coupon)
+		type('#coupon', coupon)
 		await click('Claim')
 
 		await until(() => expect(written()).toEqual(['takeOrders']))
+		expect(injected).toHaveBeenCalledWith(expect.objectContaining({ method: 'eth_call' }))
 		expect(fetch).not.toHaveBeenCalled()
 	})
 })

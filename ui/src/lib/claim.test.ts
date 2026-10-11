@@ -6,6 +6,7 @@ import { deserializeSignedContext, parseCoupon } from './coupon'
 import { TransactionStatus } from './stores/transactionStore'
 import { asBuild, BUILDS } from './testing/builds'
 import { chainAnswers, REPLACEMENT_HASH, type Fate } from './testing/chain'
+import { settled } from './testing/clock'
 
 // The coupon of HASH, a claim that ran out of gas on Sepolia.
 const COUPON = deserializeSignedContext(
@@ -182,17 +183,7 @@ async function wallet({
 	store.transactionStore.subscribe(({ status }) => {
 		if (statuses.at(-1) !== status) statuses.push(status)
 	})
-	const claimed = async () => {
-		let settled = false
-		const claiming = claim.claimCoupon(coupon)
-		claiming.then(
-			() => (settled = true),
-			() => (settled = true)
-		)
-		const limit = Date.now() + ethereum.CONFIRMATION_TIMEOUT_MS + 60_000
-		while (!settled && Date.now() < limit) await vi.advanceTimersByTimeAsync(1_000)
-		return claiming
-	}
+	const claimed = () => settled(claim.claimCoupon(coupon))
 	const logs = () => vi.mocked(console.error).mock.calls
 	return { asked, params, modalWhen, modal, statuses, logs, claim: claimed }
 }

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { asBuild, BUILDS } from './testing/builds'
 import { chainAnswers, REPLACEMENT_HASH, type Fate } from './testing/chain'
+import { settled } from './testing/clock'
 
 const SENT = {
 	hash: `0x${'12'.repeat(32)}`,
@@ -24,18 +25,9 @@ async function waitFor(fate: Fate, away = () => false) {
 		return answer(method, params)
 	})
 	vi.stubGlobal('window', { ethereum: { request, on: vi.fn() } })
-	const { waitForTransaction, CONFIRMATION_TIMEOUT_MS } = await asBuild(
-		BUILDS.sepolia,
-		() => import('./ethereum')
-	)
-	let settled = false
+	const { waitForTransaction } = await asBuild(BUILDS.sepolia, () => import('./ethereum'))
 	const waiting = waitForTransaction(SENT.hash)
-	waiting.then(
-		() => (settled = true),
-		() => (settled = true)
-	)
-	const limit = Date.now() + CONFIRMATION_TIMEOUT_MS + 60_000
-	while (!settled && Date.now() < limit) await vi.advanceTimersByTimeAsync(1_000)
+	await settled(waiting).catch(() => {})
 	return { waiting, asked }
 }
 

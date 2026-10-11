@@ -1,3 +1,5 @@
+import { vi } from 'vitest'
+import { numberToHex } from 'viem'
 import type { EthereumState } from '$lib/ethereum'
 
 export const CHAIN = { sepolia: 11155111, mainnet: 1 }
@@ -11,3 +13,14 @@ export const connected = (chainId: number): EthereumState => ({
 	isLoading: false,
 	error: null
 })
+
+/** Injects a wallet on `chainId` that answers each other method from `answers`. */
+export function injectWallet(chainId: number, answers: Record<string, unknown>) {
+	const request = vi.fn(async ({ method }: { method: string }) => {
+		if (method === 'eth_chainId') return numberToHex(chainId)
+		if (method in answers) return answers[method]
+		throw new Error(`unexpected ${method}`)
+	})
+	vi.stubGlobal('ethereum', { request, on: vi.fn() })
+	return request
+}
