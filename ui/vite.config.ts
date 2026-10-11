@@ -28,6 +28,10 @@ export default defineConfig({
 		}
 	},
 	test: {
-		include: ['src/**/*.{test,spec}.{js,ts}', 'scripts/**/*.test.ts']
+		include: ['src/**/*.{test,spec}.{js,ts}', 'scripts/**/*.test.ts'],
+		// The first test or hook to import a Svelte component compiles it and its imports, which a
+		// loaded machine can take past the 5 s and 10 s defaults.
+		testTimeout: 30_000,
+		hookTimeout: 30_000
 	}
 })
