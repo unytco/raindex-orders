@@ -27,7 +27,12 @@ async function waitFor(fate: Fate, away = () => false) {
 	vi.stubGlobal('window', { ethereum: { request, on: vi.fn() } })
 	const { waitForTransaction } = await asBuild(BUILDS.sepolia, () => import('./ethereum'))
 	const waiting = waitForTransaction(SENT.hash)
-	await settled(waiting).catch(() => {})
+	await settled(
+		waiting.then(
+			() => undefined,
+			() => undefined
+		)
+	)
 	return { waiting, asked }
 }
 

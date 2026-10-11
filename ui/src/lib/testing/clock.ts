@@ -13,5 +13,6 @@ export async function settled<T>(promise: Promise<T>): Promise<T> {
 	)
 	const giveUp = performance.now() + 4_000
 	while (!done && performance.now() < giveUp) await vi.advanceTimersByTimeAsync(1_000)
+	if (!done) throw new Error('the promise did not settle within 4 s of real time')
 	return promise
 }
