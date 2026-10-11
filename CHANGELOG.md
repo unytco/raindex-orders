@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bridge-orchestrator fails for manual resolution a deposit an older release recorded on a link it cannot prove its own.
 - bridge-orchestrator keys each lock by its vault and lock ID, and refuses a database that serves another vault.
 - bridge-orchestrator records a lock once its block has 5 confirmations, on mainnet as on Sepolia.
+- bridge-orchestrator logs each withdrawal or other agent's link it leaves parked once while it stays parked.
 - the claim page says why a claim failed and what to do next, and sends no claim the bridge would refuse.
 - a claim or lock sped up, cancelled or replaced in the wallet ends with its real result, a transaction not confirmed within five minutes says it is still pending, and the transaction window can always be closed.
 

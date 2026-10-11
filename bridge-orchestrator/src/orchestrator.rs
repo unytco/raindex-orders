@@ -37,7 +37,7 @@ pub struct BridgeOrchestrator {
     reporter: ReporterState,
     ethereum: Option<EthereumSide>,
     deferred: std::sync::Mutex<HashMap<&'static str, HashSet<String>>>,
-    told: std::sync::Mutex<HashMap<&'static str, HashSet<String>>>,
+    told: std::sync::Mutex<HashMap<String, HashSet<String>>>,
 }
 
 pub struct EthereumSide {
@@ -106,6 +106,7 @@ struct BridgingSelection {
     coupons: serde_json::Map<String, Value>,
     coupon_bytes: usize,
     withdrawals_found: usize,
+    unpayable: Vec<(Transaction, anyhow::Error)>,
 }
 
 async fn select_bridging_links(
@@ -121,6 +122,7 @@ async fn select_bridging_links(
         coupons: serde_json::Map::new(),
         coupon_bytes: 0,
         withdrawals_found: 0,
+        unpayable: Vec::new(),
     };
     let mut withdrawal_capped = false;
 
@@ -138,9 +140,6 @@ async fn select_bridging_links(
         let Some(signer) = signer else {
             continue;
         };
-        if withdrawal_capped {
-            continue;
-        }
 
         let amount = tx
             .amount
@@ -150,14 +149,13 @@ async fn select_bridging_links(
         let terms = match Payout::new(withdraw_to, &amount) {
             Ok(terms) => terms,
             Err(e) => {
-                error!(
-                    event = "bridge.withdrawal_unpayable",
-                    "[bridge/withdrawals] withdrawal {:?} stays parked, no coupon can pay it in HOT unit {hot_unit_index}: {e:#} (its amount: {:?})",
-                    tx.id, tx.amount
-                );
+                selection.unpayable.push((tx.clone(), e));
                 continue;
             }
         };
+        if withdrawal_capped {
+            continue;
+        }
         let coupon = signer.coupon(terms, tx.id.as_ref()).await?;
         let key = tx.id.to_string();
 
@@ -296,42 +294,73 @@ impl BridgeOrchestrator {
 
     /// Remembers only `check`'s latest `now`: an item that leaves and comes back
     /// is untold again.
-    fn untold<'a, T>(
-        &self,
-        check: &'static str,
-        now: &'a [T],
-        id: impl Fn(&T) -> String,
-    ) -> Vec<&'a T> {
+    fn untold<'a, T>(&self, check: &str, now: &'a [T], id: impl Fn(&T) -> String) -> Vec<&'a T> {
         let before = self
             .told
             .lock()
             .expect("told mutex poisoned")
-            .insert(check, now.iter().map(&id).collect())
+            .insert(check.to_string(), now.iter().map(&id).collect())
             .unwrap_or_default();
         now.iter()
             .filter(|item| !before.contains(&id(item)))
             .collect()
     }
 
-    fn log_skipped_spends(&self, bridging_links: &[Transaction]) {
-        let skipped: Vec<(&Transaction, &str)> = bridging_links
+    /// S2 and S4 refresh their told sets only when a cycle reaches them, so
+    /// without this a link that left during a shorter cycle would stay told.
+    fn forget_unparked(&self, parked: &HashSet<String>) {
+        for told in self.told.lock().expect("told mutex poisoned").values_mut() {
+            told.retain(|id| parked.contains(id));
+        }
+    }
+
+    fn log_skipped_links(&self, bridging_links: &[Transaction]) {
+        let skipped: Vec<(&Transaction, Option<&str>, String)> = bridging_links
             .iter()
-            .filter_map(
-                |tx| match bridging_spend(tx, &self.cfg.bridging_agent_pubkey)? {
-                    BridgingSpend::Other(role) => Some((tx, role)),
-                    _ => None,
-                },
-            )
+            .filter_map(|tx| {
+                let (role, why) = match bridging_spend(tx, &self.cfg.bridging_agent_pubkey) {
+                    None => (None, "is no spend".to_string()),
+                    Some(BridgingSpend::Withdrawal(None)) => (
+                        Some(WITHDRAWER_ROLE),
+                        format!("in role {WITHDRAWER_ROLE} names no withdraw_to_address"),
+                    ),
+                    Some(BridgingSpend::Other(role)) => (
+                        Some(role),
+                        format!("in role {role} is neither the bridging agent's deposit nor a withdrawal"),
+                    ),
+                    Some(BridgingSpend::Deposit | BridgingSpend::Withdrawal(Some(_))) => {
+                        return None
+                    }
+                };
+                Some((tx, role, why))
+            })
             .collect();
-        for (tx, role) in self.untold("spend_skipped", &skipped, |(tx, _)| tx.id.to_string()) {
+        for (tx, role, why) in self.untold("spend_skipped", &skipped, |(tx, ..)| tx.id.to_string())
+        {
             warn!(
                 event = "bridge.spend_skipped",
                 link = %tx.id,
                 creator = %tx.creator,
                 role,
-                "[bridge/withdrawals] spend {} by {} in role {role} is neither the bridging agent's deposit nor a withdrawal, and stays parked",
+                "[bridge/withdrawals] link {} by {} {why}, and stays parked",
                 tx.id,
                 tx.creator
+            );
+        }
+    }
+
+    fn log_unpayable(&self, unpayable: &[(Transaction, anyhow::Error)]) {
+        let hot_unit_index = self.cfg.hot_unit_index;
+        let untold = self.untold("withdrawal_unpayable", unpayable, |(tx, _)| {
+            tx.id.to_string()
+        });
+        for (tx, e) in untold {
+            error!(
+                event = "bridge.withdrawal_unpayable",
+                link = %tx.id,
+                creator = %tx.creator,
+                "[bridge/withdrawals] withdrawal {:?} stays parked, no coupon can pay it in HOT unit {hot_unit_index}: {e:#} (its amount: {:?})",
+                tx.id, tx.amount
             );
         }
     }
@@ -1090,6 +1119,7 @@ impl BridgeOrchestrator {
             coupons: mut coupons_map,
             coupon_bytes: coupon_cumulative_bytes,
             withdrawals_found: total_withdrawals_found,
+            unpayable,
         } = select_bridging_links(
             self.ethereum.as_ref().map(|side| &side.signer),
             &self.cfg.bridging_agent_pubkey,
@@ -1098,6 +1128,7 @@ impl BridgeOrchestrator {
             self.cfg.hot_unit_index,
         )
         .await?;
+        self.log_unpayable(&unpayable);
 
         let deposit_ids: HashSet<String> = deposit_rave_links
             .iter()
@@ -1150,14 +1181,11 @@ impl BridgeOrchestrator {
             .map(|t| t.id.to_string())
             .collect();
 
-        // Strip coupons whose withdrawal link was deferred by the cap so
-        // `execute_rave` only receives coupons for links it's actually
-        // going to process.
         coupons_map.retain(|k, _| retained_withdrawal_ids.contains(k));
 
         let retained_deposit_count = retained_deposit_ids.len();
         let withdrawal_count = retained_withdrawal_ids.len();
-        let deferred_withdrawals = total_withdrawals_found - withdrawal_count;
+        let deferred_withdrawals = total_withdrawals_found - unpayable.len() - withdrawal_count;
         let deferred_deposits_by_rave_cap = pre_cap_deposit_count - retained_deposit_count;
         let deferred_withdrawals_by_rave_cap = pre_cap_withdrawal_count - withdrawal_count;
 
@@ -1175,12 +1203,13 @@ impl BridgeOrchestrator {
         }
 
         info!(
-            "[bridge/withdrawals] scan: found={} selected={}/{} coupon_bytes={} deferred={}",
+            "[bridge/withdrawals] scan: found={} selected={}/{} coupon_bytes={} deferred={} unpayable={}",
             total_withdrawals_found,
             withdrawal_count,
             total_withdrawals_found,
             coupon_cumulative_bytes,
-            deferred_withdrawals
+            deferred_withdrawals,
+            unpayable.len()
         );
 
         let mut succeeded_locks = 0usize;
@@ -1268,11 +1297,14 @@ impl BridgeOrchestrator {
         let credit_limit: ActionHash = context.credit_limit_adjustment.clone().into();
         let bridging: ActionHash = context.bridging_agreement.clone().into();
         let cl_live = live.on(conductor, &credit_limit).await?;
+        let mut parked: HashSet<String> = cl_live.iter().map(|tx| tx.id.to_string()).collect();
         self.log_foreign_proofs("proof_foreign/credit_limit", cl_live);
         let cl_by_lock = self.links_by_lock(cl_live);
         let br_live = live.on(conductor, &bridging).await?;
+        parked.extend(br_live.iter().map(|tx| tx.id.to_string()));
+        self.forget_unparked(&parked);
         self.log_foreign_proofs("proof_foreign/bridging", br_live);
-        self.log_skipped_spends(br_live);
+        self.log_skipped_links(br_live);
         let br_by_lock = self.links_by_lock(br_live);
         let mut counts = ReconcileCounts::default();
 
@@ -1603,38 +1635,45 @@ impl BridgeOrchestrator {
         let deferred_before = deferred.remove(stage).unwrap_or_default();
         let deferring = deferred.entry(stage).or_default();
         let mut accounted = Vec::new();
+        let mut withheld = Vec::new();
+        let mut foreign = Vec::new();
         for link in links {
             let id = link.id.to_string();
-            let why = match unaccounted(&link, &id, &self.cfg.bridging_agent_pubkey, &by_lock) {
-                None => {
-                    accounted.push(link);
-                    continue;
-                }
+            match unaccounted(&link, &id, &self.cfg.bridging_agent_pubkey, &by_lock) {
+                None => accounted.push(link),
+                Some(Gap::Foreign(why)) => foreign.push((id, why)),
                 Some(Gap::Unrecorded(why)) => {
                     deferring.insert(id.clone());
-                    if !deferred_before.contains(&id) {
+                    if deferred_before.contains(&id) {
+                        withheld.push((id, why));
+                    } else {
                         warn!(
                             event = "bridge.rave.link_deferred",
                             link = id,
                             reason = why,
                             "[bridge/{stage}] link {id} waits a cycle for its rows to record it: {why}"
                         );
-                        continue;
                     }
-                    why
                 }
-                Some(Gap::Conflict(why)) => why,
-            };
+                Some(Gap::Conflict(why)) => withheld.push((id, why)),
+            }
+        }
+        let foreign_untold = self.untold(&format!("link_withheld/{stage}"), &foreign, |(id, _)| {
+            id.clone()
+        });
+        for (id, why) in withheld.iter().chain(foreign_untold) {
             error!(
                 event = "bridge.rave.link_withheld",
                 link = id,
                 reason = why,
                 "[bridge/{stage}] link {id} is withheld from the RAVE: {why}"
             );
+        }
+        for (id, why) in withheld.iter().chain(&foreign) {
             self.send_rows_recording_to_a_person(
                 &rows,
                 &recorded,
-                &id,
+                id,
                 &format!("is withheld from the RAVE: {why}"),
             )?;
         }
@@ -2904,6 +2943,7 @@ fn deposit_proofs(tx: &Transaction) -> Option<&Value> {
 }
 
 enum Gap {
+    Foreign(String),
     Unrecorded(String),
     Conflict(String),
 }
@@ -2922,7 +2962,7 @@ fn unaccounted(
 ) -> Option<Gap> {
     let conflict = |why: String| Some(Gap::Conflict(why));
     if link.creator != *bridging_agent {
-        return conflict(format!("it was parked by {}", link.creator));
+        return Some(Gap::Foreign(format!("it was parked by {}", link.creator)));
     }
     let Some(proofs) = deposit_proofs(link).and_then(Value::as_array) else {
         return conflict("it carries no list of deposit proofs".to_string());
@@ -5649,9 +5689,13 @@ mod tests {
     }
 
     async fn warnings_logged(run: impl std::future::Future) -> String {
+        logged_at(tracing::Level::WARN, run).await
+    }
+
+    async fn logged_at(level: tracing::Level, run: impl std::future::Future) -> String {
         use tracing::instrument::WithSubscriber;
         let lines = Lines::default();
-        run.with_subscriber(lines.at(tracing::Level::WARN)).await;
+        run.with_subscriber(lines.at(level)).await;
         lines.text()
     }
 
@@ -6018,19 +6062,177 @@ mod tests {
     #[tokio::test]
     async fn a_spend_left_parked_is_logged_once_while_it_stays_parked() {
         let orch = test_orchestrator("skipped-once");
+        let pair = [0xAF, 0xB0].map(|seed| signed_by_another(parked_spend_tx(seed, &[])));
+
+        told_once_while_parked(
+            &orch,
+            &bridging_conductor(),
+            BR_EA,
+            "bridge.spend_skipped",
+            pair,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_link_the_bridge_has_nothing_to_pay_on_is_logged_once_while_it_stays_parked() {
+        let orch = test_orchestrator("nothing-to-pay-once");
+        let pair = [unaddressed_withdrawal(0xC1), non_spend(0xC2)];
+
+        told_once_while_parked(
+            &orch,
+            &bridging_conductor(),
+            BR_EA,
+            "bridge.spend_skipped",
+            pair,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn only_a_link_the_bridge_leaves_parked_is_logged_as_skipped_with_why() {
+        let orch = test_orchestrator("skipped-role");
+        let mut audited = signed_by_another(parked_spend_tx(0xB8, &[]));
+        if let TransactionDetails::ParkedSpend { ct_role_id, .. } = &mut audited.details {
+            *ct_role_id = "auditor".to_string();
+        }
+        let skipped = [audited, unaddressed_withdrawal(0xBB), non_spend(0xBC)];
+        let parked = [
+            &[
+                parked_spend_tx(0xB9, &[proof("lock:own:6", "0x92")]),
+                parked_withdrawal_tx(0xBA),
+            ][..],
+            &skipped,
+        ]
+        .concat();
+
+        let logged = warnings_logged(reconcile(&orch, &[], &parked)).await;
+
+        assert_eq!(
+            told_of(&logged, "bridge.spend_skipped", &parked),
+            ids(&skipped)
+        );
+        for why in [
+            "in role auditor is neither the bridging agent's deposit nor a withdrawal",
+            "in role withdrawer names no withdraw_to_address",
+            "is no spend",
+        ] {
+            assert!(logged.contains(why), "{logged}");
+        }
+    }
+
+    fn unaddressed_withdrawal(seed: u8) -> Transaction {
+        with_payload(parked_withdrawal_tx(seed), json!({}))
+    }
+
+    fn with_payload(mut spend: Transaction, payload: Value) -> Transaction {
+        if let TransactionDetails::ParkedSpend {
+            attached_payload, ..
+        } = &mut spend.details
+        {
+            *attached_payload = payload;
+        }
+        spend
+    }
+
+    fn non_spend(seed: u8) -> Transaction {
+        signed_by_another(parked_tx(seed, &[]))
+    }
+
+    fn unpayable_withdrawal(seed: u8) -> Transaction {
+        let mut withdrawal = parked_withdrawal_tx(seed);
+        withdrawal.amount = UnitMap::from(vec![(1, "0")]);
+        withdrawal
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_no_coupon_can_pay_is_logged_once_while_it_stays_parked() {
+        let orch = test_orchestrator("unpayable-once");
         let conductor = bridging_conductor();
-        let [a, b] = [0xAF, 0xB0].map(|seed| signed_by_another(parked_spend_tx(seed, &[])));
+        let pair = [0xC3, 0xC4].map(unpayable_withdrawal);
+
+        told_once_while_parked(
+            &orch,
+            &conductor,
+            BR_EA,
+            "bridge.withdrawal_unpayable",
+            pair.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            ids(&conductor.parked.borrow()[&action_hash(BR_EA)]),
+            ids(&pair),
+            "neither is paid"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_agents_link_withheld_from_the_credit_limit_rave_is_logged_once() {
+        let orch = test_orchestrator("withheld-foreign-once");
+        let conductor = bridging_conductor();
+        let pair = [0xC5, 0xC6].map(|seed| signed_by_another(parked_tx(seed, &[])));
+
+        told_once_while_parked(
+            &orch,
+            &conductor,
+            CL_EA,
+            "bridge.rave.link_withheld",
+            pair.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            ids(&conductor.parked.borrow()[&action_hash(CL_EA)]),
+            ids(&pair),
+            "both are still withheld"
+        );
+    }
+
+    #[test]
+    fn a_row_recording_another_agents_link_goes_to_a_person_on_every_cycle() {
+        let orch = test_orchestrator("withheld-foreign-row");
+        let copy = signed_by_another(parked_tx(0xC8, &[proof("lock:foreign-row:1", "0xc8")]));
+        let id = enqueue_lock(&orch, "lock:foreign-row:1", "0xc8");
+        orch.record_cl_link(id, &copy.id.to_string(), &in_force(CL_EA, BR_EA))
+            .unwrap();
+
+        for _ in 0..2 {
+            let given = orch
+                .accounted_links("s2", vec![copy.clone()], |row| row.cl_link_hash.as_deref())
+                .unwrap();
+
+            assert!(given.is_empty());
+            let reason = failed_row(&orch, id).last_error.unwrap();
+            assert!(reason.contains("it was parked by"), "{reason}");
+            set_state(&orch, id, "queued");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_bridging_agents_own_link_withheld_is_logged_on_every_cycle() {
+        let orch = test_orchestrator("withheld-own-every-cycle");
+        let conductor = bridging_conductor();
+        let own = [parked_tx(0xC7, &[proof("lock:no-row:1", "0xc7")])];
+
+        for _ in 0..2 {
+            assert_eq!(
+                told_in_a_cycle(&orch, &conductor, CL_EA, &own, "bridge.rave.link_withheld").await,
+                ids(&own)
+            );
+        }
+    }
+
+    async fn told_once_while_parked(
+        orch: &BridgeOrchestrator,
+        conductor: &FakeConductor,
+        agreement: u8,
+        event: &str,
+        [a, b]: [Transaction; 2],
+    ) {
         let both = [a.clone(), b.clone()];
         let cycle = async |parked: &[Transaction]| {
-            conductor
-                .parked
-                .borrow_mut()
-                .insert(action_hash(BR_EA), parked.to_vec());
-            let logged = warnings_logged(async {
-                orch.run_bridge_cycle(&conductor, &running()).await.unwrap()
-            })
-            .await;
-            told_of(&logged, "bridge.spend_skipped", &both)
+            told_in_a_cycle(orch, conductor, agreement, parked, event).await
         };
 
         assert_eq!(cycle(&both).await, ids(&both));
@@ -6049,26 +6251,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn only_a_spend_the_bridge_leaves_parked_is_logged_as_skipped_with_its_role() {
-        let orch = test_orchestrator("skipped-role");
-        let mut audited = signed_by_another(parked_spend_tx(0xB8, &[]));
-        if let TransactionDetails::ParkedSpend { ct_role_id, .. } = &mut audited.details {
-            *ct_role_id = "auditor".to_string();
-        }
-        let parked = [
-            parked_spend_tx(0xB9, &[proof("lock:own:6", "0x92")]),
-            parked_withdrawal_tx(0xBA),
-            audited.clone(),
-        ];
-
-        let logged = warnings_logged(reconcile(&orch, &[], &parked)).await;
-
-        assert_eq!(
-            told_of(&logged, "bridge.spend_skipped", &parked),
-            ids(&[audited])
-        );
-        assert!(logged.contains("in role auditor"), "{logged}");
+    async fn told_in_a_cycle(
+        orch: &BridgeOrchestrator,
+        conductor: &FakeConductor,
+        agreement: u8,
+        parked: &[Transaction],
+        event: &str,
+    ) -> Vec<String> {
+        conductor
+            .parked
+            .borrow_mut()
+            .insert(action_hash(agreement), parked.to_vec());
+        let logged =
+            warnings_logged(async { orch.run_bridge_cycle(conductor, &running()).await.unwrap() })
+                .await;
+        told_of(&logged, event, parked)
     }
 
     fn told_of(logged: &str, event: &str, links: &[Transaction]) -> Vec<String> {
@@ -6787,6 +6984,7 @@ mod tests {
         let recording = |link| HashMap::from([(lock_key.clone(), link)]);
         let why = |link: &Transaction, recorded: &HashMap<LockKey, RowLink>| {
             unaccounted(link, &id, &bridging_agent(), recorded).map(|gap| match gap {
+                Gap::Foreign(why) => format!("foreign: {why}"),
                 Gap::Unrecorded(why) => format!("unrecorded: {why}"),
                 Gap::Conflict(why) => format!("conflict: {why}"),
             })
@@ -6797,7 +6995,7 @@ mod tests {
             (
                 signed_by_another(own.clone()),
                 recording(RowLink::Records(id.as_str())),
-                "conflict: it was parked by",
+                "foreign: it was parked by",
             ),
             (
                 with_proofs(json!("lock")),
@@ -8355,27 +8553,23 @@ mod tests {
     async fn a_withdrawal_no_coupon_can_pay_stays_parked_and_the_rest_go() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let paid_to = |seed, recipient: &str, amount: &[(u32, &str)]| {
-            let mut tx = parked_withdrawal_tx(seed);
+            let mut tx = with_payload(
+                parked_withdrawal_tx(seed),
+                json!({ "withdraw_to_address": recipient }),
+            );
             tx.amount = UnitMap::from(amount.to_vec());
-            if let TransactionDetails::ParkedSpend {
-                attached_payload, ..
-            } = &mut tx.details
-            {
-                *attached_payload = json!({ "withdraw_to_address": recipient });
-            }
             tx
         };
         let to = "0x1111111111111111111111111111111111111111";
         let payable = paid_to(0x60, to, &[(1, "5")]);
         let deposit = parked_spend_tx(0x61, &[proof("lock:d", "0xd0")]);
-        let links = [
+        let unpayable = [
             paid_to(0x62, to, &[(2, "5")]),
             paid_to(0x63, to, &[(1, "0")]),
             paid_to(0x64, to, &[(1, "-5")]),
             paid_to(0x65, "0xdead", &[(1, "5")]),
-            payable.clone(),
-            deposit.clone(),
         ];
+        let links = [&unpayable[..], &[payable.clone(), deposit.clone()]].concat();
 
         let selection =
             select_bridging_links(Some(&signer), &bridging_agent(), &links, usize::MAX, 1)
@@ -8386,6 +8580,54 @@ mod tests {
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
         assert_eq!(selection.coupons.len(), 1);
         assert_eq!(selection.withdrawals_found, 5);
+        assert_eq!(unpayable_ids(&selection), ids(&unpayable));
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_no_coupon_can_pay_is_found_past_the_coupons_budget() {
+        let signer = CouponSigner::with_key(PrivateKeySigner::random());
+        let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
+        let unpayable = unpayable_withdrawal(0x63);
+        let links = [
+            &withdrawals[..],
+            &[unpayable.clone(), parked_withdrawal_tx(0x64)],
+        ]
+        .concat();
+
+        let selection = select_bridging_links(Some(&signer), &bridging_agent(), &links, 1, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(ids(&selection.withdrawals), ids(&withdrawals[..1]));
+        assert_eq!(unpayable_ids(&selection), ids(&[unpayable]));
+    }
+
+    #[tokio::test]
+    async fn the_withdrawal_scan_counts_an_unpayable_withdrawal_apart_from_the_deferred() {
+        let orch = test_orchestrator("scan-unpayable");
+        let conductor = bridging_conductor().parking(
+            action_hash(BR_EA),
+            &[parked_withdrawal_tx(0xCA), unpayable_withdrawal(0xCB)],
+        );
+
+        let logged = logged_at(tracing::Level::INFO, async {
+            orch.run_bridge_cycle(&conductor, &running()).await.unwrap()
+        })
+        .await;
+
+        assert!(
+            logged.contains("found=2 selected=1/2 coupon_bytes="),
+            "{logged}"
+        );
+        assert!(logged.contains("deferred=0 unpayable=1"), "{logged}");
+    }
+
+    fn unpayable_ids(selection: &BridgingSelection) -> Vec<String> {
+        selection
+            .unpayable
+            .iter()
+            .map(|(tx, _)| tx.id.to_string())
+            .collect()
     }
 
     #[tokio::test]
