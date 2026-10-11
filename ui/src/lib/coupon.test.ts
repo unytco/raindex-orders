@@ -34,4 +34,21 @@ describe('parseCoupon', () => {
 			'0x0ede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b'
 		)
 	})
+
+	it.each([
+		['a signer one character short', '0x8E72b7568738da52ca3DCd9b24E178127A4E7d3'],
+		['a signature that is not hex', '0x8E72b7568738da52ca3DCd9b24E178127A4E7d37', '0xzz']
+	])('refuses %s, so the page calls it malformed', (_case, signer, signature = '0x00') => {
+		expect(() => deserializeSignedContext([signer, signature, '1', '2'].join(','))).toThrow(
+			'Not a coupon'
+		)
+	})
+
+	it('takes a signer in any letter case, as the orderbook does', () => {
+		const { signer } = deserializeSignedContext(
+			'0x8e72b7568738da52ca3DCd9b24E178127A4E7d37,0x00,1,2'
+		)
+
+		expect(signer).toBe('0x8e72b7568738da52ca3dcd9b24e178127a4e7d37')
+	})
 })

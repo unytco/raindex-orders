@@ -11,29 +11,26 @@
 	$: isLockSuccess =
 		$transactionStore.status === TransactionStatus.SUCCESS && $transactionStore.isLockTransaction
 
-	$: isPending =
-		$transactionStore.status === TransactionStatus.PENDING_WALLET ||
-		$transactionStore.status === TransactionStatus.PENDING_TX
+	$: isUnconfirmed = $transactionStore.status === TransactionStatus.UNCONFIRMED
 
-	function unescapeString(str: string) {
-		return str
-			.replace(/\\n/g, '\n')
-			.replace(/\\'/g, "'")
-			.replace(/\\"/g, '"')
-			.replace(/\\\\/g, '\\')
-	}
+	$: isPending = [
+		TransactionStatus.CHECKING,
+		TransactionStatus.PENDING_WALLET,
+		TransactionStatus.PENDING_TX
+	].includes($transactionStore.status)
 </script>
 
 <Modal
-	on:close={() => {
-		if (!isPending) transactionStore.reset()
-	}}
-	open={$transactionStore.status !== TransactionStatus.IDLE}
-	dismissable={!isPending}
+	on:close={() => (isPending ? transactionStore.dismiss() : transactionStore.reset())}
+	open={$transactionStore.status !== TransactionStatus.IDLE && !$transactionStore.dismissed}
 	placement="center"
 >
 	<div class="p-4">
 		<div class="flex flex-col items-center justify-center gap-2">
+			{#if $transactionStore.status === TransactionStatus.CHECKING}
+				<Spinner size="10" color="blue" />
+				<p class="text-center">{$transactionStore.status}</p>
+			{/if}
 			{#if $transactionStore.status === TransactionStatus.PENDING_WALLET}
 				<Spinner size="10" color="blue" />
 				<div class="text-center">
@@ -77,15 +74,22 @@
 				>
 			{/if}
 
-			{#if $transactionStore.status === TransactionStatus.ERROR}
+			{#if $transactionStore.status === TransactionStatus.ERROR || isUnconfirmed}
 				<div
-					class="mb-2 flex h-16 w-16 items-center justify-center rounded-full bg-green-100 dark:bg-green-900"
+					class="mb-2 flex h-16 w-16 items-center justify-center rounded-full {isUnconfirmed
+						? 'bg-yellow-100 dark:bg-yellow-900'
+						: 'bg-red-100 dark:bg-red-900'}"
 				>
-					<h1 class="text-2xl">❌</h1>
+					<h1 class="text-2xl">{isUnconfirmed ? '⏳' : '❌'}</h1>
 				</div>
-				<div class="flex flex-col">
-					{unescapeString($transactionStore.error.message)}
-				</div>
+				<p class="w-full break-words text-center">{$transactionStore.error.message}</p>
+				{#if $transactionStore.hash}
+					<a
+						class="text-blue-500 hover:underline"
+						href={explorerTx($transactionStore.hash)}
+						target="_blank">View transaction on Etherscan</a
+					>
+				{/if}
 				<Button on:click={() => transactionStore.reset()}>Close</Button>
 			{/if}
 		</div>
