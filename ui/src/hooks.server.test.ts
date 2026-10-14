@@ -21,16 +21,17 @@ const FAUCET_ROUTES: [string, string][] = [
 	['/api/%66aucet', '/api/faucet'],
 	['/%66aucet', '/faucet']
 ]
-const LOCK_PAGE: Route[] = [
-	['/lock', '/lock'],
+const PAGES: Route[] = [
+	...ROUTES.filter(([path]) => !path.startsWith('/api/')),
 	['/lock/', '/lock'],
 	['/%6cock', '/lock']
 ]
 const FAUCET_PAGE = FAUCET_ROUTES.filter(([, route]) => route === '/faucet')
 const FAUCET_API = FAUCET_ROUTES.filter(([, route]) => route === '/api/faucet')
-const OPEN_WHILE_PAUSED = ROUTES.filter(([, route]) => route !== '/lock')
+const OPEN_WHILE_PAUSED = ROUTES.filter(([path]) => path.startsWith('/api/'))
 const STOP_TEXT =
 	'The HOT bridge is paused. It will be back soon. For more information, contact info@unyt.co.'
+const STOP_PAGE_TEXT = "We'll be back soon For more information, contact info@unyt.co."
 
 async function request(
 	build: Record<string, string>,
@@ -72,8 +73,8 @@ describe('handle', () => {
 })
 
 describe.each([
-	['base-sepolia', [...LOCK_PAGE, ...FAUCET_PAGE]],
-	['mainnet', LOCK_PAGE]
+	['base-sepolia', [...PAGES, ...FAUCET_PAGE]],
+	['mainnet', PAGES]
 ] as const)('while paused, a %s build', (network, stopped) => {
 	const build = BUILDS[network]
 
@@ -84,7 +85,7 @@ describe.each([
 		expect(response.status).toBe(503)
 		expect(response.headers.get('Cache-Control')).toBe('no-store')
 		expect(response.headers.get('Content-Type')).toBe('text/html; charset=utf-8')
-		expect(html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')).toContain(STOP_TEXT)
+		expect(html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')).toContain(STOP_PAGE_TEXT)
 		expect(html).toContain('<a href="mailto:info@unyt.co">info@unyt.co</a>')
 		expect(html).not.toContain('<script')
 		expect(resolved).toBe(false)

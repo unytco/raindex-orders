@@ -43,7 +43,7 @@ You can preview the production build with `npm run preview`.
 
 ## Pausing the bridge
 
-While a Worker's `BRIDGE_PAUSED` secret is exactly `true`, Lock and the TestNet faucet show a stop page, the TestNet `/api/faucet` answers `503`, and a Lock page left open refuses to send. Claim works as usual. Any other value, or none, leaves the site open.
+While a Worker's `BRIDGE_PAUSED` secret is exactly `true`, every page shows a stop page, the TestNet `/api/faucet` answers `503`, and a Lock page left open refuses to send. Any other value, or none, leaves the site open.
 
 Run these from `ui/`. Each deploys a new version of the Worker immediately, with no build. Later deploys keep the secret, but a rollback to a version from before the pause reopens the bridge.
 

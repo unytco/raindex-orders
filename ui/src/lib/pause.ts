@@ -1,6 +1,6 @@
 export const PAUSED_CONTACT = 'info@unyt.co'
-export const PAUSED_LEAD =
-	'The HOT bridge is paused. It will be back soon. For more information, contact'
+export const CONTACT_LEAD = 'For more information, contact'
+export const PAUSED_LEAD = `The HOT bridge is paused. It will be back soon. ${CONTACT_LEAD}`
 export const PAUSED_TEXT = `${PAUSED_LEAD} ${PAUSED_CONTACT}.`
 export const STATUS_TIMEOUT_MS = 15_000
 

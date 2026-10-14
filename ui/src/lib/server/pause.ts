@@ -1,6 +1,6 @@
 import { json } from '@sveltejs/kit'
 import { env } from '$env/dynamic/private'
-import { PAUSED_CONTACT, PAUSED_LEAD, PAUSED_TEXT } from '$lib/pause'
+import { CONTACT_LEAD, PAUSED_CONTACT, PAUSED_TEXT } from '$lib/pause'
 
 export const bridgePaused = () => env.BRIDGE_PAUSED === 'true'
 
@@ -56,8 +56,8 @@ const STOP_PAGE = `<!doctype html>
 				<rect x="14" y="12" width="4" height="16" rx="1" fill="#723b13" />
 				<rect x="22" y="12" width="4" height="16" rx="1" fill="#723b13" />
 			</svg>
-			<h1>Bridge paused</h1>
-			<p>${PAUSED_LEAD} <a href="mailto:${PAUSED_CONTACT}">${PAUSED_CONTACT}</a>.</p>
+			<h1>We'll be back soon</h1>
+			<p>${CONTACT_LEAD} <a href="mailto:${PAUSED_CONTACT}">${PAUSED_CONTACT}</a>.</p>
 		</main>
 	</body>
 </html>
