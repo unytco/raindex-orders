@@ -222,8 +222,9 @@ impl BridgeOrchestrator {
                 .get(&self.cfg.hot_unit_index.to_string())
                 .map(|amount| amount.to_string())
                 .unwrap_or_default();
-            let pays = match withdraw_to.and_then(|to| to.parse::<Address>().ok()) {
-                Some(to) => gate.pays(&id, to, &hot).await?,
+            let pays = match withdraw_to.map(str::parse::<Address>) {
+                Some(Ok(to)) => gate.pays(&id, to, &hot).await?,
+                Some(Err(_)) => false,
                 None => true,
             };
             let screening = if pays {

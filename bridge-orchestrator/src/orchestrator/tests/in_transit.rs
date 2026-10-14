@@ -778,10 +778,24 @@ async fn in_transit_screens_each_withdrawal_as_s4_would_and_marks_those_not_to_p
     orch.db
         .record_withdrawal_verdict(&waiting.id.to_string(), &silent, Address::repeat_byte(0x6D))
         .unwrap();
-    let all = [held, blocked, clear, waiting, unscreened, unscreened_listed];
+    let mistyped_to = format!(" {:#x}", Address::repeat_byte(0x70));
+    let mistyped = with_payload(
+        parked_withdrawal_tx(0x70),
+        json!({ "withdraw_to_address": mistyped_to }),
+    );
+    let all = [
+        held,
+        blocked,
+        clear,
+        waiting,
+        unscreened,
+        unscreened_listed,
+        mistyped,
+    ];
     let conductor = bridging_conductor().parking(action_hash(BR_EA), &all);
-    let expected = |marks: [Option<&str>; 6]| {
-        let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F].map(listed_withdrawal);
+    let expected = |marks: [Option<&str>; 7]| {
+        let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70].map(listed_withdrawal);
+        expected[6]["withdraw_to_address"] = json!(mistyped_to);
         for (listed, mark) in expected.iter_mut().zip(marks) {
             if let Some(mark) = mark {
                 listed["screening"] = json!(mark);
@@ -800,6 +814,7 @@ async fn in_transit_screens_each_withdrawal_as_s4_would_and_marks_those_not_to_p
             Some("screening"),
             None,
             None,
+            Some("unscreened"),
         ]),
     );
 
@@ -814,6 +829,7 @@ async fn in_transit_screens_each_withdrawal_as_s4_would_and_marks_those_not_to_p
             None,
             None,
             Some("held"),
+            Some("unscreened"),
         ]),
     );
     assert_eq!(
