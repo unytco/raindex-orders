@@ -24,6 +24,9 @@ No additional flags. Before it reads from Holochain or writes anything, `run`
 refuses to start, naming each variable at fault, when:
 
 - a signer variable is unset or malformed
+- `SCREENING` is neither `on` nor `off`, a `SCREENING_DENYLIST` entry is not
+  an address, or, on `mainnet`, `SCREENING` is unset or `off` or the list is
+  empty
 - the RPC answers for a chain other than `NETWORK`'s (1 for `mainnet`,
   84532 for `base-sepolia`)
 - the vault has no contract, or its `token()`, `orderbook()` or `vaultId()`
@@ -58,6 +61,30 @@ A lock row whose next step writes a deposit proof waits for a run on a chain.
 It logs once that Ethereum is off, and names each chain variable it ignores.
 Only an explicit `none` turns Ethereum off.
 
+With `SCREENING=on`, `run` screens the addresses behind each transfer against
+`SCREENING_DENYLIST` before it credits or pays it:
+
+- The lock read records each lock in `screening`, with its transaction's
+  `from` beside the `Lock` event's `sender`. After each lock read, it screens
+  both: a clear verdict moves the lock to `queued`, and a listed address to
+  `held`, where it waits for a person. S1 takes only `queued` rows, so a held
+  lock is never credited until a person runs `release`.
+- Before S4 signs a withdrawal's coupon, it screens the spend's
+  `withdraw_to_address`. A listed one gets no coupon and stays parked until a
+  person runs `release`. A withdrawal's verdict is kept against its spend's
+  action hash, so it is screened once.
+- With no verdict, a lock waits in `screening` and a withdrawal stays parked,
+  and the next pass screens them again. The list always answers.
+- `DB_PATH` keeps every verdict, the addresses screened with their roles
+  (`sender`, `from`, `withdraw_to_address`), each list version a verdict used,
+  and each `release` and `block` with who made it and why.
+- With `SCREENING=off`, a lock is recorded `queued`. A lock in `screening` or
+  `held` stays there, which `startup.screening` names at each start, and a
+  withdrawal a verdict holds or waits on still gets no coupon.
+
+Each verdict logs `bridge.screening.clear`, `bridge.screening.hit` or
+`bridge.screening.no_answer`.
+
 ### `bridge-orchestrator status`
 
 Query the SQLite work-item database. Prints one JSON object per line to stdout.
@@ -73,7 +100,8 @@ bridge-orchestrator status [OPTIONS]
 | `--item-id` | string | _(all)_ | Filter by specific item ID |
 | `--limit` | integer | `50` | Maximum rows returned |
 
-`--state` values: `queued`, `claimed`, `in_flight`, `succeeded`, `failed`
+`--state` values: `screening`, `held`, `blocked`, `queued`, `claimed`,
+`in_flight`, `succeeded`, `failed`
 
 ### `bridge-orchestrator clear`
 
@@ -89,12 +117,13 @@ bridge-orchestrator clear --all
 | Flag | Description |
 |------|-------------|
 | `--non-in-progress` | Delete only terminal rows (`succeeded`, `failed`) |
-| `--all` | Delete every row in `work_items` |
+| `--all` | Delete every row in `work_items` but the locks in `screening`, `held` or `blocked` |
 | `--older-than-s N` | Only with `--non-in-progress`: restrict deletion to terminal rows whose `updated_at` is older than N seconds. Applied to both `succeeded` and `failed`. Use the in-process retention task (below) for per-state windows. |
 
 Outputs a JSON object. Plain `--non-in-progress` returns
 `{"mode":"non_in_progress","deleted_count":N}`; with `--older-than-s` the
-output also includes `succeeded_deleted` and `failed_deleted`. Steady-state ops
+output also includes `succeeded_deleted` and `failed_deleted`. Neither mode
+deletes a screening record. Steady-state ops
 should rely on the in-process retention task and reserve this CLI for one-off
 hygiene.
 
@@ -117,7 +146,7 @@ It prints one JSON object per line:
 |--------|--------------------|--------|
 | `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created`, or a row `in_flight` or `claimed` at any step | `item_id`, `lock_id`, `state`, `step`, `link` |
 | `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the credit-limit adjustment agreement or the bridging agreement of its lane in force | `agreement`, `link`, `lock_ids` |
-| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address` |
+| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address`, and `screening` (`held`, `blocked` or `screening`) for one screening has not cleared, which is not to be paid by hand |
 
 `lock_id` is `null` for a row whose payload cannot be read, `link` for one that
 records none, and `withdraw_to_address` for a withdrawal that names none, which
@@ -159,6 +188,50 @@ carrying it, and an earlier `failed` row may name it too. A lock whose row is
 deletes `succeeded` and `failed` rows, and so may a `row` whose `link` is not
 listed live, as a RAVE may have taken it. Pay each withdrawal once, by its
 `spend`.
+
+### `bridge-orchestrator release` and `block`
+
+A person's decision on a held transfer. Each works while `run` runs, and adds a
+record of who made it, why, and when.
+
+```
+bridge-orchestrator release lock:42 --by <name> --reason <text>
+bridge-orchestrator block withdrawal:<action hash> --by <name> --reason <text>
+```
+
+- `release` moves a `held` lock to `queued`, to be credited as normal. A held
+  withdrawal gets its coupon at the next S4.
+- `block` moves a `held` lock, or one in `screening`, to `blocked`, never to be
+  credited. A blocked withdrawal is never paid. On a blocked transfer it only
+  adds a record, such as for the vault admin moving its HOT.
+- Each refuses a transfer in any other state, and names that state. It logs
+  `bridge.screening.released` or `bridge.screening.blocked`.
+
+### `bridge-orchestrator screenings`
+
+Prints each screened transfer, and each lock in `screening`, `held` or
+`blocked`, as one JSON object per line: `transfer`, its `state`,
+`first_screened_at`, and its `records`, oldest first.
+
+```
+bridge-orchestrator screenings
+bridge-orchestrator screenings --open
+bridge-orchestrator screenings --transfer lock:42
+```
+
+`--open` keeps only the transfers that wait: `held`, or in `screening` with no
+verdict. A withdrawal's `state` is `screening`, `clear`, `held`, `released` or
+`blocked`.
+
+### `bridge-orchestrator screen`
+
+Screens one address as `run` would, with its configuration, and prints the
+verdict, the provider and its list version. It records and moves nothing. It
+exits non-zero if the provider cannot answer.
+
+```
+bridge-orchestrator screen 0x6c6EE5e31d828De241282B9606C8e98Ea48526E2
+```
 
 ## Environment variables
 
@@ -203,6 +276,16 @@ Confirmations are not configurable: the lock read reads only blocks with 5
 confirmations, on both networks. A new `DB_PATH` starts at the newest of them.
 A database an earlier release left `detected` rows in loses them on its first
 start, and the lock read goes back to read their blocks again.
+
+### Screening (`run` and `screen`)
+
+| Variable | Required | Base Sepolia default |
+|----------|----------|-----------------|
+| `SCREENING` | mainnet, where `off` is refused | `on` (`on` or `off`) |
+| `SCREENING_DENYLIST` | mainnet, with at least one address | empty (comma-separated Ethereum addresses, in any letter case) |
+
+The list's version is the sha256 of its addresses, lowercased, sorted,
+deduplicated and comma-joined. `NETWORK=none` ignores both, and names them.
 
 ### Watchtower reporter (optional)
 

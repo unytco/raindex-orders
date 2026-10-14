@@ -1,6 +1,6 @@
 use crate::config::Ethereum;
 use crate::preflight::{rpc_failure, RPC_TIMEOUT};
-use crate::state::{StateStore, LOCK_CHECKPOINT_KEY};
+use crate::state::{StateStore, WorkState, LOCK_CHECKPOINT_KEY};
 use crate::stop::ensure_running;
 use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
@@ -33,15 +33,17 @@ pub struct LockFlow {
     db: StateStore,
     stop: ShutdownRx,
     rpc_timeout: Duration,
+    screening: bool,
 }
 
 impl LockFlow {
-    pub fn new(cfg: Ethereum, db: StateStore, stop: ShutdownRx) -> Self {
+    pub fn new(cfg: Ethereum, db: StateStore, stop: ShutdownRx, screening: bool) -> Self {
         Self {
             cfg,
             db,
             stop,
             rpc_timeout: RPC_TIMEOUT,
+            screening,
         }
     }
 
@@ -129,7 +131,7 @@ impl LockFlow {
         let tx_hash_hex = format!("0x{}", hex::encode(tx_hash));
         let item_id = format!("lock:{}", data.lockId);
         let idempotency_key = self.row_key(&data.lockId.to_string());
-        let payload = json!({
+        let mut payload = json!({
             "lock_id": data.lockId.to_string(),
             "sender": sender,
             "amount": amount_wei,
@@ -141,7 +143,21 @@ impl LockFlow {
             "timestamp": block.header.timestamp,
             "required_confirmations": self.cfg.confirmations,
         });
-        self.db.enqueue_queued(
+        let state = if self.screening {
+            let from = self
+                .request("eth_getTransactionByHash", || {
+                    provider.get_transaction_by_hash(tx_hash)
+                })
+                .await?
+                .with_context(|| format!("the RPC has no transaction {tx_hash_hex} of {item_id}"))?
+                .from;
+            payload["from"] = json!(format!("{from:?}"));
+            WorkState::Screening
+        } else {
+            WorkState::Queued
+        };
+        self.db.enqueue(
+            state.clone(),
             "lock",
             "create_parked_link",
             &item_id,
@@ -149,7 +165,8 @@ impl LockFlow {
             &payload,
         )?;
         info!(
-            "[lock-flow] lock queued id={} amount={} agent={} tx={} block={}",
+            "[lock-flow] lock recorded {} id={} amount={} agent={} tx={} block={}",
+            state,
             item_id,
             payload["amount_hot"].as_str().unwrap_or("0"),
             payload["holochain_agent"].as_str().unwrap_or("unknown"),
@@ -190,7 +207,17 @@ mod tests {
     }
 
     fn lock_flow(rpc_url: String, db: StateStore, stop: ShutdownRx) -> LockFlow {
-        lock_flow_on(Network::BaseSepolia, rpc_url, db, stop)
+        lock_flow_on(Network::BaseSepolia, rpc_url, db, stop, false)
+    }
+
+    fn screening_lock_flow(rpc_url: String, db: StateStore) -> LockFlow {
+        lock_flow_on(
+            Network::BaseSepolia,
+            rpc_url,
+            db,
+            watch::channel(false).1,
+            true,
+        )
     }
 
     fn lock_flow_on(
@@ -198,6 +225,7 @@ mod tests {
         rpc_url: String,
         db: StateStore,
         stop: ShutdownRx,
+        screening: bool,
     ) -> LockFlow {
         let vault = format!("{:#x}", vault());
         let chain = ethereum_settings(test_settings(&[
@@ -207,7 +235,7 @@ mod tests {
         ]))
         .unwrap()
         .unwrap();
-        LockFlow::new(chain, db, stop)
+        LockFlow::new(chain, db, stop, screening)
     }
 
     fn store(dir: &tempfile::TempDir) -> StateStore {
@@ -314,10 +342,36 @@ mod tests {
                     .collect())
             }
             "eth_getBlockByNumber" => Ok(block(quantity(&params[0]))),
+            "eth_getTransactionByHash" => Ok(transaction(&params[0])),
             other => Err(json!({ "code": -32601, "message": format!("no {other}") })),
         })
         .await;
         (url, windows)
+    }
+
+    /// The contract wallet that sent each lock's transaction.
+    fn from() -> Address {
+        Address::repeat_byte(0x33)
+    }
+
+    fn transaction(hash: &Value) -> Value {
+        json!({
+            "hash": hash,
+            "nonce": "0x0",
+            "blockHash": B256::repeat_byte(0x55),
+            "blockNumber": "0x5",
+            "transactionIndex": "0x0",
+            "from": from(),
+            "to": vault(),
+            "value": "0x0",
+            "gasPrice": "0x1",
+            "gas": "0x5208",
+            "input": "0x",
+            "v": "0x1b",
+            "r": "0x1",
+            "s": "0x1",
+            "type": "0x0",
+        })
     }
 
     fn quantity(hex: &Value) -> u64 {
@@ -347,7 +401,7 @@ mod tests {
             db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 80).unwrap();
             let (url, windows) = chain(100, &[(7, 95), (8, 96)]).await;
 
-            lock_flow_on(network, url, db.clone(), watch::channel(false).1)
+            lock_flow_on(network, url, db.clone(), watch::channel(false).1, false)
                 .run_cycle()
                 .await
                 .unwrap();
@@ -388,7 +442,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let db = store(&dir);
             let (url, windows) = chain(100, &[(6, 95)]).await;
-            lock_flow_on(network, url, db.clone(), watch::channel(false).1)
+            lock_flow_on(network, url, db.clone(), watch::channel(false).1, false)
                 .run_cycle()
                 .await
                 .unwrap();
@@ -399,7 +453,7 @@ mod tests {
             assert!(windows.lock().unwrap().is_empty(), "{network:?}");
 
             let (url, _) = chain(101, &[(6, 95), (7, 96)]).await;
-            lock_flow_on(network, url, db.clone(), watch::channel(false).1)
+            lock_flow_on(network, url, db.clone(), watch::channel(false).1, false)
                 .run_cycle()
                 .await
                 .unwrap();
@@ -563,5 +617,58 @@ mod tests {
             "BASE_SEPOLIA_RPC_URL did not answer eth_blockNumber within 200ms"
         );
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "no request after it");
+    }
+
+    #[tokio::test]
+    async fn with_screening_on_a_lock_is_recorded_in_screening_with_its_transactions_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(&dir);
+        db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 0).unwrap();
+
+        screening_lock_flow(chain(10, &[(7, 5)]).await.0, db.clone())
+            .run_cycle()
+            .await
+            .unwrap();
+
+        assert!(lock_rows(&db).is_empty(), "no lock is queued unscreened");
+        let waiting = db
+            .list_work_items("lock", WorkState::Screening, 10)
+            .unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].item_id, "lock:7");
+        let payload = &waiting[0].payload_json;
+        assert_eq!(
+            payload["sender"],
+            format!("{:?}", Address::repeat_byte(0x11))
+        );
+        assert_eq!(payload["from"], format!("{:?}", from()));
+    }
+
+    #[tokio::test]
+    async fn a_lock_whose_transaction_the_rpc_cannot_give_is_read_again_and_never_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(&dir);
+        db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 0).unwrap();
+        let url = serve(|method, params| match method {
+            "eth_blockNumber" => Ok(json!("0xa")),
+            "eth_getLogs" => Ok(json!([lock_log(7, 5)])),
+            "eth_getBlockByNumber" => Ok(block(quantity(&params[0]))),
+            "eth_getTransactionByHash" => Ok(Value::Null),
+            other => Err(json!({ "code": -32601, "message": format!("no {other}") })),
+        })
+        .await;
+
+        let e = screening_lock_flow(url, db.clone())
+            .run_cycle()
+            .await
+            .expect_err("a lock with no sender to screen beside it was recorded");
+
+        assert!(format!("{e:#}").contains("has no transaction"), "{e:#}");
+        assert_eq!(db.get_checkpoint_u64(LOCK_CHECKPOINT_KEY).unwrap(), Some(0));
+        assert!(lock_rows(&db).is_empty());
+        assert!(db
+            .list_work_items("lock", WorkState::Screening, 10)
+            .unwrap()
+            .is_empty());
     }
 }

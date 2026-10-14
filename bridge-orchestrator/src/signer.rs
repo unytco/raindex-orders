@@ -400,6 +400,10 @@ impl Payout {
         anyhow::ensure!(!wei.is_zero(), "the amount is zero");
         Ok(Self { recipient, wei })
     }
+
+    pub fn recipient(&self) -> Address {
+        self.recipient
+    }
 }
 
 fn hot_in_wei(amount: &str) -> Option<U256> {

@@ -39,6 +39,9 @@ enum InTransit {
         spender: String,
         amount: UnitMap,
         withdraw_to_address: Option<String>,
+        /// Held, blocked or waiting for a verdict, so not to be paid by hand.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        screening: Option<String>,
     },
 }
 
@@ -202,18 +205,26 @@ impl BridgeOrchestrator {
                 lock_ids,
             });
         }
-        let withdrawals = bridging_links.iter().filter_map(|spend| {
+        let mut withdrawals = Vec::new();
+        for spend in &bridging_links {
             let Some(BridgingSpend::Withdrawal(withdraw_to)) = bridging_spend(spend, agent) else {
-                return None;
+                continue;
             };
-            Some(InTransit::Withdrawal {
+            let id = spend.id.to_string();
+            let screening = self
+                .db
+                .withdrawal_standing(&id)?
+                .filter(|standing| !standing.pays())
+                .map(|standing| standing.to_string());
+            withdrawals.push(InTransit::Withdrawal {
                 agreement: context.bridging_agreement.to_string(),
-                spend: spend.id.to_string(),
+                spend: id,
                 spender: spend.creator.to_string(),
                 amount: spend.amount.clone(),
                 withdraw_to_address: withdraw_to.map(str::to_string),
-            })
-        });
+                screening,
+            });
+        }
 
         let mut listed = Vec::new();
         let mut rows = BTreeMap::new();

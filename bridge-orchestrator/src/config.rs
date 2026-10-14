@@ -1,3 +1,4 @@
+use crate::screening::DenyList;
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use holo_hash::AgentPubKeyB64;
@@ -68,7 +69,7 @@ impl Network {
 /// contracts are at the same address on every chain, Base Sepolia included.
 /// TestNet's mock HOT, vault and claim order are chain-specific, and the
 /// orchestrator has no defaults for them, so a base-sepolia run names those too.
-const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 6] = [
+const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 7] = [
     ("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org"),
     (
         "ORDERBOOK_ADDRESS",
@@ -84,6 +85,7 @@ const BASE_SEPOLIA_DEFAULTS: [(&str, &str); 6] = [
         "0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf",
     ),
     ("CLAIM_STORE", "0x1Aa775533E28B1D843e1A589034984E3a62005DC"),
+    ("SCREENING", "on"),
 ];
 
 /// `setting`, with TestNet's value for each network value a base-sepolia run is not
@@ -147,8 +149,74 @@ pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec
         .into_iter()
         .flat_map(|network| [network.rpc_url_var(), network.lock_vault_var()])
         .chain(crate::signer::env_variables())
+        .chain(SCREENING_VARIABLES)
         .filter(|key| setting(key).is_some_and(|value| !value.is_empty()))
         .collect()
+}
+
+const SCREENING_VARIABLES: [&str; 2] = ["SCREENING", "SCREENING_DENYLIST"];
+
+/// The list `SCREENING_DENYLIST` names, or `None` with `SCREENING=off`.
+pub fn screening_from_env(network: Network) -> Result<Option<DenyList>> {
+    screening_settings(network, |key| env::var(key).ok())
+}
+
+pub(crate) fn screening_settings(
+    network: Network,
+    setting: impl Fn(&str) -> Option<String>,
+) -> Result<Option<DenyList>> {
+    log_testnet_defaults(network, &setting, &SCREENING_VARIABLES);
+    let setting = with_network_defaults(network, setting);
+    let mut faults = Vec::new();
+    let on = match setting("SCREENING")
+        .map(|raw| raw.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("on") => true,
+        Some("off") if network == Network::Mainnet => {
+            faults.push(
+                "SCREENING=off is refused on mainnet, which screens every transfer".to_string(),
+            );
+            false
+        }
+        Some("off") => false,
+        Some(_) => {
+            faults.push(format!(
+                "SCREENING={} is not on or off",
+                setting("SCREENING").unwrap_or_default()
+            ));
+            false
+        }
+        None => {
+            faults.push(format!(
+                "SCREENING is required for NETWORK={}",
+                network.name()
+            ));
+            false
+        }
+    };
+    let mut addresses = Vec::new();
+    for entry in setting("SCREENING_DENYLIST")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        match entry.parse::<Address>() {
+            Ok(address) => addresses.push(address),
+            Err(_) => faults.push(format!(
+                "SCREENING_DENYLIST entry {entry} is not an address"
+            )),
+        }
+    }
+    if network == Network::Mainnet && addresses.is_empty() {
+        faults.push(
+            "SCREENING_DENYLIST is required for NETWORK=mainnet, with at least one address"
+                .to_string(),
+        );
+    }
+    anyhow::ensure!(faults.is_empty(), "{}", faults.join("; "));
+    Ok(on.then(|| DenyList::new(addresses)))
 }
 
 /// The network `NETWORK` names, base-sepolia when it is unset or empty.
@@ -1030,5 +1098,101 @@ mod tests {
     #[test]
     fn normalize_dna_b64_only_strips_one_u() {
         assert_eq!(normalize_dna_b64("uuhC0k"), "uhC0k");
+    }
+
+    fn screening(set: &[(&str, &str)]) -> Result<Option<DenyList>> {
+        let network = match test_settings(set)("NETWORK").as_deref() {
+            Some("mainnet") => Network::Mainnet,
+            _ => Network::BaseSepolia,
+        };
+        screening_settings(network, test_settings(set))
+    }
+
+    const LISTED: &str = "0x8589427373D6D84E98730D7795D8f6f8731FDa16";
+
+    #[test]
+    fn testnet_screens_by_default_and_a_listed_address_parses_in_any_case_and_spacing() {
+        let on = screening(&[])
+            .unwrap()
+            .expect("TestNet screens unless told not to");
+        assert_eq!(on.to_string(), DenyList::new([]).to_string());
+
+        for (set, expected) in [
+            (vec![("SCREENING", "ON")], Some(0)),
+            (vec![("SCREENING", "off")], None),
+            (
+                vec![(
+                    "SCREENING_DENYLIST",
+                    " 0x8589427373d6d84e98730d7795d8f6f8731fda16 ,,0x8589427373D6D84E98730D7795D8f6f8731FDa16, 0x1111111111111111111111111111111111111111,",
+                )],
+                Some(2),
+            ),
+        ] {
+            let list = screening(&set).unwrap();
+            assert_eq!(
+                list.map(|list| list.to_string()),
+                expected.map(|size| {
+                    let addresses: Vec<Address> = [LISTED, "0x1111111111111111111111111111111111111111"]
+                        .iter()
+                        .take(size)
+                        .map(|address| address.parse().unwrap())
+                        .collect();
+                    DenyList::new(addresses).to_string()
+                }),
+                "{set:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mainnet_screens_every_transfer_against_a_list_it_is_given() {
+        let mainnet = |set: &[(&str, &str)]| {
+            let mut set = set.to_vec();
+            set.push(("NETWORK", "mainnet"));
+            screening(&set).map(|list| list.map(|list| list.to_string()))
+        };
+        assert_eq!(
+            mainnet(&[("SCREENING", "on"), ("SCREENING_DENYLIST", LISTED)]).unwrap(),
+            Some(DenyList::new([LISTED.parse().unwrap()]).to_string())
+        );
+        for (set, refusal) in [
+            (
+                vec![],
+                "SCREENING is required for NETWORK=mainnet; SCREENING_DENYLIST is required for NETWORK=mainnet, with at least one address",
+            ),
+            (
+                vec![("SCREENING", "off"), ("SCREENING_DENYLIST", LISTED)],
+                "SCREENING=off is refused on mainnet, which screens every transfer",
+            ),
+            (
+                vec![("SCREENING", "on"), ("SCREENING_DENYLIST", ",")],
+                "SCREENING_DENYLIST is required for NETWORK=mainnet, with at least one address",
+            ),
+        ] {
+            assert_eq!(format!("{:#}", mainnet(&set).unwrap_err()), refusal, "{set:?}");
+        }
+    }
+
+    #[test]
+    fn a_screening_word_or_list_entry_it_cannot_read_is_named() {
+        assert_eq!(
+            format!(
+                "{:#}",
+                screening(&[("SCREENING", "yes"), ("SCREENING_DENYLIST", "0xabc,bob")]).unwrap_err()
+            ),
+            "SCREENING=yes is not on or off; SCREENING_DENYLIST entry 0xabc is not an address; SCREENING_DENYLIST entry bob is not an address"
+        );
+    }
+
+    #[test]
+    fn network_none_names_the_screening_variables_it_ignores() {
+        assert_eq!(
+            ignored_without_ethereum(test_settings(&[
+                ("NETWORK", "none"),
+                ("SCREENING", "on"),
+                ("SCREENING_DENYLIST", LISTED),
+            ])),
+            ["SCREENING", "SCREENING_DENYLIST"]
+        );
     }
 }

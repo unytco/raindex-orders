@@ -745,3 +745,45 @@ async fn mark_failed_marks_no_row_when_a_row_changed_since_it_was_read() {
         assert_eq!(snapshot(&orch), before, "{change}: nothing is marked");
     }
 }
+
+#[tokio::test]
+async fn a_withdrawal_screening_holds_is_listed_with_its_screening_so_it_is_not_paid_by_hand() {
+    use crate::screening::{Action, Screened, Transfer, Verdict};
+    let orch = test_orchestrator("in-transit-screened");
+    let [held, blocked, clear, unscreened] = [0x6A, 0x6B, 0x6C, 0x6D].map(parked_withdrawal_tx);
+    let screened = |spend: &Transaction, verdict| {
+        orch.db
+            .record_verdict(
+                &Transfer::Withdrawal(spend.id.to_string()),
+                &Screened {
+                    provider: "denylist",
+                    list: None,
+                    at: 0,
+                    verdict,
+                },
+                &[],
+                None,
+            )
+            .unwrap();
+    };
+    screened(&held, Verdict::Hit(vec![]));
+    screened(&blocked, Verdict::Hit(vec![]));
+    orch.db
+        .act(
+            &Transfer::Withdrawal(blocked.id.to_string()),
+            Action::Block,
+            "Ana",
+            "listed",
+        )
+        .unwrap();
+    screened(&clear, Verdict::Clear);
+    let conductor =
+        bridging_conductor().parking(action_hash(BR_EA), &[held, blocked, clear, unscreened]);
+
+    let checked = check(&orch, &conductor, false).await.unwrap();
+
+    let mut expected = [0x6A, 0x6B, 0x6C, 0x6D].map(listed_withdrawal);
+    expected[0]["screening"] = json!("held");
+    expected[1]["screening"] = json!("blocked");
+    assert_lists(&checked.listed, &expected);
+}
