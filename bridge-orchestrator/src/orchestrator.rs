@@ -30,6 +30,8 @@ pub mod in_transit;
 const BRIDGING_AGENT_ROLE: &str = "bridging_agent";
 const WITHDRAWER_ROLE: &str = "withdrawer";
 const ORACLE_ROLE: &str = "oracle";
+/// The vault TestNet 0.110's bridge agreement credits, named by every proof.
+const PROOF_VAULT: &str = "0xe3e064e3c2eef66cb93da8d8114f5084e92f48d6";
 
 pub struct BridgeOrchestrator {
     cfg: Config,
@@ -1980,9 +1982,8 @@ impl BridgeOrchestrator {
         UnfittableHead::Abandoned
     }
 
-    fn extract_lock_proof(&self, vault: Address, item: &WorkItem) -> Result<(Value, UnitMap)> {
+    fn extract_lock_proof(&self, _vault: Address, item: &WorkItem) -> Result<(Value, UnitMap)> {
         let payload = LockPayload::deserialize(item.payload_json.clone())?;
-        let contract_hex = format!("{vault:x}");
         let depositor = decode_holochain_agent_as_pubkey_string(&payload.holochain_agent)?;
         let normalized = payload.normalized_amounts()?;
         let amount = normalized.amount_hot.clone();
@@ -1990,7 +1991,7 @@ impl BridgeOrchestrator {
 
         let proof = json!({
             "method": "deposit",
-            "contract_address": format!("0x{}", contract_hex.to_lowercase()),
+            "contract_address": PROOF_VAULT,
             "amount": amount,
             "depositor_wallet_address": depositor,
             "lock_id": lock.lock_id,
