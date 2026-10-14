@@ -1105,7 +1105,6 @@ mod tests {
         assert_eq!(normalize_dna_b64("uuhC0k"), "uhC0k");
     }
 
-    /// The startup description of the screener `set` configures, `None` with screening off.
     fn screening(set: &[(&str, &str)]) -> Result<Option<String>> {
         let network = match test_settings(set)("NETWORK").as_deref() {
             Some("mainnet") => Network::Mainnet,

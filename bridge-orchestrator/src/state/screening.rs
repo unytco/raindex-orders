@@ -166,8 +166,6 @@ impl StateStore {
         standing(&conn, &Transfer::Withdrawal(spend.to_string()).to_string())
     }
 
-    /// A person's `release` or `block` of `transfer`, with the record of it, or a refusal naming
-    /// the state it is in.
     pub fn act(
         &self,
         transfer: &Transfer,
@@ -329,8 +327,8 @@ fn standing(conn: &Connection, transfer: &str) -> Result<Standing> {
     Ok(Standing::of(events.iter().map(String::as_str)))
 }
 
-/// A no-answer that repeats its provider's and its cause of the transfer's last record is not
-/// recorded again.
+/// A no-answer with the same provider and cause as the transfer's last record is not recorded
+/// again.
 fn insert_verdict(
     conn: &Connection,
     transfer: &str,
