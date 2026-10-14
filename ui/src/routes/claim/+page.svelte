@@ -6,6 +6,7 @@
 	import TransactionReceipt from '$lib/components/TransactionReceipt.svelte'
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 	import WrongNetwork from '$lib/components/WrongNetwork.svelte'
+	import Paused from '$lib/components/Paused.svelte'
 	import { bridge, explorerAddress } from '$lib/config'
 	import {
 		deserializeSignedContext,
@@ -17,6 +18,7 @@
 	import { claimCoupon } from '$lib/claim'
 	import { ethereumStore, onWrongNetwork, connectWallet, readContract } from '$lib/ethereum'
 	import { errorMessage } from '$lib/utils'
+	import { bridgeStatus } from '$lib/pause'
 	import { onMount } from 'svelte'
 	import { browser } from '$app/environment'
 
@@ -110,6 +112,7 @@
 	let isLoading = false
 	let error = ''
 	let errorUnconfirmed = false
+	let paused = false
 	let success = false
 	let successTxHash = ''
 
@@ -118,10 +121,15 @@
 		if (!orderConfig) return
 
 		error = ''
+		errorUnconfirmed = false
+		paused = false
 		success = false
 		isLoading = true
 
 		try {
+			const status = await bridgeStatus()
+			;({ paused, error } = status)
+			if (!status.open) return
 			const hash = await claimCoupon(signedContext)
 			success = true
 			successTxHash = hash
@@ -245,7 +253,9 @@
 						</div>
 					{/if}
 
-					{#if error}
+					{#if paused}
+						<Paused />
+					{:else if error}
 						<Alert color={errorUnconfirmed ? 'yellow' : 'red'} class="break-words">{error}</Alert>
 					{/if}
 

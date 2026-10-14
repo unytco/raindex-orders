@@ -10,6 +10,7 @@
 	import TransactionReceipt from '$lib/components/TransactionReceipt.svelte'
 	import ConnectWalletModal from '$lib/components/ConnectWalletModal.svelte'
 	import WrongNetwork from '$lib/components/WrongNetwork.svelte'
+	import Paused from '$lib/components/Paused.svelte'
 	import { bridge } from '$lib/config'
 	import {
 		ethereumStore,
@@ -23,7 +24,7 @@
 		whyUnsent
 	} from '$lib/ethereum'
 	import { isHolochainKey, holochainKeyTo32ByteHex, causeChain } from '$lib/utils'
-	import { PAUSED_CONTACT, PAUSED_LEAD, readPaused } from '$lib/pause'
+	import { bridgeStatus } from '$lib/pause'
 
 	let amount = ''
 	let agentInput = ''
@@ -143,7 +144,6 @@
 	})
 
 	const MAX_DECIMAL_PLACES = 6
-	const STATUS_FAILED = 'Could not check that the bridge is open. Please try again.'
 	const NOT_A_NUMBER = 'Amount must be a plain number, such as 5 or 2.5.'
 	const LOCK_DECLINED = `You declined the lock in your wallet, so no ${bridge.tokenName} was locked.`
 	const LOCK_NOT_SENT =
@@ -152,14 +152,9 @@
 		"Something went wrong with your lock. Check your wallet's activity before you lock again, and contact Unyt support if it keeps failing."
 
 	async function bridgeOpen(): Promise<boolean> {
-		try {
-			paused = await readPaused()
-			return !paused
-		} catch (e) {
-			console.error('Error reading the bridge status:', e)
-			error = STATUS_FAILED
-			return false
-		}
+		const status = await bridgeStatus()
+		;({ paused, error } = status)
+		return status.open
 	}
 
 	async function balanceCovers(amountWei: bigint): Promise<boolean> {
@@ -391,10 +386,7 @@
 				</div>
 
 				{#if paused}
-					<Alert color="yellow">
-						{PAUSED_LEAD}
-						<a href="mailto:{PAUSED_CONTACT}" class="font-medium underline">{PAUSED_CONTACT}</a>.
-					</Alert>
+					<Paused />
 				{:else if error}
 					<Alert color="red">{error}</Alert>
 				{/if}
