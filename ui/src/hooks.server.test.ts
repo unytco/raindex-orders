@@ -21,16 +21,18 @@ const FAUCET_ROUTES: [string, string][] = [
 	['/api/%66aucet', '/api/faucet'],
 	['/%66aucet', '/faucet']
 ]
-const LOCK_PAGE: Route[] = [
-	['/lock', '/lock'],
+const PAGES: Route[] = [
+	...ROUTES.filter(([path]) => !path.startsWith('/api/')),
 	['/lock/', '/lock'],
 	['/%6cock', '/lock']
 ]
+const APIS = ROUTES.filter(([, route]) => route === '/api/coupon-status')
 const FAUCET_PAGE = FAUCET_ROUTES.filter(([, route]) => route === '/faucet')
 const FAUCET_API = FAUCET_ROUTES.filter(([, route]) => route === '/api/faucet')
-const OPEN_WHILE_PAUSED = ROUTES.filter(([, route]) => route !== '/lock')
+const OPEN_WHILE_PAUSED = ROUTES.filter(([, route]) => route === '/api/status')
 const STOP_TEXT =
 	'The HOT bridge is paused. It will be back soon. For more information, contact info@unyt.co.'
+const STOP_PAGE_TEXT = "We'll be back soon For more information, contact info@unyt.co."
 
 async function request(
 	build: Record<string, string>,
@@ -72,34 +74,28 @@ describe('handle', () => {
 })
 
 describe.each([
-	['base-sepolia', [...LOCK_PAGE, ...FAUCET_PAGE]],
-	['mainnet', LOCK_PAGE]
-] as const)('while paused, a %s build', (network, stopped) => {
+	['base-sepolia', [...PAGES, ...FAUCET_PAGE], [...APIS, ...FAUCET_API]],
+	['mainnet', PAGES, APIS]
+] as const)('while paused, a %s build', (network, pages, apis) => {
 	const build = BUILDS[network]
 
-	it.each(stopped)('answers %s with the stop page, without resolving it', async (path, route) => {
+	it.each(pages)('answers %s with the stop page, without resolving it', async (path, route) => {
 		const { response, resolved } = await paused(build, [path, route])
 		const html = await response.text()
 
 		expect(response.status).toBe(503)
 		expect(response.headers.get('Cache-Control')).toBe('no-store')
 		expect(response.headers.get('Content-Type')).toBe('text/html; charset=utf-8')
-		expect(html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')).toContain(STOP_TEXT)
+		expect(html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')).toContain(STOP_PAGE_TEXT)
 		expect(html).toContain('<a href="mailto:info@unyt.co">info@unyt.co</a>')
 		expect(html).not.toContain('<script')
 		expect(resolved).toBe(false)
 	})
 
-	it.each(OPEN_WHILE_PAUSED)('resolves %s', async (path, route) => {
-		expect((await paused(build, [path, route])).resolved).toBe(true)
-	})
-})
-
-describe('while paused', () => {
-	it.each(FAUCET_API)(
-		'answers %s on base-sepolia with the stop text as JSON, without resolving it',
+	it.each(apis)(
+		'answers %s with the stop text as JSON, without resolving it',
 		async (path, route) => {
-			const { response, resolved } = await paused(BASE_SEPOLIA_BUILD, [path, route])
+			const { response, resolved } = await paused(build, [path, route])
 
 			expect(response.status).toBe(503)
 			expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*')
@@ -108,6 +104,12 @@ describe('while paused', () => {
 		}
 	)
 
+	it.each(OPEN_WHILE_PAUSED)('resolves %s', async (path, route) => {
+		expect((await paused(build, [path, route])).resolved).toBe(true)
+	})
+})
+
+describe('while paused', () => {
 	it.each(FAUCET_ROUTES)('answers 404 for %s on mainnet', async (path, route) => {
 		const { response, resolved } = await paused(MAINNET_BUILD, [path, route])
 
