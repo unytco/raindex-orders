@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - the TestNet moves from Ethereum Sepolia, which has no Raindex V6, to Base Sepolia (chain 84532): `NETWORK` and `PUBLIC_NETWORK` are `base-sepolia` or `mainnet`, `deploy-base-sepolia.sh` replaces `deploy-sepolia.sh`, the RPC secret is `BASE_SEPOLIA_RPC_URL`, and the website names Base Sepolia, Basescan and Base's faucets. The website builds the deployed Base Sepolia TestNet's mock HOT, vault and claim order in as defaults. The orchestrator defaults only what is the same on every chain, so it must be given them; the old Sepolia bridge does not carry over. A lock is still recorded after 5 confirmations, 10 seconds on Base.
 - the Solidity side builds on the Soldeer packages rain.orderbook pins with solc 0.8.25, in place of the git submodules and 0.8.19. `forge soldeer install` fetches them.
 - `test/fork-rehearsal.sh` re-targets V6, forks mainnet through `https://ethereum-rpc.publicnode.com` unless `FORK_URL` is set, gives the orchestrator a durable conductor config (the startup check added since 0.3.0 refused its missing one), and makes the rotation record refuse an order run by another interpreter in place of one from another expression deployer.
+- a paused bridge website shows "We'll be back soon" on every page, and a Claim page left open sends nothing.
 
 ## [0.4.0] - 2026-10-12
 
