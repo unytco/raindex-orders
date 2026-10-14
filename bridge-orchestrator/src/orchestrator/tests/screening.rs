@@ -10,10 +10,21 @@ fn screening_with(orch: &mut BridgeOrchestrator, screener: impl Screener + 'stat
 
 /// A lock in `screening`, sent by `sender`.
 fn lock_to_screen(orch: &BridgeOrchestrator, lock: &str, tx_hash: &str, sender: Address) -> i64 {
+    lock_from(orch, lock, tx_hash, sender, sender)
+}
+
+/// A lock in `screening` whose `Lock` event names `sender`, in a transaction `from` sent.
+fn lock_from(
+    orch: &BridgeOrchestrator,
+    lock: &str,
+    tx_hash: &str,
+    sender: Address,
+    from: Address,
+) -> i64 {
     let id = enqueue_lock(orch, lock, tx_hash);
     let mut payload = lock_row(orch, id).payload_json;
     payload["sender"] = json!(format!("{sender:?}"));
-    payload["from"] = json!(format!("{sender:?}"));
+    payload["from"] = json!(format!("{from:?}"));
     rusqlite::Connection::open(&orch.cfg.db_path)
         .unwrap()
         .execute(
@@ -108,11 +119,26 @@ async fn a_clear_lock_is_credited_and_a_held_one_only_once_a_person_releases_it(
     screening_with(&mut orch, DenyList::new([LISTED]));
     let clear = lock_to_screen(&orch, "lock:clear", "0xe1", Address::repeat_byte(0x11));
     let held = lock_to_screen(&orch, "lock:held", "0xe2", LISTED);
+    let sent_by_listed = lock_from(
+        &orch,
+        "lock:sent-by-listed",
+        "0xe7",
+        Address::repeat_byte(0x11),
+        LISTED,
+    );
 
     let logged = logged_at(tracing::Level::INFO, screen_locks(&orch)).await;
 
     assert_eq!(state_of(&orch, clear).0, WorkState::Queued);
     assert_eq!(state_of(&orch, held).0, WorkState::Held);
+    assert_eq!(state_of(&orch, sent_by_listed).0, WorkState::Held);
+    let records = orch
+        .db
+        .screenings(Some(&Transfer::of_lock_row("lock:sent-by-listed")), false)
+        .unwrap()[0]["records"]
+        .clone();
+    assert_eq!(records[0]["addresses"][1]["role"], "from");
+    assert_eq!(records[0]["addresses"][1]["listed"], true);
     assert!(logged.contains("bridge.screening.clear"), "{logged}");
     assert!(
         logged.contains("bridge.screening.hit") && logged.contains(&format!("{LISTED:#x}")),
@@ -227,10 +253,20 @@ async fn with_screening_off_nothing_that_waits_moves_and_only_an_unscreened_with
     )
     .await
     .unwrap();
+    let unanswered = parked_withdrawal_tx(0x13);
+    screening_with(&mut orch, Silent);
+    orch.run_bridge_cycle(
+        &bridging_conductor().parking(action_hash(BR_EA), std::slice::from_ref(&unanswered)),
+        &running(),
+    )
+    .await
+    .unwrap();
     orch.ethereum.as_mut().unwrap().screener = None;
     let unscreened = parked_withdrawal_tx(0x12);
-    let conductor =
-        bridging_conductor().parking(action_hash(BR_EA), &[held.clone(), unscreened.clone()]);
+    let conductor = bridging_conductor().parking(
+        action_hash(BR_EA),
+        &[held.clone(), unanswered.clone(), unscreened.clone()],
+    );
 
     orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
 
@@ -240,7 +276,7 @@ async fn with_screening_off_nothing_that_waits_moves_and_only_an_unscreened_with
     );
     assert_eq!(
         ids(&conductor.parked.borrow()[&action_hash(BR_EA)]),
-        ids(&[held])
+        ids(&[held, unanswered])
     );
     assert_eq!(
         orch.db

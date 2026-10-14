@@ -527,6 +527,12 @@ mod tests {
             act(&db, &lock("held"), Action::Release).unwrap(),
             ("held".into(), "queued".into())
         );
+        let e = act(&db, &lock("waiting"), Action::Release).unwrap_err();
+        assert!(
+            format!("{e:#}")
+                .contains("lock:waiting is screening: release takes only a held transfer"),
+            "{e:#}"
+        );
         assert_eq!(
             act(&db, &lock("waiting"), Action::Block).unwrap(),
             ("screening".into(), "blocked".into())
