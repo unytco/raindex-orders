@@ -237,7 +237,8 @@ bridge-orchestrator screen 0x6c6EE5e31d828De241282B9606C8e98Ea48526E2
 
 Every subcommand loads the config below on startup, so the env file must be
 sourced even for `status` and `clear`. Only `run` reads the signer variables
-and the chain, and only `run` and `in-transit` the conductor. A network
+and the chain, only `run` and `screen` the screening variables, and only `run`
+and `in-transit` the conductor. A network
 variable set to an empty value counts as unset.
 
 ### Config (all commands)
@@ -480,8 +481,11 @@ bridge-orchestrator status --item-id "lock:42"
 # Clean up completed/failed rows
 bridge-orchestrator clear --non-in-progress
 
-# Wipe everything (use with caution)
+# Wipe every row but the locks that wait on screening (use with caution)
 bridge-orchestrator clear --all
+
+# The transfers that wait for a person
+bridge-orchestrator screenings --open
 ```
 
 ### Re-queue failed rows
