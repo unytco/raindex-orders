@@ -76,7 +76,8 @@ With `SCREENING=on`, `run` screens the addresses behind each transfer against
 - A verdict is clear only when every address has an answer and none is listed.
   With no verdict, a lock waits in `screening` and a withdrawal stays parked,
   and the next pass screens them again. A provider that gives no answer
-  within 10 s gives none. The list always answers.
+  within 10 s gives none, and is asked nothing more in that pass or bridge
+  cycle. The list always answers.
 - A lock whose row names no readable `sender` or `from` stays in `screening`,
   and logs `bridge.screening.unreadable`.
 - `DB_PATH` keeps every verdict, the addresses screened with their roles
@@ -151,7 +152,7 @@ It prints one JSON object per line:
 |--------|--------------------|--------|
 | `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created`, or a row `in_flight` or `claimed` at any step | `item_id`, `lock_id`, `state`, `step`, `link` |
 | `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the credit-limit adjustment agreement or the bridging agreement of its lane in force | `agreement`, `link`, `lock_ids` |
-| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address`, and, unless screening cleared it or a person released it, `screening` (`unscreened`, `screening`, `held` or `blocked`): do not pay it by hand until it is screened clear |
+| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address`, and, for one S4 would sign no coupon for, `screening` (`unscreened`, `screening`, `held` or `blocked`): do not pay it by hand. With screening on, it first screens each withdrawal not yet screened, as S4 would, and keeps the verdict |
 
 `lock_id` is `null` for a row whose payload cannot be read, `link` for one that
 records none, and `withdraw_to_address` for a withdrawal that names none, which
@@ -211,6 +212,8 @@ bridge-orchestrator block withdrawal:<action hash> --by <name> --reason <text>
   vault admin moving its HOT.
 - Each refuses a transfer in any other state, and names that state. It logs
   `bridge.screening.released` or `bridge.screening.blocked`.
+- A withdrawal's ID is its spend's action hash, as `in-transit` and
+  `screenings` print it. One that does not decode is refused.
 
 ### `bridge-orchestrator screenings`
 

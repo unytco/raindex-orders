@@ -14,7 +14,7 @@ async fn check(
     conductor: &FakeConductor,
     mark_failed: bool,
 ) -> Result<Checked> {
-    let found = orch.in_transit(conductor).await?;
+    let found = orch.in_transit(conductor, orch.screener()).await?;
     let mut printed = Vec::new();
     let exit = found.settle(&mut printed, &orch.db, mark_failed);
     Ok(Checked {
@@ -135,7 +135,6 @@ fn listed_withdrawal(seed: u8) -> Value {
         "spender": spend.creator.to_string(),
         "amount": spend.amount,
         "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)),
-        "screening": "unscreened",
     })
 }
 
@@ -692,7 +691,7 @@ async fn mark_failed_marks_no_row_when_a_row_it_would_mark_is_gone() {
     let orch = test_orchestrator("in-transit-mark-gone");
     waiting_at(&orch, WorkStep::ClLinkCreated, "lock:gone:1", "0xe7", 0x79);
     let gone = waiting_at(&orch, WorkStep::BrSpendCreated, "lock:gone:2", "0xe8", 0x7A);
-    let found = orch.in_transit(&bridging_conductor()).await.unwrap();
+    let found = orch.in_transit(&bridging_conductor(), None).await.unwrap();
     delete_rows(&orch, &[gone]);
     let before = snapshot(&orch);
 
@@ -725,7 +724,7 @@ async fn mark_failed_marks_no_row_when_a_row_changed_since_it_was_read() {
             "0xf2",
             0x80,
         );
-        let found = orch.in_transit(&bridging_conductor()).await.unwrap();
+        let found = orch.in_transit(&bridging_conductor(), None).await.unwrap();
         match change {
             "succeeded" => orch.db.advance_to_br_rave_executed(late, None),
             "failed" => orch.db.mark_failed_permanent(late, "resolved by a person"),
@@ -748,12 +747,12 @@ async fn mark_failed_marks_no_row_when_a_row_changed_since_it_was_read() {
 }
 
 #[tokio::test]
-async fn a_withdrawal_screening_holds_is_listed_with_its_screening_so_it_is_not_paid_by_hand() {
+async fn in_transit_screens_each_withdrawal_as_s4_would_and_marks_those_not_to_pay_by_hand() {
     use crate::screening::{screen, Action, DenyList, Screened, Transfer, Verdict};
-    let orch = test_orchestrator("in-transit-screened");
-    let [held, blocked, clear, waiting, unscreened] =
-        [0x6A, 0x6B, 0x6C, 0x6D, 0x6E].map(parked_withdrawal_tx);
-    let list = DenyList::new([Address::repeat_byte(0x6A), Address::repeat_byte(0x6B)]);
+    let mut orch = test_orchestrator("in-transit-screened");
+    let [held, blocked, clear, waiting, unscreened, unscreened_listed] =
+        [0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F].map(parked_withdrawal_tx);
+    let list = DenyList::new([0x6A, 0x6B, 0x6F].map(Address::repeat_byte));
     for (spend, seed) in [(&held, 0x6A), (&blocked, 0x6B), (&clear, 0x6C)] {
         let to = Address::repeat_byte(seed);
         orch.db
@@ -774,21 +773,52 @@ async fn a_withdrawal_screening_holds_is_listed_with_its_screening_so_it_is_not_
         at: 0,
         listed: vec![],
         verdict: Verdict::NoAnswer("down".into()),
+        in_time: true,
     };
     orch.db
-        .record_withdrawal_verdict(&waiting.id.to_string(), &silent, Address::ZERO)
+        .record_withdrawal_verdict(&waiting.id.to_string(), &silent, Address::repeat_byte(0x6D))
         .unwrap();
-    let conductor = bridging_conductor().parking(
-        action_hash(BR_EA),
-        &[held, blocked, clear, waiting, unscreened],
+    let all = [held, blocked, clear, waiting, unscreened, unscreened_listed];
+    let conductor = bridging_conductor().parking(action_hash(BR_EA), &all);
+    let expected = |marks: [Option<&str>; 6]| {
+        let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F].map(listed_withdrawal);
+        for (listed, mark) in expected.iter_mut().zip(marks) {
+            if let Some(mark) = mark {
+                listed["screening"] = json!(mark);
+            }
+        }
+        expected
+    };
+
+    let off = check(&orch, &conductor, false).await.unwrap();
+    assert_lists(
+        &off.listed,
+        &expected([
+            Some("held"),
+            Some("blocked"),
+            None,
+            Some("screening"),
+            None,
+            None,
+        ]),
     );
 
-    let checked = check(&orch, &conductor, false).await.unwrap();
-
-    let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x6E].map(listed_withdrawal);
-    expected[0]["screening"] = json!("held");
-    expected[1]["screening"] = json!("blocked");
-    expected[2].as_object_mut().unwrap().remove("screening");
-    expected[3]["screening"] = json!("screening");
-    assert_lists(&checked.listed, &expected);
+    orch.ethereum.as_mut().unwrap().screener = Some(Box::new(list));
+    let on = check(&orch, &conductor, false).await.unwrap();
+    assert_lists(
+        &on.listed,
+        &expected([
+            Some("held"),
+            Some("blocked"),
+            None,
+            None,
+            None,
+            Some("held"),
+        ]),
+    );
+    assert_eq!(
+        orch.db.withdrawal_standing(&all[5].id.to_string()).unwrap(),
+        crate::state::Standing::Held,
+        "the verdict is kept, as S4 keeps it"
+    );
 }

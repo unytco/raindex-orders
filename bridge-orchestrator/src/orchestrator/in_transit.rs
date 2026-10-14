@@ -1,10 +1,12 @@
 use super::{
     bridging_spend, connect_ham, deposit_proofs, normalize_tx_hash, own_deposit,
-    BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey,
+    BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey, WithdrawalGate,
 };
 use crate::config::{Config, Ethereum};
+use crate::screening::Screener;
 use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
 use crate::watchtower_reporter::ReporterState;
+use alloy::primitives::Address;
 use anyhow::Result;
 use holo_hash::ActionHash;
 use rave_engine::types::UnitMap;
@@ -96,6 +98,10 @@ impl Found {
 
 pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> Result<()> {
     let db = StateStore::open_existing(&cfg.db_path)?;
+    let screener = match &ethereum {
+        Some(chain) => crate::config::screener_from_env(chain.network)?,
+        None => None,
+    };
     if let Some(chain) = ethereum {
         let configured = format!("{:#x}", chain.lock_vault_address);
         let served = db.vault()?;
@@ -116,16 +122,24 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
         told: Default::default(),
     };
     let found = orchestrator
-        .in_transit(&Conductor {
-            ham: &ham,
-            role_name: &orchestrator.cfg.role_name,
-        })
+        .in_transit(
+            &Conductor {
+                ham: &ham,
+                role_name: &orchestrator.cfg.role_name,
+            },
+            screener.as_deref(),
+        )
         .await?;
     found.settle(&mut std::io::stdout(), &orchestrator.db, mark_failed)
 }
 
 impl BridgeOrchestrator {
-    pub(super) async fn in_transit(&self, conductor: &impl ConductorReads) -> Result<Found> {
+    /// Screens each listed withdrawal as S4 would before it marks the ones not to be paid by hand.
+    pub(super) async fn in_transit(
+        &self,
+        conductor: &impl ConductorReads,
+        screener: Option<&dyn Screener>,
+    ) -> Result<Found> {
         let agent = &self.cfg.bridging_agent_pubkey;
         let global_definition = conductor.global_definition().await?;
         let context = Self::resolve_deposit_context(
@@ -196,14 +210,27 @@ impl BridgeOrchestrator {
                 lock_ids,
             });
         }
+        let gate = WithdrawalGate::new(&self.db, screener);
         let mut withdrawals = Vec::new();
         for spend in &bridging_links {
             let Some(BridgingSpend::Withdrawal(withdraw_to)) = bridging_spend(spend, agent) else {
                 continue;
             };
             let id = spend.id.to_string();
-            let standing = self.db.withdrawal_standing(&id)?;
-            let screening = (!standing.pays()).then(|| standing.to_string());
+            let hot = spend
+                .amount
+                .get(&self.cfg.hot_unit_index.to_string())
+                .map(|amount| amount.to_string())
+                .unwrap_or_default();
+            let pays = match withdraw_to.and_then(|to| to.parse::<Address>().ok()) {
+                Some(to) => gate.pays(&id, to, &hot).await?,
+                None => true,
+            };
+            let screening = if pays {
+                None
+            } else {
+                Some(self.db.withdrawal_standing(&id)?.to_string())
+            };
             withdrawals.push(InTransit::Withdrawal {
                 agreement: context.bridging_agreement.to_string(),
                 spend: id,

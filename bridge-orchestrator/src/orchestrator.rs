@@ -1128,10 +1128,7 @@ impl BridgeOrchestrator {
             held: held_withdrawals,
         } = select_bridging_links(
             self.ethereum.as_ref().map(|side| &side.signer),
-            &WithdrawalGate {
-                db: &self.db,
-                screener: self.screener(),
-            },
+            &WithdrawalGate::new(&self.db, self.screener()),
             &self.cfg.bridging_agent_pubkey,
             &bridging_links,
             coupons_budget,
@@ -8519,7 +8516,7 @@ mod tests {
     }
 
     fn screening_off(db: &StateStore) -> WithdrawalGate<'_> {
-        WithdrawalGate { db, screener: None }
+        WithdrawalGate::new(db, None)
     }
 
     fn ids(links: &[Transaction]) -> Vec<String> {

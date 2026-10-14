@@ -227,10 +227,7 @@ async fn s4_counts_a_withdrawal_screening_holds_apart_and_signs_it_no_coupon() {
 
     let selection = select_bridging_links(
         Some(&signer),
-        &WithdrawalGate {
-            db: &orch.db,
-            screener: Some(&list),
-        },
+        &WithdrawalGate::new(&orch.db, Some(&list)),
         &bridging_agent(),
         &[held.clone(), clear.clone()],
         usize::MAX,
@@ -489,4 +486,56 @@ fn the_start_names_the_list_or_with_screening_off_each_lock_that_waits() {
         screening_at_start(&orch.db, None).unwrap(),
         "screening is off, so 2 lock(s) stay where they wait: lock:waiting (screening), lock:held (held)"
     );
+}
+
+struct Never;
+
+impl std::fmt::Display for Never {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("never")
+    }
+}
+
+impl Screener for Never {
+    fn name(&self) -> &'static str {
+        "never"
+    }
+
+    fn answer<'a>(&'a self, _: &'a [Address]) -> Answering<'a> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn a_provider_that_misses_its_bound_is_asked_nothing_more_in_that_pass_or_cycle() {
+    let mut orch = test_orchestrator("screening-never");
+    screening_with(&mut orch, Never);
+    let locks = [("lock:first", "0xea"), ("lock:second", "0xeb")]
+        .map(|(lock, tx_hash)| lock_to_screen(&orch, lock, tx_hash, CLEAN));
+    let withdrawals = [0x14, 0x15].map(parked_withdrawal_tx);
+    let conductor = bridging_conductor().parking(action_hash(BR_EA), &withdrawals);
+
+    screen_locks(&orch).await;
+    orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+    for id in locks {
+        assert_eq!(state_of(&orch, id).0, WorkState::Screening);
+    }
+    assert_eq!(parked_on_bridging(&conductor), ids(&withdrawals));
+    let asked: Vec<usize> = [
+        Transfer::of_lock_row("lock:first"),
+        Transfer::of_lock_row("lock:second"),
+        Transfer::Withdrawal(withdrawals[0].id.to_string()),
+        Transfer::Withdrawal(withdrawals[1].id.to_string()),
+    ]
+    .into_iter()
+    .map(|transfer| {
+        orch.db
+            .screenings(Some(&transfer), false)
+            .unwrap()
+            .first()
+            .map_or(0, |screened| screened["records"].as_array().unwrap().len())
+    })
+    .collect();
+    assert_eq!(asked, [1, 0, 1, 0]);
 }

@@ -5,6 +5,7 @@ use crate::state::{Standing, StateStore, WorkItem, WorkState};
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use ham::ShutdownRx;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
 
 impl BridgeOrchestrator {
@@ -69,6 +70,9 @@ impl BridgeOrchestrator {
                 .record_lock_verdict(&row.item_id, &screened, &roles)?;
             let amount = row.payload_json["amount_hot"].as_str().unwrap_or("unknown");
             log_verdict(&Transfer::of_lock_row(&row.item_id), &screened, amount);
+            if !screened.in_time {
+                break;
+            }
         }
         for (row, e) in self.untold("screening_unreadable", &unreadable, |(row, _)| {
             row.item_id.clone()
@@ -104,18 +108,33 @@ fn lock_addresses(row: &WorkItem) -> Result<Vec<(Address, Role)>> {
 /// A recorded standing decides before the screener does, so turning screening off pays no held
 /// or waiting withdrawal.
 pub struct WithdrawalGate<'a> {
-    pub db: &'a StateStore,
-    pub screener: Option<&'a dyn Screener>,
+    db: &'a StateStore,
+    screener: Option<&'a dyn Screener>,
+    unanswered: AtomicBool,
 }
 
-impl WithdrawalGate<'_> {
+impl<'a> WithdrawalGate<'a> {
+    pub fn new(db: &'a StateStore, screener: Option<&'a dyn Screener>) -> Self {
+        Self {
+            db,
+            screener,
+            unanswered: AtomicBool::new(false),
+        }
+    }
+
     pub async fn pays(&self, spend: &str, to: Address, amount: &str) -> Result<bool> {
         let screener = match (self.db.withdrawal_standing(spend)?, self.screener) {
             (Standing::Unscreened | Standing::Screening, Some(screener)) => screener,
             (Standing::Unscreened, None) => return Ok(true),
             (standing, _) => return Ok(standing.pays()),
         };
+        if self.unanswered.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
         let screened = screen(screener, &[to]).await;
+        if !screened.in_time {
+            self.unanswered.store(true, Ordering::Relaxed);
+        }
         log_verdict(&Transfer::Withdrawal(spend.to_string()), &screened, amount);
         Ok(self
             .db

@@ -440,6 +440,7 @@ mod tests {
             at: 1,
             listed: vec![(CLEAN, None)],
             verdict: Verdict::NoAnswer(cause.into()),
+            in_time: true,
         }
     }
 

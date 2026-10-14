@@ -1,4 +1,5 @@
 use alloy::primitives::Address;
+use holo_hash::ActionHashB64;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -8,7 +9,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(test))]
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const ANSWER_WITHIN: Duration = Duration::from_millis(50);
 
 pub type Answering<'a> = Pin<Box<dyn Future<Output = Answers> + Send + 'a>>;
 
@@ -41,6 +45,9 @@ pub struct Screened {
     /// `None` for an address with no answer.
     pub listed: Vec<(Address, Option<bool>)>,
     pub verdict: Verdict,
+    /// False when the provider gave nothing within its bound, so it is asked nothing more in the
+    /// same pass or cycle.
+    pub in_time: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,22 +70,15 @@ impl Verdict {
 /// The verdict table: a hit when any address is listed, clear only when every address has an
 /// answer and none is listed, and otherwise no verdict.
 pub async fn screen(screener: &dyn Screener, addresses: &[Address]) -> Screened {
-    screen_within(screener, addresses, ANSWER_WITHIN).await
-}
-
-async fn screen_within(
-    screener: &dyn Screener,
-    addresses: &[Address],
-    within: Duration,
-) -> Screened {
     let provider = screener.name();
-    let Ok(answers) = tokio::time::timeout(within, screener.answer(addresses)).await else {
+    let Ok(answers) = tokio::time::timeout(ANSWER_WITHIN, screener.answer(addresses)).await else {
         return Screened {
             provider,
             list: None,
             at: chrono::Utc::now().timestamp(),
             listed: addresses.iter().map(|address| (*address, None)).collect(),
-            verdict: Verdict::NoAnswer(format!("no answer within {within:?}")),
+            verdict: Verdict::NoAnswer(format!("no answer within {ANSWER_WITHIN:?}")),
+            in_time: false,
         };
     };
     let mut causes = Vec::new();
@@ -88,22 +88,26 @@ async fn screen_within(
     let listed: Vec<(Address, Option<bool>)> = addresses
         .iter()
         .map(|address| {
-            let answer = answers
+            let given: Vec<&Answer> = answers
                 .of
                 .iter()
-                .find(|(answered, _)| answered == address)
-                .map(|(_, answer)| answer);
-            let listed = match answer {
-                Some(Answer::Listed) => Some(true),
-                Some(Answer::NotListed) => Some(false),
-                Some(Answer::Failed(cause)) => {
-                    causes.push(format!("{address:#x}: {cause}"));
-                    None
-                }
-                None => {
-                    causes.push(format!("no answer for {address:#x}"));
-                    None
-                }
+                .filter(|(answered, _)| answered == address)
+                .map(|(_, answer)| answer)
+                .collect();
+            let failed = given.iter().find_map(|answer| match answer {
+                Answer::Failed(cause) => Some(cause),
+                _ => None,
+            });
+            let listed = if given.contains(&&Answer::Listed) {
+                Some(true)
+            } else if let Some(cause) = failed {
+                causes.push(format!("{address:#x}: {cause}"));
+                None
+            } else if given.is_empty() {
+                causes.push(format!("no answer for {address:#x}"));
+                None
+            } else {
+                Some(false)
             };
             (*address, listed)
         })
@@ -126,6 +130,7 @@ async fn screen_within(
         at: answers.at,
         listed,
         verdict,
+        in_time: true,
     }
 }
 
@@ -247,7 +252,10 @@ impl FromStr for Transfer {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match (s.strip_prefix("lock:"), s.strip_prefix("withdrawal:")) {
             (Some(id), _) if !id.is_empty() => Ok(Transfer::Lock(id.to_string())),
-            (_, Some(spend)) if !spend.is_empty() => Ok(Transfer::Withdrawal(spend.to_string())),
+            (_, Some(spend)) => spend
+                .parse::<ActionHashB64>()
+                .map(|_| Transfer::Withdrawal(spend.to_string()))
+                .map_err(|e| format!("{spend} is not a spend's action hash: {e:?}")),
             _ => Err(format!(
                 "{s} is neither lock:<lockId> nor withdrawal:<action hash>"
             )),
@@ -385,6 +393,25 @@ mod tests {
             "one listed address holds the transfer whatever the rest"
         );
         assert_eq!(
+            verdict(vec![
+                (a, Answer::NotListed),
+                (b, Answer::NotListed),
+                (a, Answer::Listed)
+            ])
+            .await,
+            Verdict::Hit(vec![a]),
+            "a later answer that lists an address is not lost behind an earlier one"
+        );
+        assert_eq!(
+            verdict(vec![
+                (a, Answer::NotListed),
+                (b, Answer::NotListed),
+                (b, Answer::Failed("one list is down".into()))
+            ])
+            .await,
+            Verdict::NoAnswer(format!("{b:#x}: one list is down"))
+        );
+        assert_eq!(
             screen(&Provider(Some(vec![])), &[]).await.verdict,
             Verdict::NoAnswer("no address to screen".into())
         );
@@ -394,27 +421,37 @@ mod tests {
     async fn a_provider_that_does_not_answer_in_time_gives_no_verdict() {
         let a = Address::repeat_byte(0xA);
 
-        let screened = screen_within(&Provider(None), &[a], Duration::from_millis(20)).await;
+        let screened = screen(&Provider(None), &[a]).await;
 
         assert_eq!(
             screened.verdict,
-            Verdict::NoAnswer("no answer within 20ms".into())
+            Verdict::NoAnswer("no answer within 50ms".into())
         );
+        assert!(!screened.in_time);
         assert_eq!(screened.listed, [(a, None)]);
         assert_eq!(screened.provider, "test");
     }
 
     #[test]
     fn a_transfer_id_names_a_lock_or_a_withdrawal() {
-        for id in ["lock:7", "withdrawal:uhCkkAbC"] {
+        let spend = holo_hash::ActionHash::from_raw_32(vec![7; 32]).to_string();
+        for id in ["lock:7".to_string(), format!("withdrawal:{spend}")] {
             assert_eq!(id.parse::<Transfer>().unwrap().to_string(), id);
         }
+        let mistyped = format!("withdrawal:{}", &spend[..spend.len() - 1]);
+        assert!(mistyped.parse::<Transfer>().is_err(), "{mistyped}");
         assert_eq!(Transfer::of_lock_row("lock:7"), Transfer::Lock("7".into()));
         assert_eq!(
             Transfer::of_lock_row("lock:lock:7").to_string(),
             "lock:lock:7"
         );
-        for bad in ["7", "lock:", "withdrawal:", "spend:uhCkk"] {
+        for bad in [
+            "7",
+            "lock:",
+            "withdrawal:",
+            "withdrawal:uhCkkAbC",
+            "spend:uhCkk",
+        ] {
             assert!(bad.parse::<Transfer>().is_err(), "{bad}");
         }
     }
