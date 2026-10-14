@@ -7,12 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-10-12
-
 ### Added
 
 - the TestNet is deployed on Base Sepolia (README.md, TestNet on Base Sepolia), and a TestNet website build takes its mock HOT, vault, ClaimInputToken, claim order hash and bytecode as defaults.
-- `bridge-orchestrator in-transit` lists what a migration's close would strand, and `--mark-failed` marks those deposit rows failed for payment by hand.
 - `ClaimInputToken`, the claim order's input token, deployed with the vault: Raindex V6 takes an order only at a positive io-ratio and pulls at least one unit of the input token from the taker, so the claim order's ratio is 1e-30 per HOT and this token's transfers move nothing.
 - `test/TestClaimBaseSepolia.t.sol` deploys the TestNet bridge on a fork of Base Sepolia and proves a lock and a claim against the Raindex V6 there.
 - a coupon test vector (`test/TestCouponSignature.t.sol`): fixed inputs, their nine words, the signature, the order hash and the claim's `takeOrders4` calldata, reproduced by the orchestrator's and the website's tests.
@@ -28,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - the TestNet moves from Ethereum Sepolia, which has no Raindex V6, to Base Sepolia (chain 84532): `NETWORK` and `PUBLIC_NETWORK` are `base-sepolia` or `mainnet`, `deploy-base-sepolia.sh` replaces `deploy-sepolia.sh`, the RPC secret is `BASE_SEPOLIA_RPC_URL`, and the website names Base Sepolia, Basescan and Base's faucets. The website builds the deployed Base Sepolia TestNet's mock HOT, vault and claim order in as defaults. The orchestrator defaults only what is the same on every chain, so it must be given them; the old Sepolia bridge does not carry over. A lock is still recorded after 5 confirmations, 10 seconds on Base.
 - the Solidity side builds on the Soldeer packages rain.orderbook pins with solc 0.8.25, in place of the git submodules and 0.8.19. `forge soldeer install` fetches them.
 - `test/fork-rehearsal.sh` re-targets V6, forks mainnet through `https://ethereum-rpc.publicnode.com` unless `FORK_URL` is set, gives the orchestrator a durable conductor config (the startup check added since 0.3.0 refused its missing one), and makes the rotation record refuse an order run by another interpreter in place of one from another expression deployer.
+
+## [0.4.0] - 2026-10-12
+
+### Added
+
+- `bridge-orchestrator in-transit` lists what a migration's close would strand, and `--mark-failed` marks those deposit rows failed for payment by hand.
 
 ### Fixed
 
