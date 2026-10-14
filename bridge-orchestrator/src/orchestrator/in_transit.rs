@@ -5,14 +5,13 @@ use super::{
 use crate::config::{Config, Ethereum};
 use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
 use crate::watchtower_reporter::ReporterState;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use holo_hash::ActionHash;
 use rave_engine::types::UnitMap;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
-use std::path::Path;
 use tracing::info;
 
 const PAID_BY_HAND: &str =
@@ -39,7 +38,7 @@ enum InTransit {
         spender: String,
         amount: UnitMap,
         withdraw_to_address: Option<String>,
-        /// Held, blocked or waiting for a verdict, so not to be paid by hand.
+        /// Not cleared by screening, so not to be paid by hand.
         #[serde(skip_serializing_if = "Option::is_none")]
         screening: Option<String>,
     },
@@ -96,15 +95,7 @@ impl Found {
 }
 
 pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> Result<()> {
-    let exists = Path::new(&cfg.db_path)
-        .try_exists()
-        .with_context(|| format!("DB_PATH {} cannot be read", cfg.db_path))?;
-    anyhow::ensure!(
-        exists,
-        "DB_PATH {} does not exist: opening it would create an empty database, which lists nothing in transit",
-        cfg.db_path
-    );
-    let db = StateStore::open(&cfg.db_path)?;
+    let db = StateStore::open_existing(&cfg.db_path)?;
     if let Some(chain) = ethereum {
         let configured = format!("{:#x}", chain.lock_vault_address);
         let served = db.vault()?;
@@ -211,11 +202,8 @@ impl BridgeOrchestrator {
                 continue;
             };
             let id = spend.id.to_string();
-            let screening = self
-                .db
-                .withdrawal_standing(&id)?
-                .filter(|standing| !standing.pays())
-                .map(|standing| standing.to_string());
+            let standing = self.db.withdrawal_standing(&id)?;
+            let screening = (!standing.pays()).then(|| standing.to_string());
             withdrawals.push(InTransit::Withdrawal {
                 agreement: context.bridging_agreement.to_string(),
                 spend: id,

@@ -33,7 +33,7 @@ pub struct LockFlow {
     db: StateStore,
     stop: ShutdownRx,
     rpc_timeout: Duration,
-    screening: bool,
+    pub(crate) screening: bool,
 }
 
 impl LockFlow {
@@ -144,9 +144,14 @@ impl LockFlow {
             "required_confirmations": self.cfg.confirmations,
         });
         let state = if self.screening {
+            let (Some(block_hash), Some(index)) = (log.block_hash, log.transaction_index) else {
+                anyhow::bail!("the Lock log of {item_id} names no block hash and index");
+            };
+            // By its block, not its hash: a node that prunes its transaction index still holds
+            // the block.
             let from = self
-                .request("eth_getTransactionByHash", || {
-                    provider.get_transaction_by_hash(tx_hash)
+                .request("eth_getTransactionByBlockHashAndIndex", || {
+                    provider.get_transaction_by_block_hash_and_index(block_hash, index as usize)
                 })
                 .await?
                 .with_context(|| format!("the RPC has no transaction {tx_hash_hex} of {item_id}"))?
@@ -256,7 +261,9 @@ mod tests {
                 data: event.encode_log_data(),
             },
             block_number: Some(block),
+            block_hash: Some(B256::repeat_byte(0x55)),
             transaction_hash: Some(B256::with_last_byte(id as u8)),
+            transaction_index: Some(0),
             ..Default::default()
         })
         .unwrap()
@@ -342,23 +349,22 @@ mod tests {
                     .collect())
             }
             "eth_getBlockByNumber" => Ok(block(quantity(&params[0]))),
-            "eth_getTransactionByHash" => Ok(transaction(&params[0])),
+            "eth_getTransactionByBlockHashAndIndex" => Ok(transaction(&params[0])),
             other => Err(json!({ "code": -32601, "message": format!("no {other}") })),
         })
         .await;
         (url, windows)
     }
 
-    /// The contract wallet that sent each lock's transaction.
     fn from() -> Address {
         Address::repeat_byte(0x33)
     }
 
-    fn transaction(hash: &Value) -> Value {
+    fn transaction(block_hash: &Value) -> Value {
         json!({
-            "hash": hash,
+            "hash": B256::repeat_byte(0x66),
             "nonce": "0x0",
-            "blockHash": B256::repeat_byte(0x55),
+            "blockHash": block_hash,
             "blockNumber": "0x5",
             "transactionIndex": "0x0",
             "from": from(),
@@ -653,7 +659,7 @@ mod tests {
             "eth_blockNumber" => Ok(json!("0xa")),
             "eth_getLogs" => Ok(json!([lock_log(7, 5)])),
             "eth_getBlockByNumber" => Ok(block(quantity(&params[0]))),
-            "eth_getTransactionByHash" => Ok(Value::Null),
+            "eth_getTransactionByBlockHashAndIndex" => Ok(Value::Null),
             other => Err(json!({ "code": -32601, "message": format!("no {other}") })),
         })
         .await;

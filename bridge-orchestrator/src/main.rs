@@ -17,7 +17,7 @@ use clap::builder::NonEmptyStringValueParser;
 use clap::{Parser, Subcommand};
 use config::Config;
 use orchestrator::{BridgeOrchestrator, EthereumSide};
-use screening::{Action, Screener, Transfer, Verdict};
+use screening::{Action, Transfer, Verdict};
 use signer::CouponSigner;
 use state::{StateFilter, StateStore, WorkState};
 use tracing::{info, warn};
@@ -72,23 +72,9 @@ enum Command {
         mark_failed: bool,
     },
     /// Release a held transfer: a held lock is credited, and a held withdrawal gets its coupon.
-    Release {
-        /// lock:<lockId> or withdrawal:<action hash>.
-        transfer: Transfer,
-        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
-        by: String,
-        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
-        reason: String,
-    },
+    Release(Decision),
     /// Block a held transfer, or one with no verdict: it is never credited or paid.
-    Block {
-        /// lock:<lockId> or withdrawal:<action hash>.
-        transfer: Transfer,
-        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
-        by: String,
-        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
-        reason: String,
-    },
+    Block(Decision),
     /// Print each screened transfer with its state and records, as JSON lines.
     Screenings {
         /// lock:<lockId> or withdrawal:<action hash>.
@@ -100,6 +86,16 @@ enum Command {
     },
     /// Screen one address as `run` would, recording nothing.
     Screen { address: Address },
+}
+
+#[derive(clap::Args, Debug)]
+struct Decision {
+    /// lock:<lockId> or withdrawal:<action hash>.
+    transfer: Transfer,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    by: String,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    reason: String,
 }
 
 #[tokio::main]
@@ -117,8 +113,7 @@ async fn main() -> Result<()> {
             config::require_durable_conductor(&config.conductor_config)?;
             let ethereum = match ethereum {
                 Some(chain) => {
-                    let screener = config::screening_from_env(chain.network)?
-                        .map(|list| Box::new(list) as Box<dyn Screener>);
+                    let screener = config::screener_from_env(chain.network)?;
                     let signer = CouponSigner::from_env(chain.network)?;
                     preflight::check(
                         chain.network,
@@ -215,18 +210,10 @@ async fn main() -> Result<()> {
         Command::InTransit { mark_failed } => {
             orchestrator::in_transit::run(config, ethereum, mark_failed).await?;
         }
-        Command::Release {
-            transfer,
-            by,
-            reason,
-        } => act(&config, &transfer, Action::Release, &by, &reason)?,
-        Command::Block {
-            transfer,
-            by,
-            reason,
-        } => act(&config, &transfer, Action::Block, &by, &reason)?,
+        Command::Release(decision) => act(&config, &decision, Action::Release)?,
+        Command::Block(decision) => act(&config, &decision, Action::Block)?,
         Command::Screenings { transfer, open } => {
-            let db = StateStore::open(&config.db_path)?;
+            let db = StateStore::open_existing(&config.db_path)?;
             for transfer in db.screenings(transfer.as_ref(), open)? {
                 println!("{}", serde_json::to_string(&transfer)?);
             }
@@ -235,10 +222,10 @@ async fn main() -> Result<()> {
             let Some(chain) = ethereum else {
                 anyhow::bail!("NETWORK=none ignores SCREENING, so no provider screens");
             };
-            let Some(screener) = config::screening_from_env(chain.network)? else {
+            let Some(screener) = config::screener_from_env(chain.network)? else {
                 anyhow::bail!("SCREENING=off, so no provider screens");
             };
-            let screened = screener.screen(&[address]).await;
+            let screened = screening::screen(screener.as_ref(), &[address]).await;
             let cause = match &screened.verdict {
                 Verdict::NoAnswer(cause) => Some(cause.clone()),
                 _ => None,
@@ -249,7 +236,7 @@ async fn main() -> Result<()> {
                     "address": format!("{address:#x}"),
                     "provider": screened.provider,
                     "verdict": screened.verdict.name(),
-                    "list_version": screened.list.as_ref().map(|list| &list.sha256),
+                    "list_version": screened.list.as_ref().map(|list| list.version()),
                     "at": screened.at,
                     "cause": cause,
                 })
@@ -263,8 +250,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn act(config: &Config, transfer: &Transfer, action: Action, by: &str, reason: &str) -> Result<()> {
-    let db = StateStore::open(&config.db_path)?;
+fn act(config: &Config, decision: &Decision, action: Action) -> Result<()> {
+    let Decision {
+        transfer,
+        by,
+        reason,
+    } = decision;
+    let db = StateStore::open_existing(&config.db_path)?;
     let acted = db.act(transfer, action, by, reason)?;
     warn!(
         event = format!("bridge.screening.{}", action.event()),

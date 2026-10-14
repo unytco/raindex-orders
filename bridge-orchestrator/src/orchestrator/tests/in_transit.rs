@@ -135,6 +135,7 @@ fn listed_withdrawal(seed: u8) -> Value {
         "spender": spend.creator.to_string(),
         "amount": spend.amount,
         "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)),
+        "screening": "unscreened",
     })
 }
 
@@ -748,26 +749,17 @@ async fn mark_failed_marks_no_row_when_a_row_changed_since_it_was_read() {
 
 #[tokio::test]
 async fn a_withdrawal_screening_holds_is_listed_with_its_screening_so_it_is_not_paid_by_hand() {
-    use crate::screening::{Action, Screened, Transfer, Verdict};
+    use crate::screening::{screen, Action, DenyList, Screened, Transfer, Verdict};
     let orch = test_orchestrator("in-transit-screened");
-    let [held, blocked, clear, unscreened] = [0x6A, 0x6B, 0x6C, 0x6D].map(parked_withdrawal_tx);
-    let screened = |spend: &Transaction, verdict| {
+    let [held, blocked, clear, waiting, unscreened] =
+        [0x6A, 0x6B, 0x6C, 0x6D, 0x6E].map(parked_withdrawal_tx);
+    let list = DenyList::new([Address::repeat_byte(0x6A), Address::repeat_byte(0x6B)]);
+    for (spend, seed) in [(&held, 0x6A), (&blocked, 0x6B), (&clear, 0x6C)] {
+        let to = Address::repeat_byte(seed);
         orch.db
-            .record_verdict(
-                &Transfer::Withdrawal(spend.id.to_string()),
-                &Screened {
-                    provider: "denylist",
-                    list: None,
-                    at: 0,
-                    verdict,
-                },
-                &[],
-                None,
-            )
+            .record_withdrawal_verdict(&spend.id.to_string(), &screen(&list, &[to]).await, to)
             .unwrap();
-    };
-    screened(&held, Verdict::Hit(vec![]));
-    screened(&blocked, Verdict::Hit(vec![]));
+    }
     orch.db
         .act(
             &Transfer::Withdrawal(blocked.id.to_string()),
@@ -776,14 +768,27 @@ async fn a_withdrawal_screening_holds_is_listed_with_its_screening_so_it_is_not_
             "listed",
         )
         .unwrap();
-    screened(&clear, Verdict::Clear);
-    let conductor =
-        bridging_conductor().parking(action_hash(BR_EA), &[held, blocked, clear, unscreened]);
+    let silent = Screened {
+        provider: "silent",
+        list: None,
+        at: 0,
+        listed: vec![],
+        verdict: Verdict::NoAnswer("down".into()),
+    };
+    orch.db
+        .record_withdrawal_verdict(&waiting.id.to_string(), &silent, Address::ZERO)
+        .unwrap();
+    let conductor = bridging_conductor().parking(
+        action_hash(BR_EA),
+        &[held, blocked, clear, waiting, unscreened],
+    );
 
     let checked = check(&orch, &conductor, false).await.unwrap();
 
-    let mut expected = [0x6A, 0x6B, 0x6C, 0x6D].map(listed_withdrawal);
+    let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x6E].map(listed_withdrawal);
     expected[0]["screening"] = json!("held");
     expected[1]["screening"] = json!("blocked");
+    expected[2].as_object_mut().unwrap().remove("screening");
+    expected[3]["screening"] = json!("screening");
     assert_lists(&checked.listed, &expected);
 }

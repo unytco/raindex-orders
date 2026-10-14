@@ -388,6 +388,19 @@ impl StateStore {
         Ok(store)
     }
 
+    /// Opens `path` only if it exists, where creating an empty database would answer with
+    /// nothing.
+    pub fn open_existing(path: &str) -> Result<Self> {
+        let exists = Path::new(path)
+            .try_exists()
+            .with_context(|| format!("DB_PATH {path} cannot be read"))?;
+        anyhow::ensure!(
+            exists,
+            "DB_PATH {path} does not exist: opening it would create an empty database"
+        );
+        Self::open(path)
+    }
+
     /// Open a fresh read-only sqlite connection to the same database
     /// file. Intended for callers that need to read aggregates without
     /// blocking the writer mutex — primarily the watchtower reporter.

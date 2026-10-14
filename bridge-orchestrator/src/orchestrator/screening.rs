@@ -1,5 +1,6 @@
 use super::BridgeOrchestrator;
-use crate::screening::{Role, Screened, Screener, Transfer, Verdict};
+use crate::lock_flow::LockFlow;
+use crate::screening::{screen, Role, Screened, Screener, Transfer, Verdict};
 use crate::state::{Standing, StateStore, WorkItem, WorkState};
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -11,8 +12,37 @@ impl BridgeOrchestrator {
         self.ethereum.as_ref()?.screener.as_deref()
     }
 
-    /// Screens each lock in `screening`: a clear verdict queues it, a hit holds it, and with no
-    /// verdict it waits for the next pass.
+    pub(super) fn lock_flow(&self, stop: &ShutdownRx) -> Option<LockFlow> {
+        let side = self.ethereum.as_ref()?;
+        Some(LockFlow::new(
+            side.chain.clone(),
+            self.db.clone(),
+            stop.clone(),
+            side.screener.is_some(),
+        ))
+    }
+
+    /// A failed lock read does not keep the locks it recorded earlier from being screened.
+    pub(super) async fn read_and_screen_locks(&self, lock_flow: &LockFlow, stop: &ShutdownRx) {
+        if let Err(e) = lock_flow.run_cycle().await {
+            if !crate::stop::is_stopped(&e) {
+                error!(
+                    event = "bridge.lock_read_failed",
+                    "[lock-flow] cycle failed: {e:#}"
+                );
+            }
+        }
+        let Some(screener) = self.screener() else {
+            return;
+        };
+        if let Err(e) = self.screen_waiting_locks(screener, stop).await {
+            error!(
+                event = "bridge.screening.pass_failed",
+                "[screening] the pass over the locks in screening failed: {e:#}"
+            );
+        }
+    }
+
     pub(super) async fn screen_waiting_locks(
         &self,
         screener: &dyn Screener,
@@ -26,23 +56,19 @@ impl BridgeOrchestrator {
             if *stop.borrow() {
                 break;
             }
-            let addresses = match lock_addresses(row) {
-                Ok(addresses) => addresses,
+            let roles = match lock_addresses(row) {
+                Ok(roles) => roles,
                 Err(e) => {
                     unreadable.push((row, e));
                     continue;
                 }
             };
-            let plain: Vec<Address> = addresses.iter().map(|(address, _)| *address).collect();
-            let screened = screener.screen(&plain).await;
-            let transfer = Transfer::of_lock_row(&row.item_id);
-            if self
-                .db
-                .record_verdict(&transfer, &screened, &addresses, Some(row.id))?
-            {
-                let amount = row.payload_json["amount_hot"].as_str().unwrap_or("unknown");
-                log_verdict(&transfer, &screened, amount);
-            }
+            let addresses: Vec<Address> = roles.iter().map(|(address, _)| *address).collect();
+            let screened = screen(screener, &addresses).await;
+            self.db
+                .record_lock_verdict(&row.item_id, &screened, &roles)?;
+            let amount = row.payload_json["amount_hot"].as_str().unwrap_or("unknown");
+            log_verdict(&Transfer::of_lock_row(&row.item_id), &screened, amount);
         }
         for (row, e) in self.untold("screening_unreadable", &unreadable, |(row, _)| {
             row.item_id.clone()
@@ -58,7 +84,6 @@ impl BridgeOrchestrator {
     }
 }
 
-/// The lock's `sender`, and its transaction's `from` where that is another address.
 fn lock_addresses(row: &WorkItem) -> Result<Vec<(Address, Role)>> {
     let address = |field: &str| -> Result<Address> {
         let raw = row.payload_json[field]
@@ -76,8 +101,8 @@ fn lock_addresses(row: &WorkItem) -> Result<Vec<(Address, Role)>> {
     Ok(addresses)
 }
 
-/// S4's check before it signs a withdrawal's coupon. What is recorded for the withdrawal decides
-/// first, screening on or off, so turning screening off pays no held or waiting withdrawal.
+/// A recorded standing decides before the screener does, so turning screening off pays no held
+/// or waiting withdrawal.
 pub struct WithdrawalGate<'a> {
     pub db: &'a StateStore,
     pub screener: Option<&'a dyn Screener>,
@@ -86,26 +111,22 @@ pub struct WithdrawalGate<'a> {
 impl WithdrawalGate<'_> {
     pub async fn pays(&self, spend: &str, to: Address, amount: &str) -> Result<bool> {
         let screener = match (self.db.withdrawal_standing(spend)?, self.screener) {
-            (Some(standing), _) if standing.pays() => return Ok(true),
-            (None | Some(Standing::Screening), Some(screener)) => screener,
-            (None, None) => return Ok(true),
-            (Some(_), _) => return Ok(false),
+            (Standing::Unscreened | Standing::Screening, Some(screener)) => screener,
+            (Standing::Unscreened, None) => return Ok(true),
+            (standing, _) => return Ok(standing.pays()),
         };
-        let screened = screener.screen(&[to]).await;
-        let transfer = Transfer::Withdrawal(spend.to_string());
-        if self
+        let screened = screen(screener, &[to]).await;
+        log_verdict(&Transfer::Withdrawal(spend.to_string()), &screened, amount);
+        Ok(self
             .db
-            .record_verdict(&transfer, &screened, &[(to, Role::WithdrawToAddress)], None)?
-        {
-            log_verdict(&transfer, &screened, amount);
-        }
-        Ok(screened.verdict == Verdict::Clear)
+            .record_withdrawal_verdict(spend, &screened, to)?
+            .pays())
     }
 }
 
 fn log_verdict(transfer: &Transfer, screened: &Screened, amount: &str) {
     let provider = screened.provider;
-    let list_version = screened.list.as_ref().map(|list| list.sha256.as_str());
+    let list_version = screened.list.as_ref().map(|list| list.version());
     match &screened.verdict {
         Verdict::Clear => info!(
             event = "bridge.screening.clear",
@@ -131,7 +152,7 @@ fn log_verdict(transfer: &Transfer, screened: &Screened, amount: &str) {
             event = "bridge.screening.no_answer",
             transfer = %transfer,
             provider,
-            "[screening] {transfer} waits, as {provider} did not answer: {cause}"
+            "[screening] {transfer} waits, as {provider} gave no answer: {cause}"
         ),
     }
 }

@@ -1,5 +1,5 @@
 use crate::config::{Config, Ethereum, LINK_TAG_BYTES_CEILING};
-use crate::lock_flow::{format_amount, LockFlow};
+use crate::lock_flow::format_amount;
 use crate::screening::Screener;
 use crate::signer::{CouponSigner, Payout};
 use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
@@ -248,7 +248,8 @@ impl BridgeOrchestrator {
         let db = StateStore::open(&cfg.db_path)?;
         if let Some(side) = &ethereum {
             db.bind_vault(&format!("{:#x}", side.chain.lock_vault_address))?;
-            log_screening(&db, side.screener.as_deref())?;
+            let screening = screening_at_start(&db, side.screener.as_deref())?;
+            info!(event = "startup.screening", "{screening}");
         }
         let recovered = db.recover_stale_items()?;
         if !recovered.is_empty() {
@@ -539,14 +540,7 @@ impl BridgeOrchestrator {
                     return Ok(());
                 }
             };
-        let lock_flow = self.ethereum.as_ref().map(|side| {
-            LockFlow::new(
-                side.chain.clone(),
-                self.db.clone(),
-                shutdown.clone(),
-                side.screener.is_some(),
-            )
-        });
+        let lock_flow = self.lock_flow(&shutdown);
 
         let mut last_bridge_cycle =
             std::time::Instant::now() - Duration::from_millis(self.cfg.bridge_cycle_interval_ms);
@@ -573,23 +567,7 @@ impl BridgeOrchestrator {
             }
 
             if let Some(lock_flow) = &lock_flow {
-                if let Err(e) = lock_flow.run_cycle().await {
-                    if !is_stopped(&e) {
-                        error!(
-                            event = "bridge.lock_read_failed",
-                            "[lock-flow] cycle failed: {e:#}"
-                        );
-                    }
-                }
-            }
-
-            if let Some(screener) = self.screener() {
-                if let Err(e) = self.screen_waiting_locks(screener, &shutdown).await {
-                    error!(
-                        event = "bridge.screening.pass_failed",
-                        "[screening] the pass over the locks in screening failed: {e:#}"
-                    );
-                }
+                self.read_and_screen_locks(lock_flow, &shutdown).await;
             }
 
             if *shutdown.borrow() {
@@ -2792,10 +2770,9 @@ fn apply_rave_link_cap(
     }
 }
 
-fn log_screening(db: &StateStore, screener: Option<&dyn Screener>) -> Result<()> {
+fn screening_at_start(db: &StateStore, screener: Option<&dyn Screener>) -> Result<String> {
     if let Some(screener) = screener {
-        info!(event = "startup.screening", "screening is on: {screener}");
-        return Ok(());
+        return Ok(format!("screening is on: {screener}"));
     }
     let waiting: Vec<String> = [WorkState::Screening, WorkState::Held]
         .into_iter()
@@ -2805,17 +2782,15 @@ fn log_screening(db: &StateStore, screener: Option<&dyn Screener>) -> Result<()>
         .flatten()
         .map(|row| format!("{} ({})", row.item_id, row.state))
         .collect();
-    if waiting.is_empty() {
-        info!(event = "startup.screening", "screening is off");
+    Ok(if waiting.is_empty() {
+        "screening is off".to_string()
     } else {
-        info!(
-            event = "startup.screening",
+        format!(
             "screening is off, so {} lock(s) stay where they wait: {}",
             waiting.len(),
             waiting.join(", ")
-        );
-    }
-    Ok(())
+        )
+    })
 }
 
 /// The `HamConfig` every connection this orchestrator makes is built from.

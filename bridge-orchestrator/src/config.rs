@@ -1,4 +1,4 @@
-use crate::screening::DenyList;
+use crate::screening::{DenyList, Screener};
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use holo_hash::AgentPubKeyB64;
@@ -143,7 +143,7 @@ pub struct Ethereum {
     pub confirmations: u64,
 }
 
-/// The Ethereum variables `setting` holds a value for, which NETWORK=none ignores.
+/// The variables `setting` holds a value for that NETWORK=none ignores.
 pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
     [Network::BaseSepolia, Network::Mainnet]
         .into_iter()
@@ -156,22 +156,19 @@ pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec
 
 const SCREENING_VARIABLES: [&str; 2] = ["SCREENING", "SCREENING_DENYLIST"];
 
-/// The list `SCREENING_DENYLIST` names, or `None` with `SCREENING=off`.
-pub fn screening_from_env(network: Network) -> Result<Option<DenyList>> {
+/// The provider `SCREENING_DENYLIST` configures, or `None` with `SCREENING=off`.
+pub fn screener_from_env(network: Network) -> Result<Option<Box<dyn Screener>>> {
     screening_settings(network, |key| env::var(key).ok())
 }
 
 pub(crate) fn screening_settings(
     network: Network,
     setting: impl Fn(&str) -> Option<String>,
-) -> Result<Option<DenyList>> {
+) -> Result<Option<Box<dyn Screener>>> {
     log_testnet_defaults(network, &setting, &SCREENING_VARIABLES);
     let setting = with_network_defaults(network, setting);
     let mut faults = Vec::new();
-    let on = match setting("SCREENING")
-        .map(|raw| raw.to_ascii_lowercase())
-        .as_deref()
-    {
+    let on = match setting("SCREENING").as_deref() {
         Some("on") => true,
         Some("off") if network == Network::Mainnet => {
             faults.push(
@@ -180,11 +177,8 @@ pub(crate) fn screening_settings(
             false
         }
         Some("off") => false,
-        Some(_) => {
-            faults.push(format!(
-                "SCREENING={} is not on or off",
-                setting("SCREENING").unwrap_or_default()
-            ));
+        Some(other) => {
+            faults.push(format!("SCREENING={other} is not on or off"));
             false
         }
         None => {
@@ -202,11 +196,9 @@ pub(crate) fn screening_settings(
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
     {
-        match entry.parse::<Address>() {
+        match denylist_entry(entry) {
             Ok(address) => addresses.push(address),
-            Err(_) => faults.push(format!(
-                "SCREENING_DENYLIST entry {entry} is not an address"
-            )),
+            Err(why) => faults.push(format!("SCREENING_DENYLIST entry {entry} {why}")),
         }
     }
     if network == Network::Mainnet && addresses.is_empty() {
@@ -216,7 +208,20 @@ pub(crate) fn screening_settings(
         );
     }
     anyhow::ensure!(faults.is_empty(), "{}", faults.join("; "));
-    Ok(on.then(|| DenyList::new(addresses)))
+    Ok(on.then(|| Box::new(DenyList::new(addresses)) as Box<dyn Screener>))
+}
+
+/// A mixed-case entry must carry its EIP-55 checksum, so a mistyped digit is refused rather than
+/// listing another address.
+fn denylist_entry(entry: &str) -> Result<Address, &'static str> {
+    let address: Address = entry.parse().map_err(|_| "is not an address")?;
+    let hex = entry.trim_start_matches("0x");
+    let mixed_case =
+        hex.chars().any(|c| c.is_ascii_lowercase()) && hex.chars().any(|c| c.is_ascii_uppercase());
+    if mixed_case && Address::parse_checksummed(entry, None).is_err() {
+        return Err("does not match its checksum");
+    }
+    Ok(address)
 }
 
 /// The network `NETWORK` names, base-sepolia when it is unset or empty.
@@ -235,7 +240,7 @@ fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<Network> {
     }
 }
 
-/// `NETWORK`'s chain, read and checked for every command, though only `run` uses it.
+/// `NETWORK`'s chain, read and checked for every command.
 pub fn ethereum_from_env() -> Result<Option<Ethereum>> {
     ethereum_settings(|key| env::var(key).ok())
 }
@@ -1100,60 +1105,60 @@ mod tests {
         assert_eq!(normalize_dna_b64("uuhC0k"), "uhC0k");
     }
 
-    fn screening(set: &[(&str, &str)]) -> Result<Option<DenyList>> {
+    /// The startup description of the screener `set` configures, `None` with screening off.
+    fn screening(set: &[(&str, &str)]) -> Result<Option<String>> {
         let network = match test_settings(set)("NETWORK").as_deref() {
             Some("mainnet") => Network::Mainnet,
             _ => Network::BaseSepolia,
         };
         screening_settings(network, test_settings(set))
+            .map(|screener| screener.map(|screener| screener.to_string()))
     }
 
-    const LISTED: &str = "0x8589427373D6D84E98730D7795D8f6f8731FDa16";
+    fn listed() -> Address {
+        "0x8589427373d6d84e98730d7795d8f6f8731fda16"
+            .parse()
+            .unwrap()
+    }
+
+    fn list_of(addresses: &[Address]) -> Option<String> {
+        Some(DenyList::new(addresses.iter().copied()).to_string())
+    }
 
     #[test]
-    fn testnet_screens_by_default_and_a_listed_address_parses_in_any_case_and_spacing() {
-        let on = screening(&[])
-            .unwrap()
-            .expect("TestNet screens unless told not to");
-        assert_eq!(on.to_string(), DenyList::new([]).to_string());
+    fn testnet_screens_by_default_against_the_addresses_listed() {
+        let other: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let checksummed = listed().to_checksum(None);
+        let upper = format!("0x{}", hex::encode_upper(listed()));
 
-        for (set, expected) in [
-            (vec![("SCREENING", "ON")], Some(0)),
-            (vec![("SCREENING", "off")], None),
-            (
-                vec![(
-                    "SCREENING_DENYLIST",
-                    " 0x8589427373d6d84e98730d7795d8f6f8731fda16 ,,0x8589427373D6D84E98730D7795D8f6f8731FDa16, 0x1111111111111111111111111111111111111111,",
-                )],
-                Some(2),
-            ),
-        ] {
-            let list = screening(&set).unwrap();
-            assert_eq!(
-                list.map(|list| list.to_string()),
-                expected.map(|size| {
-                    let addresses: Vec<Address> = [LISTED, "0x1111111111111111111111111111111111111111"]
-                        .iter()
-                        .take(size)
-                        .map(|address| address.parse().unwrap())
-                        .collect();
-                    DenyList::new(addresses).to_string()
-                }),
-                "{set:?}"
-            );
-        }
+        assert_eq!(screening(&[]).unwrap(), list_of(&[]));
+        assert_eq!(screening(&[("SCREENING", "off")]).unwrap(), None);
+        assert_eq!(
+            screening(&[(
+                "SCREENING_DENYLIST",
+                &format!(
+                    " {listed:#x} ,,{checksummed}, {upper},{other:#x},",
+                    listed = listed()
+                )
+            )])
+            .unwrap(),
+            list_of(&[listed(), other])
+        );
     }
 
     #[test]
     fn mainnet_screens_every_transfer_against_a_list_it_is_given() {
+        let checksummed = listed().to_checksum(None);
         let mainnet = |set: &[(&str, &str)]| {
             let mut set = set.to_vec();
             set.push(("NETWORK", "mainnet"));
-            screening(&set).map(|list| list.map(|list| list.to_string()))
+            screening(&set)
         };
         assert_eq!(
-            mainnet(&[("SCREENING", "on"), ("SCREENING_DENYLIST", LISTED)]).unwrap(),
-            Some(DenyList::new([LISTED.parse().unwrap()]).to_string())
+            mainnet(&[("SCREENING", "on"), ("SCREENING_DENYLIST", &checksummed)]).unwrap(),
+            list_of(&[listed()])
         );
         for (set, refusal) in [
             (
@@ -1161,7 +1166,7 @@ mod tests {
                 "SCREENING is required for NETWORK=mainnet; SCREENING_DENYLIST is required for NETWORK=mainnet, with at least one address",
             ),
             (
-                vec![("SCREENING", "off"), ("SCREENING_DENYLIST", LISTED)],
+                vec![("SCREENING", "off"), ("SCREENING_DENYLIST", checksummed.as_str())],
                 "SCREENING=off is refused on mainnet, which screens every transfer",
             ),
             (
@@ -1174,13 +1179,18 @@ mod tests {
     }
 
     #[test]
-    fn a_screening_word_or_list_entry_it_cannot_read_is_named() {
+    fn a_screening_word_or_list_entry_it_cannot_take_is_named() {
+        let mistyped = listed().to_checksum(None).replacen("85", "58", 1);
         assert_eq!(
             format!(
                 "{:#}",
-                screening(&[("SCREENING", "yes"), ("SCREENING_DENYLIST", "0xabc,bob")]).unwrap_err()
+                screening(&[
+                    ("SCREENING", "ON"),
+                    ("SCREENING_DENYLIST", &format!("0xabc,bob,{mistyped}"))
+                ])
+                .unwrap_err()
             ),
-            "SCREENING=yes is not on or off; SCREENING_DENYLIST entry 0xabc is not an address; SCREENING_DENYLIST entry bob is not an address"
+            format!("SCREENING=ON is not on or off; SCREENING_DENYLIST entry 0xabc is not an address; SCREENING_DENYLIST entry bob is not an address; SCREENING_DENYLIST entry {mistyped} does not match its checksum")
         );
     }
 
@@ -1190,7 +1200,10 @@ mod tests {
             ignored_without_ethereum(test_settings(&[
                 ("NETWORK", "none"),
                 ("SCREENING", "on"),
-                ("SCREENING_DENYLIST", LISTED),
+                (
+                    "SCREENING_DENYLIST",
+                    "0x8589427373d6d84e98730d7795d8f6f8731fda16"
+                ),
             ])),
             ["SCREENING", "SCREENING_DENYLIST"]
         );

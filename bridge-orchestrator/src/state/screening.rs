@@ -2,6 +2,7 @@ use super::{StateStore, WorkState};
 use crate::screening::{Action, Role, Screened, Transfer, Verdict};
 use alloy::primitives::Address;
 use anyhow::Result;
+use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -35,6 +36,7 @@ pub(super) fn create_tables(conn: &Connection) -> Result<()> {
 /// Where a withdrawal's screening stands, which its records alone decide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
+    Unscreened,
     Screening,
     Clear,
     Held,
@@ -47,23 +49,31 @@ impl Standing {
         matches!(self, Standing::Clear | Standing::Released)
     }
 
-    fn of<'a>(events: impl IntoIterator<Item = &'a str>) -> Option<Self> {
-        events.into_iter().fold(None, |standing, event| {
-            Some(match (standing, event) {
-                (Some(Standing::Blocked), _) | (_, "blocked") => Standing::Blocked,
-                (Some(Standing::Released), _) | (_, "released") => Standing::Released,
-                (Some(decided @ (Standing::Clear | Standing::Held)), _) => decided,
-                (_, "clear") => Standing::Clear,
-                (_, "hit") => Standing::Held,
-                _ => Standing::Screening,
+    fn of<'a>(events: impl IntoIterator<Item = &'a str>) -> Self {
+        events
+            .into_iter()
+            .fold(Standing::Unscreened, |standing, event| {
+                match (standing, event) {
+                    (Standing::Blocked, _) | (_, "blocked") => Standing::Blocked,
+                    (Standing::Released, _) | (_, "released") => Standing::Released,
+                    (decided @ (Standing::Clear | Standing::Held), _) => decided,
+                    (_, "clear") => Standing::Clear,
+                    (_, "hit") => Standing::Held,
+                    _ => Standing::Screening,
+                }
             })
-        })
+    }
+
+    /// Decided: no screening changes it, only a person.
+    fn decided(self) -> bool {
+        !matches!(self, Standing::Unscreened | Standing::Screening)
     }
 }
 
 impl fmt::Display for Standing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Standing::Unscreened => "unscreened",
             Standing::Screening => "screening",
             Standing::Clear => "clear",
             Standing::Held => "held",
@@ -81,7 +91,7 @@ pub struct Acted {
 #[derive(Serialize)]
 struct ScreenedAddress {
     address: String,
-    role: Role,
+    role: Option<Role>,
     listed: Option<bool>,
 }
 
@@ -106,78 +116,54 @@ struct Record {
 const VERDICTS: [&str; 3] = ["clear", "hit", "no_answer"];
 
 impl StateStore {
-    /// Records `screened` against `transfer`, and moves `lock_row` out of `screening` by its
-    /// verdict. A no-answer from the provider whose no-answer is the transfer's last record is
-    /// not recorded again, and returns false.
-    pub fn record_verdict(
+    /// Records `screened` for the lock `item_id`, and moves it out of `screening` by the
+    /// verdict, unless a person moved it meanwhile.
+    pub fn record_lock_verdict(
         &self,
-        transfer: &Transfer,
+        item_id: &str,
         screened: &Screened,
-        addresses: &[(Address, Role)],
-        lock_row: Option<i64>,
-    ) -> Result<bool> {
+        roles: &[(Address, Role)],
+    ) -> Result<()> {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
-        let tx = conn.transaction()?;
-        let id = transfer.to_string();
-        if let Verdict::NoAnswer(_) = screened.verdict {
-            let last: Option<(String, Option<String>)> = tx
-                .query_row(
-                    "SELECT event, provider FROM screening_records
-                     WHERE transfer = ?1 ORDER BY id DESC LIMIT 1",
-                    [&id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if last == Some(("no_answer".into(), Some(screened.provider.into()))) {
-                return Ok(false);
-            }
-        }
-        if let Some(list) = &screened.list {
-            tx.execute(
-                "INSERT OR IGNORE INTO screening_lists (version, addresses) VALUES (?1, ?2)",
-                params![list.sha256, list.joined()],
-            )?;
-        }
-        let (listed, cause, moved_to) = match &screened.verdict {
-            Verdict::Clear => (Some(&[][..]), None, Some(WorkState::Queued)),
-            Verdict::Hit(listed) => (Some(&listed[..]), None, Some(WorkState::Held)),
-            Verdict::NoAnswer(cause) => (None, Some(cause), None),
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_verdict(&tx, item_id, screened, roles)?;
+        let moved_to = match screened.verdict {
+            Verdict::Clear => WorkState::Queued,
+            Verdict::Hit(_) => WorkState::Held,
+            Verdict::NoAnswer(_) => return Ok(tx.commit()?),
         };
-        let addresses: Vec<ScreenedAddress> = addresses
-            .iter()
-            .map(|(address, role)| ScreenedAddress {
-                address: format!("{address:#x}"),
-                role: *role,
-                listed: listed.map(|listed| listed.contains(address)),
-            })
-            .collect();
         tx.execute(
-            "INSERT INTO screening_records (transfer, event, provider, list_version, addresses, cause, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id,
-                screened.verdict.name(),
-                screened.provider,
-                screened.list.as_ref().map(|list| &list.sha256),
-                serde_json::to_string(&addresses)?,
-                cause,
-                screened.at,
-            ],
+            "UPDATE work_items SET state = ?2, updated_at = strftime('%s', 'now')
+             WHERE flow = 'lock' AND item_id = ?1 AND state = 'screening'",
+            params![item_id, moved_to.to_string()],
         )?;
-        if let (Some(row), Some(to)) = (lock_row, moved_to) {
-            tx.execute(
-                "UPDATE work_items SET state = ?2, updated_at = strftime('%s', 'now')
-                 WHERE id = ?1 AND state = 'screening'",
-                params![row, to.to_string()],
-            )?;
-        }
-        tx.commit()?;
-        Ok(true)
+        Ok(tx.commit()?)
     }
 
-    pub fn withdrawal_standing(&self, spend: &str) -> Result<Option<Standing>> {
+    /// Records `screened` for the withdrawal `spend`, unless its standing was decided meanwhile,
+    /// and returns its standing.
+    pub fn record_withdrawal_verdict(
+        &self,
+        spend: &str,
+        screened: &Screened,
+        to: Address,
+    ) -> Result<Standing> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transfer = Transfer::Withdrawal(spend.to_string()).to_string();
+        let before = standing(&tx, &transfer)?;
+        if before.decided() {
+            return Ok(before);
+        }
+        insert_verdict(&tx, &transfer, screened, &[(to, Role::WithdrawToAddress)])?;
+        let after = standing(&tx, &transfer)?;
+        tx.commit()?;
+        Ok(after)
+    }
+
+    pub fn withdrawal_standing(&self, spend: &str) -> Result<Standing> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        standing(&conn, &Transfer::Withdrawal(spend.to_string()))
+        standing(&conn, &Transfer::Withdrawal(spend.to_string()).to_string())
     }
 
     /// A person's `release` or `block` of `transfer`, with the record of it, or a refusal naming
@@ -212,14 +198,12 @@ impl StateStore {
         };
         let was = match &lock_row {
             Some((_, state)) => state.clone(),
-            None => standing(&tx, transfer)?
-                .ok_or_else(|| anyhow::anyhow!("{id} has no screening record"))?
-                .to_string(),
+            None => standing(&tx, &id)?.to_string(),
         };
         let now = match (action, was.as_str()) {
             (Action::Release, "held") if lock_row.is_some() => "queued",
             (Action::Release, "held") => "released",
-            (Action::Block, "held" | "screening" | "blocked") => "blocked",
+            (Action::Block, "held" | "screening" | "unscreened" | "blocked") => "blocked",
             (Action::Release, _) => anyhow::bail!("{id} is {was}: release takes only a held transfer"),
             (Action::Block, _) => anyhow::bail!(
                 "{id} is {was}: block takes only a held transfer, one with no verdict, or a blocked one"
@@ -250,8 +234,8 @@ impl StateStore {
         })
     }
 
-    /// Each screened transfer, and each lock waiting in `screening`, `held` or `blocked`, with its
-    /// state and records. `open` keeps only those that wait: held, or with no verdict.
+    /// Each screened transfer, and each lock in `screening`, `held` or `blocked`, with its state
+    /// and records. `open` keeps only those that wait: held, or with no verdict.
     pub fn screenings(&self, only: Option<&Transfer>, open: bool) -> Result<Vec<Value>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let only = only.map(ToString::to_string);
@@ -269,7 +253,12 @@ impl StateStore {
                     event: row.get(1)?,
                     provider: row.get(2)?,
                     list_version: row.get(3)?,
-                    addresses: addresses.and_then(|text| serde_json::from_str(&text).ok()),
+                    addresses: addresses
+                        .map(|text| serde_json::from_str(&text))
+                        .transpose()
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(e))
+                        })?,
                     cause: row.get(5)?,
                     by: row.get(6)?,
                     reason: row.get(7)?,
@@ -312,8 +301,7 @@ impl StateStore {
                 )
                 .optional()?
             } else {
-                Standing::of(records.iter().map(|record| record.event.as_str()))
-                    .map(|standing| standing.to_string())
+                Some(Standing::of(records.iter().map(|record| record.event.as_str())).to_string())
             };
             if open && !matches!(state.as_deref(), Some("screening" | "held")) {
                 continue;
@@ -333,18 +321,83 @@ impl StateStore {
     }
 }
 
-fn standing(conn: &Connection, transfer: &Transfer) -> Result<Option<Standing>> {
+fn standing(conn: &Connection, transfer: &str) -> Result<Standing> {
     let events = conn
         .prepare("SELECT event FROM screening_records WHERE transfer = ?1 ORDER BY id")?
-        .query_map([transfer.to_string()], |row| row.get::<_, String>(0))?
+        .query_map([transfer], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Standing::of(events.iter().map(String::as_str)))
+}
+
+/// A no-answer that repeats its provider's and its cause of the transfer's last record is not
+/// recorded again.
+fn insert_verdict(
+    conn: &Connection,
+    transfer: &str,
+    screened: &Screened,
+    roles: &[(Address, Role)],
+) -> Result<()> {
+    if let Verdict::NoAnswer(cause) = &screened.verdict {
+        let last: Option<(String, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT event, provider, cause FROM screening_records
+                 WHERE transfer = ?1 ORDER BY id DESC LIMIT 1",
+                [transfer],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if last
+            == Some((
+                "no_answer".into(),
+                Some(screened.provider.into()),
+                Some(cause.clone()),
+            ))
+        {
+            return Ok(());
+        }
+    }
+    if let Some(content) = screened.list.as_ref().and_then(|list| list.content()) {
+        conn.execute(
+            "INSERT OR IGNORE INTO screening_lists (version, addresses) VALUES (?1, ?2)",
+            params![screened.list.as_ref().map(|list| list.version()), content],
+        )?;
+    }
+    let addresses: Vec<ScreenedAddress> = screened
+        .listed
+        .iter()
+        .map(|(address, listed)| ScreenedAddress {
+            address: format!("{address:#x}"),
+            role: roles
+                .iter()
+                .find(|(screened, _)| screened == address)
+                .map(|(_, role)| *role),
+            listed: *listed,
+        })
+        .collect();
+    let cause = match &screened.verdict {
+        Verdict::NoAnswer(cause) => Some(cause),
+        _ => None,
+    };
+    conn.execute(
+        "INSERT INTO screening_records (transfer, event, provider, list_version, addresses, cause, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            transfer,
+            screened.verdict.name(),
+            screened.provider,
+            screened.list.as_ref().map(|list| list.version()),
+            serde_json::to_string(&addresses)?,
+            cause,
+            screened.at,
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::screening::{DenyList, Screener};
+    use crate::screening::{screen, DenyList};
 
     const LISTED: Address = Address::repeat_byte(0xBA);
     const CLEAN: Address = Address::repeat_byte(0x11);
@@ -354,9 +407,9 @@ mod tests {
         StateStore::open(dir.path().join("screening.db")).unwrap()
     }
 
-    fn lock_in(db: &StateStore, id: &str, state: WorkState) -> i64 {
+    fn lock_in(db: &StateStore, id: &str, state: WorkState) {
         db.enqueue(
-            state.clone(),
+            state,
             "lock",
             "create_parked_link",
             &format!("lock:{id}"),
@@ -364,12 +417,6 @@ mod tests {
             &json!({ "lock_id": id }),
         )
         .unwrap();
-        db.list_work_items("lock", state, 100)
-            .unwrap()
-            .into_iter()
-            .find(|row| row.item_id == format!("lock:{id}"))
-            .unwrap()
-            .id
     }
 
     fn lock_state(db: &StateStore, id: &str) -> String {
@@ -383,15 +430,16 @@ mod tests {
     }
 
     async fn screened(addresses: &[Address]) -> Screened {
-        DenyList::new([LISTED]).screen(addresses).await
+        screen(&DenyList::new([LISTED]), addresses).await
     }
 
-    fn silent() -> Screened {
+    fn silent(cause: &str) -> Screened {
         Screened {
             provider: "silent",
             list: None,
             at: 1,
-            verdict: Verdict::NoAnswer("it timed out".into()),
+            listed: vec![(CLEAN, None)],
+            verdict: Verdict::NoAnswer(cause.into()),
         }
     }
 
@@ -408,29 +456,31 @@ mod tests {
             .map(|acted| (acted.was, acted.now))
     }
 
+    fn lock(id: &str) -> Transfer {
+        Transfer::Lock(id.into())
+    }
+
+    fn spend(id: &str) -> Transfer {
+        Transfer::Withdrawal(id.into())
+    }
+
     #[tokio::test]
     async fn a_verdict_moves_a_lock_out_of_screening_and_keeps_each_address_with_its_list() {
         let dir = tempfile::tempdir().unwrap();
         let db = store(&dir);
-        let clear = lock_in(&db, "1", WorkState::Screening);
-        let hit = lock_in(&db, "2", WorkState::Screening);
-        let roles = |sender| [(sender, Role::Sender), (WALLET, Role::From)];
-
-        for (row, id, sender) in [(clear, "1", CLEAN), (hit, "2", LISTED)] {
-            let verdict = screened(&[sender, WALLET]).await;
-            assert!(db
-                .record_verdict(
-                    &Transfer::Lock(id.into()),
-                    &verdict,
-                    &roles(sender),
-                    Some(row)
-                )
-                .unwrap());
+        for (id, sender) in [("1", CLEAN), ("2", LISTED)] {
+            lock_in(&db, id, WorkState::Screening);
+            db.record_lock_verdict(
+                &format!("lock:{id}"),
+                &screened(&[sender, WALLET]).await,
+                &[(sender, Role::Sender), (WALLET, Role::From)],
+            )
+            .unwrap();
         }
 
         assert_eq!(lock_state(&db, "1"), "queued");
         assert_eq!(lock_state(&db, "2"), "held");
-        let held = records(&db, &Transfer::Lock("2".into()));
+        let held = records(&db, &lock("2"));
         assert_eq!(held.len(), 1);
         assert_eq!(held[0]["event"], "hit");
         assert_eq!(held[0]["provider"], "denylist");
@@ -459,14 +509,13 @@ mod tests {
     async fn a_verdict_leaves_a_lock_a_person_moved_meanwhile_where_they_put_it() {
         let dir = tempfile::tempdir().unwrap();
         let db = store(&dir);
-        let row = lock_in(&db, "1", WorkState::Screening);
-        act(&db, &Transfer::Lock("1".into()), Action::Block).unwrap();
+        lock_in(&db, "1", WorkState::Screening);
+        act(&db, &lock("1"), Action::Block).unwrap();
 
-        db.record_verdict(
-            &Transfer::Lock("1".into()),
+        db.record_lock_verdict(
+            "lock:1",
             &screened(&[CLEAN]).await,
             &[(CLEAN, Role::Sender)],
-            Some(row),
         )
         .unwrap();
 
@@ -474,36 +523,36 @@ mod tests {
     }
 
     #[test]
-    fn a_no_answer_is_recorded_once_until_another_record_follows_it() {
+    fn a_no_answer_is_recorded_again_only_for_another_provider_or_cause() {
         let dir = tempfile::tempdir().unwrap();
         let db = store(&dir);
-        let row = lock_in(&db, "1", WorkState::Screening);
-        let lock = Transfer::Lock("1".into());
+        lock_in(&db, "1", WorkState::Screening);
         let record = |screened: &Screened| {
-            db.record_verdict(&lock, screened, &[(CLEAN, Role::Sender)], Some(row))
+            db.record_lock_verdict("lock:1", screened, &[(CLEAN, Role::Sender)])
                 .unwrap()
         };
 
-        assert!(record(&silent()));
-        assert!(!record(&silent()), "the same provider's silence again");
-        let mut other = silent();
+        record(&silent("it timed out"));
+        record(&silent("it timed out"));
+        record(&silent("the key was refused"));
+        let mut other = silent("the key was refused");
         other.provider = "other";
-        assert!(record(&other));
+        record(&other);
 
-        let events: Vec<_> = records(&db, &lock)
+        let events: Vec<_> = records(&db, &lock("1"))
             .iter()
-            .map(|record| (record["event"].clone(), record["provider"].clone()))
+            .map(|record| (record["provider"].clone(), record["cause"].clone()))
             .collect();
         assert_eq!(
             events,
             [
-                (json!("no_answer"), json!("silent")),
-                (json!("no_answer"), json!("other"))
+                (json!("silent"), json!("it timed out")),
+                (json!("silent"), json!("the key was refused")),
+                (json!("other"), json!("the key was refused")),
             ]
         );
-        assert_eq!(records(&db, &lock)[0]["cause"], "it timed out");
         assert_eq!(
-            records(&db, &lock)[0]["addresses"][0]["listed"],
+            records(&db, &lock("1"))[0]["addresses"][0]["listed"],
             Value::Null
         );
         assert_eq!(lock_state(&db, "1"), "screening");
@@ -521,7 +570,6 @@ mod tests {
         ] {
             lock_in(&db, id, state);
         }
-        let lock = |id: &str| Transfer::Lock(id.into());
 
         assert_eq!(
             act(&db, &lock("held"), Action::Release).unwrap(),
@@ -565,38 +613,34 @@ mod tests {
     async fn a_withdrawals_standing_is_what_its_records_say() {
         let dir = tempfile::tempdir().unwrap();
         let db = store(&dir);
-        let spend = |id: &str| Transfer::Withdrawal(id.into());
         let record = |id: &str, screened: &Screened| {
-            db.record_verdict(
-                &spend(id),
-                screened,
-                &[(LISTED, Role::WithdrawToAddress)],
-                None,
-            )
-            .unwrap();
+            db.record_withdrawal_verdict(id, screened, LISTED).unwrap()
         };
         let standing = |id: &str| db.withdrawal_standing(id).unwrap();
 
-        assert_eq!(standing("a"), None);
-        record("a", &silent());
-        assert_eq!(standing("a"), Some(Standing::Screening));
-        record("a", &screened(&[LISTED]).await);
-        assert_eq!(standing("a"), Some(Standing::Held));
+        assert_eq!(standing("a"), Standing::Unscreened);
+        assert_eq!(record("a", &silent("down")), Standing::Screening);
+        assert_eq!(record("a", &screened(&[LISTED]).await), Standing::Held);
         assert_eq!(
             act(&db, &spend("a"), Action::Release).unwrap(),
             ("held".into(), "released".into())
         );
-        assert!(standing("a").unwrap().pays());
+        assert!(standing("a").pays());
 
         record("b", &screened(&[LISTED]).await);
         act(&db, &spend("b"), Action::Block).unwrap();
         act(&db, &spend("b"), Action::Block).unwrap();
-        assert_eq!(standing("b"), Some(Standing::Blocked));
-        assert!(!standing("b").unwrap().pays());
+        assert_eq!(standing("b"), Standing::Blocked);
+        assert!(!standing("b").pays());
 
-        record("c", &screened(&[CLEAN]).await);
-        assert_eq!(standing("c"), Some(Standing::Clear));
-        assert!(standing("c").unwrap().pays());
+        assert_eq!(record("c", &screened(&[CLEAN]).await), Standing::Clear);
+        assert!(standing("c").pays());
+
+        assert_eq!(
+            act(&db, &spend("never-screened"), Action::Block).unwrap(),
+            ("unscreened".into(), "blocked".into())
+        );
+        assert_eq!(standing("never-screened"), Standing::Blocked);
 
         for (id, action, refusal) in [
             (
@@ -614,7 +658,11 @@ mod tests {
                 Action::Block,
                 "withdrawal:c is clear: block takes only",
             ),
-            ("d", Action::Block, "withdrawal:d has no screening record"),
+            (
+                "d",
+                Action::Release,
+                "withdrawal:d is unscreened: release takes only",
+            ),
         ] {
             let e = act(&db, &spend(id), action).unwrap_err();
             assert!(format!("{e:#}").contains(refusal), "{e:#}");
@@ -622,30 +670,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_verdict_on_a_withdrawal_a_person_decided_meanwhile_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(&dir);
+        db.record_withdrawal_verdict("w", &silent("down"), CLEAN)
+            .unwrap();
+        act(&db, &spend("w"), Action::Block).unwrap();
+
+        let standing = db
+            .record_withdrawal_verdict("w", &screened(&[CLEAN]).await, CLEAN)
+            .unwrap();
+
+        assert_eq!(standing, Standing::Blocked);
+        assert!(!standing.pays());
+        let events: Vec<_> = records(&db, &spend("w"))
+            .iter()
+            .map(|record| record["event"].clone())
+            .collect();
+        assert_eq!(events, [json!("no_answer"), json!("blocked")]);
+    }
+
+    #[tokio::test]
     async fn screenings_lists_each_transfer_and_open_keeps_only_those_that_wait() {
         let dir = tempfile::tempdir().unwrap();
         let db = store(&dir);
-        lock_in(&db, "1", WorkState::Screening);
-        let held = lock_in(&db, "2", WorkState::Screening);
-        let cleared = lock_in(&db, "3", WorkState::Screening);
-        lock_in(&db, "4", WorkState::Queued);
-        for (row, id, sender) in [(held, "2", LISTED), (cleared, "3", CLEAN)] {
-            db.record_verdict(
-                &Transfer::Lock(id.into()),
+        for (id, state) in [
+            ("1", WorkState::Screening),
+            ("2", WorkState::Screening),
+            ("3", WorkState::Screening),
+            ("4", WorkState::Queued),
+        ] {
+            lock_in(&db, id, state);
+        }
+        for (id, sender) in [("2", LISTED), ("3", CLEAN)] {
+            db.record_lock_verdict(
+                &format!("lock:{id}"),
                 &screened(&[sender]).await,
                 &[(sender, Role::Sender)],
-                Some(row),
             )
             .unwrap();
         }
-        let withdrawal = Transfer::Withdrawal("uhCkkSPEND".into());
-        db.record_verdict(
-            &withdrawal,
-            &silent(),
-            &[(CLEAN, Role::WithdrawToAddress)],
-            None,
-        )
-        .unwrap();
+        db.record_withdrawal_verdict("uhCkkSPEND", &silent("down"), CLEAN)
+            .unwrap();
         let listed = |open| -> Vec<(Value, Value)> {
             db.screenings(None, open)
                 .unwrap()
@@ -671,34 +737,45 @@ mod tests {
                 (json!("lock:1"), json!("screening")),
             ]
         );
-        let one = db
-            .screenings(Some(&Transfer::Lock("2".into())), false)
-            .unwrap();
+        let one = db.screenings(Some(&lock("2")), false).unwrap();
         assert_eq!(one.len(), 1);
         assert!(one[0]["first_screened_at"].as_i64().is_some());
-        let waiting = db
-            .screenings(Some(&Transfer::Lock("1".into())), true)
-            .unwrap();
+        let waiting = db.screenings(Some(&lock("1")), true).unwrap();
         assert_eq!(waiting[0]["first_screened_at"], Value::Null);
         assert_eq!(waiting[0]["records"], json!([]));
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_fails_the_listing_instead_of_dropping_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = store(&dir);
+        db.record_withdrawal_verdict("w", &silent("down"), CLEAN)
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE screening_records SET addresses = 'not json'", [])
+            .unwrap();
+
+        assert!(db.screenings(None, false).is_err());
     }
 
     #[tokio::test]
     async fn neither_clear_mode_nor_retention_deletes_a_record_or_a_lock_that_waits() {
         let dir = tempfile::tempdir().unwrap();
         let db = store(&dir);
-        let screened_row = lock_in(&db, "screened", WorkState::Screening);
-        db.record_verdict(
-            &Transfer::Lock("screened".into()),
+        lock_in(&db, "screened", WorkState::Screening);
+        db.record_lock_verdict(
+            "lock:screened",
             &screened(&[LISTED]).await,
             &[(LISTED, Role::Sender)],
-            Some(screened_row),
         )
         .unwrap();
         lock_in(&db, "waiting", WorkState::Screening);
         lock_in(&db, "blocked", WorkState::Blocked);
-        let released = lock_in(&db, "released", WorkState::Held);
-        act(&db, &Transfer::Lock("released".into()), Action::Release).unwrap();
+        lock_in(&db, "released", WorkState::Held);
+        act(&db, &lock("released"), Action::Release).unwrap();
+        let released = db.list_work_items("lock", WorkState::Queued, 10).unwrap()[0].id;
         db.advance_to_br_rave_executed(released, None).unwrap();
         lock_in(&db, "failed", WorkState::Failed);
         db.conn
@@ -706,8 +783,14 @@ mod tests {
             .unwrap()
             .execute("UPDATE work_items SET updated_at = 0, created_at = 0", [])
             .unwrap();
-        let everything = |db: &StateStore| db.screenings(None, false).unwrap();
-        let before = everything(&db);
+        let records_of_each = |db: &StateStore| -> Vec<Value> {
+            db.screenings(None, false)
+                .unwrap()
+                .iter()
+                .map(|transfer| transfer["records"].clone())
+                .collect()
+        };
+        let before = records_of_each(&db);
 
         db.prune_terminal_older_than(0, 0).unwrap();
         db.clear_non_in_progress().unwrap();
@@ -717,17 +800,7 @@ mod tests {
             cleared, 0,
             "only the waiting locks were left, and they stay"
         );
-        let after = everything(&db);
-        assert_eq!(
-            after
-                .iter()
-                .map(|transfer| transfer["records"].clone())
-                .collect::<Vec<_>>(),
-            before
-                .iter()
-                .map(|transfer| transfer["records"].clone())
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(records_of_each(&db), before);
         for (id, state) in [
             ("screened", "held"),
             ("waiting", "screening"),
@@ -736,7 +809,7 @@ mod tests {
             assert_eq!(lock_state(&db, id), state);
         }
         assert_eq!(
-            records(&db, &Transfer::Lock("released".into()))[0]["event"],
+            records(&db, &lock("released"))[0]["event"],
             "released",
             "the record of a credited lock outlives its row"
         );
@@ -773,5 +846,18 @@ mod tests {
             1
         );
         assert!(db.screenings(None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_database_that_is_not_there_is_refused_and_not_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.db");
+
+        let e = StateStore::open_existing(path.to_str().unwrap())
+            .err()
+            .unwrap();
+
+        assert!(format!("{e:#}").contains("does not exist"), "{e:#}");
+        assert!(!path.exists());
     }
 }
