@@ -388,8 +388,6 @@ impl StateStore {
         Ok(store)
     }
 
-    /// Opens `path` only if it exists, where creating an empty database would answer with
-    /// nothing.
     pub fn open_existing(path: &str) -> Result<Self> {
         let exists = Path::new(path)
             .try_exists()
