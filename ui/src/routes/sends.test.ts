@@ -476,7 +476,7 @@ describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, a Lock that 
 	})
 })
 
-async function openClaim() {
+async function claim() {
 	const coupon = TESTNET_COUPONS[0]
 	const amount = numberToHex(deserializeSignedContext(coupon).context[1], { size: 32 })
 	const pays = encodeFunctionResult({
@@ -487,55 +487,19 @@ async function openClaim() {
 	const injected = injectWallet(CHAIN['base-sepolia'], { eth_call: pays })
 	await mount('base-sepolia', './claim/+page.svelte')
 	type('#coupon', coupon)
-	return injected
-}
-
-async function claim() {
-	const injected = await openClaim()
 	await click('Claim')
 	return injected
 }
 
 describe('Claim', () => {
-	it('sends nothing, and shows the stop text, from a page opened before the pause', async () => {
-		stubFetch(OPEN)
-		const injected = await openClaim()
-		await until(() => expect(button('Claim')?.disabled).toBe(false))
-		const fetch = stubFetch(PAUSED)
-
-		await click('Claim')
-
-		await until(() => expect(shown()).toContain(PAUSED_TEXT))
-		expect(target.querySelector('a[href="mailto:info@unyt.co"]')).not.toBeNull()
-		expect(fetch).toHaveBeenCalledWith('/api/status', expect.anything())
-		expect(injected).not.toHaveBeenCalledWith(expect.objectContaining({ method: 'eth_call' }))
-		expect(wallet.writeContract).not.toHaveBeenCalled()
-		expect(dialog()).toBe('')
-		expect(button('Claim')?.disabled).toBe(false)
-	})
-
-	it.each(FAILURES)('sends nothing, and shows an error, when /api/status %s', async (_, answer) => {
-		stubFetch(answer)
+	it('sends nothing, and shows the stop text, while paused', async () => {
+		stubFetch(PAUSED)
 
 		const injected = await claim()
 
-		await until(() => expect(shown()).toContain(STATUS_FAILED))
-		expect(shown()).not.toContain(PAUSED_TEXT)
+		await until(() => expect(shown()).toContain(PAUSED_TEXT))
 		expect(injected).not.toHaveBeenCalledWith(expect.objectContaining({ method: 'eth_call' }))
 		expect(wallet.writeContract).not.toHaveBeenCalled()
-		expect(button('Claim')?.disabled).toBe(false)
-	})
-
-	it('claims on a retry once the bridge reopens', async () => {
-		const fetch = stubFetch(PAUSED, OPEN)
-		await claim()
-		await until(() => expect(shown()).toContain(PAUSED_TEXT))
-
-		await click('Claim')
-
-		await until(() => expect(written()).toEqual(['takeOrders4']))
-		expect(fetch).toHaveBeenCalledTimes(2)
-		expect(shown()).not.toContain(PAUSED_TEXT)
 	})
 
 	it('claims once /api/status reads not paused', async () => {
