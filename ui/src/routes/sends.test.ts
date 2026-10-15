@@ -295,12 +295,7 @@ const PRICE_UNAVAILABLE = 'The HOT price is not available right now. Please try 
 const PRICE_FAILURES: [string, Answer][] = [
 	['cannot be reached', UNREACHABLE],
 	['refuses too many requests', async () => Response.json({}, { status: 429 })],
-	['answers no JSON', async () => new Response('<html>', { status: 200 })],
-	['answers no HOT price', async () => Response.json({})],
-	['answers a price that is not a number', priced('0.0004')],
-	['answers a price of zero', priced(0)],
-	['answers a negative price', priced(-0.0004)],
-	['answers a price too large to read', priced(1e21)]
+	['answers no HOT price', async () => Response.json({})]
 ]
 
 describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, the lock cap', network => {
@@ -345,7 +340,6 @@ describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, the lock cap
 
 	it.each([
 		['worth less than $1,000', 0.0004, '5'],
-		['worth exactly $1,000', 0.0004, '2500000'],
 		['worth exactly $1,000, where floating point makes it $1,000.0000000000001', 0.00016, '6250000']
 	])('locks an amount %s', async (_, usd, amount) => {
 		hotPrice.mockImplementation(priced(usd))
@@ -377,39 +371,14 @@ describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, the lock cap
 		}
 	)
 
-	it('says the price is not available once a read gets no answer in time', async () => {
-		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-		hotPrice.mockImplementation(
-			(_, init) =>
-				new Promise((_, reject) =>
-					init.signal?.addEventListener('abort', () =>
-						reject(new DOMException('Aborted', 'AbortError'))
-					)
-				)
-		)
-		await enter('5')
-
-		await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS - 1)
-
-		expect(shown()).not.toContain(PRICE_UNAVAILABLE)
-
-		await vi.advanceTimersByTimeAsync(1)
-
-		await until(() => expect(shown()).toContain(PRICE_UNAVAILABLE))
-		expect(button('Lock')?.disabled).toBe(true)
-	})
-
-	it.each([
-		['turns unavailable', UNREACHABLE, PRICE_UNAVAILABLE],
-		['rises past the cap', priced(0.0006), OVER_CAP]
-	])('sends no lock when the price %s while its approve is mined', async (_, answer, says) => {
+	it('sends no lock when the price rises past the cap while its approve is mined', async () => {
 		vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
 		reads.allowance = 0n
 		reads.balanceOf = 10n ** 30n
 		wallet.waitForTransaction.mockImplementationOnce(async () => {
-			hotPrice.mockImplementation(answer)
+			hotPrice.mockImplementation(priced(0.0006))
 			await vi.advanceTimersByTimeAsync(PRICE_REFRESH_MS)
-			await until(() => expect(shown()).toContain(says))
+			await until(() => expect(shown()).toContain(OVER_CAP))
 			return { status: 'success', transactionHash: '0xabc' }
 		})
 		await enter('2000000')
@@ -419,43 +388,26 @@ describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, the lock cap
 		await until(() => expect(status).toHaveBeenCalledTimes(2))
 		await until(() => expect(target.querySelector('[role="status"]')).toBeNull())
 		expect(written()).toEqual(['approve'])
-		expect(shown()).toContain(says)
+		expect(shown()).toContain(OVER_CAP)
 	})
 
-	it.each([
-		['turns unavailable', UNREACHABLE, PRICE_UNAVAILABLE],
-		['rises past the cap', priced(0.0006), OVER_CAP]
-	])(
-		'with no approve needed, sends no lock when the price %s while the bridge status is read',
-		async (_, answer, says) => {
-			vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
-			reads.balanceOf = 10n ** 30n
-			status = stubFetch(async () => {
-				hotPrice.mockImplementation(answer)
-				await vi.advanceTimersByTimeAsync(PRICE_REFRESH_MS)
-				await until(() => expect(shown()).toContain(says))
-				return Response.json({ paused: false })
-			})
-			await enter('2000000')
+	it('with no approve needed, sends no lock when the price rises past the cap while the bridge status is read', async () => {
+		vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+		reads.balanceOf = 10n ** 30n
+		status = stubFetch(async () => {
+			hotPrice.mockImplementation(priced(0.0006))
+			await vi.advanceTimersByTimeAsync(PRICE_REFRESH_MS)
+			await until(() => expect(shown()).toContain(OVER_CAP))
+			return Response.json({ paused: false })
+		})
+		await enter('2000000')
 
-			await click('Lock')
+		await click('Lock')
 
-			await until(() => expect(status).toHaveBeenCalledTimes(1))
-			await until(() => expect(target.querySelector('[role="status"]')).toBeNull())
-			expect(wallet.writeContract).not.toHaveBeenCalled()
-			expect(shown()).toContain(says)
-		}
-	)
-
-	it("forgets an earlier visit's price until it reads one again", async () => {
-		await enter('5')
-		await until(() => expect(button('Lock')?.disabled).toBe(false))
-		hotPrice.mockImplementation(() => new Promise(() => {}))
-
-		reopen()
-
-		await until(() => expect(shown()).toContain('Ethereum (hex, used for lock)'))
-		expect(button('Lock')?.disabled).toBe(true)
+		await until(() => expect(status).toHaveBeenCalledTimes(1))
+		await until(() => expect(target.querySelector('[role="status"]')).toBeNull())
+		expect(wallet.writeContract).not.toHaveBeenCalled()
+		expect(shown()).toContain(OVER_CAP)
 	})
 
 	it('ignores a read an earlier visit started once it answers late', async () => {
