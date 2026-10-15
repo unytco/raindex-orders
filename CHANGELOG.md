@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-15
+
 ### Added
 
 - the TestNet is deployed on Base Sepolia (README.md, TestNet on Base Sepolia), and a TestNet website build takes its mock HOT, vault, ClaimInputToken, claim order hash and bytecode as defaults.
