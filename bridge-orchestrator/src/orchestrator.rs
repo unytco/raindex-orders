@@ -1014,14 +1014,12 @@ impl BridgeOrchestrator {
             let (cl_rave, s2_elapsed_ms) = timed_call(
                 "s2",
                 "execute_rave",
-                conductor.execute_rave(&RAVEExecuteInputs {
-                    ea_id: credit_limit_ea_id.clone(),
-                    executor_inputs: Value::Null,
-                    links: cl_links.clone(),
-                    global_definition: global_definition.id.clone().into(),
-                    lane_definitions: context.lane_definitions.clone(),
-                    strategy: GetStrategy::Local,
-                }),
+                conductor.execute_rave(&credit_limit_rave(
+                    credit_limit_ea_id.clone(),
+                    cl_links.clone(),
+                    global_definition.id.clone().into(),
+                    context.lane_definitions.clone(),
+                )),
             )
             .await?;
             let cl_rave_hash = cl_rave.hash.to_string();
@@ -2108,7 +2106,9 @@ struct CandidateLane {
 }
 
 impl CandidateLane {
-    /// Mirrors `adjustment_refusal` in the alliance DNA's RAVE validation.
+    /// Mirrors `adjustment_refusal` in the alliance DNA's RAVE validation, except
+    /// that the DNA also accepts the lane's `reserver`: the bridge works only on
+    /// the lane `author` bridges.
     fn accepts_adjustment(&self, author: &AgentPubKeyB64, credit_limit: &UnitMap) -> bool {
         let is_global_lane = self.version.is_none();
         self.definition.special_agents.bridging_agent.pub_key == *author
@@ -2844,6 +2844,22 @@ fn parked_data(total_amount: &UnitMap, payload: &Value) -> ParkedData {
         ct_role_id: ORACLE_ROLE.to_string(),
         amount: Some(total_amount.clone()),
         payload: payload.clone(),
+    }
+}
+
+fn credit_limit_rave(
+    ea_id: ActionHash,
+    links: Vec<Transaction>,
+    global_definition: ActionHash,
+    lane_definitions: Vec<ActionHash>,
+) -> RAVEExecuteInputs {
+    RAVEExecuteInputs {
+        ea_id,
+        executor_inputs: json!({ "call_method": "bridge" }),
+        links,
+        global_definition,
+        lane_definitions,
+        strategy: GetStrategy::Local,
     }
 }
 
@@ -4117,13 +4133,15 @@ mod tests {
     fn global_definition() -> GlobalDefinitionExt {
         let hash = ActionHashB64::from(action_hash(1)).to_string();
         let agent = AgentPubKeyB64::from(AgentPubKey::from_raw_32(vec![2u8; 32])).to_string();
-        serde_json::from_value(json!({
+        let reserver = AgentPubKeyB64::from(AgentPubKey::from_raw_32(vec![3u8; 32])).to_string();
+        off_the_wire(&json!({
             "id": hash,
             "lane_def": {
                 "effective_start_date": 0,
                 "expiration_date": 9_223_372_036_854_775_807i64,
                 "special_agents": {
-                    "bridging_agent": { "pub_key": agent, "address_book_data": null }
+                    "bridging_agent": { "pub_key": agent, "address_book_data": null },
+                    "reserver": { "pub_key": reserver, "address_book_data": null }
                 },
                 "rave_agreements": {
                     "credit_limit_adjustment": hash,
@@ -4153,7 +4171,6 @@ mod tests {
                 "opening_predecessors": []
             }
         }))
-        .expect("a per-unit-fee global definition must decode")
     }
 
     #[test]
@@ -4253,6 +4270,7 @@ mod tests {
         link_reads: RefCell<Vec<ActionHash>>,
         fails_on: Option<(ActionHash, &'static str)>,
         raves: RefCell<Vec<(ActionHash, Vec<ActionHashB64>)>>,
+        executor_inputs: RefCell<HashMap<ActionHash, Value>>,
         chain_reads: RefCell<Vec<ChainRead>>,
         chain_stalls: bool,
         chain_fails_below: Option<u32>,
@@ -4584,6 +4602,9 @@ mod tests {
 
         async fn execute_rave(&self, input: &RAVEExecuteInputs) -> Result<RaveRun> {
             let hash = self.write("execute_rave");
+            self.executor_inputs
+                .borrow_mut()
+                .insert(input.ea_id.clone(), input.executor_inputs.clone());
             tokio::time::sleep(Duration::from_millis(self.rave_delay_ms)).await;
             let given = || input.links.iter().map(|t| ActionHash::from(t.id.clone()));
             let consumed: HashSet<ActionHash> = given()
@@ -6401,6 +6422,10 @@ mod tests {
         for agreement in [CL_EA, BR_EA] {
             assert!(conductor.parked.borrow()[&action_hash(agreement)].is_empty());
         }
+        assert_eq!(
+            conductor.executor_inputs.borrow()[&action_hash(CL_EA)],
+            json!({ "call_method": "bridge" })
+        );
     }
 
     /// Two deposits at `step`, each recorded on its own live link.
@@ -8424,14 +8449,12 @@ mod tests {
 
     /// Encoded the way `Ham::call_zome` puts it on the wire.
     fn encoded_execute_rave_payload() -> Vec<u8> {
-        let payload = RAVEExecuteInputs {
-            ea_id: action_hash(0xEA),
-            executor_inputs: Value::Null,
-            links: vec![parked_tx(1, &[])],
-            global_definition: action_hash(0xAA),
-            lane_definitions: vec![action_hash(0xAB)],
-            strategy: GetStrategy::Local,
-        };
+        let payload = credit_limit_rave(
+            action_hash(0xEA),
+            vec![parked_tx(1, &[])],
+            action_hash(0xAA),
+            vec![action_hash(0xAB)],
+        );
         ExternIO::encode(&payload)
             .expect("the S2 payload must encode")
             .0
@@ -8443,6 +8466,10 @@ mod tests {
 
     #[test]
     fn the_payload_names_every_input_field_the_dna_decodes() {
+        #[derive(Deserialize)]
+        struct Payload {
+            executor_inputs: Value,
+        }
         let decoded: BTreeMap<String, IgnoredAny> =
             rmp_serde::from_slice(&encoded_execute_rave_payload()).unwrap();
         assert_eq!(
@@ -8456,6 +8483,9 @@ mod tests {
                 "strategy",
             ])
         );
+
+        let decoded: Payload = rmp_serde::from_slice(&encoded_execute_rave_payload()).unwrap();
+        assert_eq!(decoded.executor_inputs, json!({ "call_method": "bridge" }));
     }
 
     #[test]
