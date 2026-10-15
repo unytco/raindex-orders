@@ -29,7 +29,7 @@ use zfuel::fuel::ZFuel;
 pub mod in_transit;
 mod screening;
 
-use screening::WithdrawalGate;
+use screening::{WithdrawalGate, LOCKS_SCREENED, WITHDRAWALS_SCREENED};
 
 const BRIDGING_AGENT_ROLE: &str = "bridging_agent";
 const WITHDRAWER_ROLE: &str = "withdrawer";
@@ -327,8 +327,10 @@ impl BridgeOrchestrator {
     /// S2 and S4 refresh their told sets only when a cycle reaches them, so
     /// without this a link that left during a shorter cycle would stay told.
     fn forget_unparked(&self, parked: &HashSet<String>) {
-        for told in self.told.lock().expect("told mutex poisoned").values_mut() {
-            told.retain(|id| parked.contains(id));
+        for (check, told) in self.told.lock().expect("told mutex poisoned").iter_mut() {
+            if !check.starts_with(LOCKS_SCREENED) {
+                told.retain(|id| parked.contains(id));
+            }
         }
     }
 
@@ -1118,6 +1120,7 @@ impl BridgeOrchestrator {
         let bridging_links = conductor.parked_links(&bridging_ea_id).await?;
         self.log_foreign_proofs("proof_foreign/bridging", &bridging_links);
 
+        let gate = WithdrawalGate::new(&self.db, self.screener());
         let BridgingSelection {
             deposits: deposit_rave_links,
             withdrawals: selected_withdrawal_links,
@@ -1128,7 +1131,7 @@ impl BridgeOrchestrator {
             held: held_withdrawals,
         } = select_bridging_links(
             self.ethereum.as_ref().map(|side| &side.signer),
-            &WithdrawalGate::new(&self.db, self.screener()),
+            &gate,
             &self.cfg.bridging_agent_pubkey,
             &bridging_links,
             coupons_budget,
@@ -1136,6 +1139,7 @@ impl BridgeOrchestrator {
         )
         .await?;
         self.log_unpayable(&unpayable);
+        self.log_screened_out(WITHDRAWALS_SCREENED, &gate.into_screened_out());
 
         let deposit_ids: HashSet<String> = deposit_rave_links
             .iter()

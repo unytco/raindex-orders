@@ -230,7 +230,11 @@ impl BridgeOrchestrator {
             let screening = if pays {
                 None
             } else {
-                Some(self.db.withdrawal_standing(&id)?.to_string())
+                Some(
+                    self.db
+                        .withdrawal_hold(&id)?
+                        .map_or("unscreened".to_string(), |hold| hold.to_string()),
+                )
             };
             withdrawals.push(InTransit::Withdrawal {
                 agreement: context.bridging_agreement.to_string(),

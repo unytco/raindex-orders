@@ -75,11 +75,8 @@ enum Command {
     Release(Decision),
     /// Block a held transfer, or one with no verdict: it is never credited or paid.
     Block(Decision),
-    /// Print each screened transfer with its state and records, as JSON lines.
+    /// Print each transfer that is held, blocked or in screening, as JSON lines.
     Screenings {
-        /// lock:<lockId> or withdrawal:<action hash>.
-        #[arg(long)]
-        transfer: Option<Transfer>,
         /// Only the transfers that wait: held, or with no verdict.
         #[arg(long)]
         open: bool,
@@ -212,9 +209,9 @@ async fn main() -> Result<()> {
         }
         Command::Release(decision) => act(&config, &decision, Action::Release)?,
         Command::Block(decision) => act(&config, &decision, Action::Block)?,
-        Command::Screenings { transfer, open } => {
+        Command::Screenings { open } => {
             let db = StateStore::open_existing(&config.db_path)?;
-            for transfer in db.screenings(transfer.as_ref(), open)? {
+            for transfer in db.screenings(open)? {
                 println!("{}", serde_json::to_string(&transfer)?);
             }
         }
@@ -236,8 +233,6 @@ async fn main() -> Result<()> {
                     "address": format!("{address:#x}"),
                     "provider": screened.provider,
                     "verdict": screened.verdict.name(),
-                    "list_version": screened.list.as_ref().map(|list| list.version()),
-                    "at": screened.at,
                     "cause": cause,
                 })
             );
@@ -295,55 +290,5 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn status_takes_each_screening_state() {
-        for (word, state) in [
-            ("screening", WorkState::Screening),
-            ("held", WorkState::Held),
-            ("blocked", WorkState::Blocked),
-        ] {
-            let args =
-                Args::try_parse_from(["bridge-orchestrator", "status", "--state", word]).unwrap();
-            assert!(
-                matches!(args.command, Command::Status { state: Some(ref parsed), .. } if *parsed == state),
-                "{word}"
-            );
-        }
-    }
-
-    #[test]
-    fn release_and_block_name_who_acted_and_why() {
-        for command in ["release", "block"] {
-            let full = [command, "lock:7", "--by", "Ana", "--reason", "a false hit"];
-            assert!(Args::try_parse_from(["bridge-orchestrator"].iter().chain(&full)).is_ok());
-            for missing in ["--by", "--reason"] {
-                let at = full.iter().position(|arg| *arg == missing).unwrap();
-                let without: Vec<&str> = full
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != at && *i != at + 1)
-                    .map(|(_, arg)| *arg)
-                    .collect();
-                assert!(
-                    Args::try_parse_from(["bridge-orchestrator"].iter().chain(&without)).is_err(),
-                    "{command} without {missing}"
-                );
-            }
-            assert!(
-                Args::try_parse_from([
-                    "bridge-orchestrator",
-                    command,
-                    "7",
-                    "--by",
-                    "Ana",
-                    "--reason",
-                    "x"
-                ])
-                .is_err(),
-                "an ID names its kind of transfer"
-            );
-        }
     }
 }

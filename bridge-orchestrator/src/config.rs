@@ -161,7 +161,7 @@ pub fn screener_from_env(network: Network) -> Result<Option<Box<dyn Screener>>> 
     screening_settings(network, |key| env::var(key).ok())
 }
 
-pub(crate) fn screening_settings(
+fn screening_settings(
     network: Network,
     setting: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Box<dyn Screener>>> {
@@ -1103,108 +1103,5 @@ mod tests {
     #[test]
     fn normalize_dna_b64_only_strips_one_u() {
         assert_eq!(normalize_dna_b64("uuhC0k"), "uhC0k");
-    }
-
-    fn screening(set: &[(&str, &str)]) -> Result<Option<String>> {
-        let network = match test_settings(set)("NETWORK").as_deref() {
-            Some("mainnet") => Network::Mainnet,
-            _ => Network::BaseSepolia,
-        };
-        screening_settings(network, test_settings(set))
-            .map(|screener| screener.map(|screener| screener.to_string()))
-    }
-
-    fn listed() -> Address {
-        "0x8589427373d6d84e98730d7795d8f6f8731fda16"
-            .parse()
-            .unwrap()
-    }
-
-    fn list_of(addresses: &[Address]) -> Option<String> {
-        Some(DenyList::new(addresses.iter().copied()).to_string())
-    }
-
-    #[test]
-    fn testnet_screens_by_default_against_the_addresses_listed() {
-        let other: Address = "0x1111111111111111111111111111111111111111"
-            .parse()
-            .unwrap();
-        let checksummed = listed().to_checksum(None);
-        let upper = format!("0x{}", hex::encode_upper(listed()));
-
-        assert_eq!(screening(&[]).unwrap(), list_of(&[]));
-        assert_eq!(screening(&[("SCREENING", "off")]).unwrap(), None);
-        assert_eq!(
-            screening(&[(
-                "SCREENING_DENYLIST",
-                &format!(
-                    " {listed:#x} ,,{checksummed}, {upper},{other:#x},",
-                    listed = listed()
-                )
-            )])
-            .unwrap(),
-            list_of(&[listed(), other])
-        );
-    }
-
-    #[test]
-    fn mainnet_screens_every_transfer_against_a_list_it_is_given() {
-        let checksummed = listed().to_checksum(None);
-        let mainnet = |set: &[(&str, &str)]| {
-            let mut set = set.to_vec();
-            set.push(("NETWORK", "mainnet"));
-            screening(&set)
-        };
-        assert_eq!(
-            mainnet(&[("SCREENING", "on"), ("SCREENING_DENYLIST", &checksummed)]).unwrap(),
-            list_of(&[listed()])
-        );
-        for (set, refusal) in [
-            (
-                vec![],
-                "SCREENING is required for NETWORK=mainnet; SCREENING_DENYLIST is required for NETWORK=mainnet, with at least one address",
-            ),
-            (
-                vec![("SCREENING", "off"), ("SCREENING_DENYLIST", checksummed.as_str())],
-                "SCREENING=off is refused on mainnet, which screens every transfer",
-            ),
-            (
-                vec![("SCREENING", "on"), ("SCREENING_DENYLIST", ",")],
-                "SCREENING_DENYLIST is required for NETWORK=mainnet, with at least one address",
-            ),
-        ] {
-            assert_eq!(format!("{:#}", mainnet(&set).unwrap_err()), refusal, "{set:?}");
-        }
-    }
-
-    #[test]
-    fn a_screening_word_or_list_entry_it_cannot_take_is_named() {
-        let mistyped = listed().to_checksum(None).replacen("85", "58", 1);
-        assert_eq!(
-            format!(
-                "{:#}",
-                screening(&[
-                    ("SCREENING", "ON"),
-                    ("SCREENING_DENYLIST", &format!("0xabc,bob,{mistyped}"))
-                ])
-                .unwrap_err()
-            ),
-            format!("SCREENING=ON is not on or off; SCREENING_DENYLIST entry 0xabc is not an address; SCREENING_DENYLIST entry bob is not an address; SCREENING_DENYLIST entry {mistyped} does not match its checksum")
-        );
-    }
-
-    #[test]
-    fn network_none_names_the_screening_variables_it_ignores() {
-        assert_eq!(
-            ignored_without_ethereum(test_settings(&[
-                ("NETWORK", "none"),
-                ("SCREENING", "on"),
-                (
-                    "SCREENING_DENYLIST",
-                    "0x8589427373d6d84e98730d7795d8f6f8731fda16"
-                ),
-            ])),
-            ["SCREENING", "SCREENING_DENYLIST"]
-        );
     }
 }

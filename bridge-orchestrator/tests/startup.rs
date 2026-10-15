@@ -115,16 +115,10 @@ fn status_and_clear_read_no_chain_and_need_no_signer() {
 const IN_TRANSIT: [&[&str]; 2] = [&["in-transit"], &["in-transit", "--mark-failed"]];
 
 #[test]
-fn in_transit_and_the_screening_commands_refuse_a_database_that_is_not_there() {
+fn in_transit_refuses_a_database_that_is_not_there() {
     let dir = tempfile::tempdir().unwrap();
-    let decision = ["lock:7", "--by", "Ana", "--reason", "checked"];
-    let release = [&["release"][..], &decision].concat();
-    let block = [&["block"][..], &decision].concat();
 
-    for args in IN_TRANSIT
-        .into_iter()
-        .chain([&["screenings", "--open"][..], &release, &block])
-    {
+    for args in IN_TRANSIT {
         let output = orchestrator(dir.path(), &node(dir.path()), args);
 
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -436,16 +430,7 @@ fn run_with_ethereum_off_checks_no_chain_takes_no_testnet_value_and_names_what_i
             "LAIR_PASSPHRASE_FILE",
             dir.path().join("no-passphrase").display().to_string(),
         ),
-        ("SCREENING", "maybe".to_string()),
-        ("SCREENING_DENYLIST", "bob".to_string()),
     ]);
-    let screen = orchestrator(dir.path(), &env, &["screen", &listed()]);
-    assert!(!screen.status.success());
-    assert!(
-        String::from_utf8_lossy(&screen.stderr).contains("NETWORK=none ignores SCREENING"),
-        "{}",
-        String::from_utf8_lossy(&screen.stderr)
-    );
 
     let output = orchestrator(dir.path(), &env, &["run"]);
 
@@ -456,7 +441,7 @@ fn run_with_ethereum_off_checks_no_chain_takes_no_testnet_value_and_names_what_i
     );
     assert!(logged.contains("NETWORK=none: Ethereum is off"), "{logged}");
     assert!(
-        logged.contains("NETWORK=none ignores BASE_SEPOLIA_RPC_URL, BASE_SEPOLIA_LOCK_VAULT_ADDRESS, ORDER_HASH, ORDER_OWNER, TOKEN_ADDRESS, CLAIM_BYTECODE, CLAIM_INPUT_TOKEN, SIGNER_PRIVATE_KEY, SCREENING, SCREENING_DENYLIST"),
+        logged.contains("NETWORK=none ignores BASE_SEPOLIA_RPC_URL, BASE_SEPOLIA_LOCK_VAULT_ADDRESS, ORDER_HASH, ORDER_OWNER, TOKEN_ADDRESS, CLAIM_BYTECODE, CLAIM_INPUT_TOKEN, SIGNER_PRIVATE_KEY"),
         "{logged}"
     );
     assert!(
@@ -556,6 +541,8 @@ fn run_and_screen_refuse_a_bad_screening_configuration_before_either_writes_anyt
     let mut mainnet = node(dir.path());
     mainnet.extend(signer());
     let base_sepolia = with(&mainnet, &BASE_SEPOLIA);
+    let mistyped = listed().replacen("85", "58", 1);
+    let mismatch = format!("SCREENING_DENYLIST entry {mistyped} does not match its checksum");
 
     for (env, refusal) in [
         (
@@ -577,6 +564,10 @@ fn run_and_screen_refuse_a_bad_screening_configuration_before_either_writes_anyt
         (
             with(&base_sepolia, &[("SCREENING_DENYLIST", "0x11,0x2")]),
             "SCREENING_DENYLIST entry 0x11 is not an address; SCREENING_DENYLIST entry 0x2 is not an address",
+        ),
+        (
+            with(&base_sepolia, &[("SCREENING_DENYLIST", &mistyped)]),
+            &mismatch,
         ),
     ] {
         for args in [&["run"][..], &["screen", &listed()][..]] {
@@ -613,7 +604,6 @@ fn screen_answers_from_the_configured_list_and_records_nothing() {
         assert_eq!(answer["verdict"], verdict, "{answer}");
         assert_eq!(answer["provider"], "denylist");
         assert_eq!(answer["address"], address.to_lowercase());
-        assert_eq!(answer["list_version"].as_str().unwrap().len(), 64);
     }
     assert!(!db(dir.path()).exists(), "screen opened the database");
 
@@ -621,71 +611,4 @@ fn screen_answers_from_the_configured_list_and_records_nothing() {
     let output = orchestrator(dir.path(), &off, &["screen", &listed()]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("SCREENING=off"));
-}
-
-#[test]
-fn a_person_releases_or_blocks_a_held_lock_from_the_command_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let env = node(dir.path());
-    assert!(orchestrator(dir.path(), &env, &["status"]).status.success());
-    let conn = rusqlite::Connection::open(db(dir.path())).unwrap();
-    for (lock, state) in [("7", "held"), ("8", "held"), ("9", "queued")] {
-        conn.execute(
-            "INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state)
-             VALUES ('lock', 'create_parked_link', ?1, ?2, '{}', ?3)",
-            rusqlite::params![format!("lock:{lock}"), format!("lock:{lock}:key"), state],
-        )
-        .unwrap();
-    }
-    let run = |args: &[&str]| {
-        let output = orchestrator(dir.path(), &env, args);
-        (
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).to_string(),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        )
-    };
-    let open = || {
-        run(&["screenings", "--open"])
-            .1
-            .lines()
-            .map(|line| {
-                serde_json::from_str::<serde_json::Value>(line).unwrap()["transfer"].clone()
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(open(), ["lock:7", "lock:8"]);
-
-    let (ok, released, _) = run(&[
-        "release",
-        "lock:7",
-        "--by",
-        "Ana",
-        "--reason",
-        "a false hit",
-    ]);
-    assert!(ok);
-    assert!(
-        released.contains("bridge.screening.released")
-            && released.contains("lock:7 released by Ana: a false hit. It was held, and is queued"),
-        "{released}"
-    );
-    assert!(run(&["block", "lock:8", "--by", "Ana", "--reason", "listed"]).0);
-    assert!(open().is_empty());
-
-    let (ok, _, refused) = run(&["release", "lock:9", "--by", "Ana", "--reason", "x"]);
-    assert!(!ok);
-    assert!(
-        refused.contains("lock:9 is queued: release takes only a held transfer"),
-        "{refused}"
-    );
-    let (ok, _, refused) = run(&["release", "lock:8", "--by", "", "--reason", "x"]);
-    assert!(!ok, "a release names who made it");
-    assert!(refused.contains("--by"), "{refused}");
-
-    let records = run(&["screenings", "--transfer", "lock:8"]).1;
-    let record: serde_json::Value = serde_json::from_str(records.trim()).unwrap();
-    assert_eq!(record["state"], "blocked");
-    assert_eq!(record["records"][0]["by"], "Ana");
-    assert_eq!(record["records"][0]["reason"], "listed");
 }

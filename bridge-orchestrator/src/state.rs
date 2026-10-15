@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 mod screening;
 
-pub use screening::Standing;
+pub use screening::Hold;
 
 const SCHEMA_VERSION: i64 = 4;
 pub const LOCK_CHECKPOINT_KEY: &str = "lock.last_processed_block";

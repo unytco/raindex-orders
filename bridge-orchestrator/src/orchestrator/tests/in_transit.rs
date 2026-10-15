@@ -747,18 +747,13 @@ async fn mark_failed_marks_no_row_when_a_row_changed_since_it_was_read() {
 }
 
 #[tokio::test]
-async fn in_transit_screens_each_withdrawal_as_s4_would_and_marks_those_not_to_pay_by_hand() {
-    use crate::screening::{screen, Action, DenyList, Screened, Transfer, Verdict};
+async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_hand() {
+    use crate::screening::{Action, DenyList, Transfer};
     let mut orch = test_orchestrator("in-transit-screened");
-    let [held, blocked, clear, waiting, unscreened, unscreened_listed] =
-        [0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F].map(parked_withdrawal_tx);
-    let list = DenyList::new([0x6A, 0x6B, 0x6F].map(Address::repeat_byte));
-    for (spend, seed) in [(&held, 0x6A), (&blocked, 0x6B), (&clear, 0x6C)] {
-        let to = Address::repeat_byte(seed);
-        orch.db
-            .record_withdrawal_verdict(&spend.id.to_string(), &screen(&list, &[to]).await, to)
-            .unwrap();
-    }
+    let [held, blocked, clear, listed] = [0x6A, 0x6B, 0x6C, 0x6D].map(parked_withdrawal_tx);
+    orch.db
+        .hold_withdrawal(&held.id.to_string(), &[Address::repeat_byte(0x6A)])
+        .unwrap();
     orch.db
         .act(
             &Transfer::Withdrawal(blocked.id.to_string()),
@@ -767,35 +762,18 @@ async fn in_transit_screens_each_withdrawal_as_s4_would_and_marks_those_not_to_p
             "listed",
         )
         .unwrap();
-    let silent = Screened {
-        provider: "silent",
-        list: None,
-        at: 0,
-        listed: vec![],
-        verdict: Verdict::NoAnswer("down".into()),
-        in_time: true,
-    };
-    orch.db
-        .record_withdrawal_verdict(&waiting.id.to_string(), &silent, Address::repeat_byte(0x6D))
-        .unwrap();
     let mistyped_to = format!(" {:#x}", Address::repeat_byte(0x70));
     let mistyped = with_payload(
         parked_withdrawal_tx(0x70),
         json!({ "withdraw_to_address": mistyped_to }),
     );
-    let all = [
-        held,
-        blocked,
-        clear,
-        waiting,
-        unscreened,
-        unscreened_listed,
-        mistyped,
-    ];
-    let conductor = bridging_conductor().parking(action_hash(BR_EA), &all);
-    let expected = |marks: [Option<&str>; 7]| {
-        let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70].map(listed_withdrawal);
-        expected[6]["withdraw_to_address"] = json!(mistyped_to);
+    let conductor = bridging_conductor().parking(
+        action_hash(BR_EA),
+        &[held, blocked, clear, listed, mistyped],
+    );
+    let expected = |marks: [Option<&str>; 5]| {
+        let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x70].map(listed_withdrawal);
+        expected[4]["withdraw_to_address"] = json!(mistyped_to);
         for (listed, mark) in expected.iter_mut().zip(marks) {
             if let Some(mark) = mark {
                 listed["screening"] = json!(mark);
@@ -811,14 +789,13 @@ async fn in_transit_screens_each_withdrawal_as_s4_would_and_marks_those_not_to_p
             Some("held"),
             Some("blocked"),
             None,
-            Some("screening"),
-            None,
             None,
             Some("unscreened"),
         ]),
     );
 
-    orch.ethereum.as_mut().unwrap().screener = Some(Box::new(list));
+    orch.ethereum.as_mut().unwrap().screener =
+        Some(Box::new(DenyList::new([Address::repeat_byte(0x6D)])));
     let on = check(&orch, &conductor, false).await.unwrap();
     assert_lists(
         &on.listed,
@@ -826,15 +803,8 @@ async fn in_transit_screens_each_withdrawal_as_s4_would_and_marks_those_not_to_p
             Some("held"),
             Some("blocked"),
             None,
-            None,
-            None,
             Some("held"),
             Some("unscreened"),
         ]),
-    );
-    assert_eq!(
-        orch.db.withdrawal_standing(&all[5].id.to_string()).unwrap(),
-        crate::state::Standing::Held,
-        "the verdict is kept, as S4 keeps it"
     );
 }

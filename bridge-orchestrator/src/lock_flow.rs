@@ -649,32 +649,4 @@ mod tests {
         );
         assert_eq!(payload["from"], format!("{:?}", from()));
     }
-
-    #[tokio::test]
-    async fn a_lock_whose_transaction_the_rpc_cannot_give_is_read_again_and_never_queued() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = store(&dir);
-        db.set_checkpoint_u64(LOCK_CHECKPOINT_KEY, 0).unwrap();
-        let url = serve(|method, params| match method {
-            "eth_blockNumber" => Ok(json!("0xa")),
-            "eth_getLogs" => Ok(json!([lock_log(7, 5)])),
-            "eth_getBlockByNumber" => Ok(block(quantity(&params[0]))),
-            "eth_getTransactionByBlockHashAndIndex" => Ok(Value::Null),
-            other => Err(json!({ "code": -32601, "message": format!("no {other}") })),
-        })
-        .await;
-
-        let e = screening_lock_flow(url, db.clone())
-            .run_cycle()
-            .await
-            .expect_err("a lock with no sender to screen beside it was recorded");
-
-        assert!(format!("{e:#}").contains("has no transaction"), "{e:#}");
-        assert_eq!(db.get_checkpoint_u64(LOCK_CHECKPOINT_KEY).unwrap(), Some(0));
-        assert!(lock_rows(&db).is_empty());
-        assert!(db
-            .list_work_items("lock", WorkState::Screening, 10)
-            .unwrap()
-            .is_empty());
-    }
 }
