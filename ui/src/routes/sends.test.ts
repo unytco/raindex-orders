@@ -316,6 +316,14 @@ describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, the lock cap
 		type('#agent', AGENT)
 	}
 
+	function reopen() {
+		const Page = page!.constructor as Page
+		page!.$destroy()
+		page = new Page({ target })
+		type('#amount', '5')
+		type('#agent', AGENT)
+	}
+
 	function forceLock() {
 		const lock = button('Lock')!
 		lock.disabled = false
@@ -414,19 +422,57 @@ describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, the lock cap
 		expect(shown()).toContain(says)
 	})
 
+	it.each([
+		['turns unavailable', UNREACHABLE, PRICE_UNAVAILABLE],
+		['rises past the cap', priced(0.0006), OVER_CAP]
+	])(
+		'with no approve needed, sends no lock when the price %s while the bridge status is read',
+		async (_, answer, says) => {
+			vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+			reads.balanceOf = 10n ** 30n
+			status = stubFetch(async () => {
+				hotPrice.mockImplementation(answer)
+				await vi.advanceTimersByTimeAsync(PRICE_REFRESH_MS)
+				await until(() => expect(shown()).toContain(says))
+				return Response.json({ paused: false })
+			})
+			await enter('2000000')
+
+			await click('Lock')
+
+			await until(() => expect(status).toHaveBeenCalledTimes(1))
+			await until(() => expect(target.querySelector('[role="status"]')).toBeNull())
+			expect(wallet.writeContract).not.toHaveBeenCalled()
+			expect(shown()).toContain(says)
+		}
+	)
+
 	it("forgets an earlier visit's price until it reads one again", async () => {
 		await enter('5')
 		await until(() => expect(button('Lock')?.disabled).toBe(false))
-		const Page = page!.constructor as Page
-		page!.$destroy()
 		hotPrice.mockImplementation(() => new Promise(() => {}))
 
-		page = new Page({ target })
-		type('#amount', '5')
-		type('#agent', AGENT)
+		reopen()
 
 		await until(() => expect(shown()).toContain('Ethereum (hex, used for lock)'))
 		expect(button('Lock')?.disabled).toBe(true)
+	})
+
+	it('ignores a read an earlier visit started once it answers late', async () => {
+		let answerLate: (response: Response) => void = () => {}
+		hotPrice.mockImplementationOnce(() => new Promise(resolve => (answerLate = resolve)))
+		await enter('5')
+		reopen()
+		await until(() => expect(button('Lock')?.disabled).toBe(false))
+
+		answerLate(Response.json({}))
+
+		await until(() =>
+			expect(logged()).toEqual([['Error reading the HOT price:', expect.any(Error)]])
+		)
+		await new Promise(resolve => setTimeout(resolve))
+		expect(shown()).not.toContain(PRICE_UNAVAILABLE)
+		expect(button('Lock')?.disabled).toBe(false)
 	})
 
 	it('keeps Lock off, and says nothing, until the price is read', async () => {

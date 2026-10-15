@@ -246,9 +246,9 @@
 				await fetchContractData()
 				if (!(await bridgeOpen())) return
 				if (!(await balanceCovers(amountWei))) return
-				if (!capAllows(amountWei)) return
 			}
 
+			if (!capAllows(amountWei)) return
 			transactionStore.awaitWalletConfirmation(true)
 			const hash = await send({
 				address: lockVaultAddress,

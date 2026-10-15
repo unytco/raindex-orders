@@ -26,11 +26,18 @@ async function readHotPrice(): Promise<bigint | 'unavailable'> {
 
 /** HOT's price in 10⁻¹² USD per whole HOT. */
 export const hotPrice = readable<bigint | 'reading' | 'unavailable'>('reading', set => {
+	let stopped = false
 	set('reading')
-	const refresh = async () => set(await readHotPrice())
+	const refresh = async () => {
+		const price = await readHotPrice()
+		if (!stopped) set(price)
+	}
 	refresh()
 	const timer = setInterval(refresh, PRICE_REFRESH_MS)
-	return () => clearInterval(timer)
+	return () => {
+		stopped = true
+		clearInterval(timer)
+	}
 })
 
 export const lockCapWei = (price: bigint, decimals: number) =>
