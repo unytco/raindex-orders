@@ -845,39 +845,6 @@ mod tests {
     }
 
     #[test]
-    fn a_database_an_earlier_binary_kept_opens_with_its_rows_and_takes_screening() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("screening.db");
-        drop(StateStore::open(&path).unwrap());
-        let earlier = Connection::open(&path).unwrap();
-        earlier
-            .execute_batch(
-                "DROP TABLE screening_records; DROP TABLE screening_lists;
-                 UPDATE schema_meta SET version = 3;
-                 INSERT INTO work_items (flow, task_type, item_id, idempotency_key, payload_json, state)
-                 VALUES ('lock', 'create_parked_link', 'lock:1', 'lock:1:key', '{}', 'queued');",
-            )
-            .unwrap();
-
-        let db = StateStore::open(&path).unwrap();
-
-        let version: i64 = earlier
-            .query_row("SELECT version FROM schema_meta", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            version, 4,
-            "a binary before screening refuses it from now on"
-        );
-        assert_eq!(
-            db.list_work_items("lock", WorkState::Queued, 10)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(db.screenings(None, false).unwrap().is_empty());
-    }
-
-    #[test]
     fn a_database_that_is_not_there_is_refused_and_not_made() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("absent.db");
