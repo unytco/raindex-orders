@@ -223,7 +223,11 @@ async fn a_held_withdrawal_gets_no_coupon_until_a_person_releases_it_and_never_o
         lines_of(&logged, "bridge.screening.no_answer", &transfer),
         1
     );
-    assert_eq!(lines_of(&logged, "bridge.screening.hit", &transfer), 1);
+    assert_eq!(
+        lines_of(&logged, "bridge.screening.hit", &transfer),
+        1,
+        "{logged}"
+    );
 
     decide(
         &orch,

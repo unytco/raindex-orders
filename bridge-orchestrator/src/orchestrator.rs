@@ -5712,6 +5712,13 @@ mod tests {
         /// can leave a callsite cached as disabled for the captures of tests running beside it.
         fn at(&self, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
             use tracing_subscriber::fmt::writer::MakeWriterExt;
+            // While one dispatcher is registered, tracing caches a new callsite's interest from
+            // the registering thread alone, so a callsite first hit outside a capture would stay
+            // off for the capture beside it. This one, kept for the run, makes each capture count.
+            static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+            SECOND.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
             let writer = self.clone();
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::TRACE)
