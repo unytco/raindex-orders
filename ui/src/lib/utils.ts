@@ -49,3 +49,18 @@ export function causeChain(err: unknown): unknown[] {
 	}
 	return chain
 }
+
+export const READ_TIMEOUT_MS = 15_000
+
+export async function readJson(url: string): Promise<unknown> {
+	// Not AbortSignal.timeout: it needs Safari 16, and Vite 5's default build target is Safari 14.
+	const timeout = new AbortController()
+	const timer = setTimeout(() => timeout.abort(), READ_TIMEOUT_MS)
+	try {
+		const response = await fetch(url, { signal: timeout.signal })
+		if (!response.ok) throw new Error(`${url} answered ${response.status}`)
+		return await response.json()
+	} finally {
+		clearTimeout(timer)
+	}
+}

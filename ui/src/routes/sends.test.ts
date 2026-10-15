@@ -6,7 +6,8 @@ import { asBuild, BUILDS, type Network } from '$lib/testing/builds'
 import { ACCOUNT, CHAIN, connected, injectWallet } from '$lib/testing/wallet'
 import { deserializeSignedContext } from '$lib/coupon'
 import { orderbookAbi } from '../generated'
-import { PAUSED_TEXT, STATUS_TIMEOUT_MS } from '$lib/pause'
+import { PAUSED_TEXT } from '$lib/pause'
+import { READ_TIMEOUT_MS } from '$lib/utils'
 import { TESTNET_COUPONS } from './api/coupon-status/fixtures'
 
 type Page = new (options: { target: Element }) => SvelteComponent
@@ -177,7 +178,7 @@ describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, Lock', netwo
 		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
 
 		button('Lock')!.click()
-		await vi.advanceTimersByTimeAsync(STATUS_TIMEOUT_MS - 1)
+		await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS - 1)
 
 		expect(fetch).toHaveBeenCalledWith(
 			'/api/status',
