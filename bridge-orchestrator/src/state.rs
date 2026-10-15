@@ -1694,13 +1694,16 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_deletes_everything() {
+    fn clear_all_keeps_only_the_rows_in_screening_held_or_blocked() {
         let path = test_db_path("clear-all");
         let store = StateStore::open(&path).unwrap();
 
         insert_work_item_with_state(&path, "lock:queued", WorkState::Queued);
         insert_work_item_with_state(&path, "lock:succeeded", WorkState::Succeeded);
         insert_work_item_with_state(&path, "lock:failed", WorkState::Failed);
+        insert_work_item_with_state(&path, "lock:screening", WorkState::Screening);
+        insert_work_item_with_state(&path, "lock:held", WorkState::Held);
+        insert_work_item_with_state(&path, "lock:blocked", WorkState::Blocked);
 
         let deleted = store.clear_all().unwrap();
         assert_eq!(deleted, 3);
@@ -1713,7 +1716,9 @@ mod tests {
                 limit: 20,
             })
             .unwrap();
-        assert!(rows.is_empty());
+        let mut kept: Vec<String> = rows.into_iter().map(|row| row.item_id).collect();
+        kept.sort();
+        assert_eq!(kept, ["lock:blocked", "lock:held", "lock:screening"]);
     }
 
     #[test]

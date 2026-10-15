@@ -50,7 +50,7 @@ enum Command {
         /// Delete only rows that are not in progress (succeeded, failed).
         #[arg(long, conflicts_with = "all", required_unless_present = "all")]
         non_in_progress: bool,
-        /// Delete all rows from work_items.
+        /// Delete every row from work_items but those in screening, held or blocked.
         #[arg(
             long,
             conflicts_with = "non_in_progress",
