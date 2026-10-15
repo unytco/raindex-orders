@@ -56,7 +56,7 @@ impl Standing {
                 match (standing, event) {
                     (Standing::Blocked, _) | (_, "blocked") => Standing::Blocked,
                     (Standing::Released, _) | (_, "released") => Standing::Released,
-                    (decided @ (Standing::Clear | Standing::Held), _) => decided,
+                    (Standing::Held, _) => Standing::Held,
                     (_, "clear") => Standing::Clear,
                     (_, "hit") => Standing::Held,
                     _ => Standing::Screening,
@@ -66,7 +66,10 @@ impl Standing {
 
     /// Decided: no screening changes it, only a person.
     fn decided(self) -> bool {
-        !matches!(self, Standing::Unscreened | Standing::Screening)
+        matches!(
+            self,
+            Standing::Held | Standing::Released | Standing::Blocked
+        )
     }
 }
 
@@ -164,6 +167,20 @@ impl StateStore {
     pub fn withdrawal_standing(&self, spend: &str) -> Result<Standing> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         standing(&conn, &Transfer::Withdrawal(spend.to_string()).to_string())
+    }
+
+    /// The list version of the withdrawal's last clear verdict.
+    pub fn cleared_on(&self, spend: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT list_version FROM screening_records
+                 WHERE transfer = ?1 AND event = 'clear' ORDER BY id DESC LIMIT 1",
+                [Transfer::Withdrawal(spend.to_string()).to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub fn act(
@@ -395,7 +412,7 @@ fn insert_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::screening::{screen, DenyList};
+    use crate::screening::{screen, DenyList, Screener};
 
     const LISTED: Address = Address::repeat_byte(0xBA);
     const CLEAN: Address = Address::repeat_byte(0x11);
@@ -634,6 +651,19 @@ mod tests {
 
         assert_eq!(record("c", &screened(&[CLEAN]).await), Standing::Clear);
         assert!(standing("c").pays());
+        assert_eq!(
+            db.cleared_on("c").unwrap().as_deref(),
+            DenyList::new([LISTED]).version()
+        );
+        let relisted = screen(&DenyList::new([LISTED, CLEAN]), &[CLEAN]).await;
+        record("f", &screened(&[CLEAN]).await);
+        assert_eq!(
+            record("f", &relisted),
+            Standing::Held,
+            "a clear verdict gives way to a later one"
+        );
+        assert_eq!(record("e", &screened(&[CLEAN]).await), Standing::Clear);
+        assert_eq!(record("e", &silent("down")), Standing::Screening);
 
         assert_eq!(
             act(&db, &spend("never-screened"), Action::Block).unwrap(),

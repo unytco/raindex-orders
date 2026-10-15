@@ -19,6 +19,11 @@ pub type Answering<'a> = Pin<Box<dyn Future<Output = Answers> + Send + 'a>>;
 /// Its `Display` names it in the `startup.screening` log.
 pub trait Screener: Send + Sync + fmt::Display {
     fn name(&self) -> &'static str;
+    /// The version of the list it answers from now. With none, a cleared withdrawal is screened
+    /// again before each payment.
+    fn version(&self) -> Option<&str> {
+        None
+    }
     fn answer<'a>(&'a self, addresses: &'a [Address]) -> Answering<'a>;
 }
 
@@ -194,6 +199,10 @@ impl fmt::Display for DenyList {
 impl Screener for DenyList {
     fn name(&self) -> &'static str {
         "denylist"
+    }
+
+    fn version(&self) -> Option<&str> {
+        Some(self.list.version())
     }
 
     fn answer<'a>(&'a self, addresses: &'a [Address]) -> Answering<'a> {

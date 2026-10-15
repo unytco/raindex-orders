@@ -218,23 +218,27 @@ async fn a_lock_that_names_no_address_to_screen_waits_and_is_reported() {
 }
 
 #[tokio::test]
-async fn s4_counts_a_withdrawal_screening_holds_apart_and_signs_it_no_coupon() {
+async fn s4_signs_no_coupon_for_a_withdrawal_listed_now_even_one_it_cleared_on_an_earlier_list() {
     let orch = test_orchestrator("screening-select");
     let signer = CouponSigner::with_key(PrivateKeySigner::random());
     let list = DenyList::new([Address::repeat_byte(0xBA)]);
     let held = parked_withdrawal_tx(0xBA);
     let clear = parked_withdrawal_tx(0x11);
+    let select = async |list: &DenyList| {
+        select_bridging_links(
+            Some(&signer),
+            &WithdrawalGate::new(&orch.db, Some(list)),
+            &bridging_agent(),
+            &[held.clone(), clear.clone()],
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap()
+    };
+    let records_of_clear = || records_of(&orch, Transfer::Withdrawal(clear.id.to_string()));
 
-    let selection = select_bridging_links(
-        Some(&signer),
-        &WithdrawalGate::new(&orch.db, Some(&list)),
-        &bridging_agent(),
-        &[held.clone(), clear.clone()],
-        usize::MAX,
-        1,
-    )
-    .await
-    .unwrap();
+    let selection = select(&list).await;
 
     assert_eq!(selection.held, 1);
     assert_eq!(
@@ -243,11 +247,43 @@ async fn s4_counts_a_withdrawal_screening_holds_apart_and_signs_it_no_coupon() {
     );
     assert_eq!(
         selection.coupons.keys().cloned().collect::<Vec<_>>(),
-        ids(&[clear])
+        ids(std::slice::from_ref(&clear))
     );
     assert_eq!(
         orch.db.withdrawal_standing(&held.id.to_string()).unwrap(),
         Standing::Held
+    );
+
+    let unpaid_on_the_same_list = select(&list).await;
+    assert_eq!(unpaid_on_the_same_list.coupons.len(), 1);
+    assert_eq!(
+        records_of_clear().len(),
+        1,
+        "a clear verdict on the list in force is reused"
+    );
+
+    let relisted = DenyList::new([Address::repeat_byte(0xBA), Address::repeat_byte(0x11)]);
+    let after_the_list_changed = select(&relisted).await;
+
+    assert_eq!(after_the_list_changed.held, 2);
+    assert!(
+        after_the_list_changed.coupons.is_empty(),
+        "the address added after it cleared is not paid"
+    );
+    assert_eq!(
+        orch.db.withdrawal_standing(&clear.id.to_string()).unwrap(),
+        Standing::Held
+    );
+    let events: Vec<_> = records_of_clear()
+        .iter()
+        .map(|record| (record["event"].clone(), record["list_version"].clone()))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            (json!("clear"), json!(list.version())),
+            (json!("hit"), json!(relisted.version())),
+        ]
     );
 }
 

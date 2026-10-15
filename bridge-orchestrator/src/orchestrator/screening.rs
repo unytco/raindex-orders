@@ -106,7 +106,8 @@ fn lock_addresses(row: &WorkItem) -> Result<Vec<(Address, Role)>> {
 }
 
 /// A recorded standing decides before the screener does, so turning screening off pays no held
-/// or waiting withdrawal.
+/// or waiting withdrawal. With screening on, a clear verdict pays only while its list is the one
+/// in force.
 pub struct WithdrawalGate<'a> {
     db: &'a StateStore,
     screener: Option<&'a dyn Screener>,
@@ -123,11 +124,20 @@ impl<'a> WithdrawalGate<'a> {
     }
 
     pub async fn pays(&self, spend: &str, to: Address, amount: &str) -> Result<bool> {
-        let screener = match (self.db.withdrawal_standing(spend)?, self.screener) {
-            (Standing::Unscreened | Standing::Screening, Some(screener)) => screener,
+        let standing = self.db.withdrawal_standing(spend)?;
+        let screener = match (standing, self.screener) {
+            (Standing::Unscreened | Standing::Screening | Standing::Clear, Some(screener)) => {
+                screener
+            }
             (Standing::Unscreened, None) => return Ok(true),
             (standing, _) => return Ok(standing.pays()),
         };
+        if standing == Standing::Clear
+            && screener.version().is_some()
+            && self.db.cleared_on(spend)?.as_deref() == screener.version()
+        {
+            return Ok(true);
+        }
         if self.unanswered.load(Ordering::Relaxed) {
             return Ok(false);
         }

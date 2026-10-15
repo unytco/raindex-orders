@@ -72,7 +72,8 @@ With `SCREENING=on`, `run` screens the addresses behind each transfer against
 - Before it signs a withdrawal's coupon, it screens the spend's
   `withdraw_to_address`. A listed one gets no coupon and stays parked until a
   person runs `release`. A withdrawal's verdict is kept against its spend's
-  action hash, so it is screened once.
+  action hash. A clear one is reused while its list is the one in force, and
+  a withdrawal still unpaid when the list changes is screened again first.
 - A verdict is clear only when every address has an answer and none is listed.
   With no verdict, a lock waits in `screening` and a withdrawal stays parked,
   and the next pass screens them again. A provider that gives no answer
