@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tracing::{error, warn};
 
-/// Lock item IDs are no parked links, so `forget_unparked` leaves these checks' told sets alone.
 pub(super) const LOCKS_SCREENED: &str = "screened/lock";
 pub(super) const WITHDRAWALS_SCREENED: &str = "screened/withdrawal";
 
 /// A transfer screening stopped, with what to log of it.
 pub(super) struct ScreenedOut {
-    /// What it is told once by: a lock's item ID, or a withdrawal's spend.
+    /// The told key. A withdrawal's is its bare spend, as `forget_unparked` keeps only parked link
+    /// IDs.
     id: String,
     transfer: String,
     amount: String,
@@ -23,7 +23,41 @@ pub(super) struct ScreenedOut {
     screened: Screened,
 }
 
-/// Screens `addresses`, unless the provider already missed its bound in this pass or cycle.
+impl ScreenedOut {
+    fn log(&self) {
+        let Self {
+            transfer,
+            amount,
+            tx_hash,
+            screened,
+            ..
+        } = self;
+        let provider = screened.provider;
+        let tx_hash = tx_hash.as_deref();
+        match &screened.verdict {
+            Verdict::Hit(listed) => error!(
+                event = "bridge.screening.hit",
+                transfer,
+                listed = ?listed,
+                amount,
+                tx_hash,
+                provider,
+                "[screening] {transfer} of {amount} HOT is a hit: {provider} lists {listed:?}"
+            ),
+            Verdict::NoAnswer(cause) => warn!(
+                event = "bridge.screening.no_answer",
+                transfer,
+                amount,
+                tx_hash,
+                provider,
+                cause,
+                "[screening] {transfer} of {amount} HOT waits with no verdict: {cause}"
+            ),
+            Verdict::Clear => {}
+        }
+    }
+}
+
 async fn screen_unless_missed(
     screener: &dyn Screener,
     addresses: &[Address],
@@ -57,7 +91,7 @@ impl BridgeOrchestrator {
         ))
     }
 
-    /// A failed lock read does not keep the locks it recorded earlier from being screened.
+    /// A failed lock read still screens the locks already recorded.
     pub(super) async fn read_and_screen_locks(&self, lock_flow: &LockFlow, stop: &ShutdownRx) {
         if let Err(e) = lock_flow.run_cycle().await {
             if !crate::stop::is_stopped(&e) {
@@ -78,14 +112,13 @@ impl BridgeOrchestrator {
         }
     }
 
-    /// A clear lock goes to `queued`, a listed one to `held`, and one with no verdict waits.
     pub(super) async fn screen_waiting_locks(
         &self,
         screener: &dyn Screener,
         stop: &ShutdownRx,
     ) -> Result<()> {
         let missed = AtomicBool::new(false);
-        let mut screened_out = Vec::new();
+        let mut waiting = Vec::new();
         for row in self
             .db
             .list_work_items("lock", WorkState::Screening, 5000)?
@@ -97,76 +130,37 @@ impl BridgeOrchestrator {
                 Ok(addresses) => screen_unless_missed(screener, &addresses, &missed).await,
                 Err(e) => Screened::no_answer(screener.name(), format!("{e:#}")),
             };
-            match screened.verdict {
-                Verdict::Clear => {
-                    self.db
-                        .settle_screened_lock(&row.item_id, WorkState::Queued)?;
-                    continue;
-                }
-                Verdict::Hit(_) => self
-                    .db
-                    .settle_screened_lock(&row.item_id, WorkState::Held)?,
-                Verdict::NoAnswer(_) => {}
-            }
             let field = |name: &str| row.payload_json[name].as_str().map(str::to_string);
-            screened_out.push(ScreenedOut {
+            let out = ScreenedOut {
                 id: row.item_id.clone(),
                 transfer: row.item_id.clone(),
                 amount: field("amount_hot").unwrap_or_default(),
                 tx_hash: field("tx_hash"),
                 screened,
-            });
+            };
+            match out.screened.verdict {
+                Verdict::Clear => self
+                    .db
+                    .settle_screened_lock(&row.item_id, WorkState::Queued)?,
+                Verdict::Hit(_) => {
+                    self.db
+                        .settle_screened_lock(&row.item_id, WorkState::Held)?;
+                    out.log();
+                }
+                Verdict::NoAnswer(_) => waiting.push(out),
+            }
         }
-        self.log_screened_out(LOCKS_SCREENED, &screened_out);
+        self.tell_waiting(LOCKS_SCREENED, &waiting);
         Ok(())
     }
 
-    /// One told set per verdict, so a hit after a no-answer is still told.
-    pub(super) fn log_screened_out(&self, check: &str, screened_out: &[ScreenedOut]) {
-        for verdict in ["hit", "no_answer"] {
-            let of_verdict: Vec<&ScreenedOut> = screened_out
-                .iter()
-                .filter(|out| out.screened.verdict.name() == verdict)
-                .collect();
-            for out in self.untold(&format!("{check}/{verdict}"), &of_verdict, |out| {
-                out.id.clone()
-            }) {
-                let ScreenedOut {
-                    transfer,
-                    amount,
-                    tx_hash,
-                    screened,
-                    ..
-                } = *out;
-                let provider = screened.provider;
-                let tx_hash = tx_hash.as_deref();
-                match &screened.verdict {
-                    Verdict::Hit(listed) => error!(
-                        event = "bridge.screening.hit",
-                        transfer,
-                        listed = ?listed,
-                        amount,
-                        tx_hash,
-                        provider,
-                        "[screening] {transfer} of {amount} HOT is held for a person: {provider} lists {listed:?}"
-                    ),
-                    Verdict::NoAnswer(cause) => warn!(
-                        event = "bridge.screening.no_answer",
-                        transfer,
-                        amount,
-                        tx_hash,
-                        provider,
-                        cause,
-                        "[screening] {transfer} of {amount} HOT waits, as {provider} gave no answer: {cause}"
-                    ),
-                    Verdict::Clear => {}
-                }
-            }
+    pub(super) fn tell_waiting(&self, check: &str, waiting: &[ScreenedOut]) {
+        for out in self.untold(check, waiting, |out| out.id.clone()) {
+            out.log();
         }
     }
 }
 
-/// The lock's `sender`, and its transaction's `from` where that is another address.
 fn lock_addresses(row: &WorkItem) -> Result<Vec<Address>> {
     let address = |field: &str| -> Result<Address> {
         let raw = row.payload_json[field]
@@ -190,7 +184,7 @@ pub struct WithdrawalGate<'a> {
     db: &'a StateStore,
     screener: Option<&'a dyn Screener>,
     missed: AtomicBool,
-    screened_out: Mutex<Vec<ScreenedOut>>,
+    waiting: Mutex<Vec<ScreenedOut>>,
 }
 
 impl<'a> WithdrawalGate<'a> {
@@ -199,7 +193,7 @@ impl<'a> WithdrawalGate<'a> {
             db,
             screener,
             missed: AtomicBool::new(false),
-            screened_out: Mutex::new(Vec::new()),
+            waiting: Mutex::new(Vec::new()),
         }
     }
 
@@ -210,29 +204,32 @@ impl<'a> WithdrawalGate<'a> {
         let Some(screener) = self.screener else {
             return Ok(true);
         };
-        let screened = screen_unless_missed(screener, &[to], &self.missed).await;
-        let pays = match &screened.verdict {
-            // A person's block made while it was screened wins.
-            Verdict::Clear => return Ok(self.db.withdrawal_hold(spend)?.is_none()),
-            Verdict::Hit(listed) => self.db.hold_withdrawal(spend, listed)? == Hold::Released,
-            Verdict::NoAnswer(_) => false,
+        let out = ScreenedOut {
+            id: spend.to_string(),
+            transfer: format!("withdrawal:{spend}"),
+            amount: amount.to_string(),
+            tx_hash: None,
+            screened: screen_unless_missed(screener, &[to], &self.missed).await,
         };
-        self.screened_out
-            .lock()
-            .expect("screened_out mutex poisoned")
-            .push(ScreenedOut {
-                id: spend.to_string(),
-                transfer: format!("withdrawal:{spend}"),
-                amount: amount.to_string(),
-                tx_hash: None,
-                screened,
-            });
-        Ok(pays)
+        match &out.screened.verdict {
+            // A person's block made while it was screened wins.
+            Verdict::Clear => Ok(self.db.withdrawal_hold(spend)?.is_none()),
+            Verdict::Hit(listed) => {
+                let hold = self.db.hold_withdrawal(spend, listed)?;
+                out.log();
+                Ok(hold == Hold::Released)
+            }
+            Verdict::NoAnswer(_) => {
+                self.waiting
+                    .lock()
+                    .expect("waiting mutex poisoned")
+                    .push(out);
+                Ok(false)
+            }
+        }
     }
 
-    pub(super) fn into_screened_out(self) -> Vec<ScreenedOut> {
-        self.screened_out
-            .into_inner()
-            .expect("screened_out mutex poisoned")
+    pub(super) fn into_waiting(self) -> Vec<ScreenedOut> {
+        self.waiting.into_inner().expect("waiting mutex poisoned")
     }
 }

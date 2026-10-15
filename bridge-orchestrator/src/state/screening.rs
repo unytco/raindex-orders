@@ -21,7 +21,7 @@ pub(super) fn create_tables(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// A withdrawal screening stopped, and what a person made of it.
+/// A withdrawal held by screening, or released or blocked by a person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hold {
     Held,
@@ -55,7 +55,7 @@ pub struct Acted {
 }
 
 impl StateStore {
-    /// Moves the lock `item_id` out of `screening` to `to`, unless a person moved it meanwhile.
+    /// A no-op once a person has moved the lock out of `screening`.
     pub fn settle_screened_lock(&self, item_id: &str, to: WorkState) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
@@ -143,7 +143,6 @@ impl StateStore {
         })
     }
 
-    /// Each lock in `screening`, `held` or `blocked`, and each withdrawal `held` or `blocked`.
     /// `open` leaves out the blocked.
     pub fn screenings(&self, open: bool) -> Result<Vec<Value>> {
         let conn = self.conn.lock().expect("db mutex poisoned");

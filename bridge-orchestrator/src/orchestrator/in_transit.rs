@@ -134,7 +134,7 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
 }
 
 impl BridgeOrchestrator {
-    /// Screens each listed withdrawal as S4 would before it marks the ones not to be paid by hand.
+    /// Holds a listed withdrawal, as S4 would.
     pub(super) async fn in_transit(
         &self,
         conductor: &impl ConductorReads,

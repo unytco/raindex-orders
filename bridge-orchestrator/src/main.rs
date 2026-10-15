@@ -73,11 +73,11 @@ enum Command {
     },
     /// Release a held transfer: a held lock is credited, and a held withdrawal gets its coupon.
     Release(Decision),
-    /// Block a held transfer, or one with no verdict: it is never credited or paid.
+    /// Block a held transfer, or one not yet held: it is never credited or given a coupon.
     Block(Decision),
     /// Print each transfer that is held, blocked or in screening, as JSON lines.
     Screenings {
-        /// Only the transfers that wait: held, or with no verdict.
+        /// Only the transfers that wait: held, or a lock in screening.
         #[arg(long)]
         open: bool,
     },

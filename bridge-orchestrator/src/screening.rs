@@ -32,8 +32,7 @@ pub enum Answer {
 pub struct Screened {
     pub provider: &'static str,
     pub verdict: Verdict,
-    /// False when the provider gave nothing within its bound, so it is asked nothing more in the
-    /// same pass or cycle.
+    /// False when the provider gave nothing within `ANSWER_WITHIN`.
     pub in_time: bool,
 }
 
@@ -64,8 +63,8 @@ impl Verdict {
     }
 }
 
-/// The verdict table: a hit when any address is listed, clear only when every address has an
-/// answer and none is listed, and otherwise no verdict.
+/// A hit when any address is listed. Clear only when every address is answered and no answer
+/// failed. Otherwise no verdict.
 pub async fn screen(screener: &dyn Screener, addresses: &[Address]) -> Screened {
     let provider = screener.name();
     let Ok(answers) = tokio::time::timeout(ANSWER_WITHIN, screener.answer(addresses)).await else {

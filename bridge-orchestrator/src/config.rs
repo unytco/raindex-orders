@@ -156,7 +156,7 @@ pub fn ignored_without_ethereum(setting: impl Fn(&str) -> Option<String>) -> Vec
 
 const SCREENING_VARIABLES: [&str; 2] = ["SCREENING", "SCREENING_DENYLIST"];
 
-/// The provider `SCREENING_DENYLIST` configures, or `None` with `SCREENING=off`.
+/// The denylist `SCREENING_DENYLIST` configures.
 pub fn screener_from_env(network: Network) -> Result<Option<Box<dyn Screener>>> {
     screening_settings(network, |key| env::var(key).ok())
 }

@@ -328,7 +328,9 @@ impl BridgeOrchestrator {
     /// without this a link that left during a shorter cycle would stay told.
     fn forget_unparked(&self, parked: &HashSet<String>) {
         for (check, told) in self.told.lock().expect("told mutex poisoned").iter_mut() {
-            if !check.starts_with(LOCKS_SCREENED) {
+            // A lock's item ID is never a parked link ID, so pruning would tell each waiting lock
+            // again every cycle.
+            if check != LOCKS_SCREENED {
                 told.retain(|id| parked.contains(id));
             }
         }
@@ -1139,7 +1141,7 @@ impl BridgeOrchestrator {
         )
         .await?;
         self.log_unpayable(&unpayable);
-        self.log_screened_out(WITHDRAWALS_SCREENED, &gate.into_screened_out());
+        self.tell_waiting(WITHDRAWALS_SCREENED, &gate.into_waiting());
 
         let deposit_ids: HashSet<String> = deposit_rave_links
             .iter()
@@ -5708,13 +5710,12 @@ mod tests {
     }
 
     impl Lines {
-        /// Every level is enabled and filtered at the writer: a capture with a lower max level
-        /// can leave a callsite cached as disabled for the captures of tests running beside it.
+        /// tracing caches a callsite's interest from the dispatchers registered when it is first
+        /// hit, and from the hitting thread's alone while only one is. Every level is enabled and
+        /// filtered at the writer, and a second dispatcher stays registered, so a callsite another
+        /// test hits first is never left disabled for this capture.
         fn at(&self, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
             use tracing_subscriber::fmt::writer::MakeWriterExt;
-            // While one dispatcher is registered, tracing caches a new callsite's interest from
-            // the registering thread alone, so a callsite first hit outside a capture would stay
-            // off for the capture beside it. This one, kept for the run, makes each capture count.
             static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
             SECOND.get_or_init(|| {
                 tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())

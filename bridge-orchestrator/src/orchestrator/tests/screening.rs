@@ -5,7 +5,6 @@ use crate::state::{Hold, WorkState};
 const LISTED: Address = Address::repeat_byte(0xBA);
 const CLEAN: Address = Address::repeat_byte(0x11);
 
-/// A provider that is down: it answers each address with a failure.
 struct Down;
 
 impl std::fmt::Display for Down {
@@ -97,8 +96,9 @@ fn lines_of(logged: &str, event: &str, transfer: &str) -> usize {
 async fn a_clear_lock_is_queued_and_credited_and_a_listed_one_only_once_a_person_releases_it() {
     let mut orch = test_orchestrator("screening-credit");
     screening_with(&mut orch, DenyList::new([LISTED]));
+    assert!(orch.lock_flow(&running()).unwrap().screening);
     let clear = lock_to_screen(&orch, "lock:clear", "0xe1", CLEAN);
-    let held = lock_to_screen(&orch, "lock:held", "0xe2", LISTED);
+    let held = lock_from(&orch, "lock:held", "0xe2", LISTED, CLEAN);
     let sent_by_listed = lock_from(&orch, "lock:sent-by-listed", "0xe7", CLEAN, LISTED);
     let blocked = lock_to_screen(&orch, "lock:blocked", "0xe3", LISTED);
 
@@ -240,7 +240,11 @@ async fn a_held_withdrawal_gets_no_coupon_until_a_person_releases_it_and_never_o
         Action::Block,
     );
     orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
-    assert_eq!(parked_on_bridging(&conductor), ids(&[blocked]));
+    assert_eq!(
+        parked_on_bridging(&conductor),
+        ids(std::slice::from_ref(&blocked))
+    );
+    assert_eq!(hold_of(&orch, &blocked), Some(Hold::Blocked));
 }
 
 #[tokio::test]

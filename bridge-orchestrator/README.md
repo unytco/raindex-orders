@@ -25,8 +25,8 @@ refuses to start, naming each variable at fault, when:
 
 - a signer variable is unset or malformed
 - `SCREENING` is neither `on` nor `off`, a `SCREENING_DENYLIST` entry is not
-  an address, or, on `mainnet`, `SCREENING` is unset or `off` or the list is
-  empty
+  an address or fails its checksum, or, on `mainnet`, `SCREENING` is unset or
+  `off` or the list is empty
 - the RPC answers for a chain other than `NETWORK`'s (1 for `mainnet`,
   84532 for `base-sepolia`)
 - the vault has no contract, or its `token()`, `orderbook()` or `vaultId()`
@@ -67,27 +67,26 @@ With `SCREENING=on`, `run` screens the addresses behind each transfer against
 - The lock read records each lock in `screening`, with its transaction's
   `from` beside the `Lock` event's `sender`. After each lock read, even a
   failed one, it screens both: a clear verdict moves the lock to `queued`, and
-  a listed address to `held`, where it waits for a person and is never
-  credited until they run `release`.
+  a listed address to `held`, where it is credited only once a person runs
+  `release`.
 - Each time it would sign a withdrawal's coupon, it screens the spend's
-  `withdraw_to_address` against the list in force, and keeps no clear
-  verdict. A listed one is held by its spend's action hash: it gets no coupon
-  and stays parked until a person runs `release`.
-- A verdict is clear only when every address has an answer and none is listed.
+  `withdraw_to_address` against the list in force. A listed one is held: it
+  gets no coupon and stays parked until a person runs `release`.
+- A verdict is clear only when every address is answered without a failure,
+  and none is listed.
   With no verdict, a lock waits in `screening` and a withdrawal stays parked,
-  and the next pass screens them again. A provider that gives no answer
-  within 10 s gives none, and is asked nothing more in that pass or bridge
-  cycle. The list always answers.
-- A lock whose row names no readable `sender` or `from` has no verdict.
+  and the next pass screens them again. A provider that does not answer
+  within 10 s gives no verdict, and is asked nothing more in that pass or
+  bridge cycle.
 - With `SCREENING=off`, a lock is recorded `queued`. A lock in `screening` or
   `held` stays there, which `startup.screening` names at each start, and a
   held or blocked withdrawal still gets no coupon.
 
-The logs are the record of each verdict. A hit logs `bridge.screening.hit`,
-and no verdict logs `bridge.screening.no_answer`, once per transfer while
-`run` runs. Each names the transfer, its amount, the listed addresses or the
-cause, and a lock's transaction. A pass that fails logs
-`bridge.screening.pass_failed`.
+Only the logs record a verdict. A hit logs `bridge.screening.hit` as the
+transfer is held. A transfer with no verdict logs `bridge.screening.no_answer`
+once while it stays so from pass to pass. Each names the transfer, its
+amount, the listed addresses or the cause, and a lock's transaction. A clear
+verdict logs nothing. A pass that fails logs `bridge.screening.pass_failed`.
 
 ### `bridge-orchestrator status`
 
@@ -127,7 +126,7 @@ bridge-orchestrator clear --all
 Outputs a JSON object. Plain `--non-in-progress` returns
 `{"mode":"non_in_progress","deleted_count":N}`; with `--older-than-s` the
 output also includes `succeeded_deleted` and `failed_deleted`. No `clear`
-mode deletes a held or blocked withdrawal. Steady-state ops should rely on the
+mode deletes a withdrawal's hold. Steady-state ops should rely on the
 in-process retention task and reserve this CLI for one-off hygiene.
 
 ### `bridge-orchestrator in-transit`
@@ -149,7 +148,7 @@ It prints one JSON object per line:
 |--------|--------------------|--------|
 | `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created`, or a row `in_flight` or `claimed` at any step | `item_id`, `lock_id`, `state`, `step`, `link` |
 | `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the credit-limit adjustment agreement or the bridging agreement of its lane in force | `agreement`, `link`, `lock_ids` |
-| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address`, and, for one S4 would sign no coupon for, `screening` (`unscreened`, `held` or `blocked`): do not pay it by hand. With screening on, it first screens each withdrawal with no hold, as S4 would, and holds a listed one |
+| `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address`, and, for one S4 would sign no coupon for, `screening` on one that screening keeps from its coupon: `held`, `blocked`, or `unscreened` when it has no verdict or its address does not parse. Do not pay it by hand. With screening on, it first screens each withdrawal with no hold, as S4 would, and holds a listed one |
 
 `lock_id` is `null` for a row whose payload cannot be read, `link` for one that
 records none, and `withdraw_to_address` for a withdrawal that names none, which
@@ -204,8 +203,8 @@ bridge-orchestrator block withdrawal:<action hash> --by <name> --reason <text>
 - `release` moves a `held` lock to `queued`, to be credited as normal. A held
   withdrawal gets its coupon in the next bridge cycle.
 - `block` moves a `held` lock, or one in `screening`, to `blocked`, never to be
-  credited. It blocks a held withdrawal, or one with no verdict, which is then
-  never paid.
+  credited. It blocks a held withdrawal, or one with no hold, and S4 never
+  signs its coupon. A coupon S4 already signed still pays.
 - Each refuses a transfer in any other state, and names that state. It logs
   `bridge.screening.released` or `bridge.screening.blocked` with who made it
   and why, and a withdrawal's hold keeps them too.
@@ -232,8 +231,8 @@ rather than create an empty one.
 ### `bridge-orchestrator screen`
 
 Screens one address as `run` would, with its configuration, and prints the
-verdict and the provider. It records and moves nothing. It
-exits non-zero if the provider cannot answer.
+verdict and the provider. It records nothing. It exits non-zero if the
+provider cannot answer.
 
 ```
 bridge-orchestrator screen 0x6c6EE5e31d828De241282B9606C8e98Ea48526E2
@@ -243,9 +242,9 @@ bridge-orchestrator screen 0x6c6EE5e31d828De241282B9606C8e98Ea48526E2
 
 Every subcommand loads the config below on startup, so the env file must be
 sourced even for `status` and `clear`. Only `run` reads the signer variables
-and the chain, only `run`, `screen` and `in-transit` the screening variables, and only `run`
-and `in-transit` the conductor. A network
-variable set to an empty value counts as unset.
+and the chain, only `run`, `screen` and `in-transit` the screening variables,
+and only `run` and `in-transit` the conductor. A network variable set to an
+empty value counts as unset.
 
 ### Config (all commands)
 
@@ -490,7 +489,7 @@ bridge-orchestrator clear --non-in-progress
 # Wipe every row but the locks in screening, held or blocked (use with caution)
 bridge-orchestrator clear --all
 
-# The transfers that wait: held, or with no verdict
+# The transfers that wait: held, or a lock in screening
 bridge-orchestrator screenings --open
 ```
 
