@@ -767,6 +767,7 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
         parked_withdrawal_tx(0x70),
         json!({ "withdraw_to_address": mistyped_to }),
     );
+    let listed_hit = format!("withdrawal:{}", listed.id);
     let conductor = bridging_conductor().parking(
         action_hash(BR_EA),
         &[held, blocked, clear, listed, mistyped],
@@ -796,15 +797,26 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
 
     orch.ethereum.as_mut().unwrap().screener =
         Some(Box::new(DenyList::new([Address::repeat_byte(0x6D)])));
-    let on = check(&orch, &conductor, false).await.unwrap();
-    assert_lists(
-        &on.listed,
-        &expected([
-            Some("held"),
-            Some("blocked"),
-            None,
-            Some("held"),
-            Some("unscreened"),
-        ]),
+    let logged = logged_at(tracing::Level::ERROR, async {
+        let on = check(&orch, &conductor, false).await.unwrap();
+        assert_lists(
+            &on.listed,
+            &expected([
+                Some("held"),
+                Some("blocked"),
+                None,
+                Some("held"),
+                Some("unscreened"),
+            ]),
+        );
+    })
+    .await;
+    assert_eq!(
+        logged
+            .lines()
+            .filter(|line| line.contains("bridge.screening.hit") && line.contains(&listed_hit))
+            .count(),
+        1,
+        "{logged}"
     );
 }

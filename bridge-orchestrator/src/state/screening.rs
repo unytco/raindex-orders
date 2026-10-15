@@ -73,13 +73,16 @@ impl StateStore {
 
     /// Holds `spend` for a person, unless a person decided it meanwhile, and returns its hold.
     pub fn hold_withdrawal(&self, spend: &str, listed: &[Address]) -> Result<Hold> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT OR IGNORE INTO withdrawal_holds (spend, state, listed, at)
              VALUES (?1, 'held', ?2, strftime('%s', 'now'))",
             params![spend, joined(listed)],
         )?;
-        Ok(hold_of(&conn, spend)?.unwrap_or(Hold::Held))
+        let hold = hold_of(&tx, spend)?.unwrap_or(Hold::Held);
+        tx.commit()?;
+        Ok(hold)
     }
 
     /// A person's `release` or `block` of `transfer`, or a refusal naming the state it is in.

@@ -1,6 +1,7 @@
 use super::{
     bridging_spend, connect_ham, deposit_proofs, normalize_tx_hash, own_deposit,
     BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey, WithdrawalGate,
+    WITHDRAWALS_SCREENED,
 };
 use crate::config::{Config, Ethereum};
 use crate::screening::Screener;
@@ -245,6 +246,7 @@ impl BridgeOrchestrator {
                 screening,
             });
         }
+        self.tell_waiting(WITHDRAWALS_SCREENED, &gate.into_waiting());
 
         let mut listed = Vec::new();
         let mut rows = BTreeMap::new();
