@@ -7,6 +7,7 @@ import { ACCOUNT, CHAIN, connected, injectWallet } from '$lib/testing/wallet'
 import { deserializeSignedContext } from '$lib/coupon'
 import { orderbookAbi } from '../generated'
 import { PAUSED_TEXT } from '$lib/pause'
+import { HOT_PRICE_URL, PRICE_REFRESH_MS } from '$lib/lockCap'
 import { READ_TIMEOUT_MS } from '$lib/utils'
 import { TESTNET_COUPONS } from './api/coupon-status/fixtures'
 
@@ -27,6 +28,10 @@ const READS: Record<string, unknown> = {
 const PAUSED: Answer = async () => Response.json({ paused: true })
 const OPEN: Answer = async () => Response.json({ paused: false })
 const UNREACHABLE: Answer = async () => Promise.reject(new TypeError('fetch failed'))
+const priced =
+	(usd: unknown): Answer =>
+	async () =>
+		Response.json({ holotoken: { usd } })
 const FAILURES: [string, Answer][] = [
 	['cannot be reached', UNREACHABLE],
 	[
@@ -40,6 +45,7 @@ const FAILURES: [string, Answer][] = [
 ]
 
 let reads: Record<string, unknown>
+let hotPrice: ReturnType<typeof vi.fn<Parameters<Answer>, ReturnType<Answer>>>
 const wallet = {
 	readContract: vi.fn(async ({ functionName }: { functionName: string }) => reads[functionName]),
 	writeContract: vi.fn<[{ functionName: string }], Promise<string>>(async () => '0xabc'),
@@ -50,6 +56,7 @@ let page: SvelteComponent | undefined
 
 beforeEach(() => {
 	reads = { ...READS }
+	hotPrice = vi.fn(priced(0.0004))
 	vi.spyOn(console, 'error').mockImplementation(() => {})
 	target = document.body.appendChild(document.createElement('div'))
 })
@@ -77,13 +84,18 @@ async function mount(network: Network, path: './lock/+page.svelte' | './claim/+p
 	return ethereum
 }
 
-/** Stubs every `fetch`: each call takes the next answer, and the last repeats. */
+/**
+ * Stubs `fetch`: CoinGecko's calls go to `hotPrice`, and each other call takes the next answer, the
+ * last repeating. Only the others reach the returned mock.
+ */
 function stubFetch(...answers: Answer[]) {
 	let calls = 0
 	const fetch = vi.fn((url: string, init: RequestInit) =>
 		answers[Math.min(calls++, answers.length - 1)](url, init)
 	)
-	vi.stubGlobal('fetch', fetch)
+	vi.stubGlobal('fetch', (url: string, init: RequestInit) =>
+		(url === HOT_PRICE_URL ? hotPrice : fetch)(url, init)
+	)
 	return fetch
 }
 
@@ -275,6 +287,183 @@ describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, Lock', netwo
 		expect(fetch).not.toHaveBeenCalled()
 		expect(wallet.writeContract).not.toHaveBeenCalled()
 		expect(logged()).toEqual([])
+	})
+})
+
+const OVER_CAP = 'For now, the bridge does not let you lock more than $1,000 worth of'
+const PRICE_UNAVAILABLE = 'The HOT price is not available right now. Please try again in a minute.'
+const PRICE_FAILURES: [string, Answer][] = [
+	['cannot be reached', UNREACHABLE],
+	['refuses too many requests', async () => Response.json({}, { status: 429 })],
+	['answers no JSON', async () => new Response('<html>', { status: 200 })],
+	['answers no HOT price', async () => Response.json({})],
+	['answers a price that is not a number', priced('0.0004')],
+	['answers a price of zero', priced(0)],
+	['answers a negative price', priced(-0.0004)],
+	['answers a price too large to read', priced(1e21)]
+]
+
+describe.each(['base-sepolia', 'mainnet'] as const)('on a %s build, the lock cap', network => {
+	let status: ReturnType<typeof stubFetch>
+
+	beforeEach(() => {
+		status = stubFetch(OPEN)
+	})
+
+	async function enter(amount: string) {
+		await mount(network, './lock/+page.svelte')
+		type('#amount', amount)
+		type('#agent', AGENT)
+	}
+
+	function forceLock() {
+		const lock = button('Lock')!
+		lock.disabled = false
+		lock.click()
+	}
+
+	it('turns Lock off, and says why, for an amount worth more than $1,000', async () => {
+		await enter('2500000.000001')
+
+		await until(() => expect(shown()).toContain(OVER_CAP))
+		expect(shown()).toContain('At the current HOT price, you can lock up to 2500000 HOT.')
+		expect(button('Lock')?.disabled).toBe(true)
+
+		forceLock()
+
+		expect(status).not.toHaveBeenCalled()
+		expect(wallet.writeContract).not.toHaveBeenCalled()
+	})
+
+	it.each([
+		['worth less than $1,000', 0.0004, '5'],
+		['worth exactly $1,000', 0.0004, '2500000'],
+		['worth exactly $1,000, where floating point makes it $1,000.0000000000001', 0.00016, '6250000']
+	])('locks an amount %s', async (_, usd, amount) => {
+		hotPrice.mockImplementation(priced(usd))
+		reads.balanceOf = 10n ** 30n
+		await enter(amount)
+
+		await click('Lock')
+
+		await until(() => expect(written()).toEqual(['lock']))
+		expect(shown()).not.toContain(OVER_CAP)
+	})
+
+	it.each(PRICE_FAILURES)(
+		'turns Lock off, and says the price is not available, when CoinGecko %s',
+		async (_, answer) => {
+			hotPrice.mockImplementation(answer)
+
+			await enter('5')
+
+			await until(() => expect(shown()).toContain(PRICE_UNAVAILABLE))
+			expect(button('Lock')?.disabled).toBe(true)
+			expect(shown()).not.toContain(OVER_CAP)
+			expect(logged()).toEqual([['Error reading the HOT price:', expect.any(Error)]])
+
+			forceLock()
+
+			expect(status).not.toHaveBeenCalled()
+			expect(wallet.writeContract).not.toHaveBeenCalled()
+		}
+	)
+
+	it('says the price is not available once a read gets no answer in time', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		hotPrice.mockImplementation(
+			(_, init) =>
+				new Promise((_, reject) =>
+					init.signal?.addEventListener('abort', () =>
+						reject(new DOMException('Aborted', 'AbortError'))
+					)
+				)
+		)
+		await enter('5')
+
+		await vi.advanceTimersByTimeAsync(READ_TIMEOUT_MS - 1)
+
+		expect(shown()).not.toContain(PRICE_UNAVAILABLE)
+
+		await vi.advanceTimersByTimeAsync(1)
+
+		await until(() => expect(shown()).toContain(PRICE_UNAVAILABLE))
+		expect(button('Lock')?.disabled).toBe(true)
+	})
+
+	it.each([
+		['turns unavailable', UNREACHABLE, PRICE_UNAVAILABLE],
+		['rises past the cap', priced(0.0006), OVER_CAP]
+	])('sends no lock when the price %s while its approve is mined', async (_, answer, says) => {
+		vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+		reads.allowance = 0n
+		reads.balanceOf = 10n ** 30n
+		wallet.waitForTransaction.mockImplementationOnce(async () => {
+			hotPrice.mockImplementation(answer)
+			await vi.advanceTimersByTimeAsync(PRICE_REFRESH_MS)
+			await until(() => expect(shown()).toContain(says))
+			return { status: 'success', transactionHash: '0xabc' }
+		})
+		await enter('2000000')
+
+		await click('Lock')
+
+		await until(() => expect(status).toHaveBeenCalledTimes(2))
+		await until(() => expect(target.querySelector('[role="status"]')).toBeNull())
+		expect(written()).toEqual(['approve'])
+		expect(shown()).toContain(says)
+	})
+
+	it("forgets an earlier visit's price until it reads one again", async () => {
+		await enter('5')
+		await until(() => expect(button('Lock')?.disabled).toBe(false))
+		const Page = page!.constructor as Page
+		page!.$destroy()
+		hotPrice.mockImplementation(() => new Promise(() => {}))
+
+		page = new Page({ target })
+		type('#amount', '5')
+		type('#agent', AGENT)
+
+		await until(() => expect(shown()).toContain('Ethereum (hex, used for lock)'))
+		expect(button('Lock')?.disabled).toBe(true)
+	})
+
+	it('keeps Lock off, and says nothing, until the price is read', async () => {
+		hotPrice.mockImplementation(() => new Promise(() => {}))
+
+		await enter('5')
+
+		await until(() => expect(shown()).toContain('Ethereum (hex, used for lock)'))
+		expect(button('Lock')?.disabled).toBe(true)
+		expect(alerted()).toBeUndefined()
+	})
+
+	it('reads the price on load and each minute until the page closes, not on each keystroke', async () => {
+		vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+		hotPrice.mockImplementationOnce(priced(0.0004)).mockImplementationOnce(UNREACHABLE)
+		await enter('5')
+		type('#amount', '50')
+		type('#amount', '500')
+		await until(() => expect(button('Lock')?.disabled).toBe(false))
+		expect(hotPrice).toHaveBeenCalledTimes(1)
+
+		await vi.advanceTimersByTimeAsync(PRICE_REFRESH_MS)
+
+		await until(() => expect(shown()).toContain(PRICE_UNAVAILABLE))
+		expect(button('Lock')?.disabled).toBe(true)
+
+		await vi.advanceTimersByTimeAsync(PRICE_REFRESH_MS)
+
+		await until(() => expect(button('Lock')?.disabled).toBe(false))
+		expect(shown()).not.toContain(PRICE_UNAVAILABLE)
+		expect(hotPrice).toHaveBeenCalledTimes(3)
+
+		page!.$destroy()
+		page = undefined
+		await vi.advanceTimersByTimeAsync(PRICE_REFRESH_MS)
+
+		expect(hotPrice).toHaveBeenCalledTimes(3)
 	})
 })
 

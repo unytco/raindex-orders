@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- the Lock page turns Lock off for more than $1,000 worth of HOT, and while it cannot read the HOT price.
+
 ## [0.6.0] - 2026-10-15
 
 ### Added

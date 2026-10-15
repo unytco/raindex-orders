@@ -5,11 +5,14 @@ import { CHAIN, connected, OTHER_CHAIN } from '$lib/testing/wallet'
 
 vi.mock('$app/stores', () => ({ page: readable({ url: new URL('https://hot-bridge.test/') }) }))
 
-// The lock page reads its balances through the wallet, which a server render lacks.
+// The lock page reads its balances through the wallet, which a server render lacks, and the HOT
+// price from CoinGecko, which a test must not reach.
 beforeEach(() => {
 	vi.spyOn(console, 'error').mockImplementation(() => {})
+	vi.stubGlobal('fetch', async () => Promise.reject(new TypeError('fetch failed')))
 })
 afterEach(() => {
+	vi.unstubAllGlobals()
 	vi.restoreAllMocks()
 })
 

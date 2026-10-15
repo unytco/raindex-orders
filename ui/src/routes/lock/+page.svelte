@@ -25,6 +25,7 @@
 	} from '$lib/ethereum'
 	import { isHolochainKey, holochainKeyTo32ByteHex, causeChain } from '$lib/utils'
 	import { bridgeStatus } from '$lib/pause'
+	import { LOCK_CAP_USD, hotPrice, lockCapWei } from '$lib/lockCap'
 
 	let amount = ''
 	let agentInput = ''
@@ -106,6 +107,23 @@
 	}
 	$: agentHex = getAgentHex(agentInput)
 
+	function weiOf(value: string, decimals: number): bigint | undefined {
+		try {
+			return parseUnits(value, decimals)
+		} catch {
+			return undefined
+		}
+	}
+	$: enteredWei = weiOf(amount, tokenDecimals)
+	$: capWei = typeof $hotPrice === 'bigint' ? lockCapWei($hotPrice, tokenDecimals) : undefined
+	$: overCap = capWei !== undefined && enteredWei !== undefined && enteredWei > capWei
+	$: withinCap = capWei !== undefined && !overCap
+	const capAllows = (wei: bigint) => capWei !== undefined && wei <= capWei
+	$: overCapText =
+		capWei === undefined
+			? ''
+			: `For now, the bridge does not let you lock more than $${LOCK_CAP_USD.toLocaleString('en-US')} worth of ${bridge.tokenName}. At the current HOT price, you can lock up to ${formatToken(capWei, tokenDecimals)} ${tokenSymbol}.`
+
 	function formatToken(value: bigint, decimals: number): string {
 		const full = formatUnits(value, decimals)
 		const [whole, frac] = full.split('.')
@@ -145,6 +163,8 @@
 
 	const MAX_DECIMAL_PLACES = 6
 	const NOT_A_NUMBER = 'Amount must be a plain number, such as 5 or 2.5.'
+	const PRICE_UNAVAILABLE =
+		'The HOT price is not available right now. Please try again in a minute.'
 	const LOCK_DECLINED = `You declined the lock in your wallet, so no ${bridge.tokenName} was locked.`
 	const LOCK_NOT_SENT =
 		"Your wallet did not send the transaction. If your wallet's activity shows no lock, try again."
@@ -186,13 +206,12 @@
 			error = `Amount can have at most ${MAX_DECIMAL_PLACES} decimal places.`
 			return
 		}
-		let amountWei: bigint
-		try {
-			amountWei = parseUnits(amount, tokenDecimals)
-		} catch {
+		const amountWei = enteredWei
+		if (amountWei === undefined) {
 			error = NOT_A_NUMBER
 			return
 		}
+		if (!capAllows(amountWei)) return
 
 		isLoading = true
 		let step: 'approve' | 'lock' = 'lock'
@@ -227,6 +246,7 @@
 				await fetchContractData()
 				if (!(await bridgeOpen())) return
 				if (!(await balanceCovers(amountWei))) return
+				if (!capAllows(amountWei)) return
 			}
 
 			transactionStore.awaitWalletConfirmation(true)
@@ -385,6 +405,12 @@
 					{/if}
 				</div>
 
+				{#if $hotPrice === 'unavailable'}
+					<Alert color="red">{PRICE_UNAVAILABLE}</Alert>
+				{:else if overCap}
+					<Alert color="yellow">{overCapText}</Alert>
+				{/if}
+
 				{#if paused}
 					<Paused />
 				{:else if error}
@@ -395,7 +421,7 @@
 					<Button
 						class="w-fit disabled:!bg-primary-300 disabled:!opacity-100"
 						on:click={handleLock}
-						disabled={isLoading || !amount || !hasValidAgent}
+						disabled={isLoading || !amount || !hasValidAgent || !withinCap}
 					>
 						{#if isLoading}
 							<Spinner size="4" class="mr-2" />
