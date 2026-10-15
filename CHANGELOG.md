@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - bridge-orchestrator credits deposits through a credit limit adjustment that requires a `call_method`.
+- bridge-orchestrator runs against a Holochain 0.7.1 conductor and a unyt DNA built on rave_engine 0.14.0.
 
 ## [0.6.0] - 2026-10-15
 

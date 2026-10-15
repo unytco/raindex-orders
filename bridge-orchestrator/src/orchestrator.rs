@@ -4232,6 +4232,7 @@ mod tests {
                     pub_key: agent_key(bridging_agent),
                     address_book_data: Value::Null,
                 },
+                reserver: None,
                 ops_accounts: vec![],
                 service_infrastructure_account: None,
                 unit_issuers: Default::default(),
