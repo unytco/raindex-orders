@@ -5704,12 +5704,15 @@ mod tests {
     }
 
     impl Lines {
+        /// Every level is enabled and filtered at the writer: a capture with a lower max level
+        /// can leave a callsite cached as disabled for the captures of tests running beside it.
         fn at(&self, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
             let writer = self.clone();
             tracing_subscriber::fmt()
-                .with_max_level(level)
+                .with_max_level(tracing::Level::TRACE)
                 .with_ansi(false)
-                .with_writer(move || writer.clone())
+                .with_writer((move || writer.clone()).with_max_level(level))
                 .finish()
         }
 
