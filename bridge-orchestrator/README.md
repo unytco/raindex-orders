@@ -249,7 +249,7 @@ bridge-orchestrator screen 0x6c6EE5e31d828De241282B9606C8e98Ea48526E2
 
 Every subcommand loads the config below on startup, so the env file must be
 sourced even for `status` and `clear`. Only `run` reads the signer variables
-and the chain, only `run` and `screen` the screening variables, and only `run`
+and the chain, only `run`, `screen` and `in-transit` the screening variables, and only `run`
 and `in-transit` the conductor. A network
 variable set to an empty value counts as unset.
 
@@ -291,7 +291,7 @@ A database an earlier release left `detected` rows in loses them on its first
 start, and the lock read goes back to read their blocks again. An earlier
 release refuses a `DB_PATH` this one has opened.
 
-### Screening (`run` and `screen`)
+### Screening (`run`, `screen` and `in-transit`)
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
