@@ -111,6 +111,8 @@ fn refused(e: &anyhow::Error) -> bool {
 /// holds for good.
 const CHAIN_FORK_REFUSAL: &str = "carries a ChainFork warrant";
 
+const SPEND_GONE: &str = "spend_gone";
+
 /// Wait `duration_ms`, returning early if shutdown is signalled, so the loop
 /// never sits out a full cooldown or poll interval after a Ctrl-C. Only wakes
 /// the wait — the loop's own `shutdown.borrow()` checks are what exit it.
@@ -1458,12 +1460,19 @@ impl BridgeOrchestrator {
         let br_by_proof = self.links_by_proof(br_live);
         let mut counts = ReconcileCounts::default();
 
+        let gone_before = self
+            .deferred
+            .lock()
+            .expect("deferred mutex poisoned")
+            .remove(SPEND_GONE)
+            .unwrap_or_default();
+        let mut gone = HashSet::new();
         for row in self
             .db
             .list_pending_by_step(WITHDRAWAL_FLOW, WorkStep::Sent, 5000)?
         {
             if let Some(rave) = self
-                .withdrawal_taken(conductor, live, &row, &bridging)
+                .withdrawal_taken(conductor, live, &row, &bridging, &gone_before, &mut gone)
                 .await?
             {
                 if self.db.advance_to_paid(row.id, &rave.to_string())? {
@@ -1471,6 +1480,10 @@ impl BridgeOrchestrator {
                 }
             }
         }
+        self.deferred
+            .lock()
+            .expect("deferred mutex poisoned")
+            .insert(SPEND_GONE, gone);
 
         for (rave, rows) in self.paid_by_rave()? {
             let receipt = match live.receipt(conductor, &rave).await {
@@ -1870,14 +1883,17 @@ impl BridgeOrchestrator {
 
     /// The RAVE that took a withdrawal row's spend. `None` while the spend
     /// stays parked or cannot be checked, and when the row's payload does not
-    /// read or no RAVE of the bridging agent's records the spend consumed,
-    /// which sends the row to a person.
+    /// read or no RAVE of the bridging agent's records the spend consumed. The
+    /// row goes to a person on an unreadable payload, or when its spend was
+    /// gone untaken in `gone_before` too, as one listing can miss a parked spend.
     async fn withdrawal_taken(
         &self,
         conductor: &impl ConductorReads,
         live: &mut LiveLinks,
         row: &WorkItem,
         in_force: &ActionHash,
+        gone_before: &HashSet<String>,
+        gone: &mut HashSet<String>,
     ) -> Result<Option<ActionHash>> {
         let withdrawal = match WithdrawalPayload::deserialize(&row.payload_json) {
             Ok(withdrawal) => withdrawal,
@@ -1910,18 +1926,24 @@ impl BridgeOrchestrator {
                 return Self::unresolved(row, &format!("its spend {spend}"), e).map(|()| None)
             }
         };
+        let untaken = format!("left agreement {agreement}, and no RAVE in the bridging agent's chain history records it consumed");
         // A spend is written on its withdrawer's chain, so its sequence bounds
         // nothing on the bridging agent's.
         match live.consumer(conductor, spend, 0).await {
             Ok(Some(rave)) => Ok(Some(rave)),
-            Ok(None) => self
-                .for_a_person(
-                    row,
-                    "bridge.reconcile.link_not_consumed",
-                    spend,
-                    &format!("left agreement {agreement}, and no RAVE in the bridging agent's chain history records it consumed"),
-                )
+            Ok(None) if gone_before.contains(spend) => self
+                .for_a_person(row, "bridge.reconcile.link_not_consumed", spend, &untaken)
                 .map(|()| None),
+            Ok(None) => {
+                gone.insert(spend.to_string());
+                warn!(
+                    event = "bridge.reconcile.spend_gone",
+                    spend,
+                    "[bridge/reconcile] {} waits a cycle, as its spend {spend} {untaken}",
+                    row.item_id
+                );
+                Ok(None)
+            }
             Err(e) => Self::unresolved(row, &format!("its spend {spend}"), e).map(|()| None),
         }
     }
@@ -7490,6 +7512,22 @@ mod tests {
         let conductor =
             bridging_conductor().parking(action_hash(BR_EA), std::slice::from_ref(&parked));
 
+        let parked_again =
+            || bridging_conductor().parking(action_hash(BR_EA), &[left.clone(), parked.clone()]);
+        let waits = |why: &str| {
+            let row = row_of(&left);
+            assert_eq!(
+                (row.state, row.step),
+                (WorkState::Queued, WorkStep::Sent),
+                "{why}"
+            );
+        };
+
+        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+        waits("one read that misses a spend fails no row");
+        reconcile_in_force(&orch, &parked_again(), CL_EA, BR_EA).await;
+        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+        waits("a read that finds the spend parked starts the wait again");
         reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
 
         let failed = |spend: &Transaction| {
@@ -7506,8 +7544,7 @@ mod tests {
             (WorkState::Queued, WorkStep::Sent)
         );
 
-        let still_parked =
-            bridging_conductor().parking(action_hash(BR_EA), &[left.clone(), parked.clone()]);
+        let still_parked = parked_again();
         orch.run_bridge_cycle(&still_parked, &running())
             .await
             .unwrap();

@@ -119,9 +119,9 @@ bridge-orchestrator clear --all
 
 | Flag | Description |
 |------|-------------|
-| `--non-in-progress` | Delete only terminal rows (`succeeded`, `failed`) |
-| `--all` | Delete every row in `work_items` but the locks in `screening`, `held` or `blocked`. A withdrawal row it deletes after S4 paid it, and before it is `succeeded`, never has its HOT taken off the credit limit |
-| `--older-than-s N` | Only with `--non-in-progress`: restrict deletion to terminal rows whose `updated_at` is older than N seconds. Applied to both `succeeded` and `failed`. Use the in-process retention task (below) for per-state windows. |
+| `--non-in-progress` | Delete only terminal rows (`succeeded`, `failed`), except a failed withdrawal row |
+| `--all` | Delete every row in `work_items` but the locks in `screening`, `held` or `blocked`, and failed withdrawal rows. A withdrawal row it deletes after S4 paid it, and before it is `succeeded`, never has its HOT taken off the credit limit |
+| `--older-than-s N` | Only with `--non-in-progress`: restrict deletion to terminal rows whose `updated_at` is older than N seconds. Applied to both `succeeded` and `failed`, but never to a failed withdrawal row. Use the in-process retention task (below) for per-state windows. |
 
 Outputs a JSON object. Plain `--non-in-progress` returns
 `{"mode":"non_in_progress","deleted_count":N}`; with `--older-than-s` the
@@ -348,7 +348,8 @@ is required.
 
 Defaults are deliberately compact: succeeded rows are kept for 7 days
 (routine history window), failed rows for 30 days (longer because
-failures are operationally forensic). All values are tunable via
+failures are operationally forensic). A failed withdrawal row is never pruned:
+while it exists, S4 gives its spend no coupon. All values are tunable via
 environment variables; set `BRIDGE_RETENTION_DISABLED=true` to skip
 spawning the task entirely.
 
@@ -494,7 +495,7 @@ bridge-orchestrator status --item-id "lock:42"
 # Clean up completed/failed rows
 bridge-orchestrator clear --non-in-progress
 
-# Wipe every row but the locks in screening, held or blocked (use with caution)
+# Wipe every row but the locks in screening, held or blocked, and failed withdrawals (use with caution)
 bridge-orchestrator clear --all
 
 # The transfers that wait: held, or a lock in screening
@@ -529,10 +530,12 @@ Add `AND id IN (...)` to target specific rows. `attempts` must be under
 `max_attempts` or the next cycle fails it again. Before you re-queue a row,
 check the link it records (`cl_link_hash`, or `br_spend_hash` once it has one):
 while a failed row records a live link, that link is never paid, and re-queuing
-the row can let the next RAVE pay it. Leave a row whose `last_error` ends
+the row can let the next RAVE pay it. Leave a lock row whose `last_error` ends
 `resolve by hand` failed: check by hand whether its depositor was credited, and
 credit it by hand only if not and its link is not live. Also leave failed a row
-whose `last_error` starts `in transit at the old network's close`.
+whose `last_error` starts `in transit at the old network's close`. Never pay any
+other failed withdrawal by hand while its spend is live: re-queue it, and S4
+pays it.
 Rows left `claimed` or `in_flight` need no action: startup re-queues them.
 
 ### systemd service management
@@ -620,10 +623,12 @@ chain shows. `status` does not print the step or the hashes:
 | `cl_link_created` | has its proof parked, `cl_link_hash` | S2's RAVE lowers the credit limit by it, and the row is `succeeded` |
 
 A withdrawal S4 leaves parked stays `sent` until a RAVE takes its spend. No
-coupon pays a withdrawal whose row is failed or past `sent`, while retention
-keeps the row (`bridge.withdrawal_withheld`). A row whose spend left the
-bridging agreement with no RAVE of the bridging agent's recording it consumed,
-or whose RAVE is not in the bridging agent's chain, is failed for a person.
+coupon pays a withdrawal whose row is failed or past `sent`
+(`bridge.withdrawal_withheld`). A row whose spend is gone from the bridging
+agreement with no RAVE of the bridging agent's recording it consumed waits one
+cycle (`bridge.reconcile.spend_gone`), as one listing can miss a parked spend,
+and is failed for a person if the next cycle finds the same. A row whose RAVE is
+not in the bridging agent's chain is failed for a person at once.
 
 S5 receipts each RAVE on its own. The cycle goes on past a receipt that the DNA
 refuses, in its validation or its zome, and any other failure of the call ends

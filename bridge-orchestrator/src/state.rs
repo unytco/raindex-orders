@@ -702,34 +702,33 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Keeps a failed withdrawal row, as [`Self::prune_terminal_older_than`]
+    /// does.
     pub fn clear_non_in_progress(&self) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let deleted = conn.execute(
             "DELETE FROM work_items
-             WHERE state IN ('succeeded', 'failed')",
-            [],
+             WHERE state = 'succeeded' OR (state = 'failed' AND flow != ?1)",
+            params![WITHDRAWAL_FLOW],
         )?;
         Ok(deleted)
     }
 
+    /// Keeps a failed withdrawal row, as [`Self::prune_terminal_older_than`]
+    /// does.
     pub fn clear_all(&self) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let deleted = conn.execute(
-            "DELETE FROM work_items WHERE state NOT IN ('screening', 'held', 'blocked')",
-            [],
+            "DELETE FROM work_items
+             WHERE state NOT IN ('screening', 'held', 'blocked')
+               AND NOT (state = 'failed' AND flow = ?1)",
+            params![WITHDRAWAL_FLOW],
         )?;
         Ok(deleted)
     }
 
-    /// Delete terminal (`succeeded` / `failed`) `work_items` rows
-    /// whose `updated_at` is older than the supplied per-state age
-    /// windows. Called both by the background retention task and by
-    /// the CLI `Clear --older-than-s` path, so the SQL + mutex-hold
-    /// behavior lives exactly once.
-    ///
-    /// Uses two independent DELETEs — one per state — so a caller
-    /// can set very different windows for succeeded vs failed rows
-    /// without the SQL having to understand the policy.
+    /// Never deletes a failed withdrawal row: while it exists, S4 gives its
+    /// spend no coupon.
     pub fn prune_terminal_older_than(
         &self,
         succeeded_max_age_s: u64,
@@ -744,9 +743,9 @@ impl StateStore {
         )?;
         let failed_deleted = conn.execute(
             "DELETE FROM work_items
-             WHERE state = 'failed'
+             WHERE state = 'failed' AND flow != ?2
                AND updated_at < CAST(strftime('%s','now') AS INTEGER) - ?1",
-            params![failed_max_age_s as i64],
+            params![failed_max_age_s as i64, WITHDRAWAL_FLOW],
         )?;
         Ok(PruneStats {
             succeeded_deleted,
@@ -1377,6 +1376,20 @@ mod tests {
         .unwrap();
     }
 
+    fn failed_withdrawal(store: &StateStore, spend: &str) -> String {
+        store
+            .send_withdrawal(&WithdrawalPayload {
+                spend: spend.to_string(),
+                agreement: "uhCkkAgreement".to_string(),
+                amount: "5".to_string(),
+                withdrawer: "uhCAkWithdrawer".to_string(),
+            })
+            .unwrap();
+        let id = store.withdrawal(spend).unwrap().unwrap().id;
+        store.mark_failed_permanent(id, "resolve by hand").unwrap();
+        spend.to_string()
+    }
+
     fn insert_work_item_with_attempts(
         path: &str,
         item_id: &str,
@@ -1812,9 +1825,11 @@ mod tests {
         insert_work_item_with_state(&path, "lock:inflight", WorkState::InFlight);
         insert_work_item_with_state(&path, "lock:succeeded", WorkState::Succeeded);
         insert_work_item_with_state(&path, "lock:failed", WorkState::Failed);
+        let withdrawal = failed_withdrawal(&store, "uhCkkFailed");
 
         let deleted = store.clear_non_in_progress().unwrap();
         assert_eq!(deleted, 2);
+        assert!(store.withdrawal(&withdrawal).unwrap().is_some());
 
         let rows = store
             .status(StateFilter {
@@ -1834,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_all_keeps_only_the_rows_in_screening_held_or_blocked() {
+    fn clear_all_keeps_only_the_rows_in_screening_held_or_blocked_and_failed_withdrawals() {
         let path = test_db_path("clear-all");
         let store = StateStore::open(&path).unwrap();
 
@@ -1844,9 +1859,11 @@ mod tests {
         insert_work_item_with_state(&path, "lock:screening", WorkState::Screening);
         insert_work_item_with_state(&path, "lock:held", WorkState::Held);
         insert_work_item_with_state(&path, "lock:blocked", WorkState::Blocked);
+        let withdrawal = failed_withdrawal(&store, "uhCkkFailed");
 
         let deleted = store.clear_all().unwrap();
         assert_eq!(deleted, 3);
+        assert!(store.withdrawal(&withdrawal).unwrap().is_some());
 
         let rows = store
             .status(StateFilter {
@@ -1863,11 +1880,6 @@ mod tests {
 
     #[test]
     fn prune_terminal_older_than_respects_per_state_windows_and_leaves_non_terminals_alone() {
-        // Covers the three invariants the retention task relies on:
-        //   1. `queued`/`in_flight` rows are never touched, regardless of age.
-        //   2. Young terminal rows survive (within the configured window).
-        //   3. Stale terminal rows get deleted, and the per-state counts
-        //      returned in `PruneStats` match the actual deletes.
         let path = test_db_path("prune-terminal");
         let store = StateStore::open(&path).unwrap();
 
@@ -1877,21 +1889,17 @@ mod tests {
         insert_work_item_with_state(&path, "prune:succ-old", WorkState::Succeeded);
         insert_work_item_with_state(&path, "prune:fail-young", WorkState::Failed);
         insert_work_item_with_state(&path, "prune:fail-old", WorkState::Failed);
+        let withdrawal = failed_withdrawal(&store, "uhCkkFailedOld");
 
-        // Backdate the "old" rows by rewriting `updated_at`. 1M seconds
-        // (~11.6 days) puts them well beyond both 7d (succeeded) and
-        // the 30d failed window used in the test call below.
+        // About 11.6 days: past the 7 day succeeded window, inside the 30 day
+        // failed one.
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE work_items SET updated_at = CAST(strftime('%s','now') AS INTEGER) - 1000000
-             WHERE item_id IN ('prune:succ-old', 'prune:fail-old')",
+             WHERE item_id IN ('prune:succ-old', 'prune:fail-old') OR flow = 'withdrawal'",
             [],
         )
         .unwrap();
-        // Intentionally backdate `prune:fail-old` *less* than the
-        // failed window (30d = 2_592_000s). 1_000_000s is well under
-        // that, so the failed-old row should survive the first call
-        // and only get deleted when we tighten the failed window.
         drop(conn);
 
         let first = store
@@ -1901,13 +1909,12 @@ mod tests {
         assert_eq!(first.failed_deleted, 0);
         assert_eq!(first.total(), 1);
 
-        // Tighten the failed window to half a day; now the backdated
-        // failed row (~11.6d old) is eligible and should drop.
         let second = store
             .prune_terminal_older_than(7 * 24 * 60 * 60, 43_200)
             .unwrap();
         assert_eq!(second.succeeded_deleted, 0);
         assert_eq!(second.failed_deleted, 1);
+        assert!(store.withdrawal(&withdrawal).unwrap().is_some());
 
         let rows = store
             .status(StateFilter {
