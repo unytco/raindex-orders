@@ -4780,11 +4780,22 @@ mod tests {
         chain: RefCell<Vec<Chained>>,
         parked_writes: RefCell<Vec<CreateParkedLinkInput>>,
         loses_reply_to: Option<u8>,
+        /// The write whose RAVE lands only as the next `execute_rave` starts,
+        /// its reply lost.
+        lands_late: Option<u8>,
+        landing: RefCell<Option<Landing>>,
         executor_inputs: RefCell<HashMap<ActionHash, Value>>,
         chain_reads: RefCell<Vec<ChainRead>>,
         chain_stalls: bool,
         chain_fails_below: Option<u32>,
         seqs: HashMap<ActionHash, u32>,
+    }
+
+    struct Landing {
+        agreement: ActionHash,
+        deleted: HashSet<ActionHash>,
+        rave: ActionHash,
+        consumed: Vec<ActionHashB64>,
     }
 
     /// The bridging agent's RAVEs and receipts, oldest first.
@@ -4938,6 +4949,15 @@ mod tests {
                 }
                 _ => Ok(answer),
             }
+        }
+
+        fn land(&self, run: Landing) {
+            if let Some(links) = self.parked.borrow_mut().get_mut(&run.agreement) {
+                links.retain(|link| !run.deleted.contains(&link.id.clone().into()));
+            }
+            self.chain
+                .borrow_mut()
+                .push(Chained::Rave(run.rave, run.consumed));
         }
 
         fn receipts(&self) -> Vec<(ActionHash, ActionHash)> {
@@ -5152,13 +5172,27 @@ mod tests {
             self.reply(&written, link)
         }
 
+        /// Drops a handed link no longer parked, as the DNA's `run_rave` does.
         async fn execute_rave(&self, input: &RAVEExecuteInputs) -> Result<RaveRun> {
+            if let Some(late) = self.landing.borrow_mut().take() {
+                self.land(late);
+            }
             let hash = self.write("execute_rave");
             self.executor_inputs
                 .borrow_mut()
                 .insert(input.ea_id.clone(), input.executor_inputs.clone());
             tokio::time::sleep(Duration::from_millis(self.rave_delay_ms)).await;
-            let given = || input.links.iter().map(|t| ActionHash::from(t.id.clone()));
+            let parked: HashSet<ActionHash> = self.parked.borrow()[&input.ea_id]
+                .iter()
+                .map(|link| link.id.clone().into())
+                .collect();
+            let given = || {
+                input
+                    .links
+                    .iter()
+                    .map(|t| ActionHash::from(t.id.clone()))
+                    .filter(|link| parked.contains(link))
+            };
             let consumed: HashSet<ActionHash> = given()
                 .filter(|link| {
                     !self.rave_leaves.contains(link) && !self.rave_redacts.contains(link)
@@ -5167,13 +5201,18 @@ mod tests {
             let deleted: HashSet<ActionHash> = given()
                 .filter(|link| consumed.contains(link) || self.rave_redacts.contains(link))
                 .collect();
-            if let Some(links) = self.parked.borrow_mut().get_mut(&input.ea_id) {
-                links.retain(|link| !deleted.contains(&link.id.clone().into()));
-            }
             let consumed: Vec<ActionHashB64> = consumed.into_iter().map(Into::into).collect();
-            self.chain
-                .borrow_mut()
-                .push(Chained::Rave(hash.clone(), consumed.clone()));
+            let run = Landing {
+                agreement: input.ea_id.clone(),
+                deleted,
+                rave: hash.clone(),
+                consumed: consumed.clone(),
+            };
+            if self.lands_late == Some(hash.get_raw_32()[0] - 0xC0) {
+                *self.landing.borrow_mut() = Some(run);
+                anyhow::bail!("the conductor's reply to RAVE {hash} was lost before it landed");
+            }
+            self.land(run);
             self.reply(&hash.clone(), RaveRun { hash, consumed })
         }
 
@@ -7199,6 +7238,40 @@ mod tests {
             );
             assert_eq!(withdraw_proofs(&conductor).len(), 1, "write {write}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_an_earlier_s4_took_after_its_reply_was_lost_is_paid_once_on_that_rave() {
+        let orch = test_orchestrator("withdrawal-lands-late");
+        let withdrawal = hot_withdrawal(0x6C);
+        let conductor = FakeConductor {
+            lands_late: Some(0),
+            ..bridging_conductor().parking(action_hash(BR_EA), std::slice::from_ref(&withdrawal))
+        };
+
+        cycles(&orch, &conductor, 4).await;
+
+        let late = action_hash(0xC0);
+        assert!(
+            conductor.chain.borrow().iter().any(
+                |chained| matches!(chained, Chained::Rave(rave, consumed) if *rave == action_hash(0xC1) && consumed.is_empty())
+            ),
+            "the second S4 was handed the spend the first took as it started"
+        );
+        assert_eq!(
+            conductor
+                .receipts()
+                .into_iter()
+                .map(|(rave, _)| rave)
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&late)
+        );
+        assert_eq!(withdraw_proofs(&conductor).len(), 1);
+        let row = &withdrawal_rows(&orch)[0];
+        assert_eq!(
+            (row.state.clone(), row.br_rave_hash.clone()),
+            (WorkState::Succeeded, Some(late.to_string()))
+        );
     }
 
     #[tokio::test]
