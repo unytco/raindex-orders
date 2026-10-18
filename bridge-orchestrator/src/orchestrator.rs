@@ -150,12 +150,19 @@ async fn select_bridging_links(
             continue;
         };
 
+        let hot_unit = hot_unit_index.to_string();
         let amount = tx
             .amount
-            .get(&hot_unit_index.to_string())
+            .get(&hot_unit)
             .map(|v| v.to_string())
             .unwrap_or_default();
-        let terms = match Payout::new(withdraw_to, &amount) {
+        // The template pays the executor every unit in the spend, so a unit other
+        // than HOT can fail the one RAVE the whole batch shares.
+        let terms = match tx.amount.iter().find(|(unit, _)| **unit != hot_unit) {
+            Some((unit, _)) => Err(anyhow::anyhow!("the amount holds unit {unit}")),
+            None => Payout::new(withdraw_to, &amount),
+        };
+        let terms = match terms {
             Ok(terms) => terms,
             Err(e) => {
                 selection.unpayable.push((tx.clone(), e));
@@ -8651,7 +8658,7 @@ mod tests {
     async fn a_withdrawal_is_paid_from_the_hot_unit_index() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
         let mut withdrawal = parked_withdrawal_tx(0x61);
-        withdrawal.amount = UnitMap::from(vec![(1, "7"), (3, "5")]);
+        withdrawal.amount = UnitMap::from(vec![(3, "5")]);
 
         let selection = select_bridging_links(
             Some(&signer),
@@ -8695,6 +8702,9 @@ mod tests {
             paid_to(0x63, to, &[(1, "0")]),
             paid_to(0x64, to, &[(1, "-5")]),
             paid_to(0x65, "0xdead", &[(1, "5")]),
+            paid_to(0x66, to, &[(1, "5"), (0, "-3")]),
+            paid_to(0x67, to, &[(1, "5"), (2, "5")]),
+            paid_to(0x68, to, &[(1, "5"), (0, "0")]),
         ];
         let links = [&unpayable[..], &[payable.clone(), deposit.clone()]].concat();
 
@@ -8712,8 +8722,25 @@ mod tests {
         assert_eq!(ids(&selection.withdrawals), ids(&[payable]));
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
         assert_eq!(selection.coupons.len(), 1);
-        assert_eq!(selection.withdrawals_found, 5);
+        assert_eq!(selection.withdrawals_found, 8);
         assert_eq!(unpayable_ids(&selection), ids(&unpayable));
+        let reasons: Vec<String> = selection
+            .unpayable
+            .iter()
+            .map(|(_, e)| e.to_string())
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "the amount holds unit 2",
+                "the amount is zero",
+                "the amount \"-5\" is not a HOT amount",
+                "the recipient \"0xdead\" is not an address",
+                "the amount holds unit 0",
+                "the amount holds unit 2",
+                "the amount holds unit 0",
+            ]
+        );
     }
 
     #[tokio::test]

@@ -147,12 +147,20 @@ async fn s4_screens_each_withdrawal_it_would_pay_against_the_list_in_force() {
     let signer = CouponSigner::with_key(PrivateKeySigner::random());
     let held = parked_withdrawal_tx(0xBA);
     let clear = parked_withdrawal_tx(0x11);
+    let mut unpayable = parked_withdrawal_tx(0xBB);
+    unpayable.amount = UnitMap::from(vec![(1, "5"), (2, "5")]);
+    if let TransactionDetails::ParkedSpend {
+        attached_payload, ..
+    } = &mut unpayable.details
+    {
+        attached_payload["withdraw_to_address"] = json!(format!("{LISTED:#x}"));
+    }
     let select = async |list: &DenyList| {
         select_bridging_links(
             Some(&signer),
             &WithdrawalGate::new(&orch.db, Some(list)),
             &bridging_agent(),
-            &[held.clone(), clear.clone()],
+            &[held.clone(), clear.clone(), unpayable.clone()],
             usize::MAX,
             1,
         )
@@ -172,6 +180,12 @@ async fn s4_screens_each_withdrawal_it_would_pay_against_the_list_in_force() {
         hold_of(&orch, &clear),
         None,
         "a clear verdict is not stored"
+    );
+    assert_eq!(unpayable_ids(&selection), ids(&[unpayable.clone()]));
+    assert_eq!(
+        hold_of(&orch, &unpayable),
+        None,
+        "a withdrawal no coupon can pay is never screened"
     );
 
     let after_the_list_changed = select(&DenyList::new([LISTED, CLEAN])).await;
