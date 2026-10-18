@@ -11,10 +11,11 @@ mod screening;
 
 pub use screening::Hold;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 pub const LOCK_CHECKPOINT_KEY: &str = "lock.last_processed_block";
+pub const WITHDRAWAL_FLOW: &str = "withdrawal";
 /// In the order [`row_to_work_item`] reads them.
-const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id";
+const WORK_ITEM_COLUMNS: &str = "id, flow, task_type, item_id, idempotency_key, payload_json, state, attempts, max_attempts, next_retry_at, last_attempt_at, error_class, last_error, created_at, updated_at, step, cl_link_hash, cl_rave_hash, br_spend_hash, br_rave_hash, cl_ea_id, br_ea_id, receipt_hash";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -66,9 +67,11 @@ impl std::str::FromStr for WorkState {
     }
 }
 
-/// Pipeline progress for a lock row. Independent of `WorkState` (which tracks
-/// orchestrator ownership); `step` tracks which zome calls in the four-stage
-/// bridge pipeline have been proven to have landed on-chain.
+/// Pipeline progress for a lock or withdrawal row. Independent of `WorkState`
+/// (which tracks orchestrator ownership); `step` tracks which zome calls in the
+/// bridge pipeline have been proven to have landed on-chain. A lock walks from
+/// `New` to `BrRaveExecuted`, a withdrawal from `Sent` through `Collected` to
+/// `ClRaveExecuted`.
 ///
 /// Advancement is always driven by chain truth — a row is only moved to a
 /// later step once we either observed the returned `ActionHash` from the
@@ -82,7 +85,8 @@ pub enum WorkStep {
     /// S1 landed; `cl_link_hash` references the live parked link on the
     /// credit-limit EA.
     ClLinkCreated,
-    /// S2 landed; the CL `execute_rave` has consumed the parked link.
+    /// S2 landed; the CL `execute_rave` has consumed the parked link. Terminal
+    /// for a withdrawal row, which is simultaneously marked `state='succeeded'`.
     ClRaveExecuted,
     /// S3 landed; `br_spend_hash` references the live parked spend on the
     /// bridging EA.
@@ -91,6 +95,15 @@ pub enum WorkStep {
     /// Terminal for the pipeline — the row is simultaneously marked
     /// `state='succeeded'`.
     BrRaveExecuted,
+    /// A withdrawal's spend, `br_spend_hash`, went to S4's `execute_rave`,
+    /// which has not been seen to take it. One S4 leaves parked stays here.
+    Sent,
+    /// S4 took the withdrawal; `br_rave_hash` is its RAVE, which the bridging
+    /// agent has yet to receipt.
+    Paid,
+    /// S5 landed; `receipt_hash` is the bridging agent's receipt of that RAVE.
+    /// Eligible for S1.
+    Collected,
 }
 
 impl std::fmt::Display for WorkStep {
@@ -101,6 +114,9 @@ impl std::fmt::Display for WorkStep {
             WorkStep::ClRaveExecuted => "cl_rave_executed",
             WorkStep::BrSpendCreated => "br_spend_created",
             WorkStep::BrRaveExecuted => "br_rave_executed",
+            WorkStep::Sent => "sent",
+            WorkStep::Paid => "paid",
+            WorkStep::Collected => "collected",
         };
         write!(f, "{}", v)
     }
@@ -116,6 +132,9 @@ impl std::str::FromStr for WorkStep {
             "cl_rave_executed" => Ok(Self::ClRaveExecuted),
             "br_spend_created" => Ok(Self::BrSpendCreated),
             "br_rave_executed" => Ok(Self::BrRaveExecuted),
+            "sent" => Ok(Self::Sent),
+            "paid" => Ok(Self::Paid),
+            "collected" => Ok(Self::Collected),
             _ => Err(format!("Unknown step: {}", s)),
         }
     }
@@ -148,6 +167,7 @@ pub struct WorkItem {
     pub cl_ea_id: Option<String>,
     /// The agreement `br_spend_hash` was parked on, `None` as for `cl_ea_id`.
     pub br_ea_id: Option<String>,
+    pub receipt_hash: Option<String>,
 }
 
 impl WorkItem {
@@ -854,7 +874,8 @@ impl StateStore {
         Ok(())
     }
 
-    /// Advance a row to `step='cl_rave_executed'`. `cl_rave_hash` is optional
+    /// Advance a row to `step='cl_rave_executed'`, and a withdrawal row to
+    /// `state='succeeded'` with it. `cl_rave_hash` is optional
     /// — we record it when we observed the RAVE's returned ActionHash
     /// directly, and leave it NULL when the reconciler inferred the advance
     /// from the parked link no longer being live.
@@ -864,14 +885,14 @@ impl StateStore {
             "UPDATE work_items
              SET step='cl_rave_executed',
                  cl_rave_hash=?2,
-                 state='queued',
+                 state=CASE flow WHEN ?3 THEN 'succeeded' ELSE 'queued' END,
                  attempts=0,
                  error_class=NULL,
                  last_error=NULL,
                  next_retry_at=NULL,
                  updated_at=strftime('%s', 'now')
              WHERE id=?1",
-            params![id, cl_rave_hash],
+            params![id, cl_rave_hash, WITHDRAWAL_FLOW],
         )?;
         Ok(())
     }
@@ -932,6 +953,67 @@ impl StateStore {
                  updated_at=strftime('%s', 'now')
              WHERE id=?1",
             params![id, br_rave_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Records `spend` as sent to S4, unless a row records it already.
+    pub fn send_withdrawal(&self, spend: &str, agreement: &str, payload: &Value) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let item_id = format!("{WITHDRAWAL_FLOW}:{spend}");
+        conn.execute(
+            "INSERT OR IGNORE INTO work_items
+                (flow, task_type, item_id, idempotency_key, payload_json, state, step, br_spend_hash, br_ea_id)
+             VALUES (?1, 'reduce_credit_limit', ?2, ?2, ?3, 'queued', 'sent', ?4, ?5)",
+            params![
+                WITHDRAWAL_FLOW,
+                item_id,
+                serde_json::to_string(payload)?,
+                spend,
+                agreement
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn advance_to_paid(&self, id: i64, rave: &str) -> Result<()> {
+        self.advance_withdrawal(id, WorkStep::Sent, WorkStep::Paid, "br_rave_hash", rave)
+    }
+
+    pub fn advance_to_collected(&self, id: i64, receipt: &str) -> Result<()> {
+        self.advance_withdrawal(
+            id,
+            WorkStep::Paid,
+            WorkStep::Collected,
+            "receipt_hash",
+            receipt,
+        )
+    }
+
+    /// A no-op on a row no longer at `from`.
+    fn advance_withdrawal(
+        &self,
+        id: i64,
+        from: WorkStep,
+        to: WorkStep,
+        column: &str,
+        hash: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            &format!(
+                "UPDATE work_items
+                 SET step=?3,
+                     {column}=?4,
+                     state='queued',
+                     attempts=0,
+                     error_class=NULL,
+                     last_error=NULL,
+                     next_retry_at=NULL,
+                     updated_at=strftime('%s', 'now')
+                 WHERE id=?1 AND step=?2"
+            ),
+            params![id, from.to_string(), to.to_string(), hash],
         )?;
         Ok(())
     }
@@ -1104,6 +1186,7 @@ impl StateStore {
             ("br_rave_hash", "TEXT"),
             ("cl_ea_id", "TEXT"),
             ("br_ea_id", "TEXT"),
+            ("receipt_hash", "TEXT"),
         ] {
             if !cols.iter().any(|c| c == column) {
                 conn.execute(
@@ -1143,6 +1226,7 @@ fn row_to_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItem> {
         br_rave_hash: row.get(19)?,
         cl_ea_id: row.get(20)?,
         br_ea_id: row.get(21)?,
+        receipt_hash: row.get(22)?,
     })
 }
 
@@ -2162,6 +2246,80 @@ mod tests {
         assert!(row.cl_rave_hash.is_none());
         assert!(row.br_spend_hash.is_none());
         assert!(row.br_rave_hash.is_none());
+        assert!(row.receipt_hash.is_none());
+    }
+
+    #[test]
+    fn a_withdrawal_row_is_recorded_once_and_moves_only_from_the_step_it_waits_at() {
+        let path = test_db_path("withdrawal-row");
+        let store = StateStore::open(&path).unwrap();
+        let payload =
+            serde_json::json!({ "spend": "uhCkkSPEND", "amount": "5", "withdrawer": "w" });
+        for _ in 0..2 {
+            store
+                .send_withdrawal("uhCkkSPEND", BR_EA, &payload)
+                .unwrap();
+        }
+        let rows = store.list_flow(WITHDRAWAL_FLOW).unwrap();
+        let [row] = &rows[..] else {
+            panic!("one row for one spend, however often it is sent: {rows:?}");
+        };
+        assert_eq!(
+            (
+                row.item_id.as_str(),
+                &row.state,
+                &row.step,
+                row.br_spend_hash.as_deref(),
+                row.br_ea_id.as_deref(),
+                &row.payload_json,
+            ),
+            (
+                "withdrawal:uhCkkSPEND",
+                &WorkState::Queued,
+                &WorkStep::Sent,
+                Some("uhCkkSPEND"),
+                Some(BR_EA),
+                &payload,
+            )
+        );
+        let id = row.id;
+        let at = || store.list_flow(WITHDRAWAL_FLOW).unwrap().remove(0);
+
+        store.advance_to_collected(id, "uhCkkEARLY").unwrap();
+        assert_eq!(
+            at().step,
+            WorkStep::Sent,
+            "a row is collected only once paid"
+        );
+        store.advance_to_paid(id, "uhCkkRAVE").unwrap();
+        store.advance_to_paid(id, "uhCkkLATER").unwrap();
+        store.advance_to_collected(id, "uhCkkRECEIPT").unwrap();
+        let row = at();
+        assert_eq!(
+            (
+                row.step,
+                row.br_rave_hash.as_deref(),
+                row.receipt_hash.as_deref()
+            ),
+            (WorkStep::Collected, Some("uhCkkRAVE"), Some("uhCkkRECEIPT"))
+        );
+
+        store
+            .advance_to_cl_link_created(id, "uhCkkLINK", CL_EA)
+            .unwrap();
+        store
+            .advance_to_cl_rave_executed(id, Some("uhCkkCL"))
+            .unwrap();
+        let row = StateStore::open(&path)
+            .unwrap()
+            .list_work_items(WITHDRAWAL_FLOW, WorkState::Succeeded, 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (row.step, row.receipt_hash.as_deref()),
+            (WorkStep::ClRaveExecuted, Some("uhCkkRECEIPT")),
+            "the credit limit's RAVE ends a withdrawal row"
+        );
     }
 
     #[test]

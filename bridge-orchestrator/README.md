@@ -98,7 +98,7 @@ bridge-orchestrator status [OPTIONS]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--flow` | string | _(all)_ | Filter by flow name (e.g. `lock`) |
+| `--flow` | string | _(all)_ | Filter by flow name, `lock` or `withdrawal` |
 | `--state` | enum | _(all)_ | Filter by state (see values below) |
 | `--item-id` | string | _(all)_ | Filter by specific item ID |
 | `--limit` | integer | `50` | Maximum rows returned |
@@ -146,7 +146,7 @@ It prints one JSON object per line:
 
 | `kind` | What is in transit | Fields |
 |--------|--------------------|--------|
-| `row` | A row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created`, or a row `in_flight` or `claimed` at any step | `item_id`, `lock_id`, `state`, `step`, `link` |
+| `row` | A lock row that is neither `succeeded` nor `failed`, at `cl_link_created` or `br_spend_created`, or a lock row `in_flight` or `claimed` at any step | `item_id`, `lock_id`, `state`, `step`, `link` |
 | `deposit_link` | A live link carrying deposit proofs that the bridging agent parked on the credit-limit adjustment agreement or the bridging agreement of its lane in force | `agreement`, `link`, `lock_ids` |
 | `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address`, and, for one S4 would sign no coupon for, `screening` on one that screening keeps from its coupon: `held`, `blocked`, or `unscreened` when it has no verdict. Do not pay it by hand. `unpayable`, on one whose amount or recipient no coupon can pay, gives the reason in the words S4 logs. in-transit never screens it, so its `screening` is `unscreened` or a hold it already had. `stranded`, on one whose `withdraw_contract_address` is not the configured vault in lowercase, says why no coupon can pay it. With screening on, it first screens each withdrawal with no hold and no `unpayable` reason, and holds a listed one |
 
@@ -554,9 +554,9 @@ Each line from `bridge-orchestrator status` is a JSON object with these fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | integer | Auto-increment row ID |
-| `flow` | string | Flow name (e.g. `lock`) |
-| `task_type` | string | Task within the flow (e.g. `create_parked_link`, `initiate_deposit`) |
-| `item_id` | string | Identifier for the work item |
+| `flow` | string | Flow name, `lock` or `withdrawal` |
+| `task_type` | string | Task within the flow: `create_parked_link` for a lock, `reduce_credit_limit` for a withdrawal |
+| `item_id` | string | `lock:<lock ID>`, or `withdrawal:<the spend's action hash>` |
 | `direction` | string or null | `transfer_in` for lock deposits, null otherwise |
 | `transfer_type` | string or null | `lock` for lock deposits, null otherwise |
 | `amount_raw` | string or null | Human-readable HOT amount (converted from wei if needed) |
@@ -580,7 +580,8 @@ queued ─> claimed ─> in_flight ─┬─> succeeded
                                  └─> failed (after max_attempts)
 ```
 
-- **queued**: a lock in a block with 5 confirmations, ready for the next bridge cycle
+- **queued**: a lock in a block with 5 confirmations, or a withdrawal S4 was
+  sent, ready for the next bridge cycle
 - **claimed**: picked up by the single-writer executor
 - **in_flight**: actively being processed (Holochain call or on-chain tx)
 - **succeeded**: completed successfully
@@ -596,4 +597,20 @@ carries records exactly that link and is not failed. A link whose only gap is ro
 no link yet waits one cycle for reconcile to record them
 (`bridge.rave.link_deferred`). Any other deposit link, or one still short a
 cycle later, stays parked, `bridge.rave.link_withheld` logs it with the reason,
-and each row that records it is failed for a person.
+and each row that records it is failed for a person. S2 holds a link of
+`withdraw` proofs to the same rule, by each withdrawal's row.
+
+A withdrawal takes its HOT back off the bridging agent's credit limit in
+these steps, each moved only on what the bridging agent's chain shows:
+
+| `step` | The withdrawal | Next |
+|--------|----------------|------|
+| `sent` | went to S4's RAVE, with the HOT its coupon pays | S4's RAVE takes its spend |
+| `paid` | was taken by that RAVE, `br_rave_hash` | S5: `create_receipt_from_rave` on the RAVE, once for all it took, collects the HOT its template allocates the bridging agent |
+| `collected` | was receipted, `receipt_hash` | S1 of the next cycle parks a `withdraw` proof of its HOT on the credit limit adjustment |
+| `cl_link_created` | has its proof parked, `cl_link_hash` | S2's RAVE nets it against the cycle's deposits, and the row is `succeeded` |
+
+A withdrawal S4 leaves parked stays `sent`, and gets no receipt and no proof.
+One whose spend left the bridging agreement with no RAVE of the bridging
+agent's recording it consumed, or whose RAVE is not in the bridging agent's
+chain, is failed for a person.
