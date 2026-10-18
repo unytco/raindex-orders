@@ -2,6 +2,8 @@ use super::*;
 
 const PAID_BY_HAND: &str =
     "in transit at the old network's close; it is paid by hand on the new network";
+const TAKEN_OFF_BY_HAND: &str =
+    "in transit at the old network's close; if S4 paid it, its HOT is taken off the credit limit by hand";
 
 #[derive(Debug)]
 struct Checked {
@@ -958,7 +960,7 @@ async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() 
         let row = row(spend);
         assert_eq!(
             (row.state, row.last_error.as_deref()),
-            (WorkState::Failed, Some(PAID_BY_HAND)),
+            (WorkState::Failed, Some(TAKEN_OFF_BY_HAND)),
             "{}",
             row.item_id
         );

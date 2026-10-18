@@ -10,8 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - bridge-orchestrator leaves a withdrawal parked with no coupon when it holds a unit besides HOT, names another vault, or names a recipient that fails its EIP-55 checksum, and pays the rest of the batch.
-- bridge-orchestrator lowers the bridging agent's credit limit by each withdrawal it pays.
-- `bridge-orchestrator in-transit` lists each withdrawal not yet off the credit limit.
+- bridge-orchestrator lowers the bridging agent's credit limit by each withdrawal it pays, and `in-transit` lists each one it is still taking off.
 
 ## [0.7.0] - 2026-10-15
 

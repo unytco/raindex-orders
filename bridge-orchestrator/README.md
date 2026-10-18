@@ -120,7 +120,7 @@ bridge-orchestrator clear --all
 | Flag | Description |
 |------|-------------|
 | `--non-in-progress` | Delete only terminal rows (`succeeded`, `failed`) |
-| `--all` | Delete every row in `work_items` but the locks in `screening`, `held` or `blocked`. A withdrawal row it deletes before it is `succeeded` never has its HOT taken off the credit limit |
+| `--all` | Delete every row in `work_items` but the locks in `screening`, `held` or `blocked`. A withdrawal row it deletes after S4 paid it, and before it is `succeeded`, never has its HOT taken off the credit limit |
 | `--older-than-s N` | Only with `--non-in-progress`: restrict deletion to terminal rows whose `updated_at` is older than N seconds. Applied to both `succeeded` and `failed`. Use the in-process retention task (below) for per-state windows. |
 
 Outputs a JSON object. Plain `--non-in-progress` returns
@@ -132,10 +132,11 @@ in-process retention task and reserve this CLI for one-off hygiene.
 ### `bridge-orchestrator in-transit`
 
 Lists each transfer the bridging agent's network still holds, and each
-withdrawal whose HOT is not yet off its credit limit, so a migration closes the
-old network only once nothing is in transit, or the operator accepts what is. Run it with the orchestrator stopped. It takes the configuration of
-`run`, reads `DB_PATH` and the bridging agent's conductor, and sends no write
-to Holochain or Ethereum.
+withdrawal the orchestrator is still taking off the bridging agent's credit
+limit, so a migration closes the old network only once nothing is in transit,
+or the operator accepts what is. Run it with the orchestrator stopped. It takes
+the configuration of `run`, reads `DB_PATH` and the bridging agent's conductor,
+and sends no write to Holochain or Ethereum.
 
 ```
 bridge-orchestrator in-transit
@@ -150,12 +151,12 @@ It prints one JSON object per line:
 | `deposit_link` | A live link carrying proofs that the bridging agent parked on the credit-limit adjustment agreement or the bridging agreement of its lane in force | `agreement`, `link`, `lock_ids` |
 | `withdrawal` | A live spend in the `withdrawer` role on that bridging agreement | `agreement`, `spend`, `spender`, `amount`, `withdraw_to_address`, and, for one S4 would sign no coupon for, `screening` on one that screening keeps from its coupon: `held`, `blocked`, or `unscreened` when it has no verdict. Do not pay it by hand. `unpayable`, on one whose amount or recipient no coupon can pay, gives the reason in the words S4 logs. in-transit never screens it, so its `screening` is `unscreened` or a hold it already had. `stranded`, on one whose `withdraw_contract_address` is not the configured vault in lowercase, says why no coupon can pay it. With screening on, it first screens each withdrawal with no hold and no `unpayable` reason, and holds a listed one |
 
-`lock_id` is `null` for a withdrawal row and for a lock row whose payload
-cannot be read, `link` for a row that records none, `lock_ids` names no
-withdrawal, and `withdraw_to_address` for a withdrawal that names none, which
-no coupon can pay. A row `in_flight` or `claimed` had a write that may or may
-not have reached the conductor: a start of the orchestrator queues it again,
-and its reconcile settles it. `amount` is the spend's unit map, its HOT under
+`lock_id` is `null` for a withdrawal row and for a lock row whose payload cannot
+be read, `link` for a row that records none, and `withdraw_to_address` for a
+withdrawal that names none, which no coupon can pay. A link of `withdraw` proofs
+has empty `lock_ids`. A row `in_flight` or `claimed` had a write that may or may
+not have reached the conductor: a start of the orchestrator queues it again, and
+its reconcile settles it. `amount` is the spend's unit map, its HOT under
 `HOT_UNIT_INDEX`. A `failed` row is not listed, and nor is another agent's spend
 in the `bridging_agent` role or a spend in any other role: no cycle takes them.
 Log lines go to stdout too, and never start with `{`.
@@ -167,9 +168,11 @@ step it cannot read.
 
 `--mark-failed` lists the same, then marks `failed` each listed row and each
 row, neither `succeeded` nor `failed`, whose lock is in a listed link. Each
-gets `last_error` `in transit at the old network's close; it is paid by hand on
-the new network`, so the new network's orchestrator pays none of them. It marks
-all of them in one transaction, or none, and changes no other row. Each is
+lock row gets `last_error` `in transit at the old network's close; it is paid
+by hand on the new network`, and each withdrawal row `in transit at the old
+network's close; if S4 paid it, its HOT is taken off the credit limit by hand`,
+so the new network's orchestrator acts on none of them. It marks all of them in
+one transaction, or none, and changes no other row. Each is
 marked only in the state and at the step it was read in: a row whose state or
 step has changed by then, even to another pending step, or that is gone, as a
 still running orchestrator can leave it, fails the whole mark. It
@@ -183,16 +186,18 @@ The next cycle of `run` fails such a row for a person. A lock in a
 listed link whose row is already `succeeded` or `failed`, a lock with no row,
 and a live withdrawal spend are recorded only in what it prints.
 
-What it lists is paid by hand on the new network, once the person who pays has
-checked that the old network did not pay it. Pay each lock ID once: a deposit
-waiting on its link shows both as its `row` and in the `lock_ids` of the link
-carrying it, and an earlier `failed` row may name it too. A lock whose row is
-`succeeded` was paid. A lock with no row may have been paid too, as retention
-deletes `succeeded` and `failed` rows, and so may a `row` whose `link` is not
-listed live, as a RAVE may have taken it. Pay each withdrawal once, by its
-`spend`. A withdrawal `row` is one whose HOT is not off the bridging agent's
-credit limit: take it off by hand once, by its `item_id`. At `sent`, S4 may not
-have paid it.
+Each lock and each live withdrawal spend it lists is paid by hand on the new
+network, once the person who pays has checked that the old network did not pay
+it. Pay each lock ID once: a deposit waiting on its link shows both as its `row`
+and in the `lock_ids` of the link carrying it, and an earlier `failed` row may
+name it too. A lock whose row is `succeeded` was paid. A lock with no row may
+have been paid too, as retention deletes `succeeded` and `failed` rows, and so
+may a `row` whose `link` is not listed live, as a RAVE may have taken it. Pay
+each withdrawal once, by its `spend`. A withdrawal `row` may still be on the
+bridging agent's credit limit: take it off by hand once, by its `item_id`. One
+at `sent` whose spend is also listed as a `withdrawal` was not taken by a RAVE
+and has nothing to take off, and one whose `link` is not listed live may be off
+already, as S2's RAVE may have taken it.
 
 ### `bridge-orchestrator release` and `block`
 
@@ -527,8 +532,7 @@ while a failed row records a live link, that link is never paid, and re-queuing
 the row can let the next RAVE pay it. Leave a row whose `last_error` ends
 `resolve by hand` failed: check by hand whether its depositor was credited, and
 credit it by hand only if not and its link is not live. Also leave failed a row
-whose `last_error` is `in transit at the old network's close; it is paid by hand
-on the new network`.
+whose `last_error` starts `in transit at the old network's close`.
 Rows left `claimed` or `in_flight` need no action: startup re-queues them.
 
 ### systemd service management
@@ -604,18 +608,18 @@ and each row that records it is failed for a person. S2 holds a link of
 `withdraw` proofs to the same rule, by each withdrawal's row.
 
 A withdrawal takes its HOT back off the bridging agent's credit limit in
-these steps, each moved only on what the bridging agent's chain shows. The
-step and the hashes are in the database, and not in `status`:
+these steps, each moved only on a call's reply or on what the bridging agent's
+chain shows. `status` does not print the step or the hashes:
 
 | `step` | The withdrawal | Next |
 |--------|----------------|------|
-| `sent` | went to S4's RAVE, with the HOT its coupon pays | S4's RAVE takes its spend |
+| `sent` | is handed to S4's RAVE, with the HOT its coupon pays | S4's RAVE takes its spend |
 | `paid` | was taken by that RAVE, `br_rave_hash` | S5: `create_receipt_from_rave` on the RAVE, once for all it took, collects what the RAVE allocates the bridging agent |
 | `collected` | was receipted, `receipt_hash` | The next S1 parks a `withdraw` proof of its HOT on the credit limit adjustment |
 | `cl_link_created` | has its proof parked, `cl_link_hash` | S2's RAVE lowers the credit limit by it, and the row is `succeeded` |
 
 A withdrawal S4 leaves parked stays `sent` until a RAVE takes its spend. No
-coupon pays a withdrawal whose row is failed or past `sent`
-(`bridge.withdrawal_withheld`). A row whose spend left the bridging agreement
-with no RAVE of the bridging agent's recording it consumed, or whose RAVE is
-not in the bridging agent's chain, is failed for a person.
+coupon pays a withdrawal whose row is failed or past `sent`, while retention
+keeps the row (`bridge.withdrawal_withheld`). A row whose spend left the
+bridging agreement with no RAVE of the bridging agent's recording it consumed,
+or whose RAVE is not in the bridging agent's chain, is failed for a person.

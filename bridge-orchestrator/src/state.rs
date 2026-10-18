@@ -67,8 +67,8 @@ impl std::str::FromStr for WorkState {
     }
 }
 
-/// Which of a row's zome calls are known to have landed. A lock walks from
-/// `New` to `BrRaveExecuted`, a withdrawal from `Sent` through `Collected` to
+/// The pipeline step a row has reached. A lock walks from `New` to
+/// `BrRaveExecuted`, a withdrawal from `Sent` through `Collected` to
 /// `ClRaveExecuted`. A row moves on only on the call's reply or on what the
 /// chain shows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -88,8 +88,8 @@ pub enum WorkStep {
     /// S4 landed; the bridging `execute_rave` has consumed the parked spend.
     /// Ends a lock row, which is `succeeded` with it.
     BrRaveExecuted,
-    /// The withdrawal went to S4's `execute_rave`, which has not been seen to
-    /// take its spend.
+    /// Recorded before S4's `execute_rave` is called with the withdrawal, so a
+    /// lost reply still leaves a row. No RAVE is seen yet to take its spend.
     Sent,
     /// S4 took the withdrawal; `br_rave_hash` is its RAVE, which the bridging
     /// agent has yet to receipt.
@@ -877,8 +877,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Advance a row to `step='cl_rave_executed'`, and a withdrawal row to
-    /// `state='succeeded'` with it.
     pub fn advance_to_cl_rave_executed(&self, id: i64, cl_rave_hash: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
@@ -997,7 +995,7 @@ impl StateStore {
         )
     }
 
-    /// Whether the row moved: one no longer pending at `from` stays as it is.
+    /// Whether the row moved: one not pending at `from` stays as it is.
     fn advance_withdrawal(
         &self,
         id: i64,
@@ -1033,10 +1031,10 @@ impl StateStore {
 
     /// All or none, each row as it was read: one whose state or step another
     /// writer changed since, or deleted, fails the whole mark.
-    pub fn mark_all_failed_permanent(&self, rows: &[&WorkItem], error: &str) -> Result<()> {
+    pub fn mark_all_failed_permanent(&self, rows: &[(&WorkItem, &str)]) -> Result<()> {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
-        for row in rows {
+        for (row, error) in rows {
             anyhow::ensure!(
                 fail_permanently(&tx, row.id, error, Some((&row.state, &row.step)))? == 1,
                 "row {} is no longer {} at {}, or no longer in the database, so no row is marked",
@@ -1049,8 +1047,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Fails each `queued` row of `flow` that used up its attempts, and returns
-    /// their item IDs.
     pub fn fail_exhausted_queued(&self, flow: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(

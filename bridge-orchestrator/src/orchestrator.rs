@@ -936,8 +936,7 @@ impl BridgeOrchestrator {
         Some(classify_cycle_failure(e))
     }
 
-    /// Single unified bridge cycle built as a five-stage pipeline, each row's
-    /// [`WorkStep`] recording which of its zome calls landed.
+    /// Single unified bridge cycle built as a five-stage pipeline.
     ///
     /// 1. Resolve context.
     /// 2. Reconcile: settle each row against the chain before any new write
@@ -1427,8 +1426,8 @@ impl BridgeOrchestrator {
     ///
     /// A withdrawal row moves `sent` → `paid` once its spend is gone and a RAVE
     /// of the bridging agent's records it consumed, `paid` → `collected` once
-    /// the chain holds a receipt of that RAVE, and from `collected` on by the
-    /// rules of a lock row at `new`.
+    /// the chain holds a receipt of that RAVE, and on from `collected` by the
+    /// first two rules, as a lock row at `new`.
     async fn reconcile_pipeline(
         &self,
         conductor: &impl ConductorReads,
@@ -1621,28 +1620,23 @@ impl BridgeOrchestrator {
         withdrawals: &HashSet<String>,
         rave: &str,
     ) -> Result<usize> {
-        let sent: HashMap<String, i64> = self
-            .db
-            .list_pending_by_step(WITHDRAWAL_FLOW, WorkStep::Sent, 5000)?
-            .iter()
-            .filter_map(|row| Some((self.withdrawal_of(row)?.spend, row.id)))
-            .collect();
         let mut paid = 0;
         for spend in outcome.taken.iter().map(|t| t.id.to_string()) {
             if !withdrawals.contains(&spend) {
                 continue;
             }
-            match sent.get(&spend) {
-                Some(&id) => {
-                    if self.db.advance_to_paid(id, rave)? {
-                        paid += 1;
-                    }
-                }
-                None => error!(
+            let moved = match self.db.withdrawal(&spend)? {
+                Some(row) => self.db.advance_to_paid(row.id, rave)?,
+                None => false,
+            };
+            if moved {
+                paid += 1;
+            } else {
+                error!(
                     event = "bridge.withdrawal.unrecorded",
                     spend,
                     "[bridge/s4] RAVE {rave} took withdrawal {spend}, which has no row waiting at sent"
-                ),
+                );
             }
         }
         Ok(paid)
@@ -1650,7 +1644,7 @@ impl BridgeOrchestrator {
 
     /// S5. `fresh` is this cycle's S4 RAVE, which no receipt can name yet. Any
     /// other RAVE is collected only once this cycle's chain read found it due,
-    /// as reconcile settled every other outcome.
+    /// as reconcile acts on every other outcome.
     async fn collect_withdrawals(
         &self,
         conductor: &(impl ConductorReads + ConductorWrites),
@@ -1819,9 +1813,10 @@ impl BridgeOrchestrator {
         Ok(None)
     }
 
-    /// The RAVE that took a withdrawal row's spend, `None` while the spend
-    /// stays parked, or when no RAVE of the bridging agent's records it
-    /// consumed, which sends the row to a person.
+    /// The RAVE that took a withdrawal row's spend. `None` while the spend
+    /// stays parked or cannot be checked, and when the row's payload does not
+    /// read or no RAVE of the bridging agent's records the spend consumed,
+    /// which sends the row to a person.
     async fn withdrawal_taken(
         &self,
         conductor: &impl ConductorReads,
@@ -2195,9 +2190,9 @@ impl BridgeOrchestrator {
     }
 
     /// Build the S1 `create_parked_link` batch from `rows`, respecting the
-    /// link-tag cap. A row whose payload cannot be read,
-    /// encoded, or written at any cap is marked permanently failed and
-    /// excluded; a row the cap alone cannot take waits for the next cycle.
+    /// link-tag cap. A row whose payload cannot be read, encoded, or written at
+    /// any cap is marked permanently failed and excluded; a row the cap alone
+    /// cannot take waits for the next cycle.
     fn build_cl_batch(
         &self,
         vault: Address,
@@ -3157,7 +3152,7 @@ struct ProofBatch {
     capped: bool,
 }
 
-/// Per stage, S1 to S5, the rows reconcile found that stage had moved. A
+/// Per stage, S1 to S5, how many rows reconcile found that stage had moved. A
 /// nonzero count means an earlier cycle ended before it recorded a write.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReconcileCounts {
@@ -3503,8 +3498,8 @@ impl LockKey {
     }
 }
 
-/// What a proof on one of the bridging agent's own links stands for: a lock,
-/// or a withdrawal by its spend.
+/// What a proof on one of the bridging agent's own links stands for. A
+/// withdrawal is keyed by its spend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ProofKey {
     Lock(LockKey),

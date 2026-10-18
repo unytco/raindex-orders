@@ -18,6 +18,8 @@ use tracing::info;
 
 const PAID_BY_HAND: &str =
     "in transit at the old network's close; it is paid by hand on the new network";
+const TAKEN_OFF_BY_HAND: &str =
+    "in transit at the old network's close; if S4 paid it, its HOT is taken off the credit limit by hand";
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -87,12 +89,22 @@ impl Found {
             self.unmatchable.is_empty(),
             "marks no row, as {cannot_tell}"
         );
-        let rows: Vec<&WorkItem> = self.rows.values().collect();
-        db.mark_all_failed_permanent(&rows, PAID_BY_HAND)?;
-        let items: Vec<&str> = rows.iter().map(|row| row.item_id.as_str()).collect();
+        let rows: Vec<(&WorkItem, &str)> = self
+            .rows
+            .values()
+            .map(|row| {
+                if row.flow == WITHDRAWAL_FLOW {
+                    (row, TAKEN_OFF_BY_HAND)
+                } else {
+                    (row, PAID_BY_HAND)
+                }
+            })
+            .collect();
+        db.mark_all_failed_permanent(&rows)?;
+        let items: Vec<&str> = rows.iter().map(|(row, _)| row.item_id.as_str()).collect();
         info!(
             event = "bridge.in_transit.marked_failed",
-            "[bridge/in-transit] marked {} row(s) failed, to be paid by hand on the new network: {}",
+            "[bridge/in-transit] marked {} row(s) failed, to be settled by hand: {}",
             items.len(),
             items.join(", ")
         );
