@@ -163,7 +163,6 @@ pub struct WorkItem {
     pub receipt_hash: Option<String>,
 }
 
-/// What S4 sent of a withdrawal, a withdrawal row's whole payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WithdrawalPayload {
     pub spend: String,
@@ -958,7 +957,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Records the withdrawal as sent to S4, unless a row records it already.
     pub fn send_withdrawal(&self, withdrawal: &WithdrawalPayload) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
@@ -974,7 +972,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// The row of the withdrawal whose spend is `spend`, in any state.
     pub fn withdrawal(&self, spend: &str) -> Result<Option<WorkItem>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.query_row(
@@ -1052,10 +1049,8 @@ impl StateStore {
         Ok(())
     }
 
-    /// Promote any `queued` rows that have already exhausted their retry
-    /// budget to `failed` with `error_class='permanent'`, and return their
-    /// item IDs. Intended to be called at the top of each cycle so a broken
-    /// row cannot loop forever in a long-running session.
+    /// Fails each `queued` row of `flow` that used up its attempts, and returns
+    /// their item IDs.
     pub fn fail_exhausted_queued(&self, flow: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
