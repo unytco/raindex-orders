@@ -928,6 +928,8 @@ async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() 
     orch.db
         .mark_failed_permanent(failed.id, "resolved by a person")
         .unwrap();
+    let lock = enqueue_lock(&orch, "lock:beside-withdrawals:1", "0xe0");
+    set_state(&orch, lock, "in_flight");
     let conductor = bridging_conductor().parking(action_hash(CL_EA), std::slice::from_ref(&link));
     let listed = |row: &WorkItem, step: &str, link: Option<&Transaction>| {
         json!({
@@ -945,6 +947,7 @@ async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() 
         listed(&collected, "collected", None),
         listed(&linked, "cl_link_created", Some(&link)),
         listed_link(CL_EA, &link, &[]),
+        listed_row_in("in_flight", "lock:beside-withdrawals:1", "new", None),
     ];
 
     let checked = check(&orch, &conductor, false).await.unwrap();
@@ -965,6 +968,10 @@ async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() 
             row.item_id
         );
     }
+    assert_eq!(
+        failed_row(&orch, lock).last_error.as_deref(),
+        Some(PAID_BY_HAND)
+    );
     assert_eq!(row(&spends[4]).state, WorkState::Succeeded);
     assert_eq!(
         row(&spends[5]).last_error.as_deref(),
