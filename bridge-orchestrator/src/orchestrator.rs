@@ -114,7 +114,6 @@ struct BridgingSelection {
     deposits: Vec<Transaction>,
     withdrawals: Vec<Transaction>,
     coupons: serde_json::Map<String, Value>,
-    hot_by_spend: HashMap<String, String>,
     coupon_bytes: usize,
     withdrawals_found: usize,
     unpayable: Vec<(Transaction, anyhow::Error)>,
@@ -133,7 +132,6 @@ async fn select_bridging_links(
         deposits: Vec::new(),
         withdrawals: Vec::new(),
         coupons: serde_json::Map::new(),
-        hot_by_spend: HashMap::new(),
         coupon_bytes: 0,
         withdrawals_found: 0,
         unpayable: Vec::new(),
@@ -179,7 +177,6 @@ async fn select_bridging_links(
             selection.held += 1;
             continue;
         }
-        let hot = terms.hot().to_string();
         let coupon = signer.coupon(terms, tx.id.as_ref()).await?;
         let key = tx.id.to_string();
 
@@ -201,7 +198,6 @@ async fn select_bridging_links(
 
         selection.coupon_bytes += entry_bytes;
         selection.coupons.insert(key.clone(), Value::String(coupon));
-        selection.hot_by_spend.insert(key, hot);
         selection.withdrawals.push(tx.clone());
 
         info!(
@@ -894,13 +890,8 @@ impl BridgeOrchestrator {
             h.last_error = Some(err_str.clone());
             h.last_error_at_ms = Some(Self::now_ms());
         });
-        for flow in FLOWS {
-            if let Err(reset_err) = self.db.reset_in_flight_to_queued(flow, &err_str) {
-                error!(
-                    "[bridge] failed to reset in_flight {flow} rows: {}",
-                    reset_err
-                );
-            }
+        if let Err(reset_err) = self.db.reset_in_flight_to_queued(&err_str) {
+            error!("[bridge] failed to reset in_flight rows: {}", reset_err);
         }
         Some(classify_cycle_failure(e))
     }
@@ -1178,7 +1169,6 @@ impl BridgeOrchestrator {
             deposits: deposit_rave_links,
             withdrawals: selected_withdrawal_links,
             coupons: mut coupons_map,
-            hot_by_spend,
             coupon_bytes: coupon_cumulative_bytes,
             withdrawals_found: total_withdrawals_found,
             unpayable,
@@ -1293,13 +1283,9 @@ impl BridgeOrchestrator {
                 .iter()
                 .filter(|t| retained_withdrawal_ids.contains(&t.id.to_string()))
             {
-                let id = spend.id.to_string();
                 self.db.send_withdrawal(&WithdrawalPayload {
-                    amount: hot_by_spend
-                        .get(&id)
-                        .with_context(|| format!("withdrawal {id} was selected with no amount"))?
-                        .clone(),
-                    spend: id,
+                    amount: hot_amount(spend, self.cfg.hot_unit_index),
+                    spend: spend.id.to_string(),
                     agreement: context.bridging_agreement.to_string(),
                     withdrawer: spend.creator.to_string(),
                 })?;
@@ -1350,6 +1336,7 @@ impl BridgeOrchestrator {
             .await?;
 
         let duration_ms = started.elapsed().as_millis() as u64;
+        let [lock_s1, withdrawal_s1] = &s1_batches;
         info!(
             "[bridge/cycle] completed duration={}ms reconcile=(s1={} s2={} s3={} s4={} s5={}) s1_written={} s1_withdrawals_written={} s2_advanced={} s3_written={} s4_succeeded={} withdrawals={} withdrawals_paid={} s5_collected={} capped_cl={} capped_spend={} deferred_cl={} deferred_br_rave={}",
             duration_ms,
@@ -1358,15 +1345,15 @@ impl BridgeOrchestrator {
             reconcile.s3_advanced,
             reconcile.s4_advanced,
             reconcile.s5_advanced,
-            s1_batches[0].ids.len(),
-            s1_batches[1].ids.len(),
+            lock_s1.ids.len(),
+            withdrawal_s1.ids.len(),
             cl_rave_advanced,
             s3_written,
             succeeded_locks,
             withdrawal_count,
             paid_withdrawals,
             collected,
-            s1_batches.iter().any(|batch| batch.capped),
+            lock_s1.capped || withdrawal_s1.capped,
             s3_batch.capped,
             deferred_cl_links,
             deferred_br_rave,
@@ -1576,30 +1563,32 @@ impl BridgeOrchestrator {
                 Ok(Some(record)) => {
                     let link_seq = record.action().action_seq();
                     let consumer = match self.recorded_write(record, row) {
-                        RecordedWrite::Own => match live.consumer(conductor, link, link_seq).await {
-                            Ok(Some(rave)) => {
-                                info!(
-                                    event = "bridge.reconcile.consumed",
+                        RecordedWrite::Own => {
+                            match live.consumer(conductor, link, link_seq).await {
+                                Ok(Some(rave)) => {
+                                    info!(
+                                        event = "bridge.reconcile.consumed",
+                                        link,
+                                        rave = %rave,
+                                        "[bridge/reconcile] {} at {}: RAVE {} consumed link {} off agreement {}",
+                                        row.item_id,
+                                        row.step,
+                                        rave,
+                                        link,
+                                        agreement
+                                    );
+                                    return Ok(Some(rave));
+                                }
+                                Ok(None) => self.link_for_a_person(
+                                    row,
+                                    "bridge.reconcile.link_not_consumed",
                                     link,
-                                    rave = %rave,
-                                    "[bridge/reconcile] {} at {}: RAVE {} consumed link {} off agreement {}",
-                                    row.item_id,
-                                    row.step,
-                                    rave,
-                                    link,
-                                    agreement
-                                );
-                                return Ok(Some(rave));
+                                    &untaken(&agreement),
+                                ),
+                                Err(e) => Self::unresolved_link(row, link, e),
                             }
-                            Ok(None) => self.for_a_person(
-                                row,
-                                "bridge.reconcile.link_not_consumed",
-                                link,
-                                &format!("left agreement {agreement}, and no RAVE in the bridging agent's chain history records it consumed"),
-                            ),
-                            Err(e) => Self::unresolved_link(row, link, e),
-                        },
-                        RecordedWrite::Unreadable(e) => self.for_a_person(
+                        }
+                        RecordedWrite::Unreadable(e) => self.link_for_a_person(
                             row,
                             "bridge.reconcile.tag_unreadable",
                             link,
@@ -1608,7 +1597,7 @@ impl BridgeOrchestrator {
                         // Whether the deposit was credited is unknowable here, so its row is
                         // neither advanced nor written again.
                         RecordedWrite::Misrecorded(why) => {
-                            self.for_a_person(row, "bridge.rave.proof_missing", link, &why)
+                            self.link_for_a_person(row, "bridge.rave.proof_missing", link, &why)
                         }
                     };
                     return consumer.map(|()| None);
@@ -1618,15 +1607,17 @@ impl BridgeOrchestrator {
             }
         }
         if agreement != *in_force {
-            error!(
-                event = "bridge.reconcile.superseded_agreement",
-                "[bridge/reconcile] {} waits on agreement {}, no longer in force: only a RAVE on it can consume link {}",
-                row.item_id,
-                agreement,
-                link
-            );
+            Self::superseded(row, &agreement, &format!("consume link {link}"));
         }
         Ok(None)
+    }
+
+    fn superseded(row: &WorkItem, agreement: &ActionHash, what: &str) {
+        error!(
+            event = "bridge.reconcile.superseded_agreement",
+            "[bridge/reconcile] {} waits on agreement {agreement}, no longer in force: only a RAVE on it can {what}",
+            row.item_id
+        );
     }
 
     fn pending_at(&self, steps: &[(&str, WorkStep)]) -> Result<Vec<WorkItem>> {
@@ -1675,7 +1666,7 @@ impl BridgeOrchestrator {
     }
 
     fn lost(&self, row: &WorkItem, link: &str) -> Result<()> {
-        self.for_a_person(
+        self.link_for_a_person(
             row,
             "bridge.reconcile.link_not_held",
             link,
@@ -1683,7 +1674,7 @@ impl BridgeOrchestrator {
         )
     }
 
-    fn for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<()> {
+    fn link_for_a_person(&self, row: &WorkItem, event: &str, link: &str, why: &str) -> Result<()> {
         self.fail_for_a_person(row, event, &format!("its recorded link {link} {why}"))
     }
 
@@ -1790,10 +1781,7 @@ impl BridgeOrchestrator {
         links: Vec<Transaction>,
         recorded: impl Fn(&WorkItem) -> Option<&str>,
     ) -> Result<Vec<Transaction>> {
-        let mut rows = Vec::new();
-        for flow in FLOWS {
-            rows.extend(self.db.list_flow(flow)?);
-        }
+        let rows = self.db.list_all()?;
         let by_key: HashMap<ProofKey, RowLink> = rows
             .iter()
             .filter_map(|row| {
@@ -1865,7 +1853,7 @@ impl BridgeOrchestrator {
             .iter()
             .filter(|row| recorded(row) == Some(link) && row.state != WorkState::Failed)
         {
-            self.for_a_person(row, "bridge.rave.link_withheld", link, why)?;
+            self.link_for_a_person(row, "bridge.rave.link_withheld", link, why)?;
         }
         Ok(())
     }
@@ -1916,8 +1904,16 @@ impl BridgeOrchestrator {
         if item.flow != WITHDRAWAL_FLOW {
             return self.lock_key(item).map(ProofKey::Lock);
         }
-        self.withdrawal_of(item)
-            .map(|withdrawal| ProofKey::Withdrawal(withdrawal.spend))
+        match item.withdrawal() {
+            Ok(withdrawal) => Some(ProofKey::Withdrawal(withdrawal.spend)),
+            Err(e) => {
+                error!(
+                    event = "bridge.payload_unreadable",
+                    "[bridge] {} has an unreadable withdrawal payload: {}", item.item_id, e
+                );
+                None
+            }
+        }
     }
 
     /// The lock [`BridgeOrchestrator::extract_lock_proof`] writes into the row's proof.
@@ -2170,7 +2166,7 @@ impl BridgeOrchestrator {
         if item.flow != WITHDRAWAL_FLOW {
             return self.extract_lock_proof(vault, item);
         }
-        let payload = WithdrawalPayload::deserialize(&item.payload_json)?;
+        let payload = item.withdrawal()?;
         let hot: ZFuel = payload
             .amount
             .parse()
@@ -3342,6 +3338,10 @@ fn unaccounted(
         }
     }
     unrecorded.map(Gap::Unrecorded)
+}
+
+fn untaken(agreement: &ActionHash) -> String {
+    format!("left agreement {agreement}, and no RAVE in the bridging agent's chain history records it consumed")
 }
 
 /// Each proof the bridging agent's own parked links carry, by what it stands

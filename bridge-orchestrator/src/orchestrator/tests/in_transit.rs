@@ -958,7 +958,7 @@ async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() 
     assert_lists(&checked.listed, &expected);
     checked.exit.unwrap();
     let by_step = [
-        "in transit at the old network's close; if a RAVE took its spend, its HOT is taken off the credit limit by hand only together with collecting what that RAVE allocated, or neither is done",
+        "in transit at the old network's close; if a RAVE took its spend, its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done",
         "in transit at the old network's close; its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done",
         "in transit at the old network's close; its HOT is taken off the credit limit by hand",
         "in transit at the old network's close; if S2's RAVE did not take its link, its HOT is taken off the credit limit by hand",

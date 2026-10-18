@@ -1,7 +1,7 @@
 use super::{
     bridging_spend, connect_ham, deposit_proofs, hot_amount, normalize_tx_hash, own_deposit,
     vault_key, withdrawal_terms, BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads,
-    LockKey, WithdrawalGate, FLOWS, WITHDRAWALS_SCREENED,
+    LockKey, WithdrawalGate, WITHDRAWALS_SCREENED,
 };
 use crate::config::{Config, Ethereum};
 use crate::screening::Screener;
@@ -17,20 +17,25 @@ use std::io::Write;
 use tracing::info;
 
 const IN_TRANSIT: &str = "in transit at the old network's close";
+const TAKEN_WITH_ITS_RAVE: &str = "its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done";
 
 fn settled_by_hand(row: &WorkItem) -> String {
     let left = if row.flow != WITHDRAWAL_FLOW {
         "it is paid by hand on the new network"
     } else {
         match row.step {
-            WorkStep::Sent => "if a RAVE took its spend, its HOT is taken off the credit limit by hand only together with collecting what that RAVE allocated, or neither is done",
-            WorkStep::Paid => "its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done",
+            WorkStep::Sent => {
+                return format!("{IN_TRANSIT}; if a RAVE took its spend, {TAKEN_WITH_ITS_RAVE}")
+            }
+            WorkStep::Paid => TAKEN_WITH_ITS_RAVE,
             WorkStep::Collected => "its HOT is taken off the credit limit by hand",
             WorkStep::ClLinkCreated
             | WorkStep::New
             | WorkStep::ClRaveExecuted
             | WorkStep::BrSpendCreated
-            | WorkStep::BrRaveExecuted => "if S2's RAVE did not take its link, its HOT is taken off the credit limit by hand",
+            | WorkStep::BrRaveExecuted => {
+                "if S2's RAVE did not take its link, its HOT is taken off the credit limit by hand"
+            }
         }
     };
     format!("{IN_TRANSIT}; {left}")
@@ -104,14 +109,10 @@ impl Found {
             self.unmatchable.is_empty(),
             "marks no row, as {cannot_tell}"
         );
-        let settled: Vec<(&WorkItem, String)> = self
+        let rows: Vec<(&WorkItem, String)> = self
             .rows
             .values()
             .map(|row| (row, settled_by_hand(row)))
-            .collect();
-        let rows: Vec<(&WorkItem, &str)> = settled
-            .iter()
-            .map(|(row, last_error)| (*row, last_error.as_str()))
             .collect();
         db.mark_all_failed_permanent(&rows)?;
         let items: Vec<&str> = rows.iter().map(|(row, _)| row.item_id.as_str()).collect();
@@ -200,26 +201,21 @@ impl BridgeOrchestrator {
                     })
                     .map(|spend| (&context.bridging_agreement, spend)),
             );
-        let mut unreadable = Vec::new();
-        for flow in FLOWS {
-            unreadable.extend(self.db.unreadable_rows(flow)?);
-        }
+        let unreadable = self.db.unreadable_rows()?;
         anyhow::ensure!(
             unreadable.is_empty(),
             "rows whose state or step cannot be read: {}",
             unreadable.join(", ")
         );
         let mut pending: Vec<(WorkItem, Option<LockKey>)> = Vec::new();
-        for flow in FLOWS {
-            for row in self.db.list_flow(flow)? {
-                if matches!(row.state, WorkState::Succeeded | WorkState::Failed) {
-                    continue;
-                }
-                let lock = (flow != WITHDRAWAL_FLOW)
-                    .then(|| self.lock_key(&row))
-                    .flatten();
-                pending.push((row, lock));
+        for row in self.db.list_all()? {
+            if matches!(row.state, WorkState::Succeeded | WorkState::Failed) {
+                continue;
             }
+            let lock = (row.flow != WITHDRAWAL_FLOW)
+                .then(|| self.lock_key(&row))
+                .flatten();
+            pending.push((row, lock));
         }
 
         let mut links = Vec::new();

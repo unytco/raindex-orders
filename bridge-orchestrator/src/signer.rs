@@ -387,7 +387,6 @@ fn pad_address(addr: Address) -> B256 {
 pub struct Payout {
     recipient: Address,
     wei: U256,
-    hot: String,
 }
 
 impl Payout {
@@ -406,17 +405,11 @@ impl Payout {
         Ok(Self {
             recipient: address,
             wei,
-            hot: amount.to_string(),
         })
     }
 
     pub fn recipient(&self) -> Address {
         self.recipient
-    }
-
-    /// The `amount` `new` accepted.
-    pub fn hot(&self) -> &str {
-        &self.hot
     }
 }
 

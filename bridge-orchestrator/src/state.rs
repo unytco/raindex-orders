@@ -184,6 +184,10 @@ impl WorkItem {
         };
         Some((link.as_deref()?, agreement.as_deref()))
     }
+
+    pub fn withdrawal(&self) -> Result<WithdrawalPayload> {
+        Ok(WithdrawalPayload::deserialize(&self.payload_json)?)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -702,33 +706,32 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Keeps a failed withdrawal row, as [`Self::prune_terminal_older_than`]
-    /// does.
     pub fn clear_non_in_progress(&self) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let deleted = conn.execute(
-            "DELETE FROM work_items
-             WHERE state = 'succeeded' OR (state = 'failed' AND flow != ?1)",
-            params![WITHDRAWAL_FLOW],
+            &format!(
+                "DELETE FROM work_items
+                 WHERE state IN ('succeeded', 'failed') AND NOT {}",
+                failed_withdrawals()
+            ),
+            [],
         )?;
         Ok(deleted)
     }
 
-    /// Keeps a failed withdrawal row, as [`Self::prune_terminal_older_than`]
-    /// does.
     pub fn clear_all(&self) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let deleted = conn.execute(
-            "DELETE FROM work_items
-             WHERE state NOT IN ('screening', 'held', 'blocked')
-               AND NOT (state = 'failed' AND flow = ?1)",
-            params![WITHDRAWAL_FLOW],
+            &format!(
+                "DELETE FROM work_items
+                 WHERE state NOT IN ('screening', 'held', 'blocked') AND NOT {}",
+                failed_withdrawals()
+            ),
+            [],
         )?;
         Ok(deleted)
     }
 
-    /// Never deletes a failed withdrawal row: while it exists, S4 gives its
-    /// spend no coupon.
     pub fn prune_terminal_older_than(
         &self,
         succeeded_max_age_s: u64,
@@ -742,10 +745,13 @@ impl StateStore {
             params![succeeded_max_age_s as i64],
         )?;
         let failed_deleted = conn.execute(
-            "DELETE FROM work_items
-             WHERE state = 'failed' AND flow != ?2
-               AND updated_at < CAST(strftime('%s','now') AS INTEGER) - ?1",
-            params![failed_max_age_s as i64, WITHDRAWAL_FLOW],
+            &format!(
+                "DELETE FROM work_items
+                 WHERE state = 'failed' AND NOT {}
+                   AND updated_at < CAST(strftime('%s','now') AS INTEGER) - ?1",
+                failed_withdrawals()
+            ),
+            params![failed_max_age_s as i64],
         )?;
         Ok(PruneStats {
             succeeded_deleted,
@@ -821,12 +827,18 @@ impl StateStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Item IDs of the rows whose state or step `list_flow` reads as another.
-    pub fn unreadable_rows(&self, flow: &str) -> Result<Vec<String>> {
+    pub fn list_all(&self) -> Result<Vec<WorkItem>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt =
-            conn.prepare("SELECT item_id, state, step FROM work_items WHERE flow = ?1")?;
-        let rows = stmt.query_map(params![flow], |row| {
+        let mut stmt = conn.prepare(&format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items"))?;
+        let rows = stmt.query_map([], row_to_work_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Item IDs of the rows whose state or step `list_all` reads as another.
+    pub fn unreadable_rows(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare("SELECT item_id, state, step FROM work_items")?;
+        let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1027,7 +1039,7 @@ impl StateStore {
 
     /// All or none, each row as it was read: one whose state or step another
     /// writer changed since, or deleted, fails the whole mark.
-    pub fn mark_all_failed_permanent(&self, rows: &[(&WorkItem, &str)]) -> Result<()> {
+    pub fn mark_all_failed_permanent(&self, rows: &[(&WorkItem, String)]) -> Result<()> {
         let mut conn = self.conn.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
         for (row, error) in rows {
@@ -1059,11 +1071,11 @@ impl StateStore {
         failed.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn reset_in_flight_to_queued(&self, flow: &str, error: &str) -> Result<usize> {
+    pub fn reset_in_flight_to_queued(&self, error: &str) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let updated = conn.execute(
-            &format!("UPDATE work_items SET {REQUEUED} WHERE state='in_flight' AND flow=?1"),
-            params![flow, error],
+            &format!("UPDATE work_items SET {REQUEUED} WHERE state='in_flight'"),
+            params![error],
         )?;
         Ok(updated)
     }
@@ -1073,8 +1085,8 @@ impl StateStore {
         let tx = conn.transaction()?;
         for id in ids {
             tx.execute(
-                &format!("UPDATE work_items SET {REQUEUED} WHERE state='in_flight' AND id=?1"),
-                params![id, error],
+                &format!("UPDATE work_items SET {REQUEUED} WHERE state='in_flight' AND id=?2"),
+                params![error, id],
             )?;
         }
         tx.commit()?;
@@ -1082,10 +1094,15 @@ impl StateStore {
     }
 }
 
+/// While a failed withdrawal row exists, S4 gives its spend no coupon, so no delete takes one.
+fn failed_withdrawals() -> String {
+    format!("(state = 'failed' AND flow = '{WITHDRAWAL_FLOW}')")
+}
+
 const REQUEUED: &str = "state='queued',
      attempts=attempts+1,
      error_class='transient',
-     last_error=?2,
+     last_error=?1,
      last_attempt_at=strftime('%s', 'now'),
      updated_at=strftime('%s', 'now')";
 
@@ -1495,7 +1512,7 @@ mod tests {
         store.mark_in_flight(item.id).unwrap();
 
         let affected = store
-            .reset_in_flight_to_queued("lock", "simulated cycle error")
+            .reset_in_flight_to_queued("simulated cycle error")
             .unwrap();
         assert_eq!(affected, 1, "one in_flight row should have been reset");
 

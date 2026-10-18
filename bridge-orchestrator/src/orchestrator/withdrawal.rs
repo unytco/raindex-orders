@@ -1,13 +1,12 @@
 use super::{
-    action_hash_from, parked_on, timed_call, BridgeOrchestrator, ConductorReads, ConductorWrites,
-    LiveLinks, RaveOutcome, Receipt, ReconcileCounts,
+    action_hash_from, parked_on, timed_call, untaken, BridgeOrchestrator, ConductorReads,
+    ConductorWrites, LiveLinks, RaveOutcome, Receipt, ReconcileCounts,
 };
-use crate::state::{WithdrawalPayload, WorkItem, WorkState, WorkStep, WITHDRAWAL_FLOW};
+use crate::state::{WorkItem, WorkState, WorkStep, WITHDRAWAL_FLOW};
 use anyhow::Result;
 use ham::ShutdownRx;
 use holo_hash::ActionHash;
 use rave_engine::types::{ReceiptInput, Transaction};
-use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 use tracing::{debug, error, info, warn};
 
@@ -104,11 +103,10 @@ impl BridgeOrchestrator {
     ) -> Result<usize> {
         let mut collected = 0;
         for (rave, rows) in self.paid_by_rave()? {
-            if Some(&rave) != fresh {
-                match live.receipt(conductor, &rave).await {
-                    Ok(Receipt::Due) => {}
-                    Ok(Receipt::Written(_) | Receipt::NoRave) | Err(_) => continue,
-                }
+            if Some(&rave) != fresh
+                && !matches!(live.receipt(conductor, &rave).await, Ok(Receipt::Due))
+            {
+                continue;
             }
             for row in &rows {
                 self.db.mark_in_flight(row.id)?;
@@ -123,32 +121,27 @@ impl BridgeOrchestrator {
                 }),
             )
             .await;
-            let (receipt, elapsed_ms) = match written {
-                Ok(written) => written,
-                Err(e) if refused(&e) => {
-                    self.receipt_refused(&rave, &rows, &e)?;
-                    let elapsed_ms = started.elapsed().as_millis();
-                    if self.ends_cycle("s5", "create_receipt_from_rave", elapsed_ms, stop)? {
-                        break;
+            let elapsed_ms = started.elapsed().as_millis();
+            match written {
+                Ok((receipt, _)) => {
+                    info!(
+                        "[bridge/s5] create_receipt_from_rave: RAVE {} paid {} withdrawal(s), receipt={}",
+                        rave,
+                        rows.len(),
+                        receipt
+                    );
+                    for row in &rows {
+                        if self.db.advance_to_collected(row.id, &receipt.to_string())? {
+                            collected += 1;
+                        }
                     }
-                    continue;
                 }
+                Err(e) if refused(&e) => self.receipt_refused(&rave, &rows, &e)?,
                 Err(e) => {
                     return Err(e.context(format!(
                         "S5 did not receipt RAVE {rave}, which took {}",
                         item_ids(&rows)
                     )))
-                }
-            };
-            info!(
-                "[bridge/s5] create_receipt_from_rave: RAVE {} paid {} withdrawal(s), receipt={}",
-                rave,
-                rows.len(),
-                receipt
-            );
-            for row in &rows {
-                if self.db.advance_to_collected(row.id, &receipt.to_string())? {
-                    collected += 1;
                 }
             }
             if self.ends_cycle("s5", "create_receipt_from_rave", elapsed_ms, stop)? {
@@ -280,11 +273,8 @@ impl BridgeOrchestrator {
         Ok(())
     }
 
-    /// The RAVE that took a withdrawal row's spend. `None` while the spend
-    /// stays parked or cannot be checked, and when the row's payload does not
-    /// read or no RAVE of the bridging agent's records the spend consumed. The
-    /// row goes to a person on an unreadable payload, or when its spend was
-    /// gone untaken in `gone_before` too, as one listing can miss a parked spend.
+    /// The RAVE that took the row's spend, `None` while none did. A spend gone untaken fails its row
+    /// only when `gone_before` holds it too, as one listing can miss a parked spend.
     async fn withdrawal_taken(
         &self,
         conductor: &impl ConductorReads,
@@ -294,7 +284,7 @@ impl BridgeOrchestrator {
         gone_before: &HashSet<String>,
         gone: &mut HashSet<String>,
     ) -> Result<Option<ActionHash>> {
-        let withdrawal = match WithdrawalPayload::deserialize(&row.payload_json) {
+        let withdrawal = match row.withdrawal() {
             Ok(withdrawal) => withdrawal,
             Err(e) => {
                 return self
@@ -307,56 +297,36 @@ impl BridgeOrchestrator {
             }
         };
         let spend = withdrawal.spend.as_str();
+        let its_spend = format!("its spend {spend}");
         let agreement = match parked_on(conductor, live, spend, Some(&withdrawal.agreement)).await {
             Ok((agreement, true)) => {
                 if agreement != *in_force {
-                    error!(
-                        event = "bridge.reconcile.superseded_agreement",
-                        "[bridge/reconcile] {} waits on agreement {}, no longer in force: only a RAVE on it can take spend {}",
-                        row.item_id,
-                        agreement,
-                        spend
-                    );
+                    Self::superseded(row, &agreement, &format!("take spend {spend}"));
                 }
                 return Ok(None);
             }
             Ok((agreement, false)) => agreement,
-            Err(e) => {
-                return Self::unresolved(row, &format!("its spend {spend}"), e).map(|()| None)
-            }
+            Err(e) => return Self::unresolved(row, &its_spend, e).map(|()| None),
         };
-        let untaken = format!("left agreement {agreement}, and no RAVE in the bridging agent's chain history records it consumed");
+        let reason = untaken(&agreement);
         // A spend is written on its withdrawer's chain, so its sequence bounds
         // nothing on the bridging agent's.
         match live.consumer(conductor, spend, 0).await {
             Ok(Some(rave)) => Ok(Some(rave)),
             Ok(None) if gone_before.contains(spend) => self
-                .for_a_person(row, "bridge.reconcile.link_not_consumed", spend, &untaken)
+                .link_for_a_person(row, "bridge.reconcile.link_not_consumed", spend, &reason)
                 .map(|()| None),
             Ok(None) => {
                 gone.insert(spend.to_string());
                 warn!(
                     event = "bridge.reconcile.spend_gone",
                     spend,
-                    "[bridge/reconcile] {} waits a cycle, as its spend {spend} {untaken}",
+                    "[bridge/reconcile] {} waits a cycle, as {its_spend} {reason}",
                     row.item_id
                 );
                 Ok(None)
             }
-            Err(e) => Self::unresolved(row, &format!("its spend {spend}"), e).map(|()| None),
-        }
-    }
-
-    pub(super) fn withdrawal_of(&self, item: &WorkItem) -> Option<WithdrawalPayload> {
-        match WithdrawalPayload::deserialize(&item.payload_json) {
-            Ok(withdrawal) => Some(withdrawal),
-            Err(e) => {
-                error!(
-                    event = "bridge.payload_unreadable",
-                    "[bridge] {} has an unreadable withdrawal payload: {}", item.item_id, e
-                );
-                None
-            }
+            Err(e) => Self::unresolved(row, &its_spend, e).map(|()| None),
         }
     }
 }
