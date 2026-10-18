@@ -14,7 +14,9 @@ async fn check(
     conductor: &FakeConductor,
     mark_failed: bool,
 ) -> Result<Checked> {
-    let found = orch.in_transit(conductor, orch.screener()).await?;
+    let found = orch
+        .in_transit(conductor, orch.screener(), orch.vault().as_deref())
+        .await?;
     let mut printed = Vec::new();
     let exit = found.settle(&mut printed, &orch.db, mark_failed);
     Ok(Checked {
@@ -301,7 +303,7 @@ async fn each_live_withdrawal_and_deposit_link_is_in_transit_on_its_own() {
             vec![spend_as(
                 parked_withdrawal_tx(0x6E),
                 WITHDRAWER_ROLE,
-                json!({}),
+                json!({ "withdraw_contract_address": format!("{VAULT:#x}") }),
             )],
             vec![unaddressed],
         ),
@@ -502,6 +504,7 @@ async fn mark_failed_records_a_link_no_row_records_and_a_withdrawal_only_in_its_
         parked_withdrawal_tx(0x6A),
         WITHDRAWER_ROLE,
         json!({
+            "withdraw_contract_address": format!("{VAULT:#x}"),
             "withdraw_to_address": format!("{:#x}", Address::repeat_byte(0x6A)),
             "proof_of_deposit": [proof("lock:unmarked:1", "0xd8")],
         }),
@@ -691,7 +694,10 @@ async fn mark_failed_marks_no_row_when_a_row_it_would_mark_is_gone() {
     let orch = test_orchestrator("in-transit-mark-gone");
     waiting_at(&orch, WorkStep::ClLinkCreated, "lock:gone:1", "0xe7", 0x79);
     let gone = waiting_at(&orch, WorkStep::BrSpendCreated, "lock:gone:2", "0xe8", 0x7A);
-    let found = orch.in_transit(&bridging_conductor(), None).await.unwrap();
+    let found = orch
+        .in_transit(&bridging_conductor(), None, None)
+        .await
+        .unwrap();
     delete_rows(&orch, &[gone]);
     let before = snapshot(&orch);
 
@@ -724,7 +730,10 @@ async fn mark_failed_marks_no_row_when_a_row_changed_since_it_was_read() {
             "0xf2",
             0x80,
         );
-        let found = orch.in_transit(&bridging_conductor(), None).await.unwrap();
+        let found = orch
+            .in_transit(&bridging_conductor(), None, None)
+            .await
+            .unwrap();
         match change {
             "succeeded" => orch.db.advance_to_br_rave_executed(late, None),
             "failed" => orch.db.mark_failed_permanent(late, "resolved by a person"),
@@ -765,16 +774,29 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
     let mistyped_to = format!(" {:#x}", Address::repeat_byte(0x70));
     let mistyped = with_payload(
         parked_withdrawal_tx(0x70),
-        json!({ "withdraw_to_address": mistyped_to }),
+        json!({
+            "withdraw_contract_address": format!("{VAULT:#x}"),
+            "withdraw_to_address": mistyped_to,
+        }),
+    );
+    let other_vault = with_payload(
+        parked_withdrawal_tx(0x71),
+        json!({
+            "withdraw_contract_address": "0x2222222222222222222222222222222222222222",
+            "withdraw_to_address": format!("{:#x}", Address::repeat_byte(0x71)),
+        }),
     );
     let listed_hit = format!("withdrawal:{}", listed.id);
     let conductor = bridging_conductor().parking(
         action_hash(BR_EA),
-        &[held, blocked, clear, listed, mistyped],
+        &[held, blocked, clear, listed, mistyped, other_vault],
     );
-    let expected = |marks: [Option<&str>; 5]| {
-        let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x70].map(listed_withdrawal);
+    let expected = |marks: [Option<&str>; 6]| {
+        let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x70, 0x71].map(listed_withdrawal);
         expected[4]["withdraw_to_address"] = json!(mistyped_to);
+        expected[5]["stranded"] = json!(format!(
+            "names withdraw_contract_address \"0x2222222222222222222222222222222222222222\", not vault {VAULT:#x}"
+        ));
         for (listed, mark) in expected.iter_mut().zip(marks) {
             if let Some(mark) = mark {
                 listed["screening"] = json!(mark);
@@ -792,11 +814,14 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
             None,
             None,
             Some("unscreened"),
+            None,
         ]),
     );
 
-    orch.ethereum.as_mut().unwrap().screener =
-        Some(Box::new(DenyList::new([Address::repeat_byte(0x6D)])));
+    orch.ethereum.as_mut().unwrap().screener = Some(Box::new(DenyList::new([
+        Address::repeat_byte(0x6D),
+        Address::repeat_byte(0x71),
+    ])));
     let logged = logged_at(tracing::Level::ERROR, async {
         let on = check(&orch, &conductor, false).await.unwrap();
         assert_lists(
@@ -807,6 +832,7 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
                 None,
                 Some("held"),
                 Some("unscreened"),
+                Some("held"),
             ]),
         );
     })

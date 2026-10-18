@@ -157,7 +157,7 @@ async fn s4_screens_each_withdrawal_it_would_pay_against_the_list_in_force() {
     }
     let select = async |list: &DenyList| {
         select_bridging_links(
-            Some(&signer),
+            Some((&signer, VAULT)),
             &WithdrawalGate::new(&orch.db, Some(list)),
             &bridging_agent(),
             &[held.clone(), clear.clone(), unpayable.clone()],

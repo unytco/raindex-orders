@@ -1,5 +1,5 @@
 use super::{
-    bridging_spend, connect_ham, deposit_proofs, normalize_tx_hash, own_deposit,
+    bridging_spend, connect_ham, deposit_proofs, normalize_tx_hash, own_deposit, vault_key,
     BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey, WithdrawalGate,
     WITHDRAWALS_SCREENED,
 };
@@ -44,6 +44,8 @@ enum InTransit {
         /// Not cleared by screening, so not to be paid by hand.
         #[serde(skip_serializing_if = "Option::is_none")]
         screening: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stranded: Option<String>,
     },
 }
 
@@ -103,8 +105,8 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
         Some(chain) => crate::config::screener_from_env(chain.network)?,
         None => None,
     };
-    if let Some(chain) = ethereum {
-        let configured = format!("{:#x}", chain.lock_vault_address);
+    let vault = ethereum.map(|chain| vault_key(chain.lock_vault_address));
+    if let Some(configured) = &vault {
         let served = db.vault()?;
         anyhow::ensure!(
             served.as_deref() == Some(configured.as_str()),
@@ -129,17 +131,19 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
                 role_name: &orchestrator.cfg.role_name,
             },
             screener.as_deref(),
+            vault.as_deref(),
         )
         .await?;
     found.settle(&mut std::io::stdout(), &orchestrator.db, mark_failed)
 }
 
 impl BridgeOrchestrator {
-    /// Holds a listed withdrawal, as S4 would.
+    /// Holds a listed withdrawal.
     pub(super) async fn in_transit(
         &self,
         conductor: &impl ConductorReads,
         screener: Option<&dyn Screener>,
+        vault: Option<&str>,
     ) -> Result<Found> {
         let agent = &self.cfg.bridging_agent_pubkey;
         let global_definition = conductor.global_definition().await?;
@@ -163,7 +167,10 @@ impl BridgeOrchestrator {
                 bridging_links
                     .iter()
                     .filter(|spend| {
-                        matches!(bridging_spend(spend, agent), Some(BridgingSpend::Deposit))
+                        matches!(
+                            bridging_spend(spend, agent, vault),
+                            Some(BridgingSpend::Deposit)
+                        )
                     })
                     .map(|spend| (&context.bridging_agreement, spend)),
             );
@@ -214,8 +221,10 @@ impl BridgeOrchestrator {
         let gate = WithdrawalGate::new(&self.db, screener);
         let mut withdrawals = Vec::new();
         for spend in &bridging_links {
-            let Some(BridgingSpend::Withdrawal(withdraw_to)) = bridging_spend(spend, agent) else {
-                continue;
+            let (withdraw_to, stranded) = match bridging_spend(spend, agent, vault) {
+                Some(BridgingSpend::Withdrawal(to)) => (to, None),
+                Some(BridgingSpend::OtherVault { to, why }) => (to, Some(why)),
+                _ => continue,
             };
             let id = spend.id.to_string();
             let hot = spend
@@ -244,6 +253,7 @@ impl BridgeOrchestrator {
                 amount: spend.amount.clone(),
                 withdraw_to_address: withdraw_to.map(str::to_string),
                 screening,
+                stranded,
             });
         }
         self.tell_waiting(WITHDRAWALS_SCREENED, &gate.into_waiting());
