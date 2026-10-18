@@ -211,17 +211,19 @@ fn screening_settings(
     Ok(on.then(|| Box::new(DenyList::new(addresses)) as Box<dyn Screener>))
 }
 
-/// A mixed-case entry must carry its EIP-55 checksum, so a mistyped digit is refused rather than
-/// listing another address.
 fn denylist_entry(entry: &str) -> Result<Address, &'static str> {
     let address: Address = entry.parse().map_err(|_| "is not an address")?;
-    let hex = entry.trim_start_matches("0x");
-    let mixed_case =
-        hex.chars().any(|c| c.is_ascii_lowercase()) && hex.chars().any(|c| c.is_ascii_uppercase());
-    if mixed_case && Address::parse_checksummed(entry, None).is_err() {
+    if !checksum_matches(entry) {
         return Err("does not match its checksum");
     }
     Ok(address)
+}
+
+/// Only a mixed-case address carries an EIP-55 checksum.
+pub fn checksum_matches(address: &str) -> bool {
+    let hex = address.strip_prefix("0x").unwrap_or(address);
+    let mixed_case = hex != hex.to_ascii_lowercase() && hex != hex.to_ascii_uppercase();
+    !mixed_case || Address::parse_checksummed(format!("0x{hex}"), None).is_ok()
 }
 
 /// The network `NETWORK` names, base-sepolia when it is unset or empty.

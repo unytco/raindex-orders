@@ -1,4 +1,4 @@
-use crate::config::{log_testnet_defaults, with_network_defaults, Network};
+use crate::config::{checksum_matches, log_testnet_defaults, with_network_defaults, Network};
 use alloy::primitives::{address, keccak256, Address, Bytes, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
@@ -392,13 +392,20 @@ pub struct Payout {
 impl Payout {
     /// `amount` is HOT as a decimal. HOT has 18 decimals on Ethereum.
     pub fn new(recipient: &str, amount: &str) -> Result<Self> {
-        let recipient = recipient
+        let address = recipient
             .parse()
             .with_context(|| format!("the recipient {recipient:?} is not an address"))?;
+        anyhow::ensure!(
+            checksum_matches(recipient),
+            "the recipient {recipient:?} fails its EIP-55 checksum"
+        );
         let wei = hot_in_wei(amount)
             .with_context(|| format!("the amount {amount:?} is not a HOT amount"))?;
         anyhow::ensure!(!wei.is_zero(), "the amount is zero");
-        Ok(Self { recipient, wei })
+        Ok(Self {
+            recipient: address,
+            wei,
+        })
     }
 
     pub fn recipient(&self) -> Address {

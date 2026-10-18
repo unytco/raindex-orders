@@ -8768,7 +8768,18 @@ mod tests {
             let payload = json!({ "withdraw_contract_address": named, "withdraw_to_address": to });
             spend(seed, payload, &[(1, "5")])
         };
-        let payable = paid_to(0x60, to, &[(1, "5")]);
+        let checksummed = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+        let payable = [
+            paid_to(0x60, to, &[(1, "5")]),
+            paid_to(0x6E, checksummed, &[(1, "5")]),
+            paid_to(0x6F, &checksummed.to_ascii_lowercase(), &[(1, "5")]),
+            paid_to(
+                0x70,
+                &format!("0x{}", checksummed[2..].to_ascii_uppercase()),
+                &[(1, "5")],
+            ),
+            paid_to(0x72, &checksummed[2..], &[(1, "5")]),
+        ];
         let deposit = parked_spend_tx(0x61, &[proof("lock:d", "0xd0")]);
         let unpayable = [
             paid_to(0x62, to, &[(2, "5")]),
@@ -8778,6 +8789,11 @@ mod tests {
             paid_to(0x66, to, &[(1, "5"), (0, "-3")]),
             paid_to(0x67, to, &[(1, "5"), (2, "5")]),
             paid_to(0x68, to, &[(1, "5"), (0, "0")]),
+            paid_to(
+                0x71,
+                "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD",
+                &[(1, "5")],
+            ),
         ];
         let other_vaults = [
             from_vault(0x69, "0x2222222222222222222222222222222222222222"),
@@ -8789,7 +8805,8 @@ mod tests {
         let links = [
             &unpayable[..],
             &other_vaults,
-            &[payable.clone(), deposit.clone()],
+            &payable,
+            std::slice::from_ref(&deposit),
         ]
         .concat();
 
@@ -8804,10 +8821,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(ids(&selection.withdrawals), ids(&[payable]));
+        assert_eq!(ids(&selection.withdrawals), ids(&payable));
         assert_eq!(ids(&selection.deposits), ids(&[deposit]));
-        assert_eq!(selection.coupons.len(), 1);
-        assert_eq!(selection.withdrawals_found, 8);
+        assert_eq!(selection.coupons.len(), payable.len());
+        assert_eq!(selection.withdrawals_found, unpayable.len() + payable.len());
         assert_eq!(unpayable_ids(&selection), ids(&unpayable));
         let reasons: Vec<String> = selection
             .unpayable
@@ -8824,6 +8841,7 @@ mod tests {
                 "the amount holds unit 0",
                 "the amount holds unit 2",
                 "the amount holds unit 0",
+                "the recipient \"0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD\" fails its EIP-55 checksum",
             ]
         );
         let why_parked: Vec<String> = other_vaults
