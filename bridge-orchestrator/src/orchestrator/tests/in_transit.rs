@@ -786,14 +786,31 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
             "withdraw_to_address": format!("{:#x}", Address::repeat_byte(0x71)),
         }),
     );
+    let bad_checksum_to = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD";
+    let bad_checksum = with_payload(
+        parked_withdrawal_tx(0x72),
+        json!({
+            "withdraw_contract_address": format!("{VAULT:#x}"),
+            "withdraw_to_address": bad_checksum_to,
+        }),
+    );
     let listed_hit = format!("withdrawal:{}", listed.id);
     let conductor = bridging_conductor().parking(
         action_hash(BR_EA),
-        &[held, blocked, clear, listed, mistyped, other_vault],
+        &[
+            held,
+            blocked,
+            clear,
+            listed,
+            mistyped,
+            other_vault,
+            bad_checksum,
+        ],
     );
-    let expected = |marks: [Option<&str>; 6]| {
-        let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x70, 0x71].map(listed_withdrawal);
+    let expected = |marks: [Option<&str>; 7]| {
+        let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x70, 0x71, 0x72].map(listed_withdrawal);
         expected[4]["withdraw_to_address"] = json!(mistyped_to);
+        expected[6]["withdraw_to_address"] = json!(bad_checksum_to);
         expected[5]["stranded"] = json!(format!(
             "names withdraw_contract_address \"0x2222222222222222222222222222222222222222\", not vault {VAULT:#x}"
         ));
@@ -815,12 +832,14 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
             None,
             Some("unscreened"),
             None,
+            Some("unscreened"),
         ]),
     );
 
     orch.ethereum.as_mut().unwrap().screener = Some(Box::new(DenyList::new([
         Address::repeat_byte(0x6D),
         Address::repeat_byte(0x71),
+        bad_checksum_to.parse().unwrap(),
     ])));
     let logged = logged_at(tracing::Level::ERROR, async {
         let on = check(&orch, &conductor, false).await.unwrap();
@@ -833,6 +852,7 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
                 Some("held"),
                 Some("unscreened"),
                 Some("held"),
+                Some("unscreened"),
             ]),
         );
     })

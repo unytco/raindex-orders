@@ -3,7 +3,7 @@ use super::{
     BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads, LockKey, WithdrawalGate,
     WITHDRAWALS_SCREENED,
 };
-use crate::config::{Config, Ethereum};
+use crate::config::{checksum_matches, Config, Ethereum};
 use crate::screening::Screener;
 use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
 use crate::watchtower_reporter::ReporterState;
@@ -232,9 +232,11 @@ impl BridgeOrchestrator {
                 .get(&self.cfg.hot_unit_index.to_string())
                 .map(|amount| amount.to_string())
                 .unwrap_or_default();
-            let pays = match withdraw_to.map(str::parse::<Address>) {
-                Some(Ok(to)) => gate.pays(&id, to, &hot).await?,
-                Some(Err(_)) => false,
+            let pays = match withdraw_to {
+                Some(to) => match to.parse::<Address>() {
+                    Ok(address) if checksum_matches(to) => gate.pays(&id, address, &hot).await?,
+                    _ => false,
+                },
                 None => true,
             };
             let screening = if pays {
