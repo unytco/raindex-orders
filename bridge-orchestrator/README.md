@@ -596,8 +596,9 @@ queued ─> claimed ─> in_flight ─┬─> succeeded
   and needs a person (`last_error` says why)
 
 On startup, every item a stop or a crash left `claimed` or `in_flight` goes
-back to `queued` with its attempts unchanged. Only a failed cycle counts an
-attempt, against the items it had in flight.
+back to `queued` with its attempts unchanged. Only two things count an attempt:
+a failed cycle, against the items it had in flight, and a refused receipt,
+against the withdrawals its RAVE took.
 
 S2 and S4 give the RAVE a deposit link only when the row of every lock it
 carries records exactly that link and is not failed. A link whose only gap is rows that record
@@ -623,3 +624,12 @@ coupon pays a withdrawal whose row is failed or past `sent`, while retention
 keeps the row (`bridge.withdrawal_withheld`). A row whose spend left the
 bridging agreement with no RAVE of the bridging agent's recording it consumed,
 or whose RAVE is not in the bridging agent's chain, is failed for a person.
+
+S5 receipts each RAVE on its own. The cycle goes on past a receipt that the DNA
+refuses, in its validation or its zome, and any other failure of the call ends
+the cycle. A refused RAVE waits for the next cycle (`bridge.receipt.refused`),
+and its withdrawals fail once their attempts run out: re-queue them once the
+cause of the refusal is fixed. A RAVE refused because a withdrawer it took, or
+the bridging agent, carries a ChainFork warrant is never receipted, and its
+withdrawals fail at once (`bridge.receipt.forked`). A withdrawal S5 fails stays
+on both the credit limit and the debt: do not take it off by hand.

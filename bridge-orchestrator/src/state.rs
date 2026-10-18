@@ -1063,19 +1063,32 @@ impl StateStore {
     pub fn reset_in_flight_to_queued(&self, flow: &str, error: &str) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let updated = conn.execute(
-            "UPDATE work_items
-             SET state='queued',
-                 attempts=attempts+1,
-                 error_class='transient',
-                 last_error=?2,
-                 last_attempt_at=strftime('%s', 'now'),
-                 updated_at=strftime('%s', 'now')
-             WHERE state='in_flight' AND flow=?1",
+            &format!("UPDATE work_items SET {REQUEUED} WHERE state='in_flight' AND flow=?1"),
             params![flow, error],
         )?;
         Ok(updated)
     }
+
+    pub fn requeue_in_flight(&self, ids: &[i64], error: &str) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        for id in ids {
+            tx.execute(
+                &format!("UPDATE work_items SET {REQUEUED} WHERE state='in_flight' AND id=?1"),
+                params![id, error],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
+
+const REQUEUED: &str = "state='queued',
+     attempts=attempts+1,
+     error_class='transient',
+     last_error=?2,
+     last_attempt_at=strftime('%s', 'now'),
+     updated_at=strftime('%s', 'now')";
 
 fn withdrawal_item_id(spend: &str) -> String {
     format!("{WITHDRAWAL_FLOW}:{spend}")
@@ -1486,6 +1499,41 @@ mod tests {
             Some("simulated cycle error"),
             "last_error should carry the cycle error context"
         );
+    }
+
+    #[test]
+    fn requeue_in_flight_requeues_only_the_named_rows_still_in_flight() {
+        let store = StateStore::open(test_db_path("requeue-in-flight")).unwrap();
+        let ids: Vec<i64> = ["1", "2", "3"]
+            .iter()
+            .map(|lock| {
+                let item_id = format!("lock:{lock}");
+                store
+                    .enqueue_queued(
+                        "lock",
+                        "create_parked_link",
+                        &item_id,
+                        &format!("{item_id}:create_parked_link"),
+                        &serde_json::json!({ "lock_id": lock }),
+                    )
+                    .unwrap();
+                let item = store.claim_next(Some("lock")).unwrap().unwrap();
+                store.mark_in_flight(item.id).unwrap();
+                item.id
+            })
+            .collect();
+        store.mark_failed_permanent(ids[1], "in transit").unwrap();
+
+        store.requeue_in_flight(&ids[..2], "refused").unwrap();
+
+        let rows = store.list_flow("lock").unwrap();
+        let seen = |item_id: &str| {
+            let row = rows.iter().find(|row| row.item_id == item_id).unwrap();
+            (row.state.clone(), row.attempts, row.last_error.as_deref())
+        };
+        assert_eq!(seen("lock:1"), (WorkState::Queued, 2, Some("refused")));
+        assert_eq!(seen("lock:2"), (WorkState::Failed, 1, Some("in transit")));
+        assert_eq!(seen("lock:3"), (WorkState::InFlight, 1, None));
     }
 
     #[test]

@@ -99,6 +99,18 @@ fn classify_cycle_failure(e: &anyhow::Error) -> CycleFailureAction {
     }
 }
 
+/// The conductor answered, and refused. Holochain renders its validation's
+/// rejection of a write as `InvalidCommit`, which `ham` classes as source chain
+/// pressure, and an error the zome returned as `Guest`.
+fn refused(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.contains("InvalidCommit error") || text.contains("Guest(")
+}
+
+/// The transactor zome's refusal of an agent with a proven chain fork, which
+/// holds for good.
+const CHAIN_FORK_REFUSAL: &str = "carries a ChainFork warrant";
+
 /// Wait `duration_ms`, returning early if shutdown is signalled, so the loop
 /// never sits out a full cooldown or poll interval after a Ctrl-C. Only wakes
 /// the wait — the loop's own `shutdown.borrow()` checks are what exit it.
@@ -1661,7 +1673,8 @@ impl BridgeOrchestrator {
             for row in &rows {
                 self.db.mark_in_flight(row.id)?;
             }
-            let (receipt, elapsed_ms) = timed_call(
+            let started = std::time::Instant::now();
+            let written = timed_call(
                 "s5",
                 "create_receipt_from_rave",
                 conductor.create_receipt_from_rave(&ReceiptInput {
@@ -1669,13 +1682,24 @@ impl BridgeOrchestrator {
                     note: None,
                 }),
             )
-            .await
-            .with_context(|| {
-                format!(
-                    "S5 did not receipt RAVE {rave}, which took {}",
-                    item_ids(&rows)
-                )
-            })?;
+            .await;
+            let (receipt, elapsed_ms) = match written {
+                Ok(written) => written,
+                Err(e) if refused(&e) => {
+                    self.receipt_refused(&rave, &rows, &e)?;
+                    let elapsed_ms = started.elapsed().as_millis();
+                    if self.ends_cycle("s5", "create_receipt_from_rave", elapsed_ms, stop)? {
+                        break;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "S5 did not receipt RAVE {rave}, which took {}",
+                        item_ids(&rows)
+                    )))
+                }
+            };
             info!(
                 "[bridge/s5] create_receipt_from_rave: RAVE {} paid {} withdrawal(s), receipt={}",
                 rave,
@@ -1692,6 +1716,39 @@ impl BridgeOrchestrator {
             }
         }
         Ok(collected)
+    }
+
+    fn receipt_refused(
+        &self,
+        rave: &ActionHash,
+        rows: &[WorkItem],
+        e: &anyhow::Error,
+    ) -> Result<()> {
+        let why = format!("{e:#}");
+        if why.contains(CHAIN_FORK_REFUSAL) {
+            error!(
+                event = "bridge.receipt.forked",
+                rave = %rave,
+                "[bridge/s5] RAVE {rave} is never receipted, so the HOT of {} stays on the credit limit and the debt: {why}",
+                item_ids(rows)
+            );
+            for row in rows {
+                self.db.mark_failed_permanent(
+                    row.id,
+                    &format!("its RAVE {rave} is never receipted ({why}): its HOT stays on the credit limit and the debt, and is not taken off by hand"),
+                )?;
+            }
+        } else {
+            error!(
+                event = "bridge.receipt.refused",
+                rave = %rave,
+                "[bridge/s5] RAVE {rave}, which took {}, waits for the next cycle, as the conductor refused its receipt: {why}",
+                item_ids(rows)
+            );
+            let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+            self.db.requeue_in_flight(&ids, &why)?;
+        }
+        Ok(())
     }
 
     /// A row whose RAVE does not read goes to a person.
@@ -4825,7 +4882,8 @@ mod tests {
         chain_stalls: bool,
         chain_fails_below: Option<u32>,
         seqs: HashMap<ActionHash, u32>,
-        refuses_receipts: bool,
+        refuses_receipts: HashMap<ActionHash, &'static str>,
+        receipt_delay_ms: u64,
     }
 
     struct Landing {
@@ -4978,11 +5036,14 @@ mod tests {
         }
 
         /// `answer` to the call that wrote `written`, unless the reply to it
-        /// is lost after the write landed.
+        /// is lost after the write landed, which fails with the text `ham`'s
+        /// `is_request_timeout` matches.
         fn reply<T>(&self, written: &ActionHash, answer: T) -> Result<T> {
             match self.loses_reply_to {
                 Some(write) if written.get_raw_32()[0] == 0xC0 + write => {
-                    anyhow::bail!("the conductor's reply to write {write} was lost")
+                    anyhow::bail!(
+                        "Websocket error: Timeout, as the reply to write {write} was lost"
+                    )
                 }
                 _ => Ok(answer),
             }
@@ -5266,25 +5327,26 @@ mod tests {
         /// Refuses a RAVE it does not hold, and one it already receipted, as
         /// the DNA's receipt validation does.
         async fn create_receipt_from_rave(&self, input: &ReceiptInput) -> Result<ActionHashB64> {
-            if self.refuses_receipts {
-                self.call("create_receipt_from_rave");
-                anyhow::bail!("the receipt fails validation");
-            }
             let rave: ActionHash = input.hash.clone().into();
+            tokio::time::sleep(Duration::from_millis(self.receipt_delay_ms)).await;
+            if let Some(refusal) = self.refuses_receipts.get(&rave) {
+                self.call("create_receipt_from_rave");
+                anyhow::bail!("{refusal}");
+            }
             let receipt = self.write("create_receipt_from_rave");
             let chain = self.chain.borrow();
             anyhow::ensure!(
                 chain
                     .iter()
                     .any(|chained| matches!(chained, Chained::Rave(hash, _) if *hash == rave)),
-                "no RAVE {rave}"
+                r#"External API wire error: InternalError("Source chain error: InvalidCommit error: Validation failed while committing: no RAVE {rave}")"#
             );
             anyhow::ensure!(
                 !self
                     .receipts()
                     .iter()
                     .any(|(receipted, _)| *receipted == rave),
-                "The accept {rave} is already used"
+                r#"External API wire error: InternalError("Source chain error: InvalidCommit error: Validation failed while committing: The accept {rave} is already used")"#
             );
             drop(chain);
             self.chain.borrow_mut().push(Chained::Receipt {
@@ -7537,43 +7599,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_receipt_refused_every_cycle_fails_its_withdrawal_for_a_person_once_its_attempts_run_out(
+    async fn a_refused_receipt_holds_back_only_its_own_rave_and_a_forked_withdrawer_fails_its_rave_at_once(
     ) {
         let orch = test_orchestrator("withdrawal-receipt-refused");
-        let withdrawal = hot_withdrawal(0x5D);
+        let [refused, forked, receipted] = [0x5D, 0x5E, 0x5F].map(hot_withdrawal);
         let conductor = FakeConductor {
-            refuses_receipts: true,
-            ..bridging_conductor().parking(action_hash(BR_EA), std::slice::from_ref(&withdrawal))
+            refuses_receipts: HashMap::from([
+                (action_hash(0xE8), INVALID_COMMIT),
+                (action_hash(0xE9), CHAIN_FORKED),
+            ]),
+            ..bridging_conductor()
+                .taken(std::slice::from_ref(&refused))
+                .taken(std::slice::from_ref(&forked))
+                .taken(std::slice::from_ref(&receipted))
         };
-
-        let e = orch
-            .run_bridge_cycle(&conductor, &running())
-            .await
-            .unwrap_err();
-        let refused = format!(
-            "S5 did not receipt RAVE {}, which took withdrawal:{}",
-            action_hash(0xC0),
-            withdrawal.id
-        );
-        assert!(format!("{e:#}").contains(&refused), "{e:#}");
-        orch.cycle_failed(&e, &running());
-        let row = || {
+        let row = |spend: &Transaction| orch.db.withdrawal(&spend.id.to_string()).unwrap().unwrap();
+        for (spend, rave) in [(&refused, 0xE8), (&forked, 0xE9), (&receipted, 0xEA)] {
+            sent(&orch, spend);
             orch.db
-                .withdrawal(&withdrawal.id.to_string())
-                .unwrap()
-                .unwrap()
-        };
-        let attempts = row().max_attempts as usize;
+                .advance_to_paid(row(spend).id, &action_hash(rave).to_string())
+                .unwrap();
+        }
+
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+        assert_eq!(
+            conductor.receipts(),
+            [(action_hash(0xEA), action_hash(0xC0))]
+        );
+        assert_eq!(row(&receipted).step, WorkStep::Collected);
+        let waiting = row(&refused);
+        assert_eq!(
+            (&waiting.state, &waiting.step, waiting.attempts),
+            (&WorkState::Queued, &WorkStep::Paid, 1)
+        );
+        assert!(waiting
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("The accept is already used"));
+        let failed = row(&forked);
+        assert_eq!(
+            (failed.state, failed.step),
+            (WorkState::Failed, WorkStep::Paid)
+        );
+        let why = failed.last_error.unwrap();
+        assert!(why.contains("carries a ChainFork warrant"), "{why}");
+        assert!(why.contains("is not taken off by hand"), "{why}");
+
+        let attempts = waiting.max_attempts as usize;
         cycles(&orch, &conductor, attempts).await;
 
-        let row = row();
-        assert_eq!((row.state, row.step), (WorkState::Failed, WorkStep::Paid));
-        assert!(row
+        let exhausted = row(&refused);
+        assert_eq!(
+            (exhausted.state, exhausted.step),
+            (WorkState::Failed, WorkStep::Paid)
+        );
+        assert!(exhausted
             .last_error
             .unwrap()
             .contains("Exceeded max attempts in-cycle"));
-        assert_eq!(calls_to(&conductor, "create_receipt_from_rave"), attempts);
-        assert!(withdraw_proofs(&conductor).is_empty());
+        assert_eq!(
+            calls_to(&conductor, "create_receipt_from_rave"),
+            attempts + 2
+        );
+        assert_eq!(withdraw_proofs(&conductor).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_refused_receipt_ends_the_cycle() {
+        let mut orch = test_orchestrator("withdrawal-receipt-refused-slowly");
+        orch.cfg.slow_call_threshold_ms = 5;
+        let [refused, next] = [0x5D, 0x5F].map(hot_withdrawal);
+        let conductor = FakeConductor {
+            refuses_receipts: HashMap::from([(action_hash(0xE8), INVALID_COMMIT)]),
+            receipt_delay_ms: 20,
+            ..bridging_conductor()
+                .taken(std::slice::from_ref(&refused))
+                .taken(std::slice::from_ref(&next))
+        };
+        let row = |spend: &Transaction| orch.db.withdrawal(&spend.id.to_string()).unwrap().unwrap();
+        for (spend, rave) in [(&refused, 0xE8), (&next, 0xE9)] {
+            sent(&orch, spend);
+            orch.db
+                .advance_to_paid(row(spend).id, &action_hash(rave).to_string())
+                .unwrap();
+        }
+
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+        assert_eq!(calls_to(&conductor, "create_receipt_from_rave"), 1);
+        assert_eq!(
+            [&refused, &next].map(|spend| {
+                let row = row(spend);
+                (row.state, row.step, row.attempts)
+            }),
+            [
+                (WorkState::Queued, WorkStep::Paid, 1),
+                (WorkState::Queued, WorkStep::Paid, 0)
+            ]
+        );
     }
 
     /// Two deposits at `step`, each recorded on its own live link.
@@ -9570,6 +9695,29 @@ mod tests {
                 "unclassified error {msg:?} must route to the terminal cooldown fallback"
             );
         }
+    }
+
+    const INVALID_COMMIT: &str = r#"Failed to call zome: External API wire error: InternalError("Source chain error: InvalidCommit error: Validation failed while committing: The accept is already used")"#;
+    const CHAIN_FORKED: &str = r#"Failed to call zome: External API wire error: InternalError("Wasm runtime error while working with Ribosome: RuntimeError: transactor::entries:72: Guest(\"Agent AgentPubKey(uhCAk) carries a ChainFork warrant; nothing is transacted with it\")")"#;
+
+    #[test]
+    fn only_the_conductor_s_validation_or_its_zome_refuses_a_write() {
+        for refusal in [INVALID_COMMIT, CHAIN_FORKED] {
+            assert!(refused(&anyhow::anyhow!("{refusal}")), "{refusal}");
+        }
+        for failure in [
+            r#"Failed to call zome: Unable to sign zome call: {"error":"TimedOut"}"#,
+            "Failed to call zome: Websocket error: Timeout",
+            "Failed to call zome: Websocket error: Websocket closed: No connection",
+            r#"Failed to call zome: External API wire error: InternalError("Source chain error: deadline has elapsed")"#,
+            r#"Failed to call zome: External API wire error: InternalError("Wasm runtime error while working with Ribosome: RuntimeError: transactor::entries:1: Host(\"network error\")")"#,
+            r#"Failed to call zome: External API wire error: InternalError("Source chain error: The commit could not be completed but may be retried: DepMissingFromDht([])")"#,
+            r#"Failed to call zome: External API wire error: InternalError("Source chain error: Attempted to commit a bundle to the source chain, but the source chain head has moved since the bundle began. Bundle head: None, Current head: None")"#,
+            "Failed to deserialize response: invalid type",
+        ] {
+            assert!(!refused(&anyhow::anyhow!("{failure}")), "{failure}");
+        }
+        assert!(!refused(&Stopped.into()));
     }
 
     // -----------------------------------------------------------------
