@@ -155,19 +155,8 @@ async fn select_bridging_links(
             continue;
         };
 
-        let hot_unit = hot_unit_index.to_string();
-        let amount = tx
-            .amount
-            .get(&hot_unit)
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        // The template pays the executor every unit in the spend, so a unit other
-        // than HOT can fail the one RAVE the whole batch shares.
-        let terms = match tx.amount.iter().find(|(unit, _)| **unit != hot_unit) {
-            Some((unit, _)) => Err(anyhow::anyhow!("the amount holds unit {unit}")),
-            None => Payout::new(withdraw_to, &amount),
-        };
-        let terms = match terms {
+        let amount = hot_amount(tx, hot_unit_index);
+        let terms = match withdrawal_terms(tx, withdraw_to, hot_unit_index) {
             Ok(terms) => terms,
             Err(e) => {
                 selection.unpayable.push((tx.clone(), e));
@@ -264,6 +253,23 @@ fn bridging_spend<'a>(
 
 fn vault_key(vault: Address) -> String {
     format!("{vault:#x}")
+}
+
+fn hot_amount(tx: &Transaction, hot_unit_index: u32) -> String {
+    tx.amount
+        .get(&hot_unit_index.to_string())
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+}
+
+fn withdrawal_terms(tx: &Transaction, withdraw_to: &str, hot_unit_index: u32) -> Result<Payout> {
+    let hot_unit = hot_unit_index.to_string();
+    // The template pays the executor every unit in the spend, so a unit other
+    // than HOT can fail the one RAVE the whole batch shares.
+    if let Some((unit, _)) = tx.amount.iter().find(|(unit, _)| **unit != hot_unit) {
+        anyhow::bail!("the amount holds unit {unit}");
+    }
+    Payout::new(withdraw_to, &hot_amount(tx, hot_unit_index))
 }
 
 fn other_vault_reason(named: Option<&str>, vault: &str) -> String {

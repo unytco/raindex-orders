@@ -794,23 +794,45 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
             "withdraw_to_address": bad_checksum_to,
         }),
     );
+    let refused_amounts = [
+        (0x73, vec![(1, "5"), (2, "5")], "the amount holds unit 2"),
+        (0x74, vec![(1, "0")], "the amount is zero"),
+        (
+            0x75,
+            vec![(1, "-5")],
+            "the amount \"-5\" is not a HOT amount",
+        ),
+        (0x76, vec![], "the amount \"\" is not a HOT amount"),
+    ]
+    .map(|(seed, amount, why)| {
+        let mut spend = parked_withdrawal_tx(seed);
+        spend.amount = UnitMap::from(amount);
+        (seed, spend, why)
+    });
     let listed_hit = format!("withdrawal:{}", listed.id);
-    let conductor = bridging_conductor().parking(
-        action_hash(BR_EA),
-        &[
-            held,
-            blocked,
-            clear,
-            listed,
-            mistyped,
-            other_vault,
-            bad_checksum,
-        ],
-    );
+    let parked: Vec<Transaction> = [
+        held,
+        blocked,
+        clear,
+        listed,
+        mistyped,
+        other_vault,
+        bad_checksum,
+    ]
+    .into_iter()
+    .chain(refused_amounts.iter().map(|(_, spend, _)| spend.clone()))
+    .collect();
+    let conductor = bridging_conductor().parking(action_hash(BR_EA), &parked);
     let expected = |marks: [Option<&str>; 7]| {
         let mut expected = [0x6A, 0x6B, 0x6C, 0x6D, 0x70, 0x71, 0x72].map(listed_withdrawal);
         expected[4]["withdraw_to_address"] = json!(mistyped_to);
+        expected[4]["unpayable"] = json!(format!(
+            "the recipient {mistyped_to:?} is not an address: odd number of digits"
+        ));
         expected[6]["withdraw_to_address"] = json!(bad_checksum_to);
+        expected[6]["unpayable"] = json!(format!(
+            "the recipient {bad_checksum_to:?} fails its EIP-55 checksum"
+        ));
         expected[5]["stranded"] = json!(format!(
             "names withdraw_contract_address \"0x2222222222222222222222222222222222222222\", not vault {VAULT:#x}"
         ));
@@ -819,7 +841,14 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
                 listed["screening"] = json!(mark);
             }
         }
-        expected
+        let refused = refused_amounts.iter().map(|(seed, spend, why)| {
+            let mut listed = listed_withdrawal(*seed);
+            listed["amount"] = json!(spend.amount);
+            listed["unpayable"] = json!(why);
+            listed["screening"] = json!("unscreened");
+            listed
+        });
+        expected.into_iter().chain(refused).collect::<Vec<_>>()
     };
 
     let off = check(&orch, &conductor, false).await.unwrap();
@@ -836,11 +865,10 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
         ]),
     );
 
-    orch.ethereum.as_mut().unwrap().screener = Some(Box::new(DenyList::new([
-        Address::repeat_byte(0x6D),
-        Address::repeat_byte(0x71),
-        bad_checksum_to.parse().unwrap(),
-    ])));
+    let denied = [0x6D, 0x71, 0x73, 0x74, 0x75, 0x76].map(Address::repeat_byte);
+    orch.ethereum.as_mut().unwrap().screener = Some(Box::new(DenyList::new(
+        denied.into_iter().chain([bad_checksum_to.parse().unwrap()]),
+    )));
     let logged = logged_at(tracing::Level::ERROR, async {
         let on = check(&orch, &conductor, false).await.unwrap();
         assert_lists(
