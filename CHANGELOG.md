@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- bridge-orchestrator leaves a withdrawal parked with no coupon when it holds a unit besides HOT, names another vault, or names a recipient that fails its EIP-55 checksum, and pays the rest of the batch.
+
 ## [0.7.0] - 2026-10-15
 
 ### Added
