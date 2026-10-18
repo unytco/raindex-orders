@@ -120,7 +120,7 @@ bridge-orchestrator clear --all
 | Flag | Description |
 |------|-------------|
 | `--non-in-progress` | Delete only terminal rows (`succeeded`, `failed`) |
-| `--all` | Delete every row in `work_items` but the locks in `screening`, `held` or `blocked` |
+| `--all` | Delete every row in `work_items` but the locks in `screening`, `held` or `blocked`. A withdrawal row it deletes before it is `succeeded` never has its HOT taken off the credit limit |
 | `--older-than-s N` | Only with `--non-in-progress`: restrict deletion to terminal rows whose `updated_at` is older than N seconds. Applied to both `succeeded` and `failed`. Use the in-process retention task (below) for per-state windows. |
 
 Outputs a JSON object. Plain `--non-in-progress` returns
@@ -580,8 +580,8 @@ queued ─> claimed ─> in_flight ─┬─> succeeded
                                  └─> failed (after max_attempts)
 ```
 
-- **queued**: a lock in a block with 5 confirmations, or a withdrawal S4 was
-  sent, ready for the next bridge cycle
+- **queued**: a lock in a block with 5 confirmations, or a withdrawal handed
+  to S4, ready for the next bridge cycle
 - **claimed**: picked up by the single-writer executor
 - **in_flight**: actively being processed (Holochain call or on-chain tx)
 - **succeeded**: completed successfully
@@ -601,16 +601,18 @@ and each row that records it is failed for a person. S2 holds a link of
 `withdraw` proofs to the same rule, by each withdrawal's row.
 
 A withdrawal takes its HOT back off the bridging agent's credit limit in
-these steps, each moved only on what the bridging agent's chain shows:
+these steps, each moved only on what the bridging agent's chain shows. The
+step and the hashes are in the database, and not in `status`:
 
 | `step` | The withdrawal | Next |
 |--------|----------------|------|
 | `sent` | went to S4's RAVE, with the HOT its coupon pays | S4's RAVE takes its spend |
-| `paid` | was taken by that RAVE, `br_rave_hash` | S5: `create_receipt_from_rave` on the RAVE, once for all it took, collects the HOT its template allocates the bridging agent |
-| `collected` | was receipted, `receipt_hash` | S1 of the next cycle parks a `withdraw` proof of its HOT on the credit limit adjustment |
-| `cl_link_created` | has its proof parked, `cl_link_hash` | S2's RAVE nets it against the cycle's deposits, and the row is `succeeded` |
+| `paid` | was taken by that RAVE, `br_rave_hash` | S5: `create_receipt_from_rave` on the RAVE, once for all it took, collects what the RAVE allocates the bridging agent |
+| `collected` | was receipted, `receipt_hash` | The next S1 parks a `withdraw` proof of its HOT on the credit limit adjustment |
+| `cl_link_created` | has its proof parked, `cl_link_hash` | S2's RAVE lowers the credit limit by it, and the row is `succeeded` |
 
-A withdrawal S4 leaves parked stays `sent`, and gets no receipt and no proof.
-One whose spend left the bridging agreement with no RAVE of the bridging
-agent's recording it consumed, or whose RAVE is not in the bridging agent's
-chain, is failed for a person.
+A withdrawal S4 leaves parked stays `sent` until a RAVE takes its spend. No
+coupon pays a withdrawal whose row is failed or past `sent`
+(`bridge.withdrawal_withheld`). A row whose spend left the bridging agreement
+with no RAVE of the bridging agent's recording it consumed, or whose RAVE is
+not in the bridging agent's chain, is failed for a person.

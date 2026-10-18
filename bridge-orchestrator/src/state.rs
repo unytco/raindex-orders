@@ -67,16 +67,10 @@ impl std::str::FromStr for WorkState {
     }
 }
 
-/// Pipeline progress for a lock or withdrawal row. Independent of `WorkState`
-/// (which tracks orchestrator ownership); `step` tracks which zome calls in the
-/// bridge pipeline have been proven to have landed on-chain. A lock walks from
+/// Which of a row's zome calls are known to have landed. A lock walks from
 /// `New` to `BrRaveExecuted`, a withdrawal from `Sent` through `Collected` to
-/// `ClRaveExecuted`.
-///
-/// Advancement is always driven by chain truth — a row is only moved to a
-/// later step once we either observed the returned `ActionHash` from the
-/// relevant zome call, or the reconciler at the top of a cycle confirmed the
-/// expected side-effect against a fresh `get_parked_links_by_ea` probe.
+/// `ClRaveExecuted`. A row moves on only on the call's reply or on what the
+/// chain shows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStep {
@@ -85,18 +79,17 @@ pub enum WorkStep {
     /// S1 landed; `cl_link_hash` references the live parked link on the
     /// credit-limit EA.
     ClLinkCreated,
-    /// S2 landed; the CL `execute_rave` has consumed the parked link. Terminal
-    /// for a withdrawal row, which is simultaneously marked `state='succeeded'`.
+    /// S2 landed; the CL `execute_rave` has consumed the parked link. Ends a
+    /// withdrawal row, which is `succeeded` with it.
     ClRaveExecuted,
     /// S3 landed; `br_spend_hash` references the live parked spend on the
     /// bridging EA.
     BrSpendCreated,
     /// S4 landed; the bridging `execute_rave` has consumed the parked spend.
-    /// Terminal for the pipeline — the row is simultaneously marked
-    /// `state='succeeded'`.
+    /// Ends a lock row, which is `succeeded` with it.
     BrRaveExecuted,
-    /// A withdrawal's spend, `br_spend_hash`, went to S4's `execute_rave`,
-    /// which has not been seen to take it. One S4 leaves parked stays here.
+    /// The withdrawal went to S4's `execute_rave`, which has not been seen to
+    /// take its spend.
     Sent,
     /// S4 took the withdrawal; `br_rave_hash` is its RAVE, which the bridging
     /// agent has yet to receipt.
@@ -168,6 +161,17 @@ pub struct WorkItem {
     /// The agreement `br_spend_hash` was parked on, `None` as for `cl_ea_id`.
     pub br_ea_id: Option<String>,
     pub receipt_hash: Option<String>,
+}
+
+/// What S4 sent of a withdrawal, a withdrawal row's whole payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalPayload {
+    pub spend: String,
+    /// The bridging agreement the spend is parked on.
+    pub agreement: String,
+    /// The HOT its coupon pays, as `Payout::new` accepted it.
+    pub amount: String,
+    pub withdrawer: String,
 }
 
 impl WorkItem {
@@ -875,10 +879,7 @@ impl StateStore {
     }
 
     /// Advance a row to `step='cl_rave_executed'`, and a withdrawal row to
-    /// `state='succeeded'` with it. `cl_rave_hash` is optional
-    /// — we record it when we observed the RAVE's returned ActionHash
-    /// directly, and leave it NULL when the reconciler inferred the advance
-    /// from the parked link no longer being live.
+    /// `state='succeeded'` with it.
     pub fn advance_to_cl_rave_executed(&self, id: i64, cl_rave_hash: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
@@ -957,30 +958,39 @@ impl StateStore {
         Ok(())
     }
 
-    /// Records `spend` as sent to S4, unless a row records it already.
-    pub fn send_withdrawal(&self, spend: &str, agreement: &str, payload: &Value) -> Result<()> {
+    /// Records the withdrawal as sent to S4, unless a row records it already.
+    pub fn send_withdrawal(&self, withdrawal: &WithdrawalPayload) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let item_id = format!("{WITHDRAWAL_FLOW}:{spend}");
         conn.execute(
             "INSERT OR IGNORE INTO work_items
-                (flow, task_type, item_id, idempotency_key, payload_json, state, step, br_spend_hash, br_ea_id)
-             VALUES (?1, 'reduce_credit_limit', ?2, ?2, ?3, 'queued', 'sent', ?4, ?5)",
+                (flow, task_type, item_id, idempotency_key, payload_json, state, step)
+             VALUES (?1, 'reduce_credit_limit', ?2, ?2, ?3, 'queued', 'sent')",
             params![
                 WITHDRAWAL_FLOW,
-                item_id,
-                serde_json::to_string(payload)?,
-                spend,
-                agreement
+                withdrawal_item_id(&withdrawal.spend),
+                serde_json::to_string(withdrawal)?,
             ],
         )?;
         Ok(())
     }
 
-    pub fn advance_to_paid(&self, id: i64, rave: &str) -> Result<()> {
+    /// The row of the withdrawal whose spend is `spend`, in any state.
+    pub fn withdrawal(&self, spend: &str) -> Result<Option<WorkItem>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            &format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE idempotency_key = ?1"),
+            params![withdrawal_item_id(spend)],
+            row_to_work_item,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn advance_to_paid(&self, id: i64, rave: &str) -> Result<bool> {
         self.advance_withdrawal(id, WorkStep::Sent, WorkStep::Paid, "br_rave_hash", rave)
     }
 
-    pub fn advance_to_collected(&self, id: i64, receipt: &str) -> Result<()> {
+    pub fn advance_to_collected(&self, id: i64, receipt: &str) -> Result<bool> {
         self.advance_withdrawal(
             id,
             WorkStep::Paid,
@@ -990,7 +1000,7 @@ impl StateStore {
         )
     }
 
-    /// A no-op on a row no longer at `from`.
+    /// Whether the row moved: one no longer pending at `from` stays as it is.
     fn advance_withdrawal(
         &self,
         id: i64,
@@ -998,9 +1008,9 @@ impl StateStore {
         to: WorkStep,
         column: &str,
         hash: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
+        let moved = conn.execute(
             &format!(
                 "UPDATE work_items
                  SET step=?3,
@@ -1011,11 +1021,11 @@ impl StateStore {
                      last_error=NULL,
                      next_retry_at=NULL,
                      updated_at=strftime('%s', 'now')
-                 WHERE id=?1 AND step=?2"
+                 WHERE id=?1 AND step=?2 AND state IN ('queued', 'in_flight')"
             ),
             params![id, from.to_string(), to.to_string(), hash],
         )?;
-        Ok(())
+        Ok(moved == 1)
     }
 
     pub fn mark_failed_permanent(&self, id: i64, error: &str) -> Result<()> {
@@ -1043,22 +1053,23 @@ impl StateStore {
     }
 
     /// Promote any `queued` rows that have already exhausted their retry
-    /// budget to `failed` with `error_class='permanent'`. Intended to be
-    /// called at the top of each cycle so a broken lock cannot loop
-    /// forever in a long-running session.
-    pub fn fail_exhausted_queued(&self, flow: &str) -> Result<usize> {
+    /// budget to `failed` with `error_class='permanent'`, and return their
+    /// item IDs. Intended to be called at the top of each cycle so a broken
+    /// row cannot loop forever in a long-running session.
+    pub fn fail_exhausted_queued(&self, flow: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let updated = conn.execute(
+        let mut stmt = conn.prepare(
             "UPDATE work_items
              SET state='failed',
                  error_class='permanent',
                  last_error = coalesce(last_error || '; ', '') || 'Exceeded max attempts in-cycle',
                  next_retry_at=NULL,
                  updated_at=strftime('%s', 'now')
-             WHERE flow=?1 AND state='queued' AND attempts >= max_attempts",
-            params![flow],
+             WHERE flow=?1 AND state='queued' AND attempts >= max_attempts
+             RETURNING item_id",
         )?;
-        Ok(updated)
+        let failed = stmt.query_map(params![flow], |row| row.get(0))?;
+        failed.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn reset_in_flight_to_queued(&self, flow: &str, error: &str) -> Result<usize> {
@@ -1076,6 +1087,10 @@ impl StateStore {
         )?;
         Ok(updated)
     }
+}
+
+fn withdrawal_item_id(spend: &str) -> String {
+    format!("{WITHDRAWAL_FLOW}:{spend}")
 }
 
 fn forget_unconfirmed_locks(conn: &Connection) -> Result<()> {
@@ -1438,7 +1453,7 @@ mod tests {
                 .unwrap();
             assert_eq!(queued.len(), 1);
             assert_eq!(queued[0].attempts, 7, "a stop is not an attempt");
-            assert_eq!(store.fail_exhausted_queued("lock").unwrap(), 0);
+            assert!(store.fail_exhausted_queued("lock").unwrap().is_empty());
             store.mark_in_flight(queued[0].id).unwrap();
         }
         let store = StateStore::open(&path).unwrap();
@@ -1552,8 +1567,13 @@ mod tests {
         insert_work_item_with_attempts(&path, "lock:equal-over", WorkState::Queued, 9, 8);
         insert_work_item_with_attempts(&path, "lock:under", WorkState::Queued, 3, 8);
 
-        let promoted = store.fail_exhausted_queued("lock").unwrap();
-        assert_eq!(promoted, 2, "both at-cap and over-cap rows should promote");
+        let mut promoted = store.fail_exhausted_queued("lock").unwrap();
+        promoted.sort();
+        assert_eq!(
+            promoted,
+            ["lock:equal-over", "lock:over"],
+            "both at-cap and over-cap rows should promote"
+        );
 
         let failed = store
             .list_work_items("lock", WorkState::Failed, 10)
@@ -1591,8 +1611,8 @@ mod tests {
         insert_work_item_with_attempts(&path, "lock:failed", WorkState::Failed, 8, 8);
 
         let promoted = store.fail_exhausted_queued("lock").unwrap();
-        assert_eq!(
-            promoted, 0,
+        assert!(
+            promoted.is_empty(),
             "only queued rows are in scope; other states must not be touched"
         );
 
@@ -2253,12 +2273,15 @@ mod tests {
     fn a_withdrawal_row_is_recorded_once_and_moves_only_from_the_step_it_waits_at() {
         let path = test_db_path("withdrawal-row");
         let store = StateStore::open(&path).unwrap();
-        let payload =
-            serde_json::json!({ "spend": "uhCkkSPEND", "amount": "5", "withdrawer": "w" });
+        let withdrawal = |spend: &str| WithdrawalPayload {
+            spend: spend.to_string(),
+            agreement: BR_EA.to_string(),
+            amount: "5".to_string(),
+            withdrawer: "w".to_string(),
+        };
+        assert!(store.withdrawal("uhCkkSPEND").unwrap().is_none());
         for _ in 0..2 {
-            store
-                .send_withdrawal("uhCkkSPEND", BR_EA, &payload)
-                .unwrap();
+            store.send_withdrawal(&withdrawal("uhCkkSPEND")).unwrap();
         }
         let rows = store.list_flow(WITHDRAWAL_FLOW).unwrap();
         let [row] = &rows[..] else {
@@ -2270,30 +2293,29 @@ mod tests {
                 &row.state,
                 &row.step,
                 row.br_spend_hash.as_deref(),
-                row.br_ea_id.as_deref(),
-                &row.payload_json,
+                serde_json::from_value::<WithdrawalPayload>(row.payload_json.clone()).unwrap(),
             ),
             (
                 "withdrawal:uhCkkSPEND",
                 &WorkState::Queued,
                 &WorkStep::Sent,
-                Some("uhCkkSPEND"),
-                Some(BR_EA),
-                &payload,
+                None,
+                withdrawal("uhCkkSPEND"),
             )
         );
         let id = row.id;
-        let at = || store.list_flow(WITHDRAWAL_FLOW).unwrap().remove(0);
+        let at = || store.withdrawal("uhCkkSPEND").unwrap().unwrap();
+        assert_eq!(at().id, id);
 
-        store.advance_to_collected(id, "uhCkkEARLY").unwrap();
+        assert!(!store.advance_to_collected(id, "uhCkkEARLY").unwrap());
         assert_eq!(
             at().step,
             WorkStep::Sent,
             "a row is collected only once paid"
         );
-        store.advance_to_paid(id, "uhCkkRAVE").unwrap();
-        store.advance_to_paid(id, "uhCkkLATER").unwrap();
-        store.advance_to_collected(id, "uhCkkRECEIPT").unwrap();
+        assert!(store.advance_to_paid(id, "uhCkkRAVE").unwrap());
+        assert!(!store.advance_to_paid(id, "uhCkkLATER").unwrap());
+        assert!(store.advance_to_collected(id, "uhCkkRECEIPT").unwrap());
         let row = at();
         assert_eq!(
             (
@@ -2319,6 +2341,25 @@ mod tests {
             (row.step, row.receipt_hash.as_deref()),
             (WorkStep::ClRaveExecuted, Some("uhCkkRECEIPT")),
             "the credit limit's RAVE ends a withdrawal row"
+        );
+
+        store.send_withdrawal(&withdrawal("uhCkkFAILED")).unwrap();
+        let failed = store
+            .list_pending_by_step(WITHDRAWAL_FLOW, WorkStep::Sent, 10)
+            .unwrap()
+            .remove(0);
+        store
+            .mark_failed_permanent(failed.id, "resolve by hand")
+            .unwrap();
+        assert!(!store.advance_to_paid(failed.id, "uhCkkRAVE").unwrap());
+        let row = store
+            .list_work_items(WITHDRAWAL_FLOW, WorkState::Failed, 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (row.state, row.step),
+            (WorkState::Failed, WorkStep::Sent),
+            "a failed row waits for a person"
         );
     }
 
