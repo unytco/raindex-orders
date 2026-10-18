@@ -16,10 +16,25 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use tracing::info;
 
-const PAID_BY_HAND: &str =
-    "in transit at the old network's close; it is paid by hand on the new network";
-const TAKEN_OFF_BY_HAND: &str =
-    "in transit at the old network's close; if S4 paid it and S2's RAVE did not take its link, its HOT is taken off the credit limit by hand";
+const IN_TRANSIT: &str = "in transit at the old network's close";
+
+fn settled_by_hand(row: &WorkItem) -> String {
+    let left = if row.flow != WITHDRAWAL_FLOW {
+        "it is paid by hand on the new network"
+    } else {
+        match row.step {
+            WorkStep::Sent => "if a RAVE took its spend, its HOT is taken off the credit limit by hand only together with collecting what that RAVE allocated, or neither is done",
+            WorkStep::Paid => "its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done",
+            WorkStep::Collected => "its HOT is taken off the credit limit by hand",
+            WorkStep::ClLinkCreated
+            | WorkStep::New
+            | WorkStep::ClRaveExecuted
+            | WorkStep::BrSpendCreated
+            | WorkStep::BrRaveExecuted => "if S2's RAVE did not take its link, its HOT is taken off the credit limit by hand",
+        }
+    };
+    format!("{IN_TRANSIT}; {left}")
+}
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -89,16 +104,14 @@ impl Found {
             self.unmatchable.is_empty(),
             "marks no row, as {cannot_tell}"
         );
-        let rows: Vec<(&WorkItem, &str)> = self
+        let settled: Vec<(&WorkItem, String)> = self
             .rows
             .values()
-            .map(|row| {
-                if row.flow == WITHDRAWAL_FLOW {
-                    (row, TAKEN_OFF_BY_HAND)
-                } else {
-                    (row, PAID_BY_HAND)
-                }
-            })
+            .map(|row| (row, settled_by_hand(row)))
+            .collect();
+        let rows: Vec<(&WorkItem, &str)> = settled
+            .iter()
+            .map(|(row, last_error)| (*row, last_error.as_str()))
             .collect();
         db.mark_all_failed_permanent(&rows)?;
         let items: Vec<&str> = rows.iter().map(|(row, _)| row.item_id.as_str()).collect();

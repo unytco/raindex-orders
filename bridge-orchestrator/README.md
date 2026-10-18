@@ -169,9 +169,9 @@ step it cannot read.
 `--mark-failed` lists the same, then marks `failed` each listed row and each
 row, neither `succeeded` nor `failed`, whose lock is in a listed link. Each lock
 row gets `last_error` `in transit at the old network's close; it is paid by hand
-on the new network`, and each withdrawal row `in transit at the old network's
-close; if S4 paid it and S2's RAVE did not take its link, its HOT is taken off
-the credit limit by hand`, so the new network's orchestrator acts on none of
+on the new network`, and each withdrawal row a `last_error` that starts
+`in transit at the old network's close` and says what its step leaves to take
+off the credit limit, so the new network's orchestrator acts on none of
 them. It marks all of them in one transaction, or none, and changes no other
 row. Each is marked only in the state and at the step it was read in: a row
 whose state or step has changed by then, even to another pending step, or that
@@ -185,19 +185,28 @@ listed link carries any. The next cycle of `run` fails such a row for a person.
 A lock in a listed link whose row is already `succeeded` or `failed`, a lock
 with no row, and a live withdrawal spend are recorded only in what it prints.
 
-Each lock, and each live withdrawal spend it lists with no `screening` and with
-a `withdraw_to_address`, is paid by hand on the new network, once the person who
-pays has checked that the old network did not pay it. Pay each lock ID once: a
-deposit waiting on its link shows both as its `row` and in the `lock_ids` of the
-link carrying it, and an earlier `failed` row may name it too. A lock whose row
-is `succeeded` was paid. A lock with no row may have been paid too, as retention
-deletes `succeeded` and `failed` rows, and so may a `row` whose `link` is not
-listed live, as a RAVE may have taken it. Pay each withdrawal once, by its
-`spend`. The HOT of a withdrawal `row` may still be on the bridging agent's
-credit limit: take it off by hand once, by its `item_id`. One at `sent` whose
-spend is also listed as a `withdrawal` was not taken by a RAVE and has nothing
-to take off, and one whose `link` is not listed live may be off already, as S2's
-RAVE may have taken it.
+Each lock, and each live withdrawal spend it lists with a `withdraw_to_address`
+and with no `screening`, `unpayable` or `stranded`, is paid by hand on the new
+network, once the person who pays has checked that the old network did not pay
+it. Pay each lock ID once: a deposit waiting on its link shows both as its `row`
+and in the `lock_ids` of the link carrying it, and an earlier `failed` row may
+name it too. A lock whose row is `succeeded` was paid. A lock with no row may
+have been paid too, as retention deletes `succeeded` and `failed` rows, and so
+may a `row` whose `link` is not listed live, as a RAVE may have taken it. Pay
+each withdrawal once, by its `spend`.
+
+The HOT of a withdrawal `row` may still be on the bridging agent's credit limit.
+Settle each one once, by its `item_id`, as its `step` says:
+
+- `collected`: take its HOT off the credit limit.
+- `cl_link_created`: take its HOT off unless S2's RAVE took its `link`. A
+  `link` not listed live may have been taken.
+- `paid`: take its HOT off only together with collecting what its RAVE, the
+  row's `br_rave_hash`, allocated the bridging agent, or do neither. If you take
+  it off alone, the bridging agent can owe more than its credit limit. If the
+  bridging agent already receipted that RAVE, settle it as at `collected`.
+- `sent`: if a RAVE took its spend, settle it as at `paid`. If none did, as
+  when its spend is still listed as a `withdrawal`, nothing is left to take off.
 
 ### `bridge-orchestrator release` and `block`
 

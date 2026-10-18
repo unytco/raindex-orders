@@ -2,8 +2,6 @@ use super::*;
 
 const PAID_BY_HAND: &str =
     "in transit at the old network's close; it is paid by hand on the new network";
-const TAKEN_OFF_BY_HAND: &str =
-    "in transit at the old network's close; if S4 paid it and S2's RAVE did not take its link, its HOT is taken off the credit limit by hand";
 
 #[derive(Debug)]
 struct Checked {
@@ -959,11 +957,17 @@ async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() 
     let checked = check(&orch, &conductor, true).await.unwrap();
     assert_lists(&checked.listed, &expected);
     checked.exit.unwrap();
-    for spend in &spends[..4] {
+    let by_step = [
+        "in transit at the old network's close; if a RAVE took its spend, its HOT is taken off the credit limit by hand only together with collecting what that RAVE allocated, or neither is done",
+        "in transit at the old network's close; its HOT is taken off the credit limit by hand only together with collecting what its RAVE allocated, or neither is done",
+        "in transit at the old network's close; its HOT is taken off the credit limit by hand",
+        "in transit at the old network's close; if S2's RAVE did not take its link, its HOT is taken off the credit limit by hand",
+    ];
+    for (spend, last_error) in spends[..4].iter().zip(by_step) {
         let row = row(spend);
         assert_eq!(
             (row.state, row.last_error.as_deref()),
-            (WorkState::Failed, Some(TAKEN_OFF_BY_HAND)),
+            (WorkState::Failed, Some(last_error)),
             "{}",
             row.item_id
         );
