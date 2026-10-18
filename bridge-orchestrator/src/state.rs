@@ -934,9 +934,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Advance a row to `step='br_rave_executed'` and simultaneously mark it
-    /// `state='succeeded'` — the bridging RAVE is the terminal stage of the
-    /// lock pipeline.
     pub fn advance_to_br_rave_executed(&self, id: i64, br_rave_hash: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(

@@ -7366,6 +7366,45 @@ mod tests {
         assert_eq!(withdrawal_rows(&orch).len(), 1);
     }
 
+    #[test]
+    fn s4_records_its_withdrawal_paid_however_many_older_rows_wait_at_sent() {
+        let orch = test_orchestrator("withdrawal-behind-sent-rows");
+        rusqlite::Connection::open(&orch.cfg.db_path)
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                 INSERT INTO work_items
+                     (flow, task_type, item_id, idempotency_key, payload_json, state, step)
+                 SELECT ?1, 'reduce_credit_limit', 'withdrawal:older' || i,
+                        'withdrawal:older' || i, '{}', 'queued', 'sent'
+                 FROM n",
+                [WITHDRAWAL_FLOW],
+            )
+            .unwrap();
+        let withdrawal = hot_withdrawal(0x6D);
+        sent(&orch, &withdrawal);
+        let rave = action_hash(0x6E).to_string();
+
+        let paid = orch
+            .record_paid(
+                &RaveOutcome {
+                    taken: vec![withdrawal.clone()],
+                    left: vec![],
+                },
+                &HashSet::from([withdrawal.id.to_string()]),
+                &rave,
+            )
+            .unwrap();
+
+        assert_eq!(paid, 1);
+        let row = orch
+            .db
+            .withdrawal(&withdrawal.id.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!((row.step, row.br_rave_hash), (WorkStep::Paid, Some(rave)));
+    }
+
     #[tokio::test]
     async fn a_sent_withdrawal_whose_spend_left_untaken_or_whose_rave_is_not_held_goes_to_a_person()
     {

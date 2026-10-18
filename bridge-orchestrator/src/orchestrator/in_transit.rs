@@ -19,7 +19,7 @@ use tracing::info;
 const PAID_BY_HAND: &str =
     "in transit at the old network's close; it is paid by hand on the new network";
 const TAKEN_OFF_BY_HAND: &str =
-    "in transit at the old network's close; if S4 paid it, its HOT is taken off the credit limit by hand";
+    "in transit at the old network's close; if S4 paid it and S2's RAVE did not take its link, its HOT is taken off the credit limit by hand";
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
