@@ -63,7 +63,8 @@ enum Command {
         #[arg(long, conflicts_with = "all")]
         older_than_s: Option<u64>,
     },
-    /// List each transfer the bridging agent's network still holds, for a migration's close.
+    /// List each transfer the bridging agent's network still holds, and each withdrawal not yet
+    /// off its credit limit, for a migration's close.
     /// Run it with the orchestrator stopped.
     InTransit {
         /// After listing, mark failed each pending row in transit or carried by a listed link, all

@@ -894,3 +894,78 @@ async fn in_transit_marks_each_withdrawal_s4_would_not_pay_so_it_is_not_paid_by_
         "{logged}"
     );
 }
+
+#[tokio::test]
+async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() {
+    let orch = test_orchestrator("in-transit-withdrawal-rows");
+    let spends = [0x50, 0x51, 0x52, 0x53, 0x54, 0x55].map(parked_withdrawal_tx);
+    for spend in &spends {
+        sent(&orch, spend);
+    }
+    let row = |spend: &Transaction| orch.db.withdrawal(&spend.id.to_string()).unwrap().unwrap();
+    let [sent_, paid, collected, linked, succeeded, failed] = spends.each_ref().map(row);
+    let rave = action_hash(0x40).to_string();
+    for row in [&paid, &collected] {
+        orch.db.advance_to_paid(row.id, &rave).unwrap();
+    }
+    orch.db
+        .advance_to_collected(collected.id, &action_hash(0x41).to_string())
+        .unwrap();
+    let link = parked_tx(
+        0x42,
+        &[json!({ "method": "withdraw", "spend": spends[3].id.to_string() })],
+    );
+    for row in [&linked, &succeeded] {
+        orch.db
+            .advance_to_cl_link_created(row.id, &link.id.to_string(), &ea(CL_EA))
+            .unwrap();
+    }
+    orch.db
+        .advance_to_cl_rave_executed(succeeded.id, None)
+        .unwrap();
+    orch.db
+        .mark_failed_permanent(failed.id, "resolved by a person")
+        .unwrap();
+    let conductor = bridging_conductor().parking(action_hash(CL_EA), std::slice::from_ref(&link));
+    let listed = |row: &WorkItem, step: &str, link: Option<&Transaction>| {
+        json!({
+            "kind": "row",
+            "item_id": row.item_id,
+            "lock_id": null,
+            "state": "queued",
+            "step": step,
+            "link": link.map(|link| link.id.to_string()),
+        })
+    };
+    let expected = [
+        listed(&sent_, "sent", None),
+        listed(&paid, "paid", None),
+        listed(&collected, "collected", None),
+        listed(&linked, "cl_link_created", Some(&link)),
+        listed_link(CL_EA, &link, &[]),
+    ];
+
+    let checked = check(&orch, &conductor, false).await.unwrap();
+    assert_lists(&checked.listed, &expected);
+    checked
+        .exit
+        .expect_err("their HOT is not off the credit limit");
+
+    let checked = check(&orch, &conductor, true).await.unwrap();
+    assert_lists(&checked.listed, &expected);
+    checked.exit.unwrap();
+    for spend in &spends[..4] {
+        let row = row(spend);
+        assert_eq!(
+            (row.state, row.last_error.as_deref()),
+            (WorkState::Failed, Some(PAID_BY_HAND)),
+            "{}",
+            row.item_id
+        );
+    }
+    assert_eq!(row(&spends[4]).state, WorkState::Succeeded);
+    assert_eq!(
+        row(&spends[5]).last_error.as_deref(),
+        Some("resolved by a person")
+    );
+}

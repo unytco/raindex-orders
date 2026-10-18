@@ -1,11 +1,11 @@
 use super::{
     bridging_spend, connect_ham, deposit_proofs, hot_amount, normalize_tx_hash, own_deposit,
     vault_key, withdrawal_terms, BridgeOrchestrator, BridgingSpend, Conductor, ConductorReads,
-    LockKey, WithdrawalGate, WITHDRAWALS_SCREENED,
+    LockKey, WithdrawalGate, FLOWS, WITHDRAWALS_SCREENED,
 };
 use crate::config::{Config, Ethereum};
 use crate::screening::Screener;
-use crate::state::{StateStore, WorkItem, WorkState, WorkStep};
+use crate::state::{StateStore, WorkItem, WorkState, WorkStep, WITHDRAWAL_FLOW};
 use crate::watchtower_reporter::ReporterState;
 use anyhow::Result;
 use holo_hash::ActionHash;
@@ -175,22 +175,27 @@ impl BridgeOrchestrator {
                     })
                     .map(|spend| (&context.bridging_agreement, spend)),
             );
-        let unreadable = self.db.unreadable_rows("lock")?;
+        let mut unreadable = Vec::new();
+        for flow in FLOWS {
+            unreadable.extend(self.db.unreadable_rows(flow)?);
+        }
         anyhow::ensure!(
             unreadable.is_empty(),
             "rows whose state or step cannot be read: {}",
             unreadable.join(", ")
         );
-        let pending: Vec<(WorkItem, Option<LockKey>)> = self
-            .db
-            .list_flow("lock")?
-            .into_iter()
-            .filter(|row| !matches!(row.state, WorkState::Succeeded | WorkState::Failed))
-            .map(|row| {
-                let lock = self.lock_key(&row);
-                (row, lock)
-            })
-            .collect();
+        let mut pending: Vec<(WorkItem, Option<LockKey>)> = Vec::new();
+        for flow in FLOWS {
+            for row in self.db.list_flow(flow)? {
+                if matches!(row.state, WorkState::Succeeded | WorkState::Failed) {
+                    continue;
+                }
+                let lock = (flow != WITHDRAWAL_FLOW)
+                    .then(|| self.lock_key(&row))
+                    .flatten();
+                pending.push((row, lock));
+            }
+        }
 
         let mut links = Vec::new();
         let mut carried = HashSet::new();
@@ -265,7 +270,8 @@ impl BridgeOrchestrator {
         let mut unmarked = Vec::new();
         let mut unmatchable = Vec::new();
         for (row, lock) in pending {
-            let in_transit = matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated)
+            let in_transit = row.flow == WITHDRAWAL_FLOW
+                || matches!(row.step, WorkStep::ClLinkCreated | WorkStep::BrSpendCreated)
                 || matches!(row.state, WorkState::InFlight | WorkState::Claimed);
             if in_transit {
                 listed.push(InTransit::Row {
