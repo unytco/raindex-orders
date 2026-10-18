@@ -1365,9 +1365,7 @@ impl BridgeOrchestrator {
                 "[bridge/s4] RAVE executed: {} lock(s) advanced br_spend_created → br_rave_executed (succeeded), {} withdrawal(s) paid",
                 succeeded_locks, paid_withdrawals
             );
-            if paid_withdrawals > 0 {
-                fresh_rave = Some(br_rave.hash);
-            }
+            fresh_rave = Some(br_rave.hash);
             if self.ends_cycle("s4", "execute_rave", s4_elapsed_ms, stop)? {
                 return Ok(());
             }
