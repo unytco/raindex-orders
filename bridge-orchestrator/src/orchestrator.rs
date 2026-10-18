@@ -3518,16 +3518,20 @@ mod tests {
             cfg: test_config(path),
             db,
             reporter: ReporterState::new(),
-            ethereum: Some(EthereumSide {
-                chain: Ethereum {
-                    network: Network::BaseSepolia,
-                    rpc_url: "http://localhost:0".to_string(),
-                    lock_vault_address: VAULT,
-                    confirmations: 5,
-                },
-                signer: CouponSigner::with_key(PrivateKeySigner::random()),
-                screener: None,
-            }),
+            ethereum: Some(test_ethereum(VAULT)),
+        }
+    }
+
+    fn test_ethereum(vault: Address) -> EthereumSide {
+        EthereumSide {
+            chain: Ethereum {
+                network: Network::BaseSepolia,
+                rpc_url: "http://localhost:0".to_string(),
+                lock_vault_address: vault,
+                confirmations: 5,
+            },
+            signer: CouponSigner::with_key(PrivateKeySigner::random()),
+            screener: None,
         }
     }
 
@@ -3562,27 +3566,17 @@ mod tests {
     #[test]
     fn the_orchestrator_binds_its_database_to_its_vault_and_refuses_another() {
         let path = test_db_path("bind-vault");
-        let side = |vault: Address| EthereumSide {
-            chain: Ethereum {
-                network: Network::BaseSepolia,
-                rpc_url: "http://localhost:0".to_string(),
-                lock_vault_address: vault,
-                confirmations: 5,
-            },
-            signer: CouponSigner::with_key(PrivateKeySigner::random()),
-            screener: None,
-        };
         BridgeOrchestrator::new(test_config(path.clone()), None)
             .expect("NETWORK=none binds nothing");
         BridgeOrchestrator::new(
             test_config(path.clone()),
-            Some(side(Address::repeat_byte(0xA1))),
+            Some(test_ethereum(Address::repeat_byte(0xA1))),
         )
         .expect("the first vault binds the database");
 
         let Err(e) = BridgeOrchestrator::new(
             test_config(path.clone()),
-            Some(side(Address::repeat_byte(0xB2))),
+            Some(test_ethereum(Address::repeat_byte(0xB2))),
         ) else {
             panic!("a database bound to one vault started with another");
         };
@@ -6870,6 +6864,10 @@ mod tests {
             .unwrap();
     }
 
+    fn withdrawal_row(orch: &BridgeOrchestrator, spend: &Transaction) -> WorkItem {
+        orch.db.withdrawal(&spend.id.to_string()).unwrap().unwrap()
+    }
+
     /// Two deposits at `step`, each recorded on its own live link.
     fn two_parked_deposits(
         orch: &BridgeOrchestrator,
@@ -7252,6 +7250,21 @@ mod tests {
         for id in rows {
             assert_eq!(lock_row(&orch, id).step, WorkStep::ClRaveExecuted);
         }
+
+        let mut orch = test_orchestrator("rave-slow-s4");
+        orch.cfg.slow_call_threshold_ms = 5;
+        let withdrawal = parked_withdrawal_tx(0xAA);
+        let conductor = FakeConductor {
+            rave_delay_ms: 20,
+            ..bridging_conductor().parking(action_hash(BR_EA), std::slice::from_ref(&withdrawal))
+        };
+
+        orch.run_bridge_cycle(&conductor, &running()).await.unwrap();
+
+        let calls = conductor.calls.take();
+        assert_eq!(calls.last(), Some(&"execute_rave"));
+        assert!(!calls.contains(&"create_receipt_from_rave"));
+        assert_eq!(withdrawal_row(&orch, &withdrawal).step, WorkStep::Paid);
     }
 
     fn running() -> ShutdownRx {
@@ -8138,22 +8151,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_row_whose_payload_names_no_lock_is_left_for_a_person() {
+    async fn a_row_whose_payload_does_not_read_is_left_for_a_person() {
         let orch = test_orchestrator("payload-unreadable");
-        let ([unreadable, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
-        rusqlite::Connection::open(&orch.cfg.db_path)
-            .unwrap()
-            .execute(
+        let ([lock, _], links) = two_parked_deposits(&orch, WorkStep::BrSpendCreated);
+        let spend = parked_withdrawal_tx(0x6A);
+        sent(&orch, &spend);
+        let withdrawal = withdrawal_row(&orch, &spend).id;
+        let db = rusqlite::Connection::open(&orch.cfg.db_path).unwrap();
+        for id in [lock, withdrawal] {
+            db.execute(
                 "UPDATE work_items SET payload_json = '{}' WHERE id = ?1",
-                [unreadable],
+                [id],
             )
             .unwrap();
+        }
         let conductor = bridging_conductor().holding(&links);
 
-        reconcile_in_force(&orch, &conductor, CL_EA, BR_EA).await;
+        let logged = logged_at(
+            tracing::Level::ERROR,
+            reconcile_in_force(&orch, &conductor, CL_EA, BR_EA),
+        )
+        .await;
 
-        let reason = failed_row(&orch, unreadable).last_error.unwrap();
+        let reason = failed_row(&orch, lock).last_error.unwrap();
         assert!(reason.contains("names no lock"), "{reason}");
+        let row = withdrawal_row(&orch, &spend);
+        assert_eq!(row.state, WorkState::Failed);
+        let reason = row.last_error.unwrap();
+        assert!(reason.contains("its payload does not read"), "{reason}");
+        let unreadable = format!("{} has an unreadable withdrawal payload", row.item_id);
+        assert!(logged.contains(&unreadable), "{logged}");
     }
 
     #[tokio::test]

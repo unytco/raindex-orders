@@ -373,21 +373,27 @@ async fn another_agents_link_and_a_spend_in_another_role_are_not_in_transit() {
 async fn a_row_whose_state_or_step_cannot_be_read_fails_the_check() {
     for (column, garbled) in [("state", "Queued"), ("step", "cl_link_create")] {
         let orch = test_orchestrator("in-transit-garbled");
-        let id = enqueue_lock(&orch, "lock:garbled:1", "0xdd");
-        rusqlite::Connection::open(&orch.cfg.db_path)
-            .unwrap()
-            .execute(
+        let lock = enqueue_lock(&orch, "lock:garbled:1", "0xdd");
+        let spend = parked_withdrawal_tx(0xDE);
+        sent(&orch, &spend);
+        let withdrawal = withdrawal_row(&orch, &spend);
+        let db = rusqlite::Connection::open(&orch.cfg.db_path).unwrap();
+        for id in [lock, withdrawal.id] {
+            db.execute(
                 &format!("UPDATE work_items SET {column} = ?2 WHERE id = ?1"),
                 rusqlite::params![id, garbled],
             )
             .unwrap();
+        }
         let before = snapshot(&orch);
 
         for mark_failed in [false, true] {
             let e = check(&orch, &bridging_conductor(), mark_failed)
                 .await
                 .expect_err("a row it cannot read");
-            assert!(format!("{e:#}").contains("lock:garbled:1"), "{e:#}");
+            for item in ["lock:garbled:1", &withdrawal.item_id] {
+                assert!(format!("{e:#}").contains(item), "{e:#}");
+            }
         }
         assert_eq!(snapshot(&orch), before);
     }
@@ -902,8 +908,8 @@ async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() 
     for spend in &spends {
         sent(&orch, spend);
     }
-    let row = |spend: &Transaction| orch.db.withdrawal(&spend.id.to_string()).unwrap().unwrap();
-    let [sent_, paid, collected, linked, succeeded, failed] = spends.each_ref().map(row);
+    let [sent_, paid, collected, linked, succeeded, failed] =
+        spends.each_ref().map(|spend| withdrawal_row(&orch, spend));
     let rave = action_hash(0x40).to_string();
     for row in [&paid, &collected] {
         orch.db.advance_to_paid(row.id, &rave).unwrap();
@@ -964,7 +970,7 @@ async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() 
         "in transit at the old network's close; if S2's RAVE did not take its link, its HOT is taken off the credit limit by hand",
     ];
     for (spend, last_error) in spends[..4].iter().zip(by_step) {
-        let row = row(spend);
+        let row = withdrawal_row(&orch, spend);
         assert_eq!(
             (row.state, row.last_error.as_deref()),
             (WorkState::Failed, Some(last_error)),
@@ -976,9 +982,12 @@ async fn a_withdrawal_row_is_in_transit_until_its_hot_is_off_the_credit_limit() 
         failed_row(&orch, lock).last_error.as_deref(),
         Some(PAID_BY_HAND)
     );
-    assert_eq!(row(&spends[4]).state, WorkState::Succeeded);
     assert_eq!(
-        row(&spends[5]).last_error.as_deref(),
+        withdrawal_row(&orch, &spends[4]).state,
+        WorkState::Succeeded
+    );
+    assert_eq!(
+        withdrawal_row(&orch, &spends[5]).last_error.as_deref(),
         Some("resolved by a person")
     );
 }

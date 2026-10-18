@@ -2331,21 +2331,18 @@ mod tests {
 
     #[test]
     fn a_withdrawal_row_is_recorded_once_and_moves_only_from_the_step_it_waits_at() {
-        let path = test_db_path("withdrawal-row");
-        let store = StateStore::open(&path).unwrap();
-        let withdrawal = |spend: &str| WithdrawalPayload {
-            spend: spend.to_string(),
+        let store = StateStore::open(test_db_path("withdrawal-row")).unwrap();
+        let withdrawal = WithdrawalPayload {
+            spend: "uhCkkSPEND".to_string(),
             agreement: BR_EA.to_string(),
             amount: "5".to_string(),
             withdrawer: "w".to_string(),
         };
         assert!(store.withdrawal("uhCkkSPEND").unwrap().is_none());
-        for _ in 0..2 {
-            store.send_withdrawal(&withdrawal("uhCkkSPEND")).unwrap();
-        }
+        store.send_withdrawal(&withdrawal).unwrap();
         let rows = store.list_flow(WITHDRAWAL_FLOW).unwrap();
         let [row] = &rows[..] else {
-            panic!("one row for one spend, however often it is sent: {rows:?}");
+            panic!("one row for one spend: {rows:?}");
         };
         assert_eq!(
             (
@@ -2353,19 +2350,18 @@ mod tests {
                 &row.state,
                 &row.step,
                 row.br_spend_hash.as_deref(),
-                serde_json::from_value::<WithdrawalPayload>(row.payload_json.clone()).unwrap(),
+                row.withdrawal().unwrap(),
             ),
             (
                 "withdrawal:uhCkkSPEND",
                 &WorkState::Queued,
                 &WorkStep::Sent,
                 None,
-                withdrawal("uhCkkSPEND"),
+                withdrawal.clone(),
             )
         );
         let id = row.id;
         let at = || store.withdrawal("uhCkkSPEND").unwrap().unwrap();
-        assert_eq!(at().id, id);
 
         assert!(!store.advance_to_collected(id, "uhCkkEARLY").unwrap());
         assert_eq!(
@@ -2375,6 +2371,13 @@ mod tests {
         );
         assert!(store.advance_to_paid(id, "uhCkkRAVE").unwrap());
         assert!(!store.advance_to_paid(id, "uhCkkLATER").unwrap());
+        store.send_withdrawal(&withdrawal).unwrap();
+        let row = at();
+        assert_eq!(
+            (row.id, row.step),
+            (id, WorkStep::Paid),
+            "a spend sent again keeps its row"
+        );
         assert!(store.advance_to_collected(id, "uhCkkRECEIPT").unwrap());
         let row = at();
         assert_eq!(
@@ -2392,30 +2395,21 @@ mod tests {
         store
             .advance_to_cl_rave_executed(id, Some("uhCkkCL"))
             .unwrap();
-        let row = StateStore::open(&path)
-            .unwrap()
-            .list_work_items(WITHDRAWAL_FLOW, WorkState::Succeeded, 10)
-            .unwrap()
-            .remove(0);
+        let row = at();
         assert_eq!(
-            (row.step, row.receipt_hash.as_deref()),
-            (WorkStep::ClRaveExecuted, Some("uhCkkRECEIPT")),
+            (row.state, row.step, row.receipt_hash.as_deref()),
+            (
+                WorkState::Succeeded,
+                WorkStep::ClRaveExecuted,
+                Some("uhCkkRECEIPT")
+            ),
             "the credit limit's RAVE ends a withdrawal row"
         );
 
-        store.send_withdrawal(&withdrawal("uhCkkFAILED")).unwrap();
-        let failed = store
-            .list_pending_by_step(WITHDRAWAL_FLOW, WorkStep::Sent, 10)
-            .unwrap()
-            .remove(0);
-        store
-            .mark_failed_permanent(failed.id, "resolve by hand")
-            .unwrap();
-        assert!(!store.advance_to_paid(failed.id, "uhCkkRAVE").unwrap());
-        let row = store
-            .list_work_items(WITHDRAWAL_FLOW, WorkState::Failed, 10)
-            .unwrap()
-            .remove(0);
+        let spend = failed_withdrawal(&store, "uhCkkFAILED");
+        let failed = || store.withdrawal(&spend).unwrap().unwrap();
+        assert!(!store.advance_to_paid(failed().id, "uhCkkRAVE").unwrap());
+        let row = failed();
         assert_eq!(
             (row.state, row.step),
             (WorkState::Failed, WorkStep::Sent),
