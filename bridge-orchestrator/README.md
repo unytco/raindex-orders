@@ -296,12 +296,12 @@ bridge-orchestrator signer
 ## Environment variables
 
 Every subcommand but `signer` loads the config below on startup, so the env
-file must be sourced even for `status` and `clear`. Only `run` reads the signer variables
-and the chain, only `run`, `screen` and `in-transit` the screening variables,
-and only `run` and `in-transit` the conductor. A network variable set to an
-empty value counts as unset.
+file must be sourced even for `status` and `clear`. Of those, only `run` reads
+the [Signer](#signer-run-only) variables and the chain, only `run`, `screen` and
+`in-transit` the screening variables, and only `run` and `in-transit` the
+conductor. A network variable set to an empty value counts as unset.
 
-### Config (all commands)
+### Config (every command but `signer`)
 
 | Variable | Required | Default |
 |----------|----------|---------|
@@ -339,7 +339,7 @@ A database an earlier release left `detected` rows in loses them on its first
 start, and the lock read goes back to read their blocks again. An earlier
 release refuses a `DB_PATH` this one has opened.
 
-### Screening (`run`, `screen` and `in-transit`)
+### Screening (`run`, `screen`, `in-transit` and `signer`)
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
@@ -504,9 +504,10 @@ mock HOT, vault and claim order are not defaulted: the rest is required on
 
 `signer` also reads `HOLOCHAIN_ADMIN_PORT`, `HOLOCHAIN_APP_PORT`,
 `HOLOCHAIN_APP_ID`, `HOLOCHAIN_ROLE_NAME`, `CONDUCTOR_CONFIG`,
-`LAIR_PASSPHRASE_FILE`, `HOT_UNIT_INDEX`, `HAM_REQUEST_TIMEOUT_SECS` and
-`HAM_RECONNECT_*` as in [Config](#config-all-commands), and `SCREENING` and
-`SCREENING_DENYLIST` as in [Screening](#screening-run-screen-and-in-transit).
+`LAIR_PASSPHRASE_FILE`, `HOLOCHAIN_BRIDGING_AGENT_PUBKEY`, `HOT_UNIT_INDEX`,
+`HAM_REQUEST_TIMEOUT_SECS` and `HAM_RECONNECT_*` as in
+[Config](#config-every-command-but-signer), and `SCREENING` and
+`SCREENING_DENYLIST` as in [Screening](#screening-run-screen-in-transit-and-signer).
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
@@ -518,10 +519,9 @@ mock HOT, vault and claim order are not defaulted: the rest is required on
 | `SIGNER_BEARER_TOKEN` | Yes | -- (the token the orchestrator sends this service as `Authorization: Bearer <token>`) |
 | `SIGNER_BIND_ADDR` | No | `127.0.0.1` |
 | `SIGNER_BIND_PORT` | Yes | -- |
-| `SIGNER_DB_PATH` | Yes | -- (the record of each withdrawal signed, as SQLite. A missing file is created) |
+| `SIGNER_DB_PATH` | Yes | -- (the record of each withdrawal signed, as SQLite, for [one order per withdrawal](../docs/signer-service.md#one-order-per-withdrawal): keep it across redeploys. A missing file is created) |
 | `EXPIRY_SECONDS` | No | `604800`, as for `run` |
-| `EXPIRY_TOLERANCE_SECONDS` | No | `600` |
-| `HOLOCHAIN_BRIDGING_AGENT_PUBKEY` | Yes | -- |
+| `EXPIRY_TOLERANCE_SECONDS` | No | `600` (the slack for the two clocks, added to both ends of [the expiry](../docs/signer-service.md#the-expiry) window) |
 
 ## Usage on the HOT-2-mHOT bridge server
 

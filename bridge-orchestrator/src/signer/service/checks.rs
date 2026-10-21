@@ -88,6 +88,7 @@ impl Refusal {
 
     fn log(&self) {
         let code = self.code.name();
+        let withdrawal = self.withdrawal.as_ref().map(tracing::field::display);
         let asked = match &self.withdrawal {
             Some(withdrawal) => format!("the coupon of withdrawal {withdrawal}"),
             None => "a request".to_string(),
@@ -98,13 +99,15 @@ impl Refusal {
                 event = "signer.unauthorized",
                 "refused a request without this signer's token"
             ),
+            // Both can clear on their own: the withdrawal can still reach this
+            // node, and what is down can come back.
             Code::NotReady | Code::UnknownWithdrawal => warn!(
                 event = "signer.waiting",
-                code, "cannot sign {asked} yet, {code}: {reason}"
+                code, withdrawal, "cannot sign {asked} yet, {code}: {reason}"
             ),
             _ => error!(
                 event = "signer.refused",
-                code, "refused {asked}, {code}: {reason}"
+                code, withdrawal, "refused {asked}, {code}: {reason}"
             ),
         }
     }
@@ -143,16 +146,29 @@ impl Service {
         body: &[u8],
         now: u64,
     ) -> Result<Signed, Refusal> {
-        let config = &self.config;
         self.authorized(authorization)?;
         let (request, withdrawal) = parsed(body)?;
-        if request.safe != config.safe || request.chain_id != config.network.chain_id() {
+        let answer = self.answer(&request, withdrawal.as_ref(), now).await;
+        match &withdrawal {
+            Some(withdrawal) => answer.map_err(|refusal| refusal.of(withdrawal)),
+            None => answer,
+        }
+    }
+
+    async fn answer(
+        &self,
+        request: &SignBody,
+        withdrawal: Option<&ActionHash>,
+        now: u64,
+    ) -> Result<Signed, Refusal> {
+        let config = &self.config;
+        let chain_id = config.network.chain_id();
+        if request.safe != config.safe || request.chain_id != chain_id {
             return Err(Refusal::new(
                 Code::WrongSafeOrChain,
                 format!(
-                    "this signer signs for Safe {} on chain {}",
-                    config.safe,
-                    config.network.chain_id()
+                    "the request is for Safe {} on chain {}, and this signer signs for Safe {} on chain {chain_id}",
+                    request.safe, request.chain_id, config.safe
                 ),
             ));
         }
@@ -160,25 +176,31 @@ impl Service {
         if request.owner != owner {
             return Err(Refusal::new(
                 Code::WrongOwner,
-                format!("this signer signs as owner {owner}"),
+                format!(
+                    "the request asks owner {}, and this signer signs as owner {owner}",
+                    request.owner
+                ),
             ));
         }
-        if request.context[3..8] != config.order {
+        if let Some(word) = (3..8).find(|&word| request.context[word] != config.order[word - 3]) {
             return Err(Refusal::new(
                 Code::OrderMismatch,
-                "words 3 to 7 are not this signer's claim order",
+                format!(
+                    "word {word} is {}, and this signer's claim order has {}",
+                    request.context[word],
+                    config.order[word - 3]
+                ),
             ));
         }
         match withdrawal {
-            None => self.probe(&request),
-            Some(withdrawal) => self
-                .withdrawal(&request, &withdrawal, now)
-                .await
-                .map_err(|refusal| refusal.of(&withdrawal)),
+            None => self.probe(request),
+            Some(withdrawal) => self.withdrawal(request, withdrawal, now).await,
         }
     }
 
     fn authorized(&self, authorization: Option<&str>) -> Result<(), Refusal> {
+        // Not constant time: only the orchestrator is meant to reach the
+        // listener.
         if authorization == Some(self.config.authorization.as_str()) {
             Ok(())
         } else {
@@ -234,10 +256,12 @@ impl Service {
             Ok(ParkedLinkStanding::Parked(spend)) => spend,
             // Reissuing the coupon of a withdrawal that is no longer parked is
             // not handled here.
-            Ok(ParkedLinkStanding::Unparked | ParkedLinkStanding::NotAParkedLink) => {
+            Ok(standing @ (ParkedLinkStanding::Unparked | ParkedLinkStanding::NotAParkedLink)) => {
                 return Err(Refusal::new(
                     Code::NotAWithdrawal,
-                    "this signer's node holds the action, and it is not a parked link that is still parked",
+                    format!(
+                        "this signer's node answers {standing:?} for the withdrawal, not Parked"
+                    ),
                 ));
             }
             Ok(ParkedLinkStanding::NotHeld) => {
@@ -274,15 +298,18 @@ impl Service {
         if words[1] != amount {
             return Err(Refusal::new(
                 Code::AmountMismatch,
-                format!("word 1 is not {amount}, this signer's word for the spend's HOT"),
+                format!(
+                    "word 1 is {}, and this signer's word for the spend's HOT is {amount}",
+                    words[1]
+                ),
             ));
         }
         if words[0] != pad_address(payout.recipient) {
             return Err(Refusal::new(
                 Code::RecipientMismatch,
                 format!(
-                    "word 0 is not the spend's withdraw_to_address {:#x}",
-                    payout.recipient
+                    "word 0 is {}, and the spend's withdraw_to_address is {:#x}",
+                    words[0], payout.recipient
                 ),
             ));
         }
@@ -307,7 +334,7 @@ impl Service {
                 }
             }
         }
-        match self.records.record(words[8], words[3], withdrawal, now) {
+        match self.records.record(withdrawal, words[3], now) {
             Ok(None) => Ok(self.signed(&hash, Some(withdrawal))),
             Ok(Some(order)) => Err(Refusal::new(
                 Code::AlreadySigned,
@@ -315,7 +342,7 @@ impl Service {
             )),
             Err(err) => Err(Refusal::new(
                 Code::NotReady,
-                format!("this signer cannot write its records: {err:#}"),
+                format!("this signer cannot use its records: {err:#}"),
             )),
         }
     }
@@ -323,11 +350,17 @@ impl Service {
     fn own_hash(&self, request: &SignBody) -> Result<B256, Refusal> {
         let digest = context_digest(&request.context);
         let hash = safe_message_hash(self.config.network.chain_id(), self.config.safe, &digest);
-        if request.coupon_digest != digest || request.safe_message_hash != hash {
-            return Err(Refusal::new(
+        let mismatch = |sent: &str| {
+            Refusal::new(
                 Code::HashMismatch,
-                "couponDigest or safeMessageHash is not the one this signer makes of the words",
-            ));
+                format!("{sent} is not the one this signer makes of the words"),
+            )
+        };
+        if request.coupon_digest != digest {
+            return Err(mismatch("couponDigest"));
+        }
+        if request.safe_message_hash != hash {
+            return Err(mismatch("safeMessageHash"));
         }
         Ok(hash)
     }
@@ -370,13 +403,16 @@ fn parsed(body: &[u8]) -> Result<(SignBody, Option<ActionHash>), Refusal> {
         .map(|raw| {
             ActionHashB64::from_b64_str(raw)
                 .map(ActionHash::from)
-                .map_err(|_| bad(format!("withdrawal {raw:?} is not a canonical action hash")))
+                .map_err(|err| {
+                    bad(format!(
+                        "withdrawal {raw:?} is not a canonical action hash: {err}"
+                    ))
+                })
         })
         .transpose()?;
     Ok((request, withdrawal))
 }
 
-/// What `spend` pays when it is a withdrawal the bridge pays, or why it is not.
 fn payout(
     spend: &Transaction,
     agreement: &ActionHashB64,

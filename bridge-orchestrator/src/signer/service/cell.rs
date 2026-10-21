@@ -11,9 +11,7 @@ use tokio::sync::Notify;
 
 pub type Reading<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
-/// The signer's own cell. A trait so a test can stand in for the conductor.
 pub trait Cell: Send + Sync {
-    /// Whether the conductor and the cell answer.
     fn answers(&self) -> Reading<'_, ()>;
     fn standing<'a>(&'a self, link: &'a ActionHash) -> Reading<'a, ParkedLinkStanding>;
     fn bridging_agreement<'a>(
@@ -26,26 +24,24 @@ pub trait Cell: Send + Sync {
 /// The cell the local conductor runs, through a connection `keep_connected`
 /// holds open.
 pub struct HamCell {
-    role_name: String,
+    holochain: Holochain,
     ham: Mutex<Option<Arc<Ham>>>,
     lost: Notify,
 }
 
 impl HamCell {
-    pub fn new(role_name: String) -> Self {
+    pub fn new(holochain: Holochain) -> Self {
         Self {
-            role_name,
+            holochain,
             ham: Mutex::default(),
             lost: Notify::new(),
         }
     }
 
-    /// Connects with backoff, and again each time a call finds the connection
-    /// lost, until shutdown.
-    pub async fn keep_connected(&self, holochain: &Holochain, mut shutdown: ShutdownRx) {
-        let backoff = backoff_config(holochain);
+    pub async fn keep_connected(&self, mut shutdown: ShutdownRx) {
+        let backoff = backoff_config(&self.holochain);
         while let Some(ham) =
-            connect_with_backoff(|| connect_ham(holochain), &backoff, &mut shutdown).await
+            connect_with_backoff(|| connect_ham(&self.holochain), &backoff, &mut shutdown).await
         {
             *self.ham.lock().expect("ham mutex poisoned") = Some(Arc::new(ham));
             tokio::select! {
@@ -63,7 +59,8 @@ impl HamCell {
             .context("the conductor is not connected")
     }
 
-    /// `read`, made over `ham`, after dropping `ham` if `read` found it lost.
+    /// A connection error drops `ham` and wakes `keep_connected`, but never a
+    /// newer connection a reconnect already holds.
     fn checked<T>(&self, ham: &Arc<Ham>, read: Result<T>) -> Result<T> {
         if read.as_ref().is_err_and(is_connection_error) {
             let mut held = self.ham.lock().expect("ham mutex poisoned");
@@ -85,9 +82,14 @@ impl Cell for HamCell {
             let ham = self.connected()?;
             let read = async {
                 ham.ping().await?;
-                ham.call_zome::<_, AgentPubKey>(&self.role_name, "transactor", "whoami", ())
-                    .await
-                    .map(drop)
+                ham.call_zome::<_, AgentPubKey>(
+                    &self.holochain.role_name,
+                    "transactor",
+                    "whoami",
+                    (),
+                )
+                .await
+                .map(drop)
             }
             .await;
             self.checked(&ham, read)
@@ -99,7 +101,7 @@ impl Cell for HamCell {
             let ham = self.connected()?;
             let read = ham
                 .call_zome(
-                    &self.role_name,
+                    &self.holochain.role_name,
                     "transactor",
                     "get_parked_link_standing",
                     link,
@@ -116,8 +118,13 @@ impl Cell for HamCell {
     ) -> Reading<'a, ActionHashB64> {
         Box::pin(async move {
             let ham = self.connected()?;
-            let read =
-                bridging_agreement(&ham, &self.role_name, bridging_agent, hot_unit_index).await;
+            let read = bridging_agreement(
+                &ham,
+                &self.holochain.role_name,
+                bridging_agent,
+                hot_unit_index,
+            )
+            .await;
             self.checked(&ham, read)
         })
     }

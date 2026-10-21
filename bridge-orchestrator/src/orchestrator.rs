@@ -2327,8 +2327,7 @@ impl BridgeOrchestrator {
     }
 }
 
-/// The bridging agreement of the lane each bridge cycle bridges on, read from
-/// the cell `ham` reaches.
+/// The bridging agreement of the lane a bridge cycle bridges on.
 pub(crate) async fn bridging_agreement(
     ham: &Ham,
     role_name: &str,

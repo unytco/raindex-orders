@@ -3,7 +3,7 @@ use super::checks::Code;
 use super::config::ServiceConfig;
 use super::records::Records;
 use super::{router, Service};
-use crate::config::{changed_settings, Network};
+use crate::config::{changed_settings, with_network_defaults, Network};
 use crate::orchestrator::tests::screening::Down;
 use crate::orchestrator::tests::{
     action_hash, bridging_agent, logged_at, parked_tx, parked_withdrawal_tx, test_db_path,
@@ -91,8 +91,6 @@ fn withdrawal() -> ActionHash {
     ActionHash::from_raw_32(vec![7; 32])
 }
 
-/// A withdrawal of 1.5 HOT from the vector's vault to RECIPIENT, as the bridge
-/// pays it.
 fn spend() -> Transaction {
     paying(json!({ "withdraw_contract_address": VAULT, "withdraw_to_address": RECIPIENT }))
 }
@@ -189,7 +187,15 @@ async fn answer(service: &Service, body: &[u8]) -> Result<Signed, Code> {
         .map_err(|refusal| refusal.code)
 }
 
-/// The code `body` is refused with, or `None` when it is signed.
+async fn reason(service: &Service, body: &SignBody) -> String {
+    service
+        .sign(Some(&format!("Bearer {TOKEN}")), &bytes(body), NOW)
+        .await
+        .err()
+        .map(|refusal| refusal.reason)
+        .unwrap_or_default()
+}
+
 async fn refused(service: &Service, body: &SignBody) -> Option<Code> {
     answer(service, &bytes(body)).await.err()
 }
@@ -198,8 +204,6 @@ fn signed(answer: Result<Signed, Code>) -> Signed {
     answer.unwrap_or_else(|code| panic!("refused with {code:?}"))
 }
 
-/// The request docs/signer-service.md gives as its worked example, as the
-/// orchestrator sends it, gets the signature the doc gives.
 #[tokio::test]
 async fn the_worked_example_is_signed_as_the_doc_gives_it() {
     let service = service(FakeCell::holding(spend()), &[]);
@@ -214,8 +218,8 @@ async fn the_worked_example_is_signed_as_the_doc_gives_it() {
     );
 }
 
-/// Every check made before the cell is asked. The startup probe is signed and
-/// records nothing.
+/// Every check made before the cell is asked, but the expiry's. The startup
+/// probe is signed and records nothing.
 #[tokio::test]
 async fn each_check_of_the_request_refuses_with_its_code() {
     let service = service(FakeCell::holding(spend()), &[]);
@@ -325,21 +329,35 @@ async fn each_check_of_the_request_refuses_with_its_code() {
             serde_json::to_string(&body).unwrap()
         );
     }
+    let mut wrong_digest = coupon(|_| {});
+    wrong_digest.coupon_digest = B256::repeat_byte(1);
+    assert!(reason(&service, &wrong_digest)
+        .await
+        .starts_with("couponDigest"));
+    let mut wrong_hash = coupon(|_| {});
+    wrong_hash.safe_message_hash = B256::repeat_byte(1);
+    assert!(reason(&service, &wrong_hash)
+        .await
+        .starts_with("safeMessageHash"));
+    let mut unheld_and_wrong_hash = coupon(|_| {});
+    unheld_and_wrong_hash.coupon_digest = B256::repeat_byte(1);
+    let unheld = service_with(Some(ParkedLinkStanding::NotHeld));
+    assert_eq!(
+        refused(&unheld, &unheld_and_wrong_hash).await,
+        Some(Code::HashMismatch)
+    );
 
     let with_a_field_it_does_not_know = edited(&|body| {
         body.insert("memo".to_string(), json!("ignored"));
     });
     signed(answer(&service, &with_a_field_it_does_not_know).await);
 
-    let probed = signed(answer(&service, &bytes(&probe(|_| {}))).await);
+    let probing = service_at(&test_db_path("signer"), FakeCell::holding(spend()), &[]);
+    let probed = signed(answer(&probing, &bytes(&probe(|_| {}))).await);
     assert_eq!(probed.owner, owner(0));
-    let other_order = B256::repeat_byte(2);
     assert_eq!(
-        service
-            .records
-            .record(probe_nonce(), other_order, &withdrawal(), NOW)
-            .unwrap(),
-        None,
+        records_in(&probing.config.db_path),
+        0,
         "the probe left a record"
     );
 }
@@ -374,9 +392,8 @@ async fn the_expiry_is_signed_only_within_its_window() {
     }
 }
 
-/// A lane lookup that fails waits too.
 #[tokio::test]
-async fn the_cell_says_whether_the_withdrawal_is_still_parked() {
+async fn the_cell_says_whether_the_withdrawal_is_still_parked_and_on_which_lane() {
     for (standing, code) in [
         (Some(ParkedLinkStanding::Unparked), Code::NotAWithdrawal),
         (
@@ -386,12 +403,16 @@ async fn the_cell_says_whether_the_withdrawal_is_still_parked() {
         (Some(ParkedLinkStanding::NotHeld), Code::UnknownWithdrawal),
         (None, Code::NotReady),
     ] {
-        let service = service(FakeCell::answering(standing.clone()), &[]);
+        let service = service_with(standing.clone());
         assert_eq!(
             refused(&service, &coupon(|_| {})).await,
             Some(code),
             "{standing:?}"
         );
+        if code == Code::NotAWithdrawal {
+            let answered = format!("answers {:?}", standing.unwrap());
+            assert!(reason(&service, &coupon(|_| {})).await.contains(&answered));
+        }
     }
 
     let other_link = ActionHash::from_raw_32(vec![8; 32]);
@@ -489,18 +510,22 @@ async fn only_a_withdrawal_the_bridge_pays_is_signed_as_it_pays() {
 
     let paid_out = service(FakeCell::holding(spend()), &[]);
     let one_wei = amount_word(U256::from(1)).unwrap();
-    assert_eq!(
-        refused(&paid_out, &coupon(|words| words[1] = one_wei)).await,
-        Some(Code::AmountMismatch)
-    );
-    assert_eq!(
-        refused(
-            &paid_out,
-            &coupon(|words| words[0] = pad_address(Address::repeat_byte(0x22)))
-        )
-        .await,
-        Some(Code::RecipientMismatch)
-    );
+    let other = pad_address(Address::repeat_byte(0x22));
+    for (edited, code, word) in [
+        (
+            coupon(|words| words[1] = one_wei),
+            Code::AmountMismatch,
+            one_wei,
+        ),
+        (
+            coupon(|words| words[0] = other),
+            Code::RecipientMismatch,
+            other,
+        ),
+    ] {
+        assert_eq!(refused(&paid_out, &edited).await, Some(code));
+        assert!(reason(&paid_out, &edited).await.contains(&word.to_string()));
+    }
 
     let checksummed = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
     let service = service(FakeCell::holding(paying(paid(checksummed))), &[]);
@@ -511,8 +536,15 @@ async fn only_a_withdrawal_the_bridge_pays_is_signed_as_it_pays() {
     );
 }
 
+fn records_in(db: &str) -> u64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[tokio::test]
-async fn a_listed_recipient_is_refused_and_an_unscreened_one_waits() {
+async fn a_listed_recipient_is_refused_and_one_the_screener_cannot_answer_for_waits() {
     let listed = service(
         FakeCell::holding(spend()),
         &[(
@@ -524,6 +556,7 @@ async fn a_listed_recipient_is_refused_and_an_unscreened_one_waits() {
         refused(&listed, &coupon(|_| {})).await,
         Some(Code::RecipientListed)
     );
+    assert_eq!(records_in(&listed.config.db_path), 0);
 
     let mut down = service(FakeCell::holding(spend()), &[]);
     down.config.screener = Some(Box::new(Down));
@@ -541,8 +574,6 @@ async fn a_listed_recipient_is_refused_and_an_unscreened_one_waits() {
     assert_eq!(refused(&unscreened, &on_sepolia).await, None);
 }
 
-/// A signer that restarts on a rotated claim order refuses a withdrawal it
-/// signed for the old one, and signs it again for the same order.
 #[tokio::test]
 async fn the_records_outlive_a_restart_and_stop_a_second_order() {
     let db = test_db_path("signer-records");
@@ -563,6 +594,24 @@ async fn the_records_outlive_a_restart_and_stop_a_second_order() {
         refused(&on_rotated, &coupon(|words| words[3] = rotated)).await,
         Some(Code::AlreadySigned)
     );
+    assert_eq!(records_in(&db), 1);
+}
+
+#[tokio::test]
+async fn a_signer_that_cannot_write_its_record_does_not_sign() {
+    let unwritable = service(FakeCell::holding(spend()), &[]);
+    rusqlite::Connection::open(&unwritable.config.db_path)
+        .unwrap()
+        .execute(
+            "CREATE TRIGGER refuse BEFORE INSERT ON records BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        refused(&unwritable, &coupon(|_| {})).await,
+        Some(Code::NotReady)
+    );
 }
 
 async fn serve(service: Service) -> String {
@@ -573,8 +622,6 @@ async fn serve(service: Service) -> String {
     url
 }
 
-/// The orchestrator's own client, `OwnerService`, gets this service's identity,
-/// its signature of the probe and of a coupon, and reads its refusal.
 #[tokio::test]
 async fn the_orchestrator_gets_its_coupons_signed_here() {
     let chain = FakeSafe::new(2, &[0, 1, 2]);
@@ -620,12 +667,21 @@ async fn the_endpoints_answer_as_the_contract_says() {
     ))
     .await;
 
+    let lost = service(FakeCell::holding(spend()), &[]);
+    rusqlite::Connection::open(&lost.config.db_path)
+        .unwrap()
+        .execute("DROP TABLE records", [])
+        .unwrap();
+    let without_records = serve(lost).await;
+
     let healthz = |url: &str| client.get(format!("{url}/healthz")).send();
     let healthy = healthz(&up).await.unwrap();
     assert_eq!(healthy.status(), 200);
-    let unhealthy = healthz(&down).await.unwrap();
-    assert_eq!(unhealthy.status(), 503);
-    assert_eq!(unhealthy.text().await.unwrap(), "");
+    for url in [&down, &without_records] {
+        let unhealthy = healthz(url).await.unwrap();
+        assert_eq!(unhealthy.status(), 503, "{url}");
+        assert_eq!(unhealthy.text().await.unwrap(), "");
+    }
 
     for answer in [
         client.get(format!("{up}/signer")).send().await.unwrap(),
@@ -669,16 +725,26 @@ async fn the_endpoints_answer_as_the_contract_says() {
 #[tokio::test]
 async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
     let service = service(FakeCell::holding(spend()), &[]);
+    let good = bytes(&coupon(|_| {}));
 
     let logged = logged_at(tracing::Level::INFO, async {
         let _ = service.sign(Some("Bearer wrong"), b"{}", NOW).await;
+        let _ = service.sign(Some(TOKEN), &good, NOW).await;
+        let _ = service
+            .sign(Some(&format!("Bearer {TOKEN}x")), &good, NOW)
+            .await;
         let _ = service.identity(None);
         let _ = answer(&service, b"{}").await;
         let _ = refused(&service, &coupon(|words| words[1] = B256::ZERO)).await;
+        let mut other_owner = coupon(|_| {});
+        other_owner.owner = owner(1);
+        let _ = refused(&service, &other_owner).await;
         let _ = refused(&service, &probe(|_| {})).await;
         let _ = refused(&service, &coupon(|_| {})).await;
-        let unheld = service_with(ParkedLinkStanding::NotHeld);
+        let unheld = service_with(Some(ParkedLinkStanding::NotHeld));
         let _ = refused(&unheld, &coupon(|_| {})).await;
+        let silent = service_with(None);
+        let _ = refused(&silent, &coupon(|_| {})).await;
     })
     .await;
 
@@ -689,23 +755,47 @@ async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
             .filter(|line| line.contains(level) && line.contains(&format!("event=\"{event}\"")))
             .count()
     };
-    assert_eq!(at("WARN", "signer.unauthorized"), 2, "{logged}");
-    assert_eq!(at("ERROR", "signer.refused"), 2, "{logged}");
-    assert_eq!(at("WARN", "signer.waiting"), 1, "{logged}");
+    assert_eq!(at("WARN", "signer.unauthorized"), 4, "{logged}");
+    assert_eq!(at("ERROR", "signer.refused"), 3, "{logged}");
+    assert_eq!(at("WARN", "signer.waiting"), 2, "{logged}");
     assert_eq!(at("INFO", "signer.signed"), 2, "{logged}");
-    assert!(logged.contains("code=\"bad_request\""), "{logged}");
-    assert!(logged.contains("code=\"amount_mismatch\""), "{logged}");
-    assert!(logged.contains("code=\"unknown_withdrawal\""), "{logged}");
+    for code in [
+        "bad_request",
+        "amount_mismatch",
+        "unknown_withdrawal",
+        "not_ready",
+    ] {
+        assert!(
+            logged.contains(&format!("code=\"{code}\"")),
+            "{code}: {logged}"
+        );
+    }
+    assert!(logged.contains("the zome call failed"), "{logged}");
+    let withdrawal = ActionHashB64::from(withdrawal()).to_string();
+    for event in [
+        "signer.signed",
+        "wrong_owner",
+        "amount_mismatch",
+        "not_ready",
+    ] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(event)
+                    && line.contains(&format!("withdrawal={withdrawal}"))),
+            "{event}: {logged}"
+        );
+    }
     assert!(
-        logged.contains(&ActionHashB64::from(withdrawal()).to_string()),
+        logged.contains(&format!("asks owner {}", owner(1))),
         "{logged}"
     );
     assert!(!logged.contains(TOKEN), "{logged}");
     assert!(!logged.contains(&OWNER_KEYS[0][2..]), "{logged}");
 }
 
-fn service_with(standing: ParkedLinkStanding) -> Service {
-    service(FakeCell::answering(Some(standing)), &[])
+fn service_with(standing: Option<ParkedLinkStanding>) -> Service {
+    service(FakeCell::answering(standing), &[])
 }
 
 fn refused_config(changes: &[(&'static str, Option<&str>)]) -> String {
@@ -756,17 +846,28 @@ fn the_settings_name_every_fault_and_never_the_key_or_the_token() {
         .contains("SIGNER_BEARER_TOKEN is required"));
     assert!(refused_config(&[("SAFE_OWNER_KEY", None)]).contains("SAFE_OWNER_KEY is required"));
     assert_eq!(
-        refused_config(&[("NETWORK", Some("none"))]),
-        "NETWORK=none is not base-sepolia or mainnet"
+        refused_config(&[
+            ("NETWORK", Some("none")),
+            ("CLAIM_SIGNER", None),
+            ("ORDERBOOK_ADDRESS", None),
+            ("VAULT_ID", None),
+            ("SCREENING", Some("maybe")),
+        ]),
+        "NETWORK=none is not base-sepolia or mainnet; CLAIM_SIGNER is required; SCREENING=maybe is not on or off"
     );
     assert!(refused_config(&[(
         "SAFE_OWNER_KEY",
         Some("0xdcbe53cbf4cbee212fe6339821058f2787c7726ae0684335118cdea2e8adaafd")
     )])
     .contains("SAFE_OWNER_KEY is the test signer"));
+    assert!(refused_config(&[("SCREENING", Some("off"))])
+        .contains("SCREENING=off is refused on mainnet"));
+    assert_eq!(
+        refused_config(&[("ORDERBOOK_ADDRESS", None), ("VAULT_ID", None)]),
+        "ORDERBOOK_ADDRESS is required; VAULT_ID is required"
+    );
 }
 
-/// On TestNet the orderbook and vault ID default, and the Safe never does.
 #[test]
 fn testnet_defaults_the_orderbook_and_vault_but_never_the_safe() {
     let testnet = [
@@ -774,6 +875,7 @@ fn testnet_defaults_the_orderbook_and_vault_but_never_the_safe() {
         ("ORDERBOOK_ADDRESS", None),
         ("VAULT_ID", None),
         ("SCREENING", Some("off")),
+        ("SIGNER_BIND_PORT", Some("8123")),
     ];
     let without_safe: Vec<_> = testnet
         .iter()
@@ -785,9 +887,17 @@ fn testnet_defaults_the_orderbook_and_vault_but_never_the_safe() {
     let Ok(config) = ServiceConfig::from_settings(settings("unused.db", &testnet)) else {
         panic!("TestNet's settings were refused");
     };
+    let default = |key: &str| with_network_defaults(Network::BaseSepolia, |_| None)(key).unwrap();
     assert_eq!(config.network, Network::BaseSepolia);
-    assert_eq!(config.order, ClaimOrder::vector().words());
-    assert_eq!(config.bind.to_string(), "127.0.0.1:0");
+    assert_eq!(
+        config.order[2],
+        pad_address(default("ORDERBOOK_ADDRESS").parse().unwrap())
+    );
+    assert_eq!(
+        config.order[4],
+        default("VAULT_ID").parse::<B256>().unwrap()
+    );
+    assert_eq!(config.bind.to_string(), "127.0.0.1:8123");
     assert_eq!(config.expiry_seconds.get(), WEEK);
     assert_eq!(config.expiry_tolerance_seconds, 600);
     assert_eq!(config.hot_unit_index, 1);

@@ -33,14 +33,15 @@ struct Service {
 
 pub async fn run() -> Result<()> {
     let config = ServiceConfig::from_env()?;
+    // Refuses a conductor without an external lair before the records file is
+    // created or the listener binds.
     ham_config(&config.holochain)?;
     let records = Records::open(&config.db_path)?;
     let mut shutdown = ham::install_shutdown_handler();
-    let cell = Arc::new(HamCell::new(config.holochain.role_name.clone()));
+    let cell = Arc::new(HamCell::new(config.holochain.clone()));
     let connection = tokio::spawn({
-        let (cell, holochain, shutdown) =
-            (cell.clone(), config.holochain.clone(), shutdown.clone());
-        async move { cell.keep_connected(&holochain, shutdown).await }
+        let (cell, shutdown) = (cell.clone(), shutdown.clone());
+        async move { cell.keep_connected(shutdown).await }
     });
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
@@ -50,6 +51,9 @@ pub async fn run() -> Result<()> {
                 config.bind
             )
         })?;
+    let bound = listener
+        .local_addr()
+        .context("the signer's listener has no local address")?;
     info!(
         event = "signer.started",
         owner = %config.key.address(),
@@ -59,7 +63,7 @@ pub async fn run() -> Result<()> {
         config.key.address(),
         config.safe,
         config.network.name(),
-        config.bind,
+        bound,
         config
             .screener
             .as_ref()

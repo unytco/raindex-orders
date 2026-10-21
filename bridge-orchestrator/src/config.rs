@@ -242,7 +242,6 @@ pub(crate) fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<
     }
 }
 
-/// `NETWORK`'s chain, read and checked for every command.
 pub fn ethereum_from_env() -> Result<Option<Ethereum>> {
     ethereum_settings(|key| env::var(key).ok())
 }
@@ -667,7 +666,7 @@ const RETIRED_SETTINGS: [(&str, &str); 2] = [
     ("HOLOCHAIN_UNIT_INDEX", "rename it to HOT_UNIT_INDEX"),
 ];
 
-/// The conductor `ham` connects to, as `run`, `in-transit` and `signer` read it.
+/// The conductor `ham` connects to.
 #[derive(Debug, Clone)]
 pub struct Holochain {
     pub admin_port: u16,
@@ -806,7 +805,6 @@ pub(crate) fn test_settings(set: &[(&str, &str)]) -> impl Fn(&str) -> Option<Str
     }
 }
 
-/// `set`, with each of `changes` in its place, or removed when it is `None`.
 #[cfg(test)]
 pub(crate) fn changed_settings(
     mut set: Vec<(&'static str, String)>,

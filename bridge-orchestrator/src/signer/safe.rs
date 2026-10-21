@@ -707,7 +707,7 @@ pub struct Identity {
     pub chain_id: u64,
 }
 
-/// A signer service's refusal, `409 { "code": "...", "reason": "..." }`.
+/// A signer service's refusal of `GET /signer` or `POST /sign`.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Refused {
     pub code: String,

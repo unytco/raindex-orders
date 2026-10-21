@@ -294,9 +294,9 @@ impl CouponSigner {
         self.key.new_cycle();
     }
 
-    /// Simulated, the probe shows whether the claim order accepts the signer. A
-    /// Safe's owners sign it too, at their signer services, which know it by
-    /// its words and its missing withdrawal (docs/signer-service.md).
+    /// Simulated, the probe shows whether the claim order accepts the signer.
+    /// Its words are fixed by docs/signer-service.md: every signer service
+    /// checks them.
     pub async fn probe_coupon(&self) -> Result<SignedCoupon> {
         let context = probe_context(self.key.address(), self.order.words())?;
         self.sign(context, None).await
@@ -344,8 +344,6 @@ pub fn probe_nonce() -> B256 {
     keccak256(b"bridge-orchestrator startup probe")
 }
 
-/// A coupon's nine words: `amount` wei to `recipient` until `expiry`, claimed
-/// on the order whose words are `order`, once for `nonce`.
 fn coupon_context(
     recipient: Address,
     amount: U256,
@@ -363,14 +361,11 @@ fn coupon_context(
     Ok(context)
 }
 
-/// The startup probe's words for `signer`: one wei to the signer itself, which
-/// expires at the latest second a float of exponent 0 can hold, with a nonce no
-/// withdrawal has.
 fn probe_context(signer: Address, order: [B256; 5]) -> Result<Vec<B256>> {
     coupon_context(signer, U256::from(1), MAX_EXPIRY, order, probe_nonce())
 }
 
-/// Words 3 to 7 of a coupon: the claim order it is claimed on.
+/// Words 3 to 7 of a coupon: its claim order.
 fn order_words(
     order_hash: B256,
     order_owner: Address,

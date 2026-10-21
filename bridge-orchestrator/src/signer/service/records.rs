@@ -1,3 +1,4 @@
+use crate::signer::withdrawal_nonce;
 use alloy::primitives::B256;
 use anyhow::{Context, Result};
 use holo_hash::{ActionHash, ActionHashB64};
@@ -5,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::sync::Mutex;
 
 /// Each withdrawal this signer signed, keyed by its nonce, with the order hash
-/// it signed it for.
+/// it signed it for: one order per withdrawal (docs/signer-service.md).
 pub struct Records {
     conn: Mutex<Connection>,
 }
@@ -29,16 +30,15 @@ impl Records {
         })
     }
 
-    /// Records `withdrawal` under `order_hash`, unless its nonce is recorded
-    /// already. Answers the other order hash it is recorded under, and then
-    /// writes nothing.
+    /// `Some(order hash)` when `withdrawal` is recorded under another order hash.
+    /// Otherwise `None`, after recording it if it is new.
     pub fn record(
         &self,
-        nonce: B256,
-        order_hash: B256,
         withdrawal: &ActionHash,
+        order_hash: B256,
         signed_at: u64,
     ) -> Result<Option<B256>> {
+        let nonce = withdrawal_nonce(withdrawal);
         let mut conn = self.conn.lock().expect("records mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let recorded: Option<String> = tx

@@ -15,16 +15,13 @@ const TESTNET_DEFAULTED: [&str; 2] = ["ORDERBOOK_ADDRESS", "VAULT_ID"];
 
 const DEFAULT_EXPIRY_TOLERANCE_SECONDS: u64 = 600;
 
-/// `bridge-orchestrator signer`'s configuration. It holds the owner key and
-/// the token, so it has no `Debug`.
+/// No `Debug`: it holds the bearer token.
 pub struct ServiceConfig {
     pub network: Network,
     pub safe: Address,
     pub order_owner: Address,
-    /// Words 3 to 7 of every coupon it signs.
     pub order: [B256; 5],
     pub key: PrivateKeySigner,
-    /// `Bearer <SIGNER_BEARER_TOKEN>`, as `Authorization` carries it.
     pub authorization: String,
     pub bind: SocketAddr,
     pub db_path: String,
@@ -45,15 +42,19 @@ impl ServiceConfig {
     /// Names every fault in one refusal, and never quotes the key or the token.
     pub(super) fn from_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let given = |key: &str| setting(key).filter(|value| !value.is_empty());
+        let mut faults = Vec::new();
         let network = match given("NETWORK") {
             Some(raw) if raw.parse::<Network>().is_err() => {
-                anyhow::bail!("NETWORK={raw} is not base-sepolia or mainnet")
+                faults.push(format!("NETWORK={raw} is not base-sepolia or mainnet"));
+                None
             }
-            _ => network_from(&setting)?,
+            _ => Some(network_from(&setting)?),
         };
-        log_testnet_defaults(network, &setting, &TESTNET_DEFAULTED);
-        let defaulted = with_network_defaults(network, &setting);
-        let mut faults = Vec::new();
+        // With a bad NETWORK, the rest is checked by base-sepolia's rules, which
+        // mainnet's only add to.
+        let rules = network.unwrap_or(Network::BaseSepolia);
+        log_testnet_defaults(rules, &setting, &TESTNET_DEFAULTED);
+        let defaulted = with_network_defaults(rules, &setting);
 
         let safe = parsed(&given, "CLAIM_SIGNER", "an address", &mut faults);
         let order_hash = parsed(&given, "ORDER_HASH", "a 32-byte hash", &mut faults);
@@ -71,7 +72,7 @@ impl ServiceConfig {
                 None
             }
             Some(Ok(key)) => {
-                if network == Network::Mainnet && key.address() == TEST_SIGNER {
+                if rules == Network::Mainnet && key.address() == TEST_SIGNER {
                     faults.push(format!(
                         "SAFE_OWNER_KEY is the test signer {TEST_SIGNER}, whose key is public: mainnet refuses it"
                     ));
@@ -83,33 +84,34 @@ impl ServiceConfig {
         if bearer.is_none() {
             faults.push("SIGNER_BEARER_TOKEN is required".to_string());
         }
-        let bind_addr = match given("SIGNER_BIND_ADDR") {
-            None => Some(IpAddr::from([127, 0, 0, 1])),
-            Some(_) => parsed(&given, "SIGNER_BIND_ADDR", "an IP address", &mut faults),
-        };
+        let bind_addr = parsed_or(
+            &given,
+            "SIGNER_BIND_ADDR",
+            "an IP address",
+            IpAddr::from([127, 0, 0, 1]),
+            &mut faults,
+        );
         let bind_port: Option<u16> = parsed(&given, "SIGNER_BIND_PORT", "a port", &mut faults);
         let db_path = given("SIGNER_DB_PATH");
         if db_path.is_none() {
             faults.push("SIGNER_DB_PATH is required".to_string());
         }
         let expiry_seconds = expiry_seconds(&given, &mut faults);
-        let expiry_tolerance_seconds = match given("EXPIRY_TOLERANCE_SECONDS") {
-            None => Some(DEFAULT_EXPIRY_TOLERANCE_SECONDS),
-            Some(_) => parsed(
-                &given,
-                "EXPIRY_TOLERANCE_SECONDS",
-                "a number of seconds",
-                &mut faults,
-            ),
-        };
-        let screener = named(screening_settings(network, &setting), &mut faults);
+        let expiry_tolerance_seconds = parsed_or(
+            &given,
+            "EXPIRY_TOLERANCE_SECONDS",
+            "a number of seconds",
+            DEFAULT_EXPIRY_TOLERANCE_SECONDS,
+            &mut faults,
+        );
+        let screener = named(screening_settings(rules, &setting), &mut faults);
         let bridging_agent = named(bridging_agent(&setting), &mut faults);
         let hot_unit_index = named(hot_unit_index(&setting), &mut faults);
         let holochain = named(Holochain::from_settings(&setting), &mut faults);
 
         let config = (|| {
             Some(Self {
-                network,
+                network: network?,
                 safe: safe?,
                 order_owner: order_owner?,
                 order: order_words(order_hash?, order_owner?, orderbook?, token?, vault_id?),
@@ -129,6 +131,19 @@ impl ServiceConfig {
             Some(config) if faults.is_empty() => Ok(config),
             _ => anyhow::bail!("{}", faults.join("; ")),
         }
+    }
+}
+
+fn parsed_or<T: std::str::FromStr>(
+    setting: &impl Fn(&str) -> Option<String>,
+    key: &str,
+    what: &str,
+    default: T,
+    faults: &mut Vec<String>,
+) -> Option<T> {
+    match setting(key) {
+        None => Some(default),
+        Some(_) => parsed(setting, key, what, faults),
     }
 }
 
