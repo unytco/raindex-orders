@@ -612,3 +612,140 @@ fn screen_answers_from_the_configured_list_and_records_nothing() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("SCREENING=off"));
 }
+
+/// Owner 0's signer service for the Safe of docs/signer-service.md's worked
+/// example, on mainnet, at `port`, with its conductor at a closed port.
+fn signer_service(dir: &Path, port: u16) -> Vec<(&'static str, String)> {
+    let passphrase = dir.join("lair-passphrase");
+    std::fs::write(&passphrase, "deadbeef\n").unwrap();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let conductor = closed.local_addr().unwrap().port().to_string();
+    drop(closed);
+    let order = [
+        "ORDER_HASH",
+        "ORDER_OWNER",
+        "ORDERBOOK_ADDRESS",
+        "TOKEN_ADDRESS",
+        "VAULT_ID",
+    ];
+    let mut env: Vec<_> = signer()
+        .into_iter()
+        .filter(|(key, _)| order.contains(key))
+        .collect();
+    let agent: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1; 32]).into();
+    env.extend([
+        ("NETWORK", "mainnet".to_string()),
+        (
+            "CLAIM_SIGNER",
+            "0x3838Fc4E0cba211c3D6D202539bB2dc2B72C7a22".to_string(),
+        ),
+        (
+            "SAFE_OWNER_KEY",
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".to_string(),
+        ),
+        ("SIGNER_BEARER_TOKEN", "startup-token".to_string()),
+        ("SIGNER_BIND_PORT", port.to_string()),
+        ("SIGNER_DB_PATH", signer_db(dir).display().to_string()),
+        ("SCREENING", "on".to_string()),
+        ("SCREENING_DENYLIST", listed()),
+        ("HOLOCHAIN_BRIDGING_AGENT_PUBKEY", agent.to_string()),
+        ("HOLOCHAIN_ADMIN_PORT", conductor.clone()),
+        ("HOLOCHAIN_APP_PORT", conductor),
+        durable_conductor(dir),
+        ("LAIR_PASSPHRASE_FILE", passphrase.display().to_string()),
+    ]);
+    env
+}
+
+fn signer_db(dir: &Path) -> std::path::PathBuf {
+    dir.join("signer.db")
+}
+
+#[test]
+fn signer_names_each_fault_of_its_own_settings_and_reads_none_of_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = with(
+        &signer_service(dir.path(), 0),
+        &[
+            ("CLAIM_SIGNER", ""),
+            ("SIGNER_BEARER_TOKEN", ""),
+            ("SIGNER_BIND_PORT", ""),
+            ("POLL_INTERVAL_MS", "often"),
+        ],
+    );
+
+    let output = orchestrator(dir.path(), &env, &["signer"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains(
+            "CLAIM_SIGNER is required; SIGNER_BEARER_TOKEN is required; SIGNER_BIND_PORT is required"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("POLL_INTERVAL_MS"), "{stderr}");
+    assert!(!signer_db(dir.path()).exists());
+}
+
+/// One HTTP/1.1 request to the service at `port`, answered as its status line
+/// and body, or `None` while nothing listens.
+fn ask(port: u16, request: &str) -> Option<(String, String)> {
+    let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    socket.write_all(request.as_bytes()).ok()?;
+    let mut answer = String::new();
+    socket.read_to_string(&mut answer).ok()?;
+    let (head, body) = answer.split_once("\r\n\r\n")?;
+    Some((head.lines().next()?.to_string(), body.to_string()))
+}
+
+#[test]
+fn signer_serves_its_identity_and_is_unhealthy_while_its_conductor_is_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = free.local_addr().unwrap().port();
+    drop(free);
+    let env = signer_service(dir.path(), port);
+
+    let mut service = Command::new(env!("CARGO_BIN_EXE_bridge-orchestrator"))
+        .arg("signer")
+        .current_dir(dir.path())
+        .env_clear()
+        .envs(env.iter().map(|(key, value)| (key, value)))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let healthz = "GET /healthz HTTP/1.1\r\nHost: signer\r\nConnection: close\r\n\r\n";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let health = loop {
+        if let Some(answer) = ask(port, healthz) {
+            break Some(answer);
+        }
+        if std::time::Instant::now() > deadline || service.try_wait().unwrap().is_some() {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let identity = ask(
+        port,
+        "GET /signer HTTP/1.1\r\nHost: signer\r\nAuthorization: Bearer startup-token\r\nConnection: close\r\n\r\n",
+    );
+    service.kill().unwrap();
+    service.wait().unwrap();
+
+    let (status, body) = health.expect("the signer never listened");
+    assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+    assert_eq!(body, "");
+    let (status, body) = identity.unwrap();
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "owner": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            "safe": "0x3838fc4e0cba211c3d6d202539bb2dc2b72c7a22",
+            "chainId": 1,
+        })
+    );
+    assert!(signer_db(dir.path()).exists());
+}

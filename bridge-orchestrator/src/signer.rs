@@ -1,7 +1,7 @@
 use crate::config::{checksum_matches, log_testnet_defaults, with_network_defaults, Network};
 use alloy::primitives::{address, keccak256, Address, Bytes, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::signers::Signer;
+use alloy::signers::{Signer, SignerSync};
 use anyhow::{Context, Result};
 use holo_hash::ActionHash;
 use std::collections::BTreeMap;
@@ -13,6 +13,7 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod safe;
+pub(crate) mod service;
 #[cfg(test)]
 pub use safe::safe_message_hash;
 pub use safe::{disjoint_quorums, safe_domain_separator, ISafe, Owner, OwnerService, SafeOwners};
@@ -121,15 +122,13 @@ impl CouponKey for PrivateKeySigner {
     }
 
     fn sign<'a>(&'a self, request: &'a SignRequest) -> Signing<'a> {
-        Box::pin(async move {
-            let signature = self.sign_hash(&request.digest).await?;
-            let mut bytes = Vec::with_capacity(65);
-            bytes.extend_from_slice(&signature.r().to_be_bytes::<32>());
-            bytes.extend_from_slice(&signature.s().to_be_bytes::<32>());
-            bytes.push(if signature.v() { 28 } else { 27 });
-            Ok(bytes)
-        })
+        Box::pin(std::future::ready(signature_of(self, &request.digest)))
     }
+}
+
+/// `key`'s 65-byte signature of `hash`: r, s, then v as 27 or 28.
+pub(crate) fn signature_of(key: &PrivateKeySigner, hash: &B256) -> Result<Vec<u8>> {
+    Ok(key.sign_hash_sync(hash)?.as_bytes().to_vec())
 }
 
 pub struct CouponSigner {
@@ -157,18 +156,7 @@ impl CouponSigner {
         let store = parsed(&setting, "CLAIM_STORE", "an address", &mut faults);
         let bytecode = parsed(&setting, "CLAIM_BYTECODE", "hex bytecode", &mut faults);
         let input_token = parsed(&setting, "CLAIM_INPUT_TOKEN", "an address", &mut faults);
-        let expiry_seconds = match setting("EXPIRY_SECONDS") {
-            None => Some(DEFAULT_EXPIRY_SECONDS),
-            Some(raw) => match raw.parse::<NonZeroU64>() {
-                Ok(seconds) if seconds.get() <= MAX_EXPIRY_SECONDS => Some(seconds),
-                _ => {
-                    faults.push(format!(
-                        "EXPIRY_SECONDS={raw} is not a number of seconds from 1 to {MAX_EXPIRY_SECONDS}"
-                    ));
-                    None
-                }
-            },
-        };
+        let expiry_seconds = expiry_seconds(&setting, &mut faults);
 
         let mut tokens = service_tokens(setting("SAFE_OWNER_SERVICE_TOKENS"), &mut faults);
         let key: Option<Box<dyn CouponKey>> = match (
@@ -289,15 +277,14 @@ impl CouponSigner {
     }
 
     async fn coupon_at(&self, terms: Payout, withdrawal: &ActionHash, now: u64) -> Result<String> {
-        let coupon = self
-            .sign(
-                terms.recipient,
-                terms.wei,
-                U256::from(now) + U256::from(self.expiry_seconds.get()),
-                withdrawal_nonce(withdrawal),
-                Some(withdrawal.clone()),
-            )
-            .await?;
+        let context = coupon_context(
+            terms.recipient,
+            terms.wei,
+            U256::from(now) + U256::from(self.expiry_seconds.get()),
+            self.order.words(),
+            withdrawal_nonce(withdrawal),
+        )?;
+        let coupon = self.sign(context, Some(withdrawal.clone())).await?;
         Ok(serialize(&coupon))
     }
 
@@ -307,42 +294,19 @@ impl CouponSigner {
         self.key.new_cycle();
     }
 
-    /// A coupon for one wei to the signer itself, which expires at the latest
-    /// second a float of exponent 0 can hold, with a nonce no withdrawal has.
-    /// Simulated, it shows whether the claim order accepts the signer. A Safe's
-    /// owners sign it too, at their signer services, which know it by those
-    /// words and its missing withdrawal (docs/signer-service.md).
+    /// Simulated, the probe shows whether the claim order accepts the signer. A
+    /// Safe's owners sign it too, at their signer services, which know it by
+    /// its words and its missing withdrawal (docs/signer-service.md).
     pub async fn probe_coupon(&self) -> Result<SignedCoupon> {
-        self.sign(
-            self.key.address(),
-            U256::from(1),
-            MAX_EXPIRY,
-            probe_nonce(),
-            None,
-        )
-        .await
+        let context = probe_context(self.key.address(), self.order.words())?;
+        self.sign(context, None).await
     }
 
     async fn sign(
         &self,
-        recipient: Address,
-        amount: U256,
-        expiry: U256,
-        nonce: B256,
+        context: Vec<B256>,
         withdrawal: Option<ActionHash>,
     ) -> Result<SignedCoupon> {
-        let order = &self.order;
-        let context: Vec<B256> = vec![
-            pad_address(recipient),
-            amount_word(amount)?,
-            B256::from(expiry),
-            order.order_hash,
-            pad_address(order.order_owner),
-            pad_address(order.orderbook),
-            pad_address(order.token),
-            order.vault_id,
-            nonce,
-        ];
         let request = SignRequest {
             digest: context_digest(&context),
             context,
@@ -357,9 +321,82 @@ impl CouponSigner {
     }
 }
 
+fn expiry_seconds(
+    setting: &impl Fn(&str) -> Option<String>,
+    faults: &mut Vec<String>,
+) -> Option<NonZeroU64> {
+    match setting("EXPIRY_SECONDS") {
+        None => Some(DEFAULT_EXPIRY_SECONDS),
+        Some(raw) => match raw.parse::<NonZeroU64>() {
+            Ok(seconds) if seconds.get() <= MAX_EXPIRY_SECONDS => Some(seconds),
+            _ => {
+                faults.push(format!(
+                    "EXPIRY_SECONDS={raw} is not a number of seconds from 1 to {MAX_EXPIRY_SECONDS}"
+                ));
+                None
+            }
+        },
+    }
+}
+
 /// The startup probe's nonce, which no withdrawal's is.
 pub fn probe_nonce() -> B256 {
     keccak256(b"bridge-orchestrator startup probe")
+}
+
+/// A coupon's nine words: `amount` wei to `recipient` until `expiry`, claimed
+/// on the order whose words are `order`, once for `nonce`.
+fn coupon_context(
+    recipient: Address,
+    amount: U256,
+    expiry: U256,
+    order: [B256; 5],
+    nonce: B256,
+) -> Result<Vec<B256>> {
+    let mut context = vec![
+        pad_address(recipient),
+        amount_word(amount)?,
+        B256::from(expiry),
+    ];
+    context.extend(order);
+    context.push(nonce);
+    Ok(context)
+}
+
+/// The startup probe's words for `signer`: one wei to the signer itself, which
+/// expires at the latest second a float of exponent 0 can hold, with a nonce no
+/// withdrawal has.
+fn probe_context(signer: Address, order: [B256; 5]) -> Result<Vec<B256>> {
+    coupon_context(signer, U256::from(1), MAX_EXPIRY, order, probe_nonce())
+}
+
+/// Words 3 to 7 of a coupon: the claim order it is claimed on.
+fn order_words(
+    order_hash: B256,
+    order_owner: Address,
+    orderbook: Address,
+    token: Address,
+    vault_id: B256,
+) -> [B256; 5] {
+    [
+        order_hash,
+        pad_address(order_owner),
+        pad_address(orderbook),
+        pad_address(token),
+        vault_id,
+    ]
+}
+
+impl ClaimOrder {
+    fn words(&self) -> [B256; 5] {
+        order_words(
+            self.order_hash,
+            self.order_owner,
+            self.orderbook,
+            self.token,
+            self.vault_id,
+        )
+    }
 }
 
 /// A fault never quotes the entry, which holds a token.
@@ -646,7 +683,7 @@ fn hot_in_wei(amount: &str) -> Option<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::test_settings;
+    use crate::config::{changed_settings, test_settings};
     use crate::signer::safe::tests::{owner_service, FakeService};
     use holo_hash::ActionHashB64;
 
@@ -853,21 +890,11 @@ mod tests {
     ];
 
     fn settings_with(changes: &[(&'static str, Option<&str>)]) -> impl Fn(&str) -> Option<String> {
-        let mut set: Vec<(&'static str, String)> = VECTOR_SIGNER_SETTINGS
+        let set = VECTOR_SIGNER_SETTINGS
             .iter()
             .map(|(key, value)| (*key, value.to_string()))
             .collect();
-        for (key, value) in changes {
-            set.retain(|(set_key, _)| set_key != key);
-            if let Some(value) = value {
-                set.push((key, value.to_string()));
-            }
-        }
-        let set: Vec<(&str, &str)> = set
-            .iter()
-            .map(|(key, value)| (*key, value.as_str()))
-            .collect();
-        test_settings(&set)
+        changed_settings(set, changes)
     }
 
     fn refusal(network: Network, setting: impl Fn(&str) -> Option<String>) -> String {

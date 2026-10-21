@@ -16,8 +16,7 @@ use alloy::transports::http::{Client, Http};
 use anyhow::{anyhow, bail, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use holo_hash::ActionHashB64;
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -127,14 +126,7 @@ impl Owner {
 
     async fn sign(&self, request: &OwnerRequest<'_>) -> Result<Vec<u8>> {
         match self {
-            Owner::Key(key) => {
-                let signature = key.sign_hash(&request.safe_message_hash).await?;
-                let mut bytes = Vec::with_capacity(65);
-                bytes.extend_from_slice(&signature.r().to_be_bytes::<32>());
-                bytes.extend_from_slice(&signature.s().to_be_bytes::<32>());
-                bytes.push(if signature.v() { 28 } else { 27 });
-                Ok(bytes)
-            }
+            Owner::Key(key) => super::signature_of(key, &request.safe_message_hash),
             Owner::Service(service) => service.request_signature(request).await,
         }
     }
@@ -683,15 +675,31 @@ pub struct OwnerService {
     client: reqwest::Client,
 }
 
+/// What a signer service is sent on `POST /sign`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SignBody {
+    pub safe: Address,
+    pub chain_id: u64,
+    pub owner: Address,
+    /// Null for the startup probe, never missing: `deserialize_with` stops serde
+    /// reading a missing field as `None`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub withdrawal: Option<String>,
+    pub context: Vec<B256>,
+    pub coupon_digest: B256,
+    pub safe_message_hash: B256,
+}
+
 /// A signer service's answer to `POST /sign`.
-#[derive(Deserialize)]
-struct Signed {
-    owner: Address,
-    signature: Bytes,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Signed {
+    pub owner: Address,
+    pub signature: Bytes,
 }
 
 /// A signer service's answer to `GET /signer`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Identity {
     pub owner: Address,
     pub safe: Address,
@@ -700,11 +708,11 @@ pub struct Identity {
 }
 
 /// A signer service's refusal, `409 { "code": "...", "reason": "..." }`.
-#[derive(Deserialize)]
-struct Refused {
-    code: String,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Refused {
+    pub code: String,
     #[serde(default)]
-    reason: String,
+    pub reason: String,
 }
 
 impl OwnerService {
@@ -825,19 +833,19 @@ impl OwnerService {
     }
 
     async fn request_signature(&self, request: &OwnerRequest<'_>) -> Result<Vec<u8>> {
-        let body = json!({
-            "safe": request.safe,
-            "chainId": request.chain_id,
-            "owner": self.owner,
-            "withdrawal": request
+        let body = SignBody {
+            safe: request.safe,
+            chain_id: request.chain_id,
+            owner: self.owner,
+            withdrawal: request
                 .sign
                 .withdrawal
                 .as_ref()
                 .map(|w| ActionHashB64::from(w.clone()).to_string()),
-            "context": request.sign.context.iter().map(|word| word.to_string()).collect::<Vec<_>>(),
-            "couponDigest": request.sign.digest,
-            "safeMessageHash": request.safe_message_hash,
-        });
+            context: request.sign.context.clone(),
+            coupon_digest: request.sign.digest,
+            safe_message_hash: request.safe_message_hash,
+        };
         let answer = self
             .request(reqwest::Method::POST, "sign")
             .json(&body)

@@ -23,6 +23,7 @@ alloy = { version = "0.8", default-features = false, features = [
     "signer-local",
 ] }
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
@@ -34,7 +35,7 @@ holo_hash = { version = "0.7.1", features = ["encoding"] }
 holochain_client = "0.9.1"
 holochain_conductor_api = "0.7.1"
 holochain_zome_types = "0.7.1"
-rave_engine = "=0.14.0"
+rave_engine = "=0.15.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmp-serde = "1.1"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }

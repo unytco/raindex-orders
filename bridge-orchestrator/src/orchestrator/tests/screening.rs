@@ -5,7 +5,7 @@ use crate::state::{Hold, WorkState};
 const LISTED: Address = Address::repeat_byte(0xBA);
 const CLEAN: Address = Address::repeat_byte(0x11);
 
-struct Down;
+pub(crate) struct Down;
 
 impl std::fmt::Display for Down {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
