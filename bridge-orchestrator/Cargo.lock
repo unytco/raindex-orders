@@ -4376,6 +4376,8 @@ dependencies = [
 [[package]]
 name = "rave_engine"
 version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7987b4bf8932a86c7da1e85d8803c9de2c96e8c9c5a68d9d9802b19376fb8fde"
 dependencies = [
  "curve25519-dalek",
  "getrandom 0.3.4",
