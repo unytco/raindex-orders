@@ -100,7 +100,7 @@ pub struct SignRequest {
 pub type Signing<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 
 /// How long a signer, or a Safe owner's signer service, has to sign a coupon.
-pub const SIGN_TIMEOUT: Duration = Duration::from_secs(20);
+pub const SIGN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The claim order's `valid-signer`. Raindex checks its signature of the
 /// coupon's digest with OpenZeppelin's `SignatureChecker`: a key's 65-byte
