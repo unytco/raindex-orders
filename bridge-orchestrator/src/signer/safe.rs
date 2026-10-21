@@ -679,6 +679,7 @@ fn checked(
 pub struct OwnerService {
     owner: Address,
     url: String,
+    token: Option<String>,
     client: reqwest::Client,
 }
 
@@ -730,6 +731,7 @@ impl OwnerService {
         let service = Self {
             owner,
             url: url.trim_end_matches('/').to_string(),
+            token: None,
             client,
         };
         anyhow::ensure!(
@@ -738,6 +740,18 @@ impl OwnerService {
             service.host()
         );
         Ok(service)
+    }
+
+    pub fn with_token(self, token: Option<String>) -> Self {
+        Self { token, ..self }
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let request = self.client.request(method, format!("{}/{path}", self.url));
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     /// Where the service is, for logs: its host and port, never its path, which
@@ -781,8 +795,7 @@ impl OwnerService {
 
     async fn ask_identity(&self) -> Result<Identity> {
         let answer = self
-            .client
-            .get(format!("{}/signer", self.url))
+            .request(reqwest::Method::GET, "signer")
             .send()
             .await
             .map_err(|err| self.unreachable(&err))?;
@@ -826,8 +839,7 @@ impl OwnerService {
             "safeMessageHash": request.safe_message_hash,
         });
         let answer = self
-            .client
-            .post(format!("{}/sign", self.url))
+            .request(reqwest::Method::POST, "sign")
             .json(&body)
             .send()
             .await

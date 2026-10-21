@@ -1021,6 +1021,7 @@ mod tests {
             ("ETH_RPC_URL", "https://eth.rpc.test"),
             ("ORDER_HASH", ""),
             ("SIGNER_PRIVATE_KEY", "0xabc"),
+            ("SAFE_OWNER_SERVICE_TOKENS", "0xabc=token"),
         ];
 
         for network in ["none", "NONE"] {
@@ -1034,7 +1035,8 @@ mod tests {
                 "BASE_SEPOLIA_RPC_URL",
                 "BASE_SEPOLIA_LOCK_VAULT_ADDRESS",
                 "ETH_RPC_URL",
-                "SIGNER_PRIVATE_KEY"
+                "SIGNER_PRIVATE_KEY",
+                "SAFE_OWNER_SERVICE_TOKENS"
             ]
         );
     }

@@ -1519,10 +1519,13 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(path, _)| path.clone())
+            .map(|sent| sent.path.clone())
             .collect();
         assert_eq!(paths, ["/holo/signer", "/holo/sign"]);
-        assert_eq!(a.requests.lock().unwrap()[1].1["withdrawal"], Value::Null);
+        assert_eq!(
+            a.requests.lock().unwrap()[1].body["withdrawal"],
+            Value::Null
+        );
     }
 
     /// A signer service that takes each connection and never answers, and how

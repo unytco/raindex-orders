@@ -42,24 +42,28 @@ where
 }
 
 pub async fn read_request(socket: &mut TcpStream) -> Vec<u8> {
+    read_head_and_body(socket).await.1
+}
+
+pub async fn read_head_and_body(socket: &mut TcpStream) -> (String, Vec<u8>) {
     let mut request = Vec::new();
     let mut chunk = [0u8; 4096];
-    let body = loop {
+    loop {
         let read = socket.read(&mut chunk).await.unwrap();
         assert!(read > 0, "connection closed mid-request");
         request.extend_from_slice(&chunk[..read]);
         let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
             continue;
         };
-        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
-        let length: usize = headers
+        let head = String::from_utf8_lossy(&request[..end]).to_string();
+        let length: usize = head
+            .to_lowercase()
             .lines()
             .find_map(|line| line.strip_prefix("content-length:"))
             .map(|value| value.trim().parse().unwrap())
             .unwrap_or(0);
         if request.len() >= end + 4 + length {
-            break request[end + 4..end + 4 + length].to_vec();
+            return (head, request[end + 4..end + 4 + length].to_vec());
         }
-    };
-    body
+    }
 }
