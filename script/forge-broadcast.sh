@@ -25,6 +25,20 @@ require_wallet() {
 	[[ -n $signer ]] || die "pass the signer as a forge wallet option: --ledger, --trezor or --account <keystore>"
 }
 
+# Waits until rpc_url serves code at address. A load-balanced RPC such as
+# sepolia.base.org can answer from a node that has not yet seen the block with
+# the deploy, and the next forge script then reverts with "call to non-contract address".
+# Gives up after 30 tries 2 s apart, each of which can itself wait out the RPC
+# timeout, and dies with `recovery`, if given, after its own message.
+wait_for_code() {
+	local address=$1 rpc_url=$2 recovery=${3:-} try
+	for try in $(seq 30); do
+		[[ $(cast code "$address" --rpc-url "$rpc_url" 2>/dev/null) =~ ^0x[0-9a-fA-F]{2,}$ ]] && return 0
+		sleep 2
+	done
+	die "$rpc_url serves no code at $address after 30 tries 2 s apart${recovery:+. $recovery}"
+}
+
 # Whether forge wrote run_file after the marker file was created.
 sent_since() {
 	local marker=$1 run_file=$2

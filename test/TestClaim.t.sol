@@ -87,12 +87,18 @@ contract TestClaim is Test, SignContext {
 
     /// The claim order as the vault adds it and a claim names it.
     function order() internal view returns (OrderV4 memory) {
+        return orderRunning(bytecode);
+    }
+
+    /// The claim order running `code`: the one a rotation adds, composed for
+    /// another signer, has another order hash on the same owner.
+    function orderRunning(bytes memory code) internal view returns (OrderV4 memory) {
         IOV2[] memory inputs = new IOV2[](1);
         inputs[0] = IOV2(address(inputToken), HOLO_VAULT_ID);
         IOV2[] memory outputs = new IOV2[](1);
         outputs[0] = IOV2(address(MAINNET_HOT), HOLO_VAULT_ID);
         return OrderV4(
-            orderOwner, EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, bytecode), inputs, outputs, CLAIM_ORDER_NONCE
+            orderOwner, EvaluableV4(RAINLANG_INTERPRETER, RAINLANG_STORE, code), inputs, outputs, CLAIM_ORDER_NONCE
         );
     }
 
@@ -137,10 +143,15 @@ contract TestClaim is Test, SignContext {
 
     /// The claim: takeOrders4 for exactly `amount` of HOT, as the website sends it.
     function claim(SignedContextV1 memory signedCoupon, uint256 amount) internal {
+        claimOn(order(), signedCoupon, amount);
+    }
+
+    /// The claim of `signedCoupon` on `claimOrder`.
+    function claimOn(OrderV4 memory claimOrder, SignedContextV1 memory signedCoupon, uint256 amount) internal {
         SignedContextV1[] memory signedContexts = new SignedContextV1[](1);
         signedContexts[0] = signedCoupon;
         TakeOrderConfigV4[] memory orders = new TakeOrderConfigV4[](1);
-        orders[0] = TakeOrderConfigV4(order(), 0, 0, signedContexts);
+        orders[0] = TakeOrderConfigV4(claimOrder, 0, 0, signedContexts);
         Float io = LibDecimalFloat.fromFixedDecimalLosslessPacked(amount, 18);
         vm.prank(claimer);
         RAINDEX.takeOrders4(TakeOrdersConfigV5(io, io, CLAIM_IO_RATIO, true, orders, ""));
@@ -184,6 +195,56 @@ contract TestClaim is Test, SignContext {
 
         vm.expectRevert(bytes("Nonce already used"));
         claim(again, 40e18);
+    }
+
+    /// A rotation replaces the claim order with one composed for another
+    /// signer, so the order hash changes. The store keeps the used nonces under
+    /// the vault, the order's owner, not under the order: a nonce claimed on the
+    /// old order is used on the new one too, so one burn pays once whatever the
+    /// signer becomes. A fresh nonce still claims on the new order.
+    function testANonceClaimedOnOneClaimOrderIsUsedOnTheNext() public {
+        claim(signed(coupon(40e18, inAWeek(), 7)), 40e18);
+
+        (address nextSigner, uint256 nextKey) = makeAddrAndKey("the coupon signer after a rotation");
+        OrderV4 memory next = orderRunning(RAINLANG_DEPLOYER.parse2(composed(nextSigner)));
+        bytes32 nextHash = keccak256(abi.encode(next));
+        assertTrue(nextHash != orderHash);
+        vm.startPrank(orderOwner);
+        assertTrue(
+            RAINDEX.addOrder4(
+                OrderConfigV4(next.evaluable, next.validInputs, next.validOutputs, CLAIM_ORDER_NONCE, bytes32(0), ""),
+                new TaskV2[](0)
+            )
+        );
+        vm.stopPrank();
+        bytes32[] memory sameNonce = LibCoupon.words(
+            claimer,
+            40e18,
+            inAWeek(),
+            nextHash,
+            orderOwner,
+            address(RAINDEX),
+            address(MAINNET_HOT),
+            HOLO_VAULT_ID,
+            bytes32(uint256(7))
+        );
+        vm.expectRevert(bytes("Nonce already used"));
+        claimOn(next, signContext(nextKey, sameNonce), 40e18);
+
+        bytes32[] memory freshNonce = LibCoupon.words(
+            claimer,
+            40e18,
+            inAWeek(),
+            nextHash,
+            orderOwner,
+            address(RAINDEX),
+            address(MAINNET_HOT),
+            HOLO_VAULT_ID,
+            bytes32(uint256(8))
+        );
+        claimOn(next, signContext(nextKey, freshNonce), 40e18);
+        assertEq(MAINNET_HOT.balanceOf(claimer), 80e18);
+        assertEq(vaultBalance(), 20e18);
     }
 
     function testAnExpiredCouponFails() public {

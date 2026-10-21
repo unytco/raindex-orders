@@ -20,6 +20,11 @@
 #   3 or mint            Mint test tokens to your wallet (MINT_AMOUNT, in wei)
 #   4 or order-via-vault Deploy claim order via vault
 #   all                  Run all steps
+#   safe                 Create the bridge's Safe (SAFE_OWNERS, SAFE_THRESHOLD), or find it
+#   bridge               Deploy the vault and claim order in one transaction, with
+#                        the Safe ADMIN_ADDRESS as the vault admin and VALID_SIGNER
+#   all-safe             token, mint, safe, bridge: a fresh TestNet whose one Safe
+#                        is the vault admin and the coupon signer
 #   status               Show current deployment status
 
 set -e
@@ -113,6 +118,8 @@ deploy_token() {
         echo -e "${GREEN}MockHOT deployed at: $TOKEN_ADDR${NC}"
         set_env TOKEN_ADDRESS "$TOKEN_ADDR"
         echo -e "${GREEN}Updated $ENV_FILE with TOKEN_ADDRESS${NC}"
+        wait_for_code "$TOKEN_ADDR" "$BASE_SEPOLIA_RPC_URL" \
+            "The token is in $ENV_FILE: once the RPC serves it, run the next step, not this one again"
     else
         die "Could not extract token address from output"
     fi
@@ -207,6 +214,73 @@ deploy_order_via_vault() {
     fi
 }
 
+create_safe() {
+    echo -e "${YELLOW}=== Creating the bridge's Safe, or finding it ===${NC}"
+    [ -n "$SAFE_OWNERS" ] && [ -n "$SAFE_THRESHOLD" ] ||
+        die "SAFE_OWNERS (the owners, separated by commas) and SAFE_THRESHOLD are required"
+    NETWORK=base-sepolia broadcast script/CreateSafe.s.sol:CreateSafe
+    SAFE_ADDR=$(echo "$OUTPUT" | grep -oP "^\s*SAFE=\K0x[a-fA-F0-9]{40}" | tail -1 || true)
+    [ -n "$SAFE_ADDR" ] || die "Could not extract the Safe's address from output"
+    echo -e "${GREEN}The bridge's Safe: $SAFE_ADDR${NC}"
+    set_env ADMIN_ADDRESS "$SAFE_ADDR"
+    set_env ADMIN_SAFE_THRESHOLD "$SAFE_THRESHOLD"
+    set_env ADMIN_SAFE_OWNERS "$SAFE_OWNERS"
+    set_env VALID_SIGNER "$SAFE_ADDR"
+    echo -e "${GREEN}Updated $ENV_FILE: the Safe is ADMIN_ADDRESS and VALID_SIGNER${NC}"
+    wait_for_code "$SAFE_ADDR" "$BASE_SEPOLIA_RPC_URL" \
+        "The Safe is in $ENV_FILE: once the RPC serves it, run the next step"
+}
+
+# Writes the deploy record's `name` into ENV_FILE.
+record_to_env() {
+    local name value
+    for name in "$@"; do
+        value=$(echo "$RECORD" | grep -oP "^\s*$name=\K0x[a-fA-F0-9]+" | head -1 || true)
+        [ -n "$value" ] || die "The deploy record has no $name"
+        set_env "$name" "$value"
+    done
+}
+
+deploy_bridge() {
+    echo -e "${YELLOW}=== Deploying the vault and claim order in one transaction ===${NC}"
+    [ -n "$TOKEN_ADDRESS" ] || die "TOKEN_ADDRESS is not set in $ENV_FILE: run step 1 first"
+    [ -n "$ADMIN_ADDRESS" ] && [ -n "$VALID_SIGNER" ] ||
+        die "ADMIN_ADDRESS and VALID_SIGNER are not set in $ENV_FILE: run the safe step first"
+    echo "Token: $TOKEN_ADDRESS"
+    echo "Vault admin: $ADMIN_ADDRESS"
+    echo "Coupon signer: $VALID_SIGNER"
+    local script=script/DeployBridge.s.sol:DeployBaseSepoliaBridge
+    local run_file="${FOUNDRY_BROADCAST:-broadcast}/DeployBridge.s.sol/84532/run-latest.json"
+    local started deployer block forge_failed= sent=
+    started=$(mktemp)
+    # Not through broadcast: forge can fail after it sent, as when the receipt
+    # wait times out on the load-balanced sepolia.base.org. A second run would
+    # then deploy a second bridge, so what landed is read before anything stops.
+    OUTPUT=$(forge script "$script" --rpc-url "$BASE_SEPOLIA_RPC_URL" "${WALLET[@]}" --broadcast -vvv 2>&1) || forge_failed=1
+    echo "$OUTPUT"
+    sent_since "$started" "$run_file" && sent=1
+    rm -f "$started"
+    [ -n "$sent" ] || die "forge sent nothing${forge_failed:+: forge script $script failed}"
+    if [ -n "$forge_failed" ]; then
+        echo "forge script $script failed after it sent. Do not run this again: a new run deploys a second bridge. It sent:" >&2
+        landed "$run_file" >&2
+        die "If HoloBridgeDeployer succeeded, read it and its block from $run_file, then run: forge script $script --rpc-url \$BASE_SEPOLIA_RPC_URL --sig 'record(address,uint256)' <HoloBridgeDeployer> <block>"
+    fi
+    deployer=$(jq -r '[.transactions[] | select(.transactionType == "CREATE" and .contractName == "HoloBridgeDeployer")][0].contractAddress // empty' "$run_file")
+    block=$(first_block "$run_file")
+    [[ $deployer =~ ^0x[0-9a-fA-F]{40}$ && $block =~ ^[1-9][0-9]*$ ]] ||
+        die "The deploy landed. Read the HoloBridgeDeployer and its block from $run_file, then run: forge script $script --rpc-url \$BASE_SEPOLIA_RPC_URL --sig 'record(address,uint256)' <HoloBridgeDeployer> <block>"
+    wait_for_code "$deployer" "$BASE_SEPOLIA_RPC_URL" \
+        "The deploy landed: HoloBridgeDeployer $deployer in block $block. Once the RPC serves it, run: forge script $script --rpc-url \$BASE_SEPOLIA_RPC_URL --sig 'record(address,uint256)' $deployer $block"
+    RECORD=$(forge script "$script" --rpc-url "$BASE_SEPOLIA_RPC_URL" --sig 'record(address,uint256)' "$deployer" "$block" 2>&1) || {
+        echo "$RECORD"
+        die "The deploy landed: HoloBridgeDeployer $deployer in block $block. Its record failed; fix the above and run the record again"
+    }
+    echo "$RECORD" | sed -n '/Deploy record/,$p'
+    record_to_env BASE_SEPOLIA_LOCK_VAULT_ADDRESS CLAIM_INPUT_TOKEN ORDER_HASH ORDER_OWNER CLAIM_SIGNER CLAIM_BYTECODE
+    echo -e "${GREEN}Updated $ENV_FILE with the deploy record${NC}"
+}
+
 show_status() {
     echo -e "${BLUE}=== Deployment Status ===${NC}"
     echo ""
@@ -219,6 +293,8 @@ show_status() {
     echo "Vault Address:   ${BASE_SEPOLIA_LOCK_VAULT_ADDRESS:-Not deployed}"
     echo "Order Hash:      ${ORDER_HASH:-Not deployed}"
     echo "Order Owner:     ${ORDER_OWNER:-Not set}"
+    echo "Vault Admin:     ${ADMIN_ADDRESS:-the deployer}"
+    echo "Coupon Signer:   ${VALID_SIGNER:-the test signer}"
     echo ""
     echo "Orderbook:       $ORDERBOOK_ADDRESS"
     echo "Vault ID:        $VAULT_ID"
@@ -256,6 +332,24 @@ case "$STEP" in
         load_env
         deploy_order_via_vault
         ;;
+    safe)
+        create_safe
+        ;;
+    bridge)
+        deploy_bridge
+        ;;
+    all-safe)
+        deploy_token
+        echo ""
+        load_env
+        mint_tokens
+        echo ""
+        load_env
+        create_safe
+        echo ""
+        load_env
+        deploy_bridge
+        ;;
     status)
         show_status
         ;;
@@ -268,6 +362,9 @@ case "$STEP" in
         echo "  3 or mint           - Mint test tokens"
         echo "  4 or order-via-vault - Deploy claim order via vault"
         echo "  all                 - Run all steps"
+        echo "  safe                - Create the bridge's Safe, or find it"
+        echo "  bridge              - Deploy vault and claim order, the Safe as admin and signer"
+        echo "  all-safe            - token, mint, safe, bridge"
         echo "  status              - Show deployment status"
         exit 1
         ;;

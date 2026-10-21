@@ -35,14 +35,42 @@ refuses to start, naming each variable at fault, when:
 - the claim order that `ORDER_OWNER`, `TOKEN_ADDRESS`, `VAULT_ID` and the
   `CLAIM_*` values describe does not hash to `ORDER_HASH`
 - `ORDERBOOK_ADDRESS` holds no order `ORDER_HASH`
-- `CLAIM_SIGNER` is a contract, such as a Safe: the orchestrator signs only as
-  a key
+- `SIGNER_PRIVATE_KEY` is set with `SAFE_OWNER_KEYS` or `SAFE_OWNER_SERVICES`,
+  or none of them is set
+- `CLAIM_SIGNER` is a contract, such as a Safe, and `SIGNER_PRIVATE_KEY` is
+  set: a key cannot sign for it
+- `CLAIM_SIGNER` is a key and `SAFE_OWNER_KEYS` or `SAFE_OWNER_SERVICES` is set
 - `SIGNER_PRIVATE_KEY` is not the key of `CLAIM_SIGNER`
-- the claim order does not accept a coupon signed with that key. `run`
-  simulates `takeOrders4` with a one-wei coupon to itself, and starts only if
-  the order pays it, or answers `MinimumIO` because its vault is empty.
-- on `mainnet`, `SIGNER_PRIVATE_KEY` is the test signer
-  `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
+- `CLAIM_SIGNER` is a Safe and `SAFE_OWNER_KEYS` holds more keys than its
+  threshold, a key that is not one of its owners, or one twice;
+  `SAFE_OWNER_SERVICES` names an address that is not one of its owners, or a
+  service that answers `GET /signer` for another owner, Safe or chain; fewer
+  owners than its threshold can sign now (the services are asked at once, 5 s
+  each; one that does not answer is logged and left out of the probe, and the
+  first cycle asks it again); or `CLAIM_SIGNER` does not answer as a Safe, or does
+  not sign under the EIP-712 domain of a Safe 1.3.0 or later on `NETWORK`'s
+  chain
+- the claim order does not accept a coupon signed with that key, or by those
+  owners for the Safe. `run` simulates `takeOrders4` with a one-wei coupon to
+  the signer, and starts only if the order pays it, answers `MinimumIO`
+  because its vault is empty, or answers `Nonce already used` because the
+  signer claimed the probe once (the nonce is the order's last check). For a Safe, the probe is signed by M owners, the
+  signer services among them, and ends once M have signed, the Safe's own `isValidSignature` must accept
+  them, and the simulated claim with M-1 of them must fail with
+  `InvalidSignature(0)`: another revert would not show the Safe refused them.
+- on any network, with `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes` too: the Safe
+  `CLAIM_SIGNER` has a threshold of half its owners or fewer, such as 2 of 4, so two sets of M owners can share none
+  and sign one withdrawal for two claim orders
+  ([docs/signer-service.md](../docs/signer-service.md#one-order-per-withdrawal)).
+  Each coupon refuses such a Safe too, before it asks any owner
+- on `mainnet`, `SIGNER_PRIVATE_KEY` or one of `SAFE_OWNER_KEYS` is the test
+  signer `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`, whose key is public
+- on `mainnet`, unless `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes`: the Safe
+  `CLAIM_SIGNER` has a threshold of 1; `SAFE_OWNER_KEYS` holds as many keys as
+  its threshold, so this process alone signs as the Safe; or `SAFE_OWNER_KEYS`
+  holds any key while the Safe is also the vault's `admin()`, as that key also
+  approves the vault's admin transactions, `adminWithdraw` among them. Off
+  mainnet these are logged (`startup.one_party`) and the orchestrator starts
 
 An RPC it cannot reach, or that does not answer within 30 s, also stops it, and
 its supervisor restarts it. So does a conductor config, at `CONDUCTOR_CONFIG`,
@@ -445,13 +473,16 @@ mock HOT, vault and claim order are not defaulted: the rest is required on
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
-| `SIGNER_PRIVATE_KEY` | Yes | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`) |
+| `SIGNER_PRIVATE_KEY` | For a key | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`). The key of `CLAIM_SIGNER`, when it is a key |
+| `SAFE_OWNER_SERVICES` | For a Safe | -- The signer services of owners of `CLAIM_SIGNER`, when it is a Safe, as `<owner address>=<base URL>`, separated by commas: https, or http on this machine, on mainnet. For each coupon the orchestrator asks them all at once, 20 seconds each (one that timed out is not asked again that cycle while the others are at least M), takes M owner signatures and has the Safe accept them; a withdrawal fewer than M sign stays parked until the next cycle ([docs/signer-service.md](../docs/signer-service.md)) |
+| `SAFE_OWNER_KEYS` | For a Safe | -- Keys of owners of `CLAIM_SIGNER` this orchestrator holds, separated by commas, alone or with `SAFE_OWNER_SERVICES`, and no more than its threshold. Holding the threshold's worth of keys is one party, however many keys ([docs/signer-service.md](../docs/signer-service.md)). On mainnet it needs `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes` when it holds the threshold's worth, or any key of a Safe that is also the vault admin |
+| `UNSAFE_ALLOW_ONE_PARTY_SIGNER` | No | -- `yes` lets a mainnet orchestrator start although it alone can sign as the Safe `CLAIM_SIGNER` (a threshold of 1, or the threshold's worth of `SAFE_OWNER_KEYS`), or holds owner keys of a Safe that is also the vault admin. It logs that, as `startup.one_party`. It does not let through a Safe whose threshold is half its owners or fewer, on any network. Any value other than `yes` is refused |
 | `ORDER_HASH` | Yes | -- |
 | `ORDER_OWNER` | Yes | -- (the vault) |
 | `ORDERBOOK_ADDRESS` | mainnet | `0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20` (RaindexV6, the same on every chain) |
 | `TOKEN_ADDRESS` | Yes | -- (the mock HOT deploy-base-sepolia.sh deployed) |
 | `VAULT_ID` | mainnet | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
-| `CLAIM_SIGNER` | mainnet | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` (the claim order's `valid-signer`: the key's address) |
+| `CLAIM_SIGNER` | mainnet | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` (the claim order's `valid-signer`: the key's address, or the Safe) |
 | `CLAIM_INTERPRETER` | mainnet | `0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf` (Rainlang 0.1.9, the same on every chain) |
 | `CLAIM_STORE` | mainnet | `0x1Aa775533E28B1D843e1A589034984E3a62005DC` (Rainlang 0.1.9, the same on every chain) |
 | `CLAIM_BYTECODE` | Yes | -- (the claim order's parsed expression, as hex; a V6 order carries its bytecode in place of an expression address) |

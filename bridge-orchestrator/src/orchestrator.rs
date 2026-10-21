@@ -118,6 +118,9 @@ struct BridgingSelection {
     withdrawals_found: usize,
     unpayable: Vec<(Transaction, anyhow::Error)>,
     held: usize,
+    /// Withdrawals fewer than CLAIM_THRESHOLD signers signed a coupon for this
+    /// cycle: each stays parked, and is asked again the next.
+    unsigned: Vec<(Transaction, anyhow::Error)>,
 }
 
 async fn select_bridging_links(
@@ -136,9 +139,15 @@ async fn select_bridging_links(
         withdrawals_found: 0,
         unpayable: Vec::new(),
         held: 0,
+        unsigned: Vec::new(),
     };
     let mut withdrawal_capped = false;
     let vault = ethereum.map(|(_, vault)| vault_key(vault));
+    // One selection is one cycle's signing: an owner of a Safe signer that
+    // timed out in the last is asked again.
+    if let Some((signer, _)) = ethereum {
+        signer.new_cycle();
+    }
 
     for tx in bridging_links {
         let withdraw_to = match bridging_spend(tx, bridging_agent, vault.as_deref()) {
@@ -170,6 +179,7 @@ async fn select_bridging_links(
         if withdrawal_capped {
             continue;
         }
+        // Screening first: no signer is asked to sign for a held withdrawal.
         if !gate
             .pays(&tx.id.to_string(), terms.recipient(), &amount)
             .await?
@@ -177,7 +187,13 @@ async fn select_bridging_links(
             selection.held += 1;
             continue;
         }
-        let coupon = signer.coupon(terms, tx.id.as_ref()).await?;
+        let coupon = match signer.coupon(terms, tx.id.as_ref()).await {
+            Ok(coupon) => coupon,
+            Err(e) => {
+                selection.unsigned.push((tx.clone(), e));
+                continue;
+            }
+        };
         let key = tx.id.to_string();
 
         let entry_bytes = serde_json::to_vec(&json!({ &key: &coupon }))
@@ -440,6 +456,20 @@ impl BridgeOrchestrator {
                 creator = %tx.creator,
                 "[bridge/withdrawals] withdrawal {:?} stays parked, no coupon can pay it in HOT unit {hot_unit_index}: {e:#} (its amount: {:?})",
                 tx.id, tx.amount
+            );
+        }
+    }
+
+    /// Once per withdrawal while it stays unsigned: a signer service down for
+    /// hours logs each withdrawal it holds up once, not once a cycle.
+    fn log_unsigned(&self, unsigned: &[(Transaction, anyhow::Error)]) {
+        for (tx, e) in self.untold("withdrawal_unsigned", unsigned, |(tx, _)| tx.id.to_string()) {
+            warn!(
+                event = "bridge.withdrawal_unsigned",
+                link = %tx.id,
+                creator = %tx.creator,
+                "[bridge/withdrawals] withdrawal {:?} stays parked until enough signers sign its coupon: {e:#}",
+                tx.id
             );
         }
     }
@@ -1173,6 +1203,7 @@ impl BridgeOrchestrator {
             withdrawals_found: total_withdrawals_found,
             unpayable,
             held: held_withdrawals,
+            unsigned,
         } = select_bridging_links(
             self.ethereum
                 .as_ref()
@@ -1185,6 +1216,7 @@ impl BridgeOrchestrator {
         )
         .await?;
         self.log_unpayable(&unpayable);
+        self.log_unsigned(&unsigned);
         self.tell_waiting(WITHDRAWALS_SCREENED, &gate.into_waiting());
 
         let deposit_ids: HashSet<String> = deposit_rave_links
@@ -6510,6 +6542,56 @@ mod tests {
         );
     }
 
+    /// A key that counts the cycles it is told of.
+    struct CycleCountingKey {
+        key: PrivateKeySigner,
+        cycles: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::signer::CouponKey for CycleCountingKey {
+        fn address(&self) -> alloy::primitives::Address {
+            crate::signer::CouponKey::address(&self.key)
+        }
+
+        fn sign<'a>(
+            &'a self,
+            request: &'a crate::signer::SignRequest,
+        ) -> crate::signer::Signing<'a> {
+            crate::signer::CouponKey::sign(&self.key, request)
+        }
+
+        fn new_cycle(&self) {
+            self.cycles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Each cycle's selection starts a new cycle for the signer, so a Safe's
+    /// owner that timed out in one is asked again in the next.
+    #[tokio::test]
+    async fn each_selection_starts_a_new_cycle_for_the_signer() {
+        let cycles = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let signer = CouponSigner::with_key(CycleCountingKey {
+            key: PrivateKeySigner::random(),
+            cycles: std::sync::Arc::clone(&cycles),
+        });
+
+        for _ in 0..2 {
+            select_bridging_links(
+                Some((&signer, VAULT)),
+                &screening_off(&unscreened()),
+                &bridging_agent(),
+                &[],
+                usize::MAX,
+                1,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(cycles.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn another_agents_spend_in_the_bridging_agents_role_gets_no_coupon() {
         let signer = CouponSigner::with_key(PrivateKeySigner::random());
@@ -9136,6 +9218,74 @@ mod tests {
         assert_eq!(
             selection.coupons.keys().cloned().collect::<BTreeSet<_>>(),
             ids(&withdrawals).into_iter().collect()
+        );
+        assert_eq!(selection.withdrawals_found, 2);
+    }
+
+    /// A coupon signer that refuses one withdrawal and signs the others, as a
+    /// signer service whose own check of that withdrawal failed.
+    struct RefusesOne {
+        key: PrivateKeySigner,
+        refused: ActionHash,
+    }
+
+    impl crate::signer::CouponKey for RefusesOne {
+        fn address(&self) -> Address {
+            alloy::signers::Signer::address(&self.key)
+        }
+
+        fn sign<'a>(
+            &'a self,
+            request: &'a crate::signer::SignRequest,
+        ) -> crate::signer::Signing<'a> {
+            Box::pin(async move {
+                anyhow::ensure!(
+                    request.withdrawal.as_ref() != Some(&self.refused),
+                    "the signer service refused: the amount is not the spend's"
+                );
+                self.key.sign(request).await
+            })
+        }
+    }
+
+    /// Fewer than CLAIM_THRESHOLD signers signing one withdrawal's coupon parks
+    /// that withdrawal for the cycle; the rest of the cycle goes on.
+    #[tokio::test]
+    async fn a_withdrawal_too_few_signers_sign_stays_parked_and_the_others_go() {
+        let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
+        let deposit = parked_spend_tx(0x60, &[proof("lock:d", "0xd0")]);
+        let signer = CouponSigner::with_key(RefusesOne {
+            key: PrivateKeySigner::random(),
+            refused: withdrawals[0].id.as_ref().clone(),
+        });
+        let links = [
+            withdrawals[0].clone(),
+            deposit.clone(),
+            withdrawals[1].clone(),
+        ];
+
+        let selection = select_bridging_links(
+            Some((&signer, VAULT)),
+            &screening_off(&unscreened()),
+            &bridging_agent(),
+            &links,
+            usize::MAX,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ids(&selection.deposits), ids(&[deposit]));
+        assert_eq!(ids(&selection.withdrawals), ids(&withdrawals[1..]));
+        assert_eq!(
+            selection.coupons.keys().cloned().collect::<Vec<_>>(),
+            ids(&withdrawals[1..])
+        );
+        assert_eq!(selection.unsigned.len(), 1);
+        assert_eq!(selection.unsigned[0].0.id, withdrawals[0].id);
+        assert_eq!(
+            format!("{:#}", selection.unsigned[0].1),
+            "the signer service refused: the amount is not the spend's"
         );
         assert_eq!(selection.withdrawals_found, 2);
     }

@@ -14,12 +14,12 @@ export const HOLO_VAULT_ID = 0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba020
 export const amountWord = wei => ((2n ** 32n - 18n) << 224n) | wei
 
 /**
- * The coupon string the claim page takes, `signer,signature,ctx0,...,ctx8`: `key`
- * signs the EIP-191 message of keccak256 over the nine context words. `order` is
- * the claim order's { hash, owner, orderbook, token, vaultId }, each a bigint.
+ * The nine context words of a coupon, each a bigint, in the order src/holo-claim.rain
+ * reads them. `order` is the claim order's { hash, owner, orderbook, token, vaultId },
+ * each a bigint.
  */
-export async function signCoupon({ key, order, recipient, wei, expiry, nonce }) {
-	const words = [
+export function couponWords({ order, recipient, wei, expiry, nonce }) {
+	return [
 		BigInt(recipient),
 		amountWord(wei),
 		BigInt(expiry),
@@ -30,8 +30,20 @@ export async function signCoupon({ key, order, recipient, wei, expiry, nonce }) 
 		order.vaultId,
 		BigInt(nonce)
 	]
+}
+
+/** The coupon string the claim page takes: `signer,signature,ctx0,...,ctx8`. */
+export const couponString = (signer, signature, words) =>
+	[signer, signature, ...words.map(String)].join(',')
+
+/**
+ * The coupon string for `key`: it signs the EIP-191 message of keccak256 over the nine
+ * context words, as the claim order checks a key's signature.
+ */
+export async function signCoupon({ key, ...terms }) {
+	const words = couponWords(terms)
 	const signer = privateKeyToAccount(key)
-	const hash = keccak256(encodePacked(Array(9).fill('uint256'), words))
+	const hash = keccak256(encodePacked(Array(words.length).fill('uint256'), words))
 	const signature = await signer.signMessage({ message: { raw: hash } })
-	return [signer.address, signature, ...words.map(String)].join(',')
+	return couponString(signer.address, signature, words)
 }

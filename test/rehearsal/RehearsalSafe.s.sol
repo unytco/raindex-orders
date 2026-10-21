@@ -14,6 +14,17 @@ contract RehearsalSafe is Script {
         console2.log(string.concat("SAFE=", vm.toString(safe)));
     }
 
+    /// A Safe with no fallback handler, which answers no EIP-1271 question.
+    function createWithoutHandler(address[] calldata owners, uint256 threshold, uint256 salt) external {
+        bytes memory setup = abi.encodeCall(
+            ISafe.setup, (owners, threshold, address(0), "", address(0), address(0), 0, payable(address(0)))
+        );
+        vm.startBroadcast();
+        address safe = SAFE_PROXY_FACTORY.createProxyWithNonce(SAFE_SINGLETON, setup, salt);
+        vm.stopBroadcast();
+        console2.log(string.concat("SAFE=", vm.toString(safe)));
+    }
+
     /// Has `safe` call `data` on `to`, signed by the owner keys in
     /// REHEARSAL_OWNER_KEYS.
     function exec(ISafe safe, address to, bytes calldata data) external {

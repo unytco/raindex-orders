@@ -14,6 +14,7 @@ import {
 	isHex,
 	keccak256,
 	maxUint256,
+	numberToHex,
 	parseAbi,
 	recoverMessageAddress,
 	stringToHex,
@@ -63,14 +64,22 @@ const orderHash = BigInt(CLAIM_ORDER.orderHash)
 
 // Raindex evaluates the claim order under the namespace
 // LibNamespace.qualifyNamespace(order owner, raindex) = keccak256(owner, raindex),
-// and src/holo-claim.rain marks a nonce used there at hash(order-hash() nonce).
+// and src/holo-claim.rain marks a nonce used there at the nonce itself: the key
+// names no order hash, so a nonce stays used across claim order rotations.
 const namespace = BigInt(
 	keccak256(
 		encodeAbiParameters([{ type: 'address' }, { type: 'address' }], [CLAIM_ORDER.owner, orderbook])
 	)
 )
-const nonceKey = (nonce: bigint) =>
+const nonceKey = (nonce: bigint) => numberToHex(nonce, { size: 32 })
+// A claim order deployed before that change, as a TestNet's may be, marked a nonce at
+// hash(order-hash() nonce): the order hash and the nonce, keccak256 as Rainlang's hash
+// takes them. Each nonce is read at both keys, so a coupon redeemed on either
+// expression of this order reads as redeemed. Only this order's old expression wrote
+// the legacy key, which names this order's hash.
+const legacyNonceKey = (nonce: bigint) =>
 	keccak256(encodePacked(['uint256', 'uint256'], [orderHash, nonce]))
+const nonceKeys = (nonce: bigint) => [nonceKey(nonce), legacyNonceKey(nonce)]
 
 // Rainlang's IInterpreterStoreV3: keys and values are bytes32 words.
 const readAbi = parseAbi([
@@ -319,8 +328,8 @@ async function signedByClaimSigner({ hash, signature }: Coupon): Promise<boolean
 }
 
 /**
- * One aggregate3 eth_call at the `safe` block reads each nonce's flag once, along with
- * the chain, number and timestamp of the block it read them in. In the same call the
+ * One aggregate3 eth_call at the `safe` block reads each nonce's flag once, at each of
+ * its two keys, along with the chain, number and timestamp of the block it read them in. In the same call the
  * claim signer's EIP-1271 isValidSignature checks each `unverified` coupon over the
  * digest the orderbook passes it, accepting only the magic value, as the orderbook does.
  */
@@ -334,12 +343,14 @@ async function readChain(
 		{ address: multicall3, abi: readAbi, functionName: 'getChainId' },
 		{ address: multicall3, abi: readAbi, functionName: 'getBlockNumber' },
 		{ address: multicall3, abi: readAbi, functionName: 'getCurrentBlockTimestamp' },
-		...nonces.map(nonce => ({
-			address: CLAIM_ORDER.store,
-			abi: readAbi,
-			functionName: 'get' as const,
-			args: [namespace, nonceKey(nonce)] as const
-		})),
+		...nonces.flatMap(nonce =>
+			nonceKeys(nonce).map(key => ({
+				address: CLAIM_ORDER.store,
+				abi: readAbi,
+				functionName: 'get' as const,
+				args: [namespace, key] as const
+			}))
+		),
 		...unverified.map(({ hash, signature }) => ({
 			address: CLAIM_ORDER.signer,
 			abi: readAbi,
@@ -369,7 +380,10 @@ async function readChain(
 	if (chainId !== BigInt(bridge.chain.id)) {
 		throw new Error(`RPC answered for chain ${chainId}, expected ${bridge.chain.id}`)
 	}
-	const checks = results.slice(3 + nonces.length)
+	const reads = nonceKeys(0n).length
+	// A nonce's flag: the one at its key, or else the one at its legacy key.
+	const redeemed = (i: number) => flag(3 + reads * i) || flag(3 + reads * i + 1)
+	const checks = results.slice(3 + reads * nonces.length)
 	if (
 		checks.some(
 			answer =>
@@ -386,7 +400,7 @@ async function readChain(
 	return {
 		block: read(1),
 		timestamp: read(2),
-		flags: new Map(nonces.map((nonce, i) => [nonce, flag(3 + i)])),
+		flags: new Map(nonces.map((nonce, i) => [nonce, redeemed(i)])),
 		contractSigned: new Set(
 			unverified.filter((_, i) => {
 				const answer = checks[i]
