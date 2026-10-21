@@ -153,7 +153,7 @@ nix develop -c test/fork-rehearsal.sh
 
 - Test signer key in repo is for testing only, and every mainnet input refuses it
 - The coupon signer is a key with no EIP-7702 delegation, or a Safe: Raindex V6 asks a delegated key's delegate for a coupon's signature, so the scripts and the orchestrator refuse one ([docs/enable-multisig.md](./docs/enable-multisig.md))
-- On mainnet the vault admin is a Safe multisig from the deploy's first transaction, and the coupon signer is a key or a Safe: [docs/enable-multisig.md](./docs/enable-multisig.md). Each key holder follows [docs/key-holder.md](./docs/key-holder.md). A Safe coupon signer whose owner keys one orchestrator holds is still one party; M-of-N needs the signer service of [docs/signer-service.md](./docs/signer-service.md), which is not built
+- On mainnet the vault admin is a Safe multisig from the deploy's first transaction, and the coupon signer is a key or a Safe: [docs/enable-multisig.md](./docs/enable-multisig.md). Each key holder follows [docs/key-holder.md](./docs/key-holder.md). A Safe coupon signer whose owner keys one orchestrator holds is still one party; M-of-N needs the signer service of [docs/signer-service.md](./docs/signer-service.md)
 - Each coupon has a unique nonce (prevents replay)
 - Coupons have expiry timestamps
 - Admin functions protected by access control

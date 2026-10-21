@@ -2,7 +2,7 @@
 
 This is the contract for the signer services Unyt builds. One Safe is the bridge's vault admin and its coupon signer ([enable-multisig.md](./enable-multisig.md)). The Safe has N owners and a threshold M. Each owner is a signer service run by a separate party, holding that owner's key. A HOT claim on Ethereum pays only with a coupon that M owners signed.
 
-The orchestrator's side is built and tested (`bridge-orchestrator/src/signer/safe.rs`). The rehearsal runs it against mock services (`ui/scripts/mock-signer-service.mjs`) that speak this API but take no token and check nothing on Holochain. The real services are not built.
+The orchestrator's side is built and tested (`bridge-orchestrator/src/signer/safe.rs`). The rehearsal runs it against mock services (`ui/scripts/mock-signer-service.mjs`) that speak this API but take no token and check nothing on Holochain. The service itself is `bridge-orchestrator signer` ([its configuration](../bridge-orchestrator/README.md#signer-service-signer-only)).
 
 ## Why each service checks for itself
 
@@ -71,6 +71,7 @@ A refusal is HTTP 409 with a `code` from this list and a `reason` for people. Th
 | `not_a_withdrawal` | the spend is not a bridge withdrawal (role, lane or unit, below), is no longer parked, or its HOT amount is not one a coupon can carry ([the amount](#the-amount)) |
 | `amount_mismatch` | word 1 is not the word the service makes of the spend's amount |
 | `recipient_mismatch` | word 0 is not the spend's withdraw-to address |
+| `recipient_listed` | the service screens the spend's withdraw-to address, and its denylist names it |
 | `expiry_out_of_range` | word 2 is outside the window in [the expiry](#the-expiry) |
 | `nonce_mismatch` | word 8 is not keccak256 of the withdrawal's 39 bytes |
 | `order_mismatch` | words 3 to 7 are not the service's own copy of the deploy record |
