@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use holo_hash::{ActionHash, ActionHashB64};
 use rave_engine::types::{ParkedLinkStanding, Transaction, TransactionDetails};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,9 +201,9 @@ impl Service {
     }
 
     fn authorized(&self, authorization: Option<&str>) -> Result<(), Refusal> {
-        // Digests are compared, so the time a refusal takes says nothing about the token.
         let digest = |value: &str| Sha256::digest(value.as_bytes());
-        if authorization.map(digest) == Some(digest(&self.config.authorization)) {
+        let expected = digest(&self.config.authorization);
+        if authorization.is_some_and(|given| bool::from(digest(given).ct_eq(&expected))) {
             Ok(())
         } else {
             Err(Refusal::new(
