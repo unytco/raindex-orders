@@ -5,7 +5,7 @@
 
 use super::{SignRequest, Signing, SIGN_TIMEOUT};
 use crate::config::Network;
-use crate::preflight::RPC_TIMEOUT;
+use crate::preflight::{rpc_failure, RPC_TIMEOUT};
 use alloy::primitives::{keccak256, Address, Bytes, PrimitiveSignature, B256, U256};
 use alloy::providers::{ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
@@ -13,6 +13,7 @@ use alloy::signers::Signer;
 use alloy::sol;
 use alloy::sol_types::SolValue;
 use alloy::transports::http::{Client, Http};
+use alloy::transports::RpcError;
 use anyhow::{anyhow, bail, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use holo_hash::ActionHashB64;
@@ -416,9 +417,18 @@ impl SafeOwners {
             .await?;
         match answer {
             Ok(answer) => Ok(answer._0.0 == EIP1271_MAGIC_VALUE),
-            Err(alloy::contract::Error::TransportError(
-                alloy::transports::RpcError::ErrorResp(_),
-            )) => Ok(false),
+            Err(alloy::contract::Error::TransportError(RpcError::ErrorResp(payload)))
+                if payload.as_revert_data().is_some() =>
+            {
+                Ok(false)
+            }
+            Err(alloy::contract::Error::TransportError(err @ RpcError::ErrorResp(_))) => {
+                Err(rpc_failure(
+                    &format!("CLAIM_SIGNER {}", self.safe),
+                    "isValidSignature(...)",
+                    &err,
+                ))
+            }
             Err(_) => Err(anyhow!(
                 "CLAIM_SIGNER {}: isValidSignature(...) could not be asked",
                 self.safe

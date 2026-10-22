@@ -3,7 +3,7 @@ use crate::fake_rpc::{read_head_and_body, read_request, serve};
 use crate::signer::{context_digest, CouponSigner, Payout};
 use alloy::primitives::address;
 use alloy::signers::SignerSync;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{Revert, SolCall, SolError};
 use holo_hash::{ActionHash, ActionHashB64};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -84,6 +84,9 @@ pub(crate) struct FakeSafe {
     chain_id: u64,
     threshold: u64,
     owners: Vec<Address>,
+    /// The RPC's error answer to isValidSignature for signatures the Safe does
+    /// not accept.
+    refusal: Value,
     /// Asks of isValidSignature, as the signatures it was given.
     asked: Arc<Mutex<Vec<Vec<u8>>>>,
 }
@@ -94,6 +97,7 @@ impl FakeSafe {
             chain_id: 1,
             threshold,
             owners: owners.iter().map(|i| owner(*i)).collect(),
+            refusal: json!({"code": 3, "message": "execution reverted: GS026", "data": "0x"}),
             asked: Arc::default(),
         }
     }
@@ -150,9 +154,7 @@ impl FakeSafe {
                     let asked = ISafe::isValidSignatureCall::abi_decode(&input, true).unwrap();
                     safe.asked.lock().unwrap().push(asked.signature.to_vec());
                     if !safe.accepts(&asked.dataHash, &asked.signature) {
-                        return Err(
-                            json!({"code": 3, "message": "execution reverted: GS026", "data": "0x"}),
-                        );
+                        return Err(safe.refusal.clone());
                     }
                     alloy::primitives::FixedBytes::<4>::from(EIP1271_MAGIC_VALUE).abi_encode()
                 }
@@ -759,29 +761,60 @@ async fn an_owner_the_safe_no_longer_lists_is_not_counted() {
 }
 
 /// A Safe that refuses the owners' signatures, here because it is on another
-/// chain than the one they signed for, fails the coupon.
+/// chain than the one they signed for, fails the coupon. Only a revert with
+/// data, even 0x, is the Safe refusing them: any other error the RPC answers
+/// is a failed read.
 #[tokio::test]
 async fn a_coupon_the_safe_refuses_is_an_error() {
-    let mut chain = FakeSafe::new(2, &[0, 1, 2]);
-    chain.chain_id = 84_532;
-    let url = chain.serve().await;
-    let owners = safe_owners(
-        vec![Owner::Key(owner_key(0)), Owner::Key(owner_key(1))],
-        &url,
-    );
+    let refused = format!("CLAIM_SIGNER {SAFE} refused the signatures of 2 of its owners: its isValidSignature did not accept them");
+    let failed = |code: i64| {
+        format!("CLAIM_SIGNER {SAFE}: isValidSignature(...) failed: the RPC answered with error code {code}")
+    };
+    let gs026 = Revert {
+        reason: "GS026".to_string(),
+    }
+    .abi_encode();
+    for (answer, expected) in [
+        (
+            json!({"code": 3, "message": "execution reverted: GS026", "data": "0x"}),
+            refused.clone(),
+        ),
+        (
+            json!({"code": 3, "message": "execution reverted: GS026", "data": format!("0x{}", hex::encode(gs026))}),
+            refused.clone(),
+        ),
+        (
+            json!({"code": 3, "message": "execution reverted"}),
+            failed(3),
+        ),
+        (
+            json!({"code": -32005, "message": "rate limit exceeded"}),
+            failed(-32005),
+        ),
+        (
+            json!({"code": -32603, "message": "internal error", "data": "0x"}),
+            failed(-32603),
+        ),
+    ] {
+        let mut chain = FakeSafe::new(2, &[0, 1, 2]);
+        chain.chain_id = 84_532;
+        chain.refusal = answer.clone();
+        let url = chain.serve().await;
+        let owners = safe_owners(
+            vec![Owner::Key(owner_key(0)), Owner::Key(owner_key(1))],
+            &url,
+        );
 
-    let err = format!(
-        "{:#}",
-        owners
-            .sign_request(&request(Some(withdrawal())))
-            .await
-            .unwrap_err()
-    );
+        let err = format!(
+            "{:#}",
+            owners
+                .sign_request(&request(Some(withdrawal())))
+                .await
+                .unwrap_err()
+        );
 
-    assert_eq!(
-        err,
-        format!("CLAIM_SIGNER {SAFE} refused the signatures of 2 of its owners: its isValidSignature did not accept them")
-    );
+        assert_eq!(err, expected, "the RPC answered {answer}");
+    }
 }
 
 /// The tests of a silent service run on the real clock, with `SHORT_SIGN_TIMEOUT`
