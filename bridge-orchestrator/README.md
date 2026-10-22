@@ -283,15 +283,25 @@ provider cannot answer.
 bridge-orchestrator screen 0x6c6EE5e31d828De241282B9606C8e98Ea48526E2
 ```
 
+### `bridge-orchestrator signer`
+
+One Safe owner's signer service ([docs/signer-service.md](../docs/signer-service.md)),
+on `GET /healthz`, `GET /signer` and `POST /sign`. It reads only the variables
+in [Signer service](#signer-service-signer-only).
+
+```
+bridge-orchestrator signer
+```
+
 ## Environment variables
 
-Every subcommand loads the config below on startup, so the env file must be
-sourced even for `status` and `clear`. Only `run` reads the signer variables
-and the chain, only `run`, `screen` and `in-transit` the screening variables,
-and only `run` and `in-transit` the conductor. A network variable set to an
-empty value counts as unset.
+Every subcommand but `signer` loads the config below on startup, so the env
+file must be sourced even for `status` and `clear`. Of those, only `run` reads
+the [Signer](#signer-run-only) variables and the chain, only `run`, `screen` and
+`in-transit` the screening variables, and only `run` and `in-transit` the
+conductor. A network variable set to an empty value counts as unset.
 
-### Config (all commands)
+### Config (every command but `signer`)
 
 | Variable | Required | Default |
 |----------|----------|---------|
@@ -329,7 +339,7 @@ A database an earlier release left `detected` rows in loses them on its first
 start, and the lock read goes back to read their blocks again. An earlier
 release refuses a `DB_PATH` this one has opened.
 
-### Screening (`run`, `screen` and `in-transit`)
+### Screening (`run`, `screen`, `in-transit` and `signer`)
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
@@ -474,7 +484,8 @@ mock HOT, vault and claim order are not defaulted: the rest is required on
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
 | `SIGNER_PRIVATE_KEY` | For a key | -- (TestNet's claim order takes the test signer's key, `TEST_SIGNER_KEY` in `src/Constants.sol`). The key of `CLAIM_SIGNER`, when it is a key |
-| `SAFE_OWNER_SERVICES` | For a Safe | -- The signer services of owners of `CLAIM_SIGNER`, when it is a Safe, as `<owner address>=<base URL>`, separated by commas: https, or http on this machine, on mainnet. For each coupon the orchestrator asks them all at once, 20 seconds each (one that timed out is not asked again that cycle while the others are at least M), takes M owner signatures and has the Safe accept them; a withdrawal fewer than M sign stays parked until the next cycle ([docs/signer-service.md](../docs/signer-service.md)) |
+| `SAFE_OWNER_SERVICES` | For a Safe | -- The signer services of owners of `CLAIM_SIGNER`, when it is a Safe, as `<owner address>=<base URL>`, separated by commas: https, or http on this machine, on mainnet. For each coupon the orchestrator asks them all at once, 60 seconds each (one that timed out is not asked again that cycle while the others are at least M), takes M owner signatures and has the Safe accept them; a withdrawal fewer than M sign stays parked until the next cycle ([docs/signer-service.md](../docs/signer-service.md)) |
+| `SAFE_OWNER_SERVICE_TOKENS` | No | -- The token of each signer service in `SAFE_OWNER_SERVICES`, as `<owner address>=<token>`, separated by commas. Each service is sent its own as `Authorization: Bearer <token>`, and a service with none is sent no header. A token is visible ASCII with no comma. Refused: an owner `SAFE_OWNER_SERVICES` does not name, an owner named twice, or an empty token |
 | `SAFE_OWNER_KEYS` | For a Safe | -- Keys of owners of `CLAIM_SIGNER` this orchestrator holds, separated by commas, alone or with `SAFE_OWNER_SERVICES`, and no more than its threshold. Holding the threshold's worth of keys is one party, however many keys ([docs/signer-service.md](../docs/signer-service.md)). On mainnet it needs `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes` when it holds the threshold's worth, or any key of a Safe that is also the vault admin |
 | `UNSAFE_ALLOW_ONE_PARTY_SIGNER` | No | -- `yes` lets a mainnet orchestrator start although it alone can sign as the Safe `CLAIM_SIGNER` (a threshold of 1, or the threshold's worth of `SAFE_OWNER_KEYS`), or holds owner keys of a Safe that is also the vault admin. It logs that, as `startup.one_party`. It does not let through a Safe whose threshold is half its owners or fewer, on any network. Any value other than `yes` is refused |
 | `ORDER_HASH` | Yes | -- |
@@ -488,6 +499,29 @@ mock HOT, vault and claim order are not defaulted: the rest is required on
 | `CLAIM_BYTECODE` | Yes | -- (the claim order's parsed expression, as hex; a V6 order carries its bytecode in place of an expression address) |
 | `CLAIM_INPUT_TOKEN` | Yes | -- (the ClaimInputToken deployed with the vault) |
 | `EXPIRY_SECONDS` | No | `604800` (7 days), from 1 to `31536000` (a year) |
+
+### Signer service (`signer` only)
+
+`signer` also reads `HOLOCHAIN_ADMIN_PORT`, `HOLOCHAIN_APP_PORT`,
+`HOLOCHAIN_APP_ID`, `HOLOCHAIN_ROLE_NAME`, `CONDUCTOR_CONFIG`,
+`LAIR_PASSPHRASE_FILE`, `HOLOCHAIN_BRIDGING_AGENT_PUBKEY`, `HOT_UNIT_INDEX`,
+`HAM_REQUEST_TIMEOUT_SECS` and `HAM_RECONNECT_*` as in
+[Config](#config-every-command-but-signer), and `SCREENING` and
+`SCREENING_DENYLIST` as in [Screening](#screening-run-screen-in-transit-and-signer).
+
+| Variable | Required | Base Sepolia default |
+|----------|----------|-----------------|
+| `NETWORK` | No | `base-sepolia` (`base-sepolia` or `mainnet`; `none` is refused) |
+| `CLAIM_SIGNER` | Yes | -- (the Safe) |
+| `ORDER_HASH`, `ORDER_OWNER`, `TOKEN_ADDRESS` | Yes | -- (the claim order's) |
+| `ORDERBOOK_ADDRESS`, `VAULT_ID` | mainnet | as for `run` |
+| `SAFE_OWNER_KEY` | Yes | -- (the owner's private key. Mainnet refuses the test signer's) |
+| `SIGNER_BEARER_TOKEN` | Yes | -- (the token the orchestrator sends this service as `Authorization: Bearer <token>`) |
+| `SIGNER_BIND_ADDR` | No | `127.0.0.1` |
+| `SIGNER_BIND_PORT` | Yes | -- |
+| `SIGNER_DB_PATH` | Yes | -- (the record of each withdrawal signed, as SQLite, for [one order per withdrawal](../docs/signer-service.md#one-order-per-withdrawal): keep it across redeploys. A missing file is created) |
+| `EXPIRY_SECONDS` | No | `604800`, as for `run` |
+| `EXPIRY_TOLERANCE_SECONDS` | No | `600` (the slack for the two clocks, added to both ends of [the expiry](../docs/signer-service.md#the-expiry) window) |
 
 ## Usage on the HOT-2-mHOT bridge server
 

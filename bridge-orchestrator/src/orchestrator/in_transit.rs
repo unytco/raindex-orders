@@ -142,7 +142,7 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
             served.as_deref().unwrap_or("none")
         );
     }
-    let ham = connect_ham(&cfg).await?;
+    let ham = connect_ham(&cfg.holochain).await?;
     let orchestrator = BridgeOrchestrator {
         cfg,
         db,
@@ -155,7 +155,7 @@ pub async fn run(cfg: Config, ethereum: Option<Ethereum>, mark_failed: bool) -> 
         .in_transit(
             &Conductor {
                 ham: &ham,
-                role_name: &orchestrator.cfg.role_name,
+                role_name: &orchestrator.cfg.holochain.role_name,
             },
             screener.as_deref(),
             vault.as_deref(),

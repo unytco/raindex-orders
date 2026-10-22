@@ -1,11 +1,11 @@
 use super::*;
-use crate::fake_rpc::{read_request, serve};
+use crate::fake_rpc::{read_head_and_body, read_request, serve};
 use crate::signer::{context_digest, CouponSigner, Payout};
 use alloy::primitives::address;
 use alloy::signers::SignerSync;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{Revert, SolCall, SolError};
 use holo_hash::{ActionHash, ActionHashB64};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -21,6 +21,29 @@ pub(crate) const OWNER_KEYS: [&str; 4] = [
 ];
 pub(crate) const SAFE: Address = address!("3838Fc4E0cba211c3D6D202539bB2dc2B72C7a22");
 const NOW: u64 = 1_750_000_000;
+
+/// The request of docs/signer-service.md's worked example, and owner 0's
+/// signature of it.
+pub(crate) const WORKED_EXAMPLE: &str = r#"{
+  "safe": "0x3838fc4e0cba211c3d6d202539bb2dc2b72c7a22",
+  "chainId": 1,
+  "owner": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+  "withdrawal": "uhCkkBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBweIGAsC",
+  "context": [
+    "0x0000000000000000000000001111111111111111111111111111111111111111",
+    "0xffffffee000000000000000000000000000000000000000014d1120d7b160000",
+    "0x0000000000000000000000000000000000000000000000000000000068581c00",
+    "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9",
+    "0x000000000000000000000000e3e064e3c2eef66cb93da8d8114f5084e92f48d6",
+    "0x00000000000000000000000037fc0efec37d19f8a221aa4f8f7600c9ba2acd20",
+    "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
+    "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
+    "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77"
+  ],
+  "couponDigest": "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f",
+  "safeMessageHash": "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
+}"#;
+pub(crate) const WORKED_EXAMPLE_SIGNATURE: &str = "0xba849cad3e89c4cfe1e5bb91fe102512c6c419a63eb7ef051875c6a378fa983e1512f61cf01f253ea5a62c247dd7b1ae2ea2a70d69e7262320f7d5fdf9e97d4a1c";
 
 pub(crate) fn owner_key(i: usize) -> PrivateKeySigner {
     OWNER_KEYS[i].parse().unwrap()
@@ -57,20 +80,24 @@ fn the_safe_message_hash_is_what_the_fallback_handler_computes() {
 /// 65-byte signatures each an owner's, ascending, over the SafeMessage hash
 /// (v 27 or 28) or its EIP-191 hash (v 31 or 32).
 #[derive(Clone)]
-struct FakeSafe {
+pub(crate) struct FakeSafe {
     chain_id: u64,
     threshold: u64,
     owners: Vec<Address>,
+    /// The RPC's error answer to isValidSignature for signatures the Safe does
+    /// not accept.
+    refusal: Value,
     /// Asks of isValidSignature, as the signatures it was given.
     asked: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl FakeSafe {
-    fn new(threshold: u64, owners: &[usize]) -> Self {
+    pub(crate) fn new(threshold: u64, owners: &[usize]) -> Self {
         Self {
             chain_id: 1,
             threshold,
             owners: owners.iter().map(|i| owner(*i)).collect(),
+            refusal: json!({"code": 3, "message": "execution reverted: GS026", "data": "0x"}),
             asked: Arc::default(),
         }
     }
@@ -110,7 +137,7 @@ impl FakeSafe {
         true
     }
 
-    async fn serve(&self) -> String {
+    pub(crate) async fn serve(&self) -> String {
         let safe = self.clone();
         serve(move |method, params| {
             assert_eq!(method, "eth_call", "the signer sent {method}");
@@ -127,9 +154,7 @@ impl FakeSafe {
                     let asked = ISafe::isValidSignatureCall::abi_decode(&input, true).unwrap();
                     safe.asked.lock().unwrap().push(asked.signature.to_vec());
                     if !safe.accepts(&asked.dataHash, &asked.signature) {
-                        return Err(
-                            json!({"code": 3, "message": "execution reverted: GS026", "data": "0x"}),
-                        );
+                        return Err(safe.refusal.clone());
                     }
                     alloy::primitives::FixedBytes::<4>::from(EIP1271_MAGIC_VALUE).abi_encode()
                 }
@@ -146,7 +171,14 @@ impl FakeSafe {
 /// sent.
 pub(crate) struct FakeService {
     pub(crate) url: String,
-    pub(crate) requests: Arc<Mutex<Vec<(String, Value)>>>,
+    pub(crate) requests: Arc<Mutex<Vec<Sent>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct Sent {
+    pub(crate) path: String,
+    pub(crate) body: Value,
+    pub(crate) authorization: Option<String>,
 }
 
 /// Serves `answer(path, body)` as `(status, body)` to every request.
@@ -163,14 +195,20 @@ where
         while let Ok((mut socket, _)) = listener.accept().await {
             let (seen, answer) = (Arc::clone(&seen), Arc::clone(&answer));
             tokio::spawn(async move {
-                let mut head = [0u8; 256];
-                let peeked = socket.peek(&mut head).await.unwrap();
-                let line = String::from_utf8_lossy(&head[..peeked]);
-                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
-                let body = read_request(&mut socket).await;
+                let (head, body) = read_head_and_body(&mut socket).await;
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let authorization = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                });
                 let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let (status, reply) = answer(&path, &body);
-                seen.lock().unwrap().push((path, body));
+                seen.lock().unwrap().push(Sent {
+                    path,
+                    body,
+                    authorization,
+                });
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
                     reply.len()
@@ -352,19 +390,29 @@ fn the_owners_asked_are_two_to_twenty_and_none_twice() {
 
 /// The service is sent the Safe, the chain, its owner, the withdrawal, the
 /// nine words, their digest and their SafeMessage hash, and the coupon carries
-/// the owners' signatures that come back.
+/// the owners' signatures that come back. Each service is sent its own token,
+/// and one with none is sent no `Authorization`.
 #[tokio::test]
 async fn a_signer_service_is_sent_the_coupon_and_answers_its_owners_signature() {
     let chain = FakeSafe::new(2, &[0, 1, 2]);
     let url = chain.serve().await;
-    let (a, b) = (
+    let (a, b, c) = (
         owner_service(owner_key(0)).await,
         owner_service(owner_key(1)).await,
+        owner_service(owner_key(2)).await,
     );
+    let service = |i: usize, at: &FakeService, token: Option<&str>| {
+        Owner::Service(
+            OwnerService::new(Network::Mainnet, owner(i), &at.url)
+                .unwrap()
+                .with_token(token.map(str::to_string)),
+        )
+    };
     let owners = safe_owners(
         vec![
-            service_owner(&owner_key(0), &a),
-            service_owner(&owner_key(1), &b),
+            service(0, &a, Some("token-a")),
+            service(1, &b, Some("token-b")),
+            service(2, &c, None),
         ],
         &url,
     );
@@ -379,9 +427,9 @@ async fn a_signer_service_is_sent_the_coupon_and_answers_its_owners_signature() 
     );
     let requests = a.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].0, "/holo/sign");
+    assert_eq!(requests[0].path, "/holo/sign");
     assert_eq!(
-        requests[0].1,
+        requests[0].body,
         json!({
             "safe": SAFE,
             "chainId": 1,
@@ -400,6 +448,42 @@ async fn a_signer_service_is_sent_the_coupon_and_answers_its_owners_signature() 
         (identity.owner, identity.safe, identity.chain_id),
         (owner(0), SAFE, 1)
     );
+    for other in &owners.owners()[1..] {
+        let Owner::Service(service) = other else {
+            unreachable!()
+        };
+        service.identity().await.unwrap();
+    }
+    let sent = |service: &FakeService| {
+        service
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|sent| {
+                format!(
+                    "{} {}",
+                    sent.path,
+                    sent.authorization.as_deref().unwrap_or("unauthorized")
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sent(&a),
+        ["/holo/sign Bearer token-a", "/holo/signer Bearer token-a"]
+    );
+    assert_eq!(
+        sent(&b),
+        ["/holo/sign Bearer token-b", "/holo/signer Bearer token-b"]
+    );
+    assert_eq!(
+        sent(&c),
+        ["/holo/sign unauthorized", "/holo/signer unauthorized"]
+    );
+    let logged: Vec<String> = owners.owners().iter().map(Owner::name).collect();
+    let logged = format!("{owners:?} {logged:?}");
+    assert!(!logged.contains("token-"), "{logged}");
 }
 
 /// The startup probe pays no withdrawal: a service is sent it with
@@ -416,7 +500,10 @@ async fn the_startup_probe_is_sent_with_no_withdrawal() {
 
     owners.sign_request(&request(None)).await.unwrap();
 
-    assert_eq!(a.requests.lock().unwrap()[0].1["withdrawal"], Value::Null);
+    assert_eq!(
+        a.requests.lock().unwrap()[0].body["withdrawal"],
+        Value::Null
+    );
 }
 
 /// All three owners sign; the coupon carries the two lowest, ascending.
@@ -674,29 +761,60 @@ async fn an_owner_the_safe_no_longer_lists_is_not_counted() {
 }
 
 /// A Safe that refuses the owners' signatures, here because it is on another
-/// chain than the one they signed for, fails the coupon.
+/// chain than the one they signed for, fails the coupon. Only a revert with
+/// data, even 0x, is the Safe refusing them: any other error the RPC answers
+/// is a failed read.
 #[tokio::test]
 async fn a_coupon_the_safe_refuses_is_an_error() {
-    let mut chain = FakeSafe::new(2, &[0, 1, 2]);
-    chain.chain_id = 84_532;
-    let url = chain.serve().await;
-    let owners = safe_owners(
-        vec![Owner::Key(owner_key(0)), Owner::Key(owner_key(1))],
-        &url,
-    );
+    let refused = format!("CLAIM_SIGNER {SAFE} refused the signatures of 2 of its owners: its isValidSignature did not accept them");
+    let failed = |code: i64| {
+        format!("CLAIM_SIGNER {SAFE}: isValidSignature(...) failed: the RPC answered with error code {code}")
+    };
+    let gs026 = Revert {
+        reason: "GS026".to_string(),
+    }
+    .abi_encode();
+    for (answer, expected) in [
+        (
+            json!({"code": 3, "message": "execution reverted: GS026", "data": "0x"}),
+            refused.clone(),
+        ),
+        (
+            json!({"code": 3, "message": "execution reverted: GS026", "data": format!("0x{}", hex::encode(gs026))}),
+            refused.clone(),
+        ),
+        (
+            json!({"code": 3, "message": "execution reverted"}),
+            failed(3),
+        ),
+        (
+            json!({"code": -32005, "message": "rate limit exceeded"}),
+            failed(-32005),
+        ),
+        (
+            json!({"code": -32603, "message": "internal error", "data": "0x"}),
+            failed(-32603),
+        ),
+    ] {
+        let mut chain = FakeSafe::new(2, &[0, 1, 2]);
+        chain.chain_id = 84_532;
+        chain.refusal = answer.clone();
+        let url = chain.serve().await;
+        let owners = safe_owners(
+            vec![Owner::Key(owner_key(0)), Owner::Key(owner_key(1))],
+            &url,
+        );
 
-    let err = format!(
-        "{:#}",
-        owners
-            .sign_request(&request(Some(withdrawal())))
-            .await
-            .unwrap_err()
-    );
+        let err = format!(
+            "{:#}",
+            owners
+                .sign_request(&request(Some(withdrawal())))
+                .await
+                .unwrap_err()
+        );
 
-    assert_eq!(
-        err,
-        format!("CLAIM_SIGNER {SAFE} refused the signatures of 2 of its owners: its isValidSignature did not accept them")
-    );
+        assert_eq!(err, expected, "the RPC answered {answer}");
+    }
 }
 
 /// The tests of a silent service run on the real clock, with `SHORT_SIGN_TIMEOUT`
@@ -1000,36 +1118,18 @@ async fn the_worked_example_in_the_signer_service_doc() {
     owners.sign_request(&asked).await.unwrap();
 
     assert_eq!(
-        service.requests.lock().unwrap()[0].1,
-        serde_json::from_str::<Value>(
-            r#"{
-              "safe": "0x3838fc4e0cba211c3d6d202539bb2dc2b72c7a22",
-              "chainId": 1,
-              "owner": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
-              "withdrawal": "uhCkkBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBweIGAsC",
-              "context": [
-                "0x0000000000000000000000001111111111111111111111111111111111111111",
-                "0xffffffee000000000000000000000000000000000000000014d1120d7b160000",
-                "0x0000000000000000000000000000000000000000000000000000000068581c00",
-                "0x5eeff397dac16f82057e20da98cf183daf95a0695980a196270e9e0922a275f9",
-                "0x000000000000000000000000e3e064e3c2eef66cb93da8d8114f5084e92f48d6",
-                "0x00000000000000000000000037fc0efec37d19f8a221aa4f8f7600c9ba2acd20",
-                "0x0000000000000000000000006c6ee5e31d828de241282b9606c8e98ea48526e2",
-                "0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b",
-                "0x12c911abe545a1669fcbcdaeeede5352ee5a6743f59dbacdc0251b1e4c2f7b77"
-              ],
-              "couponDigest": "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f",
-              "safeMessageHash": "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
-            }"#
-        )
-        .unwrap()
+        service.requests.lock().unwrap()[0].body,
+        serde_json::from_str::<Value>(WORKED_EXAMPLE).unwrap()
     );
     let hash: B256 = "0xd02d17b3c4226662353fa285586b495d7fcf937967ac510d2ebf535047b68d34"
         .parse()
         .unwrap();
     assert_eq!(
-        format!("0x{}", hex::encode(typed_data_signature(&hash, &owner_key(0)))),
-        "0xba849cad3e89c4cfe1e5bb91fe102512c6c419a63eb7ef051875c6a378fa983e1512f61cf01f253ea5a62c247dd7b1ae2ea2a70d69e7262320f7d5fdf9e97d4a1c"
+        format!(
+            "0x{}",
+            hex::encode(typed_data_signature(&hash, &owner_key(0)))
+        ),
+        WORKED_EXAMPLE_SIGNATURE
     );
 }
 

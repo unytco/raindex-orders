@@ -87,6 +87,8 @@ enum Command {
     },
     /// Screen one address as `run` would, recording nothing.
     Screen { address: Address },
+    /// Sign coupons as one owner of the Safe, as its signer service.
+    Signer,
 }
 
 #[derive(clap::Args, Debug)]
@@ -105,13 +107,16 @@ async fn main() -> Result<()> {
     init_logging();
 
     let args = Args::parse();
+    if let Command::Signer = args.command {
+        return signer::service::run().await;
+    }
     let config = Config::from_env()?;
     let ethereum = config::ethereum_from_env()?;
 
     match args.command {
         Command::Run => {
             info!("bridge-orchestrator starting");
-            config::require_durable_conductor(&config.conductor_config)?;
+            config::require_durable_conductor(&config.holochain.conductor_config)?;
             let ethereum = match ethereum {
                 Some(chain) => {
                     let screener = config::screener_from_env(chain.network)?;
@@ -244,6 +249,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("{} did not answer: {cause}", screened.provider);
             }
         }
+        Command::Signer => unreachable!("signer returns before the orchestrator's config"),
     }
 
     Ok(())

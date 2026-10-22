@@ -161,7 +161,7 @@ pub fn screener_from_env(network: Network) -> Result<Option<Box<dyn Screener>>> 
     screening_settings(network, |key| env::var(key).ok())
 }
 
-fn screening_settings(
+pub(crate) fn screening_settings(
     network: Network,
     setting: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Box<dyn Screener>>> {
@@ -227,7 +227,7 @@ pub fn checksum_matches(address: &str) -> bool {
 }
 
 /// The network `NETWORK` names, base-sepolia when it is unset or empty.
-fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<Network> {
+pub(crate) fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<Network> {
     match setting("NETWORK").filter(|raw| !raw.is_empty()) {
         None => {
             tracing::info!(
@@ -242,7 +242,6 @@ fn network_from(setting: &impl Fn(&str) -> Option<String>) -> Result<Network> {
     }
 }
 
-/// `NETWORK`'s chain, read and checked for every command.
 pub fn ethereum_from_env() -> Result<Option<Ethereum>> {
     ethereum_settings(|key| env::var(key).ok())
 }
@@ -319,26 +318,9 @@ pub struct Config {
     /// MAX_TAG_SIZE).
     pub coupons_target_bytes: usize,
     pub db_path: String,
-    pub role_name: String,
-    pub app_id: String,
-    pub admin_port: u16,
-    pub app_port: u16,
-    /// Conductor config path — its `keystore.connection_url` is read to sign
-    /// zome calls via lair (no cap grant). Defaults to the fleet path.
-    pub conductor_config: String,
-    /// Lair passphrase file, read to unlock the keystore. Defaults to the
-    /// fleet path.
-    pub lair_passphrase_file: String,
+    pub holochain: Holochain,
     pub bridging_agent_pubkey: AgentPubKeyB64,
     pub hot_unit_index: u32,
-    /// Per-request timeout applied to the Holochain app websocket. Prevents a
-    /// slow or hung zome call from blocking the orchestrator indefinitely.
-    pub ham_request_timeout_secs: u64,
-    pub ham_reconnect_backoff_initial_ms: u64,
-    pub ham_reconnect_backoff_max_ms: u64,
-    /// Number of consecutive failed reconnect attempts before the log level
-    /// escalates from `warn` to `error`. The loop keeps retrying forever.
-    pub ham_reconnect_escalate_after: u32,
     /// Pause (milliseconds) applied after a cycle fails with a Holochain
     /// source-chain-pressure error (e.g. `"deadline has elapsed"`). The
     /// socket is healthy but the conductor is backpressured, so we back off
@@ -464,42 +446,9 @@ impl Config {
 
         let db_path =
             env::var("DB_PATH").unwrap_or_else(|_| "./data/bridge_orchestrator.db".into());
-        let admin_port = env::var("HOLOCHAIN_ADMIN_PORT")
-            .unwrap_or_else(|_| "30000".into())
-            .parse()
-            .context("Invalid HOLOCHAIN_ADMIN_PORT")?;
-        let app_port = env::var("HOLOCHAIN_APP_PORT")
-            .unwrap_or_else(|_| "30001".into())
-            .parse()
-            .context("Invalid HOLOCHAIN_APP_PORT")?;
-        let app_id = env::var("HOLOCHAIN_APP_ID").unwrap_or_else(|_| "bridging-app".into());
-        let role_name = env::var("HOLOCHAIN_ROLE_NAME").unwrap_or_else(|_| "alliance".into());
-        let conductor_config = env::var("CONDUCTOR_CONFIG")
-            .unwrap_or_else(|_| "/etc/holochain/conductor-config.yaml".into());
-        let lair_passphrase_file = env::var("LAIR_PASSPHRASE_FILE")
-            .unwrap_or_else(|_| "/var/lib/holochain/lair-passphrase".into());
-        let bridging_agent_pubkey = AgentPubKeyB64::from_str(
-            &env::var("HOLOCHAIN_BRIDGING_AGENT_PUBKEY")
-                .context("HOLOCHAIN_BRIDGING_AGENT_PUBKEY required")?,
-        )
-        .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")?;
+        let holochain = Holochain::from_settings(|key| env::var(key).ok())?;
+        let bridging_agent_pubkey = bridging_agent(|key| env::var(key).ok())?;
         let hot_unit_index = hot_unit_index(|key| env::var(key).ok())?;
-        let ham_request_timeout_secs = env::var("HAM_REQUEST_TIMEOUT_SECS")
-            .unwrap_or_else(|_| "120".into())
-            .parse()
-            .context("Invalid HAM_REQUEST_TIMEOUT_SECS")?;
-        let ham_reconnect_backoff_initial_ms = env::var("HAM_RECONNECT_BACKOFF_INITIAL_MS")
-            .unwrap_or_else(|_| "1000".into())
-            .parse()
-            .context("Invalid HAM_RECONNECT_BACKOFF_INITIAL_MS")?;
-        let ham_reconnect_backoff_max_ms = env::var("HAM_RECONNECT_BACKOFF_MAX_MS")
-            .unwrap_or_else(|_| "30000".into())
-            .parse()
-            .context("Invalid HAM_RECONNECT_BACKOFF_MAX_MS")?;
-        let ham_reconnect_escalate_after = env::var("HAM_RECONNECT_ESCALATE_AFTER")
-            .unwrap_or_else(|_| "5".into())
-            .parse()
-            .context("Invalid HAM_RECONNECT_ESCALATE_AFTER")?;
         let ham_pressure_cooldown_ms = env::var("HAM_PRESSURE_COOLDOWN_MS")
             .unwrap_or_else(|_| "30000".into())
             .parse()
@@ -546,18 +495,9 @@ impl Config {
             max_link_tag_bytes,
             coupons_target_bytes,
             db_path,
-            role_name,
-            app_id,
-            admin_port,
-            app_port,
-            conductor_config,
-            lair_passphrase_file,
+            holochain,
             bridging_agent_pubkey,
             hot_unit_index,
-            ham_request_timeout_secs,
-            ham_reconnect_backoff_initial_ms,
-            ham_reconnect_backoff_max_ms,
-            ham_reconnect_escalate_after,
             ham_pressure_cooldown_ms,
             ham_pressure_cooldown_max_ms,
             slow_call_threshold_ms,
@@ -726,7 +666,93 @@ const RETIRED_SETTINGS: [(&str, &str); 2] = [
     ("HOLOCHAIN_UNIT_INDEX", "rename it to HOT_UNIT_INDEX"),
 ];
 
-fn hot_unit_index(setting: impl Fn(&str) -> Option<String>) -> Result<u32> {
+/// The conductor `ham` connects to.
+#[derive(Debug, Clone)]
+pub struct Holochain {
+    pub admin_port: u16,
+    pub app_port: u16,
+    pub app_id: String,
+    pub role_name: String,
+    pub conductor_config: String,
+    pub lair_passphrase_file: String,
+    pub ham_request_timeout_secs: u64,
+    pub ham_reconnect_backoff_initial_ms: u64,
+    pub ham_reconnect_backoff_max_ms: u64,
+    pub ham_reconnect_escalate_after: u32,
+}
+
+impl Holochain {
+    pub(crate) fn from_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let mut faults = Vec::new();
+        let text = |key: &str, default: &str| setting(key).unwrap_or_else(|| default.to_string());
+        let holochain = Self {
+            admin_port: number(&setting, "HOLOCHAIN_ADMIN_PORT", "30000", &mut faults),
+            app_port: number(&setting, "HOLOCHAIN_APP_PORT", "30001", &mut faults),
+            app_id: text("HOLOCHAIN_APP_ID", "bridging-app"),
+            role_name: text("HOLOCHAIN_ROLE_NAME", "alliance"),
+            conductor_config: text("CONDUCTOR_CONFIG", "/etc/holochain/conductor-config.yaml"),
+            lair_passphrase_file: text(
+                "LAIR_PASSPHRASE_FILE",
+                "/var/lib/holochain/lair-passphrase",
+            ),
+            ham_request_timeout_secs: number(
+                &setting,
+                "HAM_REQUEST_TIMEOUT_SECS",
+                "120",
+                &mut faults,
+            ),
+            ham_reconnect_backoff_initial_ms: number(
+                &setting,
+                "HAM_RECONNECT_BACKOFF_INITIAL_MS",
+                "1000",
+                &mut faults,
+            ),
+            ham_reconnect_backoff_max_ms: number(
+                &setting,
+                "HAM_RECONNECT_BACKOFF_MAX_MS",
+                "30000",
+                &mut faults,
+            ),
+            ham_reconnect_escalate_after: number(
+                &setting,
+                "HAM_RECONNECT_ESCALATE_AFTER",
+                "5",
+                &mut faults,
+            ),
+        };
+        anyhow::ensure!(faults.is_empty(), "{}", faults.join("; "));
+        Ok(holochain)
+    }
+}
+
+fn number<T: FromStr + Default>(
+    setting: &impl Fn(&str) -> Option<String>,
+    key: &str,
+    default: &str,
+    faults: &mut Vec<String>,
+) -> T
+where
+    T::Err: std::fmt::Display,
+{
+    setting(key)
+        .as_deref()
+        .unwrap_or(default)
+        .parse()
+        .unwrap_or_else(|err| {
+            faults.push(format!("Invalid {key}: {err}"));
+            T::default()
+        })
+}
+
+pub(crate) fn bridging_agent(setting: impl Fn(&str) -> Option<String>) -> Result<AgentPubKeyB64> {
+    AgentPubKeyB64::from_str(
+        &setting("HOLOCHAIN_BRIDGING_AGENT_PUBKEY")
+            .context("HOLOCHAIN_BRIDGING_AGENT_PUBKEY required")?,
+    )
+    .context("Invalid HOLOCHAIN_BRIDGING_AGENT_PUBKEY")
+}
+
+pub(crate) fn hot_unit_index(setting: impl Fn(&str) -> Option<String>) -> Result<u32> {
     let retired: Vec<String> = RETIRED_SETTINGS
         .iter()
         .filter(|(key, _)| setting(key).is_some())
@@ -775,6 +801,24 @@ pub(crate) fn test_settings(set: &[(&str, &str)]) -> impl Fn(&str) -> Option<Str
     move |key| {
         set.iter()
             .find(|(set_key, _)| set_key == key)
+            .map(|(_, value)| value.clone())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn changed_settings(
+    mut set: Vec<(&'static str, String)>,
+    changes: &[(&'static str, Option<&str>)],
+) -> impl Fn(&str) -> Option<String> {
+    for (key, value) in changes {
+        set.retain(|(set_key, _)| set_key != key);
+        if let Some(value) = value {
+            set.push((key, value.to_string()));
+        }
+    }
+    move |key| {
+        set.iter()
+            .find(|(set_key, _)| *set_key == key)
             .map(|(_, value)| value.clone())
     }
 }
@@ -1021,6 +1065,7 @@ mod tests {
             ("ETH_RPC_URL", "https://eth.rpc.test"),
             ("ORDER_HASH", ""),
             ("SIGNER_PRIVATE_KEY", "0xabc"),
+            ("SAFE_OWNER_SERVICE_TOKENS", "0xabc=token"),
         ];
 
         for network in ["none", "NONE"] {
@@ -1034,7 +1079,8 @@ mod tests {
                 "BASE_SEPOLIA_RPC_URL",
                 "BASE_SEPOLIA_LOCK_VAULT_ADDRESS",
                 "ETH_RPC_URL",
-                "SIGNER_PRIVATE_KEY"
+                "SIGNER_PRIVATE_KEY",
+                "SAFE_OWNER_SERVICE_TOKENS"
             ]
         );
     }

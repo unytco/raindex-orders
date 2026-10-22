@@ -1,4 +1,4 @@
-use crate::config::{Config, Ethereum, LINK_TAG_BYTES_CEILING};
+use crate::config::{Config, Ethereum, Holochain, LINK_TAG_BYTES_CEILING};
 use crate::lock_flow::format_amount;
 use crate::screening::Screener;
 use crate::signer::{CouponSigner, Payout};
@@ -225,14 +225,14 @@ async fn select_bridging_links(
     Ok(selection)
 }
 
-enum BridgingSpend<'a> {
+pub(crate) enum BridgingSpend<'a> {
     Deposit,
     Withdrawal(Option<&'a str>),
     OtherVault { to: Option<&'a str>, why: String },
     OtherRole(&'a str),
 }
 
-fn bridging_spend<'a>(
+pub(crate) fn bridging_spend<'a>(
     tx: &'a Transaction,
     bridging_agent: &AgentPubKeyB64,
     vault: Option<&str>,
@@ -271,7 +271,7 @@ fn bridging_spend<'a>(
     )
 }
 
-fn vault_key(vault: Address) -> String {
+pub(crate) fn vault_key(vault: Address) -> String {
     format!("{vault:#x}")
 }
 
@@ -282,7 +282,11 @@ fn hot_amount(tx: &Transaction, hot_unit_index: u32) -> String {
         .unwrap_or_default()
 }
 
-fn withdrawal_terms(tx: &Transaction, withdraw_to: &str, hot_unit_index: u32) -> Result<Payout> {
+pub(crate) fn withdrawal_terms(
+    tx: &Transaction,
+    withdraw_to: &str,
+    hot_unit_index: u32,
+) -> Result<Payout> {
     let hot_unit = hot_unit_index.to_string();
     // The template pays the executor every unit in the spend, so a unit other
     // than HOT can fail the one RAVE the whole batch shares.
@@ -593,7 +597,7 @@ impl BridgeOrchestrator {
         // be a failure the reconnect loop retries forever instead. The closures
         // still rebuild it per attempt, so a lair reset that rewrites the
         // conductor's connection_url is picked up without a restart.
-        ham_config(&self.cfg)?;
+        ham_config(&self.cfg.holochain)?;
 
         // The reporter runs detached: any failure inside it is logged and
         // swallowed by the task itself.
@@ -621,16 +625,21 @@ impl BridgeOrchestrator {
         ));
 
         let mut shutdown = install_shutdown_handler();
-        let backoff = backoff_config(&self.cfg);
+        let backoff = backoff_config(&self.cfg.holochain);
 
-        let mut ham =
-            match connect_with_backoff(|| connect_ham(&self.cfg), &backoff, &mut shutdown).await {
-                Some(h) => h,
-                None => {
-                    info!("[bridge] shutdown received before initial connect, exiting");
-                    return Ok(());
-                }
-            };
+        let mut ham = match connect_with_backoff(
+            || connect_ham(&self.cfg.holochain),
+            &backoff,
+            &mut shutdown,
+        )
+        .await
+        {
+            Some(h) => h,
+            None => {
+                info!("[bridge] shutdown received before initial connect, exiting");
+                return Ok(());
+            }
+        };
         let lock_flow = self.lock_flow(&shutdown);
 
         let mut last_bridge_cycle =
@@ -682,7 +691,7 @@ impl BridgeOrchestrator {
                         });
                         let conductor = Conductor {
                             ham: &ham,
-                            role_name: &self.cfg.role_name,
+                            role_name: &self.cfg.holochain.role_name,
                         };
                         match self.run_bridge_cycle(&conductor, &shutdown).await {
                             Ok(()) => {
@@ -736,7 +745,7 @@ impl BridgeOrchestrator {
                                             h.set_cycle_class(CycleClass::None);
                                         });
                                         match connect_with_backoff(
-                                            || connect_ham(&self.cfg),
+                                            || connect_ham(&self.cfg.holochain),
                                             &backoff,
                                             &mut shutdown,
                                         )
@@ -882,7 +891,7 @@ impl BridgeOrchestrator {
                                 h.set_cycle_class(CycleClass::None);
                             });
                             match connect_with_backoff(
-                                || connect_ham(&self.cfg),
+                                || connect_ham(&self.cfg.holochain),
                                 &backoff,
                                 &mut shutdown,
                             )
@@ -2318,6 +2327,25 @@ impl BridgeOrchestrator {
     }
 }
 
+/// The bridging agreement of the lane a bridge cycle bridges on.
+pub(crate) async fn bridging_agreement(
+    ham: &Ham,
+    role_name: &str,
+    bridging_agent: &AgentPubKeyB64,
+    hot_unit_index: u32,
+) -> Result<ActionHashB64> {
+    let conductor = Conductor { ham, role_name };
+    let global_definition = conductor.global_definition().await?;
+    let context = BridgeOrchestrator::resolve_deposit_context(
+        &conductor,
+        bridging_agent,
+        hot_unit_index,
+        &global_definition,
+    )
+    .await?;
+    Ok(context.bridging_agreement)
+}
+
 struct CandidateLane {
     name: String,
     version: Option<ActionHash>,
@@ -3078,44 +3106,47 @@ fn screening_at_start(db: &StateStore, screener: Option<&dyn Screener>) -> Resul
     })
 }
 
-/// The `HamConfig` every connection this orchestrator makes is built from.
-/// Lair signing is required, never best-effort: the bridging agent carries its
-/// key across migrations, and the signing path `ham` would otherwise use
-/// commits a capability grant to that chain on every connect. Against a chain
-/// that has already closed, that grant is invalid and costs the agent its
-/// migration for good.
-fn ham_config(cfg: &Config) -> Result<HamConfig> {
-    HamConfig::new(cfg.admin_port, cfg.app_port, cfg.app_id.clone())
-        .with_request_timeout_secs(cfg.ham_request_timeout_secs)
-        .with_signing(
-            LairCredentials::Node {
-                conductor_config: cfg.conductor_config.clone().into(),
-                passphrase_file: cfg.lair_passphrase_file.clone().into(),
-            },
-            CapGrantOptIn::Withheld,
-        )
-        .context(
-            "CONDUCTOR_CONFIG / LAIR_PASSPHRASE_FILE must name a node whose conductor runs an \
+/// The `HamConfig` every connection this binary makes is built from.
+/// Lair signing is required, never best-effort: an agent carries its key
+/// across migrations, and the signing path `ham` would otherwise use commits a
+/// capability grant to that chain on every connect. Against a chain that has
+/// already closed, that grant is invalid and costs the agent its migration for
+/// good.
+pub(crate) fn ham_config(holochain: &Holochain) -> Result<HamConfig> {
+    HamConfig::new(
+        holochain.admin_port,
+        holochain.app_port,
+        holochain.app_id.clone(),
+    )
+    .with_request_timeout_secs(holochain.ham_request_timeout_secs)
+    .with_signing(
+        LairCredentials::Node {
+            conductor_config: holochain.conductor_config.clone().into(),
+            passphrase_file: holochain.lair_passphrase_file.clone().into(),
+        },
+        CapGrantOptIn::Withheld,
+    )
+    .context(
+        "CONDUCTOR_CONFIG / LAIR_PASSPHRASE_FILE must name a node whose conductor runs an \
              external lair_server",
-        )
+    )
 }
 
 /// One connect path, shared by startup and reconnect. Rebuilds the signing
 /// config on every attempt: `reset-lair.sh` rewrites the conductor's
 /// `connection_url` under a running orchestrator, and a config read once at
 /// startup would dial the old keystore until someone restarted the service.
-async fn connect_ham(cfg: &Config) -> Result<Ham> {
-    Ham::connect(ham_config(cfg)?)
+pub(crate) async fn connect_ham(holochain: &Holochain) -> Result<Ham> {
+    Ham::connect(ham_config(holochain)?)
         .await
         .context("Failed to connect to Holochain")
 }
 
-/// Project orchestrator config into the shared [`BackoffConfig`].
-fn backoff_config(cfg: &Config) -> BackoffConfig {
+pub(crate) fn backoff_config(holochain: &Holochain) -> BackoffConfig {
     BackoffConfig {
-        initial_ms: cfg.ham_reconnect_backoff_initial_ms,
-        max_ms: cfg.ham_reconnect_backoff_max_ms,
-        escalate_after: cfg.ham_reconnect_escalate_after,
+        initial_ms: holochain.ham_reconnect_backoff_initial_ms,
+        max_ms: holochain.ham_reconnect_backoff_max_ms,
+        escalate_after: holochain.ham_reconnect_escalate_after,
     }
 }
 
@@ -3456,7 +3487,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // -----------------------------------------------------------------
@@ -3493,10 +3524,10 @@ mod tests {
     use zfuel::fuel::Precision;
 
     mod in_transit;
-    mod screening;
+    pub(crate) mod screening;
     mod withdrawal;
 
-    fn test_db_path(name: &str) -> String {
+    pub(crate) fn test_db_path(name: &str) -> String {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3515,18 +3546,20 @@ mod tests {
             max_link_tag_bytes: 800,
             coupons_target_bytes: 512 * 1024,
             db_path,
-            role_name: "alliance".to_string(),
-            app_id: "bridging-app".to_string(),
-            admin_port: 0,
-            app_port: 0,
-            conductor_config: "/etc/holochain/conductor-config.yaml".to_string(),
-            lair_passphrase_file: "/var/lib/holochain/lair-passphrase".to_string(),
+            holochain: Holochain {
+                admin_port: 0,
+                app_port: 0,
+                app_id: "bridging-app".to_string(),
+                role_name: "alliance".to_string(),
+                conductor_config: "/etc/holochain/conductor-config.yaml".to_string(),
+                lair_passphrase_file: "/var/lib/holochain/lair-passphrase".to_string(),
+                ham_request_timeout_secs: 120,
+                ham_reconnect_backoff_initial_ms: 1000,
+                ham_reconnect_backoff_max_ms: 30000,
+                ham_reconnect_escalate_after: 5,
+            },
             bridging_agent_pubkey: agent_pubkey,
             hot_unit_index: 1,
-            ham_request_timeout_secs: 120,
-            ham_reconnect_backoff_initial_ms: 1000,
-            ham_reconnect_backoff_max_ms: 30000,
-            ham_reconnect_escalate_after: 5,
             ham_pressure_cooldown_ms: 30000,
             ham_pressure_cooldown_max_ms: 90000,
             slow_call_threshold_ms: 35000,
@@ -3590,8 +3623,9 @@ mod tests {
     /// happens to have at /etc/holochain.
     fn config_for_node(name: &str, conductor_config: &str, node: &tempfile::TempDir) -> Config {
         let mut cfg = test_config(test_db_path(name));
-        cfg.conductor_config = node.path().join(conductor_config).display().to_string();
-        cfg.lair_passphrase_file = node.path().join("lair-passphrase").display().to_string();
+        cfg.holochain.conductor_config = node.path().join(conductor_config).display().to_string();
+        cfg.holochain.lair_passphrase_file =
+            node.path().join("lair-passphrase").display().to_string();
         cfg
     }
 
@@ -3627,7 +3661,7 @@ mod tests {
     #[test]
     fn the_orchestrator_connects_through_lair() {
         let node = node_with_lair();
-        let cfg = ham_config(&config_for_node("lair", "conductor-config.yaml", &node))
+        let cfg = ham_config(&config_for_node("lair", "conductor-config.yaml", &node).holochain)
             .expect("a node with an external lair_server configures lair signing");
         assert_eq!(
             cfg.lair.expect("lair signing").connection_url.as_str(),
@@ -3642,11 +3676,9 @@ mod tests {
     #[test]
     fn a_node_without_lair_stops_the_orchestrator() {
         let node = node_with_lair();
-        let err = ham_config(&config_for_node(
-            "no-lair",
-            "absent-conductor-config.yaml",
-            &node,
-        ))
+        let err = ham_config(
+            &config_for_node("no-lair", "absent-conductor-config.yaml", &node).holochain,
+        )
         .expect_err("without lair there is no signing path that does not write to the chain");
         let err = format!("{err:#}");
         // ham states the fault; the orchestrator names the knobs to turn.
@@ -3654,12 +3686,12 @@ mod tests {
         assert!(err.contains("CONDUCTOR_CONFIG"), "{err}");
     }
 
-    fn action_hash(seed: u8) -> ActionHash {
+    pub(crate) fn action_hash(seed: u8) -> ActionHash {
         ActionHash::from_raw_32(vec![seed; 32])
     }
 
     const CL_EA: u8 = 0xEA;
-    const BR_EA: u8 = 0xEB;
+    pub(crate) const BR_EA: u8 = 0xEB;
 
     fn ea(seed: u8) -> String {
         action_hash(seed).to_string()
@@ -3672,7 +3704,7 @@ mod tests {
 
     /// The agent `test_config` bridges for, which signs every link the
     /// orchestrator writes.
-    fn bridging_agent() -> AgentPubKeyB64 {
+    pub(crate) fn bridging_agent() -> AgentPubKeyB64 {
         AgentPubKey::from_raw_32(vec![1u8; 32]).into()
     }
 
@@ -3681,7 +3713,7 @@ mod tests {
         link
     }
 
-    fn parked_tx(seed: u8, proofs: &[Value]) -> Transaction {
+    pub(crate) fn parked_tx(seed: u8, proofs: &[Value]) -> Transaction {
         let id = action_hash(seed).into();
         let executor = bridging_agent();
         let ea_id = action_hash(CL_EA).into();
@@ -6198,7 +6230,7 @@ mod tests {
         logged_at(tracing::Level::WARN, run).await
     }
 
-    async fn logged_at(level: tracing::Level, run: impl std::future::Future) -> String {
+    pub(crate) async fn logged_at(level: tracing::Level, run: impl std::future::Future) -> String {
         use tracing::instrument::WithSubscriber;
         let lines = Lines::default();
         run.with_subscriber(lines.at(level)).await;
@@ -6711,7 +6743,7 @@ mod tests {
         )
     }
 
-    fn with_payload(mut spend: Transaction, payload: Value) -> Transaction {
+    pub(crate) fn with_payload(mut spend: Transaction, payload: Value) -> Transaction {
         if let TransactionDetails::ParkedSpend {
             attached_payload, ..
         } = &mut spend.details
@@ -9135,7 +9167,7 @@ mod tests {
         );
     }
 
-    fn parked_withdrawal_tx(seed: u8) -> Transaction {
+    pub(crate) fn parked_withdrawal_tx(seed: u8) -> Transaction {
         let mut tx = signed_by_another(parked_spend_tx(seed, &[]));
         tx.amount = UnitMap::from(vec![(1, "5")]);
         if let TransactionDetails::ParkedSpend {
