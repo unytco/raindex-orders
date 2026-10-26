@@ -475,12 +475,11 @@ which the lock read gives up on after 30 s.
 ### Signer (run only)
 
 `run` parses these at startup. The deploy record prints every one but the key,
-under these names. On `base-sepolia` the values that are the same on every chain
-default to TestNet's, and startup logs which ones it took: Raindex V6, the
-Rainlang interpreter and store, the vault ID and the test signer. TestNet's
-mock HOT, vault and claim order are not defaulted: the rest is required on
-`base-sepolia` as on `mainnet`, TestNet's from the [README](../README.md#testnet-on-base-sepolia),
-and `CLAIM_SIGNER` too, as TestNet's claim order takes coupons from a Safe.
+under these names. On `base-sepolia` five default to TestNet's, and startup
+logs which ones it took: Raindex V6, the Rainlang interpreter and store and the
+vault ID, the same on every chain, and `CLAIM_SIGNER`, TestNet's coupon Safe.
+TestNet's mock HOT, vault and claim order are not defaulted: the rest is
+required on `base-sepolia` as on `mainnet`, TestNet's from the [README](../README.md#testnet-on-base-sepolia).
 
 | Variable | Required | Base Sepolia default |
 |----------|----------|-----------------|
@@ -494,7 +493,7 @@ and `CLAIM_SIGNER` too, as TestNet's claim order takes coupons from a Safe.
 | `ORDERBOOK_ADDRESS` | mainnet | `0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20` (RaindexV6, the same on every chain) |
 | `TOKEN_ADDRESS` | Yes | -- (the mock HOT deploy-base-sepolia.sh deployed) |
 | `VAULT_ID` | mainnet | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
-| `CLAIM_SIGNER` | mainnet | `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37` (the claim order's `valid-signer`: the key's address, or the Safe) |
+| `CLAIM_SIGNER` | mainnet | `0x46F873c3ed0Fd059e2052cA3ac5835Bf6E997EE3`, TestNet's coupon Safe (the claim order's `valid-signer`: the key's address, or the Safe) |
 | `CLAIM_INTERPRETER` | mainnet | `0x4c52eee7Fb6aeD0F1a30130d96d02409D9d886cf` (Rainlang 0.1.9, the same on every chain) |
 | `CLAIM_STORE` | mainnet | `0x1Aa775533E28B1D843e1A589034984E3a62005DC` (Rainlang 0.1.9, the same on every chain) |
 | `CLAIM_BYTECODE` | Yes | -- (the claim order's parsed expression, as hex; a V6 order carries its bytecode in place of an expression address) |

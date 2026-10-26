@@ -942,12 +942,12 @@ mod tests {
         }
     }
 
-    /// TestNet's values are the ones the same on every chain: the orderbook, the
-    /// interpreter, the store, the vault ID and the test signer. Its mock HOT,
-    /// vault and claim order are chain-specific and have no defaults, so a
-    /// base-sepolia run names those as mainnet does.
+    /// TestNet's values are the orderbook, the interpreter, the store and the
+    /// vault ID, the same on every chain, and its coupon Safe as the signer. Its
+    /// mock HOT, vault and claim order have no defaults, so a base-sepolia run
+    /// names those as mainnet does.
     #[test]
-    fn base_sepolia_takes_testnet_values_for_what_is_the_same_on_every_chain() {
+    fn base_sepolia_takes_testnet_values_but_its_vault_and_order() {
         let key = test_settings(&[("SIGNER_PRIVATE_KEY", TEST_SIGNER_KEY)]);
 
         assert_eq!(
@@ -966,7 +966,13 @@ mod tests {
             ("CLAIM_STORE", None),
         ]);
         let signer = CouponSigner::from_settings(Network::BaseSepolia, given).unwrap();
-        assert_eq!(signer.order(), &ClaimOrder::vector());
+        assert_eq!(
+            signer.order(),
+            &ClaimOrder {
+                signer: address!("46F873c3ed0Fd059e2052cA3ac5835Bf6E997EE3"),
+                ..ClaimOrder::vector()
+            }
+        );
     }
 
     #[test]
