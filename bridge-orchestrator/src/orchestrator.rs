@@ -9322,13 +9322,31 @@ pub(crate) mod tests {
         assert_eq!(selection.withdrawals_found, 2);
     }
 
+    /// Signer services sign a held back coupon again at a later expiry.
     #[tokio::test]
-    async fn the_coupons_budget_holds_back_withdrawals_past_the_first() {
-        let signer = CouponSigner::with_key(PrivateKeySigner::random());
-        let withdrawals = [parked_withdrawal_tx(0x61), parked_withdrawal_tx(0x62)];
+    async fn the_coupons_budget_holds_back_withdrawals_past_the_first_to_the_next_cycle() {
+        use crate::signer::safe::tests::{FakeSafe, SAFE};
+        use crate::signer::service::tests::{records_in, served_owner, WEEK};
+        use crate::signer::{context_digest, ClaimOrder, Owner, SafeOwners, SignedCoupon};
+
+        let vault = ClaimOrder::vector().order_owner;
+        let withdrawals = [0x61, 0x62, 0x63].map(|seed| {
+            let paid = json!({
+                "withdraw_contract_address": vault_key(vault),
+                "withdraw_to_address": format!("{:#x}", Address::repeat_byte(seed)),
+            });
+            with_payload(parked_withdrawal_tx(seed), paid)
+        });
+        let records = [0, 1].map(|i| test_db_path(&format!("budget-owner-{i}")));
+        let mut owners = Vec::new();
+        for (i, db) in records.iter().enumerate() {
+            owners.push(Owner::Service(served_owner(i, db, &withdrawals).await));
+        }
+        let rpc = FakeSafe::new(2, &[0, 1, 2]).serve().await;
+        let signer = CouponSigner::with_key(SafeOwners::new(SAFE, 1, owners, rpc).unwrap());
 
         let selection = select_bridging_links(
-            Some((&signer, VAULT)),
+            Some((&signer, vault)),
             &screening_off(&unscreened()),
             &bridging_agent(),
             &withdrawals,
@@ -9338,9 +9356,54 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
+        assert!(
+            selection.unsigned.is_empty(),
+            "{:#}",
+            selection.unsigned[0].1
+        );
         assert_eq!(ids(&selection.withdrawals), ids(&withdrawals[..1]));
         assert_eq!(selection.coupons.len(), 1);
-        assert_eq!(selection.withdrawals_found, 2);
+        assert_eq!(selection.withdrawals_found, 3);
+        for db in &records {
+            assert_eq!(
+                records_in(db),
+                2,
+                "the second is signed and held back, the third not asked"
+            );
+        }
+        let first_cycle_ended = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let next = select_bridging_links(
+            Some((&signer, vault)),
+            &screening_off(&unscreened()),
+            &bridging_agent(),
+            &withdrawals[1..],
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert!(next.unsigned.is_empty(), "{:#}", next.unsigned[0].1);
+        assert_eq!(ids(&next.withdrawals), ids(&withdrawals[1..2]));
+        let coupon = SignedCoupon::parse(
+            next.coupons[&withdrawals[1].id.to_string()]
+                .as_str()
+                .unwrap(),
+        );
+        assert!(U256::from_be_bytes(coupon.context[2].0) > U256::from(first_cycle_ended + WEEK));
+        let safe = signer.safe().unwrap();
+        assert!(safe
+            .accepts(&context_digest(&coupon.context), &coupon.signature)
+            .await
+            .unwrap());
+        for db in &records {
+            assert_eq!(records_in(db), withdrawals.len() as u64);
+        }
     }
 
     #[tokio::test]

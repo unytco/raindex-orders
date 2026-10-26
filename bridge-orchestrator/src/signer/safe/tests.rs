@@ -1,6 +1,6 @@
 use super::*;
 use crate::fake_rpc::{read_head_and_body, read_request, serve};
-use crate::signer::{context_digest, CouponSigner, Payout};
+use crate::signer::{context_digest, CouponSigner, Payout, SignedCoupon};
 use alloy::primitives::address;
 use alloy::signers::SignerSync;
 use alloy::sol_types::{Revert, SolCall, SolError};
@@ -319,11 +319,9 @@ async fn owner_keys_sign_the_safe_message_hash_in_ascending_owner_order() {
 
     let coupon = signer.coupon_at(terms, &withdrawal(), NOW).await.unwrap();
     let fields: Vec<&str> = coupon.split(',').collect();
-    let context: Vec<B256> = fields[2..]
-        .iter()
-        .map(|f| B256::from(f.parse::<U256>().unwrap()))
-        .collect();
-    let signature = hex::decode(&fields[1][2..]).unwrap();
+    let SignedCoupon {
+        context, signature, ..
+    } = SignedCoupon::parse(&coupon);
     let hash = safe_message_hash(1, SAFE, &context_digest(&context));
 
     assert_eq!(fields[0], format!("{SAFE:?}"));

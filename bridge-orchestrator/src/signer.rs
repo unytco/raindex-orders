@@ -534,6 +534,21 @@ fn serialize(coupon: &SignedCoupon) -> String {
     )
 }
 
+#[cfg(test)]
+impl SignedCoupon {
+    pub fn parse(coupon: &str) -> Self {
+        let fields: Vec<&str> = coupon.split(',').collect();
+        Self {
+            signer: fields[0].parse().unwrap(),
+            signature: hex::decode(&fields[1][2..]).unwrap(),
+            context: fields[2..]
+                .iter()
+                .map(|field| B256::from(field.parse::<U256>().unwrap()))
+                .collect(),
+        }
+    }
+}
+
 /// The amount word of a coupon: the decimal float Raindex V6 pays out, with the
 /// wei as its coefficient and -18 as its exponent, so 0xffffffee followed by the
 /// wei in the low 224 bits. Converting back loses nothing. A float's
@@ -799,13 +814,8 @@ mod tests {
         let coupon = coupon(&signer, &ActionHash::from_raw_32(vec![7; 32]), NOW).await;
 
         assert_eq!(coupon, GOLDEN_COUPON);
-        let fields: Vec<&str> = coupon.split(',').collect();
-        let words: Vec<B256> = fields[2..]
-            .iter()
-            .map(|field| B256::from(field.parse::<U256>().unwrap()))
-            .collect();
         assert_eq!(
-            context_digest(&words),
+            context_digest(&SignedCoupon::parse(&coupon).context),
             "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f"
                 .parse::<B256>()
                 .unwrap()
@@ -834,11 +844,7 @@ mod tests {
 
         let coupon = coupon(&signer, &withdrawal, NOW).await;
         let fields: Vec<&str> = coupon.split(',').collect();
-        let context: Vec<B256> = fields[2..]
-            .iter()
-            .map(|f| B256::from(f.parse::<U256>().unwrap()))
-            .collect();
-        let digest = context_digest(&context);
+        let digest = context_digest(&SignedCoupon::parse(&coupon).context);
 
         assert_eq!(fields[0], format!("{:?}", ContractSigner.address()));
         assert_eq!(

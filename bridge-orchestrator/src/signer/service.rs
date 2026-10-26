@@ -6,7 +6,7 @@ mod checks;
 mod config;
 mod records;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use super::safe::Refused;
 use crate::orchestrator::ham_config;

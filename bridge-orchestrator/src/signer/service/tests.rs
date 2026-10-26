@@ -26,16 +26,17 @@ use std::sync::Arc;
 
 const TOKEN: &str = "signer-test-token";
 const NOW: u64 = 1_750_000_000;
-const WEEK: u64 = 604_800;
+pub(crate) const WEEK: u64 = 604_800;
 const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
 const VAULT: &str = "0xe3e064e3c2eef66cb93da8d8114f5084e92f48d6";
 
-/// The signer's cell, which holds `standing` for `withdrawal()` alone and finds
-/// the bridging agreement of `bridging_agent()` at HOT unit 1. `None` is a call
-/// that fails.
+/// The signer's cell, which answers `standing` for `withdrawal()`, holds
+/// each of `parked` as parked, and finds the bridging agreement of
+/// `bridging_agent()` at HOT unit 1. `None` is a call that fails.
 struct FakeCell {
     up: bool,
     standing: Option<ParkedLinkStanding>,
+    parked: Vec<Transaction>,
     agreement: Option<ActionHashB64>,
 }
 
@@ -48,6 +49,7 @@ impl FakeCell {
         Self {
             up: true,
             standing,
+            parked: Vec::new(),
             agreement: Some(action_hash(BR_EA).into()),
         }
     }
@@ -65,7 +67,13 @@ impl Cell for FakeCell {
 
     fn standing<'a>(&'a self, link: &'a ActionHash) -> Reading<'a, ParkedLinkStanding> {
         let answer = match &self.standing {
-            Some(_) if *link != withdrawal() => Ok(ParkedLinkStanding::NotHeld),
+            Some(_) if *link != withdrawal() => Ok(self
+                .parked
+                .iter()
+                .find(|spend| spend.id.as_ref() == link)
+                .map_or(ParkedLinkStanding::NotHeld, |spend| {
+                    ParkedLinkStanding::Parked(Box::new(spend.clone()))
+                })),
             Some(standing) => Ok(standing.clone()),
             None => Err(anyhow!("the zome call failed")),
         };
@@ -536,7 +544,7 @@ async fn only_a_withdrawal_the_bridge_pays_is_signed_as_it_pays() {
     );
 }
 
-fn records_in(db: &str) -> u64 {
+pub(crate) fn records_in(db: &str) -> u64 {
     rusqlite::Connection::open(db)
         .unwrap()
         .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
@@ -622,14 +630,27 @@ async fn serve(service: Service) -> String {
     url
 }
 
+pub(crate) async fn served_owner(i: usize, db: &str, parked: &[Transaction]) -> OwnerService {
+    let cell = FakeCell {
+        parked: parked.to_vec(),
+        ..FakeCell::holding(spend())
+    };
+    let url = serve(service_at(
+        db,
+        cell,
+        &[("SAFE_OWNER_KEY", Some(OWNER_KEYS[i]))],
+    ))
+    .await;
+    OwnerService::new(Network::Mainnet, owner(i), &url)
+        .unwrap()
+        .with_token(Some(TOKEN.to_string()))
+}
+
 #[tokio::test]
 async fn the_orchestrator_gets_its_coupons_signed_here() {
     let chain = FakeSafe::new(2, &[0, 1, 2]);
     let rpc = chain.serve().await;
-    let url = serve(service(FakeCell::holding(spend()), &[])).await;
-    let here = OwnerService::new(Network::Mainnet, owner(0), &url)
-        .unwrap()
-        .with_token(Some(TOKEN.to_string()));
+    let here = served_owner(0, &test_db_path("signer"), &[]).await;
 
     let identity = here.identity().await.unwrap();
     assert_eq!(
