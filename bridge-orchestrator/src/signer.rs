@@ -942,12 +942,8 @@ mod tests {
         }
     }
 
-    /// TestNet's values are the orderbook, the interpreter, the store and the
-    /// vault ID, the same on every chain, and its coupon Safe as the signer. Its
-    /// mock HOT, vault and claim order have no defaults, so a base-sepolia run
-    /// names those as mainnet does.
     #[test]
-    fn base_sepolia_takes_testnet_values_but_its_vault_and_order() {
+    fn base_sepolia_takes_testnet_values_but_its_token_vault_and_order() {
         let key = test_settings(&[("SIGNER_PRIVATE_KEY", TEST_SIGNER_KEY)]);
 
         assert_eq!(

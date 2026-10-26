@@ -268,8 +268,7 @@ Import owner 1's and owner 2's keys into MetaMask (Add account, Import account,
 `sed -n 2p ~/mofn/owner1`). Decline a smart account. Give the executing owner gas:
 `cast send $(head -1 ~/mofn/owner2) --value 0.005ether --account deployer --rpc-url https://sepolia.base.org`.
 Open `https://app.safe.global/home?safe=basesep:<ADMIN_ADDRESS>`. You can look without connecting. Changing owners or threshold
-needs 2 of the 3 to sign. That is how Unyt's notary keys replace these test keys later,
-with no redeploy and no new claim order. Do not take the offer to update to Safe 1.5.0.
+needs 2 of the 3 to sign. Owners change this way, with no redeploy. Do not take the offer to update to Safe 1.5.0.
 
 DEPLOY.md step 8 has a worked admin call (`setMinLockAmount`) signed by two owners.
 

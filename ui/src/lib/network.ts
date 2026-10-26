@@ -138,9 +138,7 @@ const BASE_SEPOLIA_CLAIM_BYTECODE: Hex =
  * the same on every chain: Raindex V6 and the Rainlang interpreter and store. The
  * rest are TestNet's deploy on Base Sepolia (README.md, TestNet on Base Sepolia):
  * mock HOT, the lock vault, its ClaimInputToken, and the claim order and its signer.
- * A build that names a new deploy names all of it: the order hash check refuses a
- * vault or token given alone, and the build refuses a claim signer or order hash
- * without the other.
+ * A build that names a new deploy names all of it.
  * Mainnet has no defaults.
  */
 export const BASE_SEPOLIA_DEFAULTS: Partial<

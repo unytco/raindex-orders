@@ -96,7 +96,7 @@ describe('parseBridgeConfig', () => {
 		])
 	})
 
-	it('refuses a TestNet build that names part of a new deploy: the rest is the old one, and the order hash says so, or a claim signer and order hash not given together', () => {
+	it('refuses a TestNet build that names part of a new deploy', () => {
 		const hashFault = 'PUBLIC_CLAIM_ORDER_HASH is not the hash of the order'
 		const pairFault = 'PUBLIC_CLAIM_SIGNER and PUBLIC_CLAIM_ORDER_HASH name one claim order'
 		const neither = without(
