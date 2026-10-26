@@ -222,7 +222,7 @@ The first signs with the keys of owners 1 and 2, the second at the three service
 | Claim order hash (owner: the vault) | `0x98a13365e5b43eebe38053830636bb132cddd0b14cef82c9c6c8d79cf823623e` |
 | Claim order signer | the coupon Safe `0x46F873c3ed0Fd059e2052cA3ac5835Bf6E997EE3`, 2 of 3 |
 
-Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). `deploy-base-sepolia.sh all-safe` deployed these in one `HoloBridgeDeployer` transaction, at block 48367313 ([docs/m-of-n-test-run.md](./docs/m-of-n-test-run.md)), and `rotate-claim-signer.sh` replaced its claim order with this one, whose signer is the coupon Safe ([docs/enable-multisig.md](./docs/enable-multisig.md#move-the-coupon-signer-to-another-signer)). `broadcast/*/84532/run-latest.json` records the previous Base Sepolia TestNet, vault `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937`.
+Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). `deploy-base-sepolia.sh all-safe` deployed these, the Safe as 2 of 3, and the vault and its claim order in one `HoloBridgeDeployer` transaction at block 48367313 ([docs/m-of-n-test-run.md](./docs/m-of-n-test-run.md)), and `rotate-claim-signer.sh` replaced that claim order with this one, whose signer is the coupon Safe ([docs/enable-multisig.md](./docs/enable-multisig.md#move-the-coupon-signer-to-another-signer)). `broadcast/*/84532/run-latest.json` records the previous Base Sepolia TestNet, vault `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937`.
 
 The previous TestNet, on Ethereum Sepolia against OrderBookV3 (vault `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6`, orderbook `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe`), does not carry over: its vault, order and coupons are V3's.
 

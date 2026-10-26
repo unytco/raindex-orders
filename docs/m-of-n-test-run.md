@@ -2,14 +2,17 @@
 
 How to repeat the by-hand run of 2026-10-20: a second TestNet on the real Base Sepolia
 whose 2-of-3 Safe is both the vault admin and the coupon signer, three mock signer
-services, lock and claim on a local website. No Holochain, no Unyt. Nothing here
-touches Unyt's TestNet or the public website.
+services, lock and claim on a local website. No Holochain, no Unyt. A repeat
+touches neither Unyt's TestNet nor the public website.
 
 Steps 1-8 follow the guide "Try M-of-N on Base Sepolia by hand" in DEPLOY.md; this file
 adds what that guide does not have: recovery from RPC lag, the faucet, the failover
 test with `make-coupon`, and coupons with bad signatures, in the website and on chain.
 
 ## The deploy from 2026-10-20
+
+As deployed. It is Unyt's TestNet: [README.md](../README.md#testnet-on-base-sepolia) has its
+vault admin and claim order as they are.
 
 | | Address |
 |---|---|
@@ -264,7 +267,7 @@ branch from another worktree: check `git log --oneline -1` in the worktree that 
 Import owner 1's and owner 2's keys into MetaMask (Add account, Import account,
 `sed -n 2p ~/mofn/owner1`). Decline a smart account. Give the executing owner gas:
 `cast send $(head -1 ~/mofn/owner2) --value 0.005ether --account deployer --rpc-url https://sepolia.base.org`.
-Open the link at the top. You can look without connecting. Changing owners or threshold
+Open `https://app.safe.global/home?safe=basesep:<ADMIN_ADDRESS>`. You can look without connecting. Changing owners or threshold
 needs 2 of the 3 to sign. That is how Unyt's notary keys replace these test keys later,
 with no redeploy and no new claim order. Do not take the offer to update to Safe 1.5.0.
 
