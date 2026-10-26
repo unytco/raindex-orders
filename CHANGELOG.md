@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-26
+
 ### Added
 
 - `npm run make-coupon` signs for a Safe coupon signer: the Safe's threshold of owners sign, with keys from `--owner-keys-file` or `SAFE_OWNER_KEYS` (never the command line) or at signer services in `SAFE_OWNER_SERVICES`, each signature is checked to be its owner's, they are sorted as the Safe takes them, and the Safe's `isValidSignature` accepts them before it prints the claim link. It reads the website's env file or a deploy record (`.env` after `deploy-base-sepolia.sh all-safe`), and refuses mainnet as before. `test/base-sepolia-safe-rehearsal.sh` claims its 2-of-3 coupons on a fork. DEPLOY.md, "Try M-of-N on Base Sepolia by hand", walks through a second TestNet with a 2-of-3 Safe on Base Sepolia: owner keys, the deploy, three mock signer services, the orchestrator's startup checks with services down, a lock and a claim on the website on your machine, and the Safe in the Safe app.
