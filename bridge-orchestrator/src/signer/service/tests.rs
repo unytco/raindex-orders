@@ -644,6 +644,7 @@ pub(crate) async fn served_owner(i: usize, db: &str, parked: &[Transaction]) -> 
     OwnerService::new(Network::Mainnet, owner(i), &url)
         .unwrap()
         .with_token(Some(TOKEN.to_string()))
+        .unwrap()
 }
 
 #[tokio::test]

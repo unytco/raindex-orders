@@ -760,8 +760,14 @@ impl OwnerService {
         Ok(service)
     }
 
-    pub fn with_token(self, token: Option<String>) -> Self {
-        Self { token, ..self }
+    pub fn with_token(self, token: Option<String>) -> Result<Self> {
+        anyhow::ensure!(
+            token.is_none() || !self.is_plain_http_off_host(),
+            "SAFE_OWNER_SERVICE_TOKENS holds a token for {}, whose service is plain http at {}: a token takes https, or http on this machine",
+            self.owner,
+            self.host()
+        );
+        Ok(Self { token, ..self })
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -786,8 +792,6 @@ impl OwnerService {
             .unwrap_or_default()
     }
 
-    /// Whether the URL is plain http to another machine: a signature crosses it,
-    /// so mainnet takes https or this machine only.
     fn is_plain_http_off_host(&self) -> bool {
         reqwest::Url::parse(&self.url).is_ok_and(|url| {
             url.scheme() == "http"

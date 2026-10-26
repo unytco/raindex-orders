@@ -486,8 +486,10 @@ fn safe_owners_from(
                 continue;
             };
             let token = tokens.remove(&owner);
-            match OwnerService::new(network, owner, url.trim()) {
-                Ok(service) => owners.push(Owner::Service(service.with_token(token))),
+            match OwnerService::new(network, owner, url.trim())
+                .and_then(|service| service.with_token(token))
+            {
+                Ok(service) => owners.push(Owner::Service(service)),
                 Err(err) => faults.push(format!("{err:#}")),
             }
         }
@@ -1219,6 +1221,12 @@ mod tests {
         let tokens =
             |tokens: String| with_tokens(tokens, safe_settings_with(None, Some(&services)));
         let refused_tokens = |given: String| refusal(Network::Mainnet, tokens(given));
+        let plain_http = format!(
+            "{owner}=http://holo.example,{}=https://unyt.example",
+            owner_key(1).address()
+        );
+        let testnet_tokens =
+            |tokens: String| with_tokens(tokens, safe_settings_with(None, Some(&plain_http)));
         let stranger = owner_key(2).address();
         let not_an_entry =
             "SAFE_OWNER_SERVICE_TOKENS holds an entry that is not <owner address>=<token>";
@@ -1250,6 +1258,10 @@ mod tests {
                 refused_tokens(format!("{owner}=sécret")),
                 format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a character outside visible ASCII"),
             ),
+            (
+                refusal(Network::BaseSepolia, testnet_tokens(format!("{owner}=secret-1"))),
+                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner}, whose service is plain http at holo.example: a token takes https, or http on this machine"),
+            ),
             (refused_tokens(format!("{owner}=secret,1")), not_an_entry.to_string()),
             (refused_tokens("secret-1".to_string()), not_an_entry.to_string()),
             (refused_tokens("0x12=secret-1".to_string()), not_an_entry.to_string()),
@@ -1264,6 +1276,11 @@ mod tests {
                 "{owner}=secret-1 , {}=secret-2",
                 owner_key(1).address()
             ))
+        )
+        .is_ok());
+        assert!(CouponSigner::from_settings(
+            Network::BaseSepolia,
+            testnet_tokens(format!("{}=secret-2", owner_key(1).address()))
         )
         .is_ok());
     }

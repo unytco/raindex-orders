@@ -403,7 +403,8 @@ async fn a_signer_service_is_sent_the_coupon_and_answers_its_owners_signature() 
         Owner::Service(
             OwnerService::new(Network::Mainnet, owner(i), &at.url)
                 .unwrap()
-                .with_token(token.map(str::to_string)),
+                .with_token(token.map(str::to_string))
+                .unwrap(),
         )
     };
     let owners = safe_owners(
