@@ -74,7 +74,7 @@ The `deploy-base-sepolia.sh` script handles all deployment steps:
 
 ### 4. Run the orchestrator and the website against it
 
-The orchestrator and the website take what is the same on every chain from TestNet's defaults (RaindexV6, the Rainlang interpreter and store, the vault ID, the test signer) and need the rest from this deploy: the orchestrator `BASE_SEPOLIA_LOCK_VAULT_ADDRESS`, `TOKEN_ADDRESS`, `ORDER_HASH`, `ORDER_OWNER`, `CLAIM_BYTECODE` and `CLAIM_INPUT_TOKEN`, and the website `PUBLIC_LOCK_VAULT_ADDRESS`, `PUBLIC_TOKEN_ADDRESS`, `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_BYTECODE` and `PUBLIC_CLAIM_INPUT_TOKEN`. `rotate-claim-signer.sh record <block>` prints them all as a deploy record once the order is added, reading from `<block>` on (a block before the `order-via-vault` step); so does `cast` on the order's `AddOrderV3` event. `record` is written for a signer rotation and refuses while `ORDER_HASH`, the order a rotation replaces, is still on the orderbook. A first deploy has no previous order, so pass a zero hash, which overrides the one in `.env`:
+The orchestrator and the website take what is the same on every chain from TestNet's defaults (RaindexV6, the Rainlang interpreter and store, the vault ID, and for the orchestrator the test signer) and need the rest from this deploy: the orchestrator `BASE_SEPOLIA_LOCK_VAULT_ADDRESS`, `TOKEN_ADDRESS`, `ORDER_HASH`, `ORDER_OWNER`, `CLAIM_BYTECODE` and `CLAIM_INPUT_TOKEN`, and the website `PUBLIC_LOCK_VAULT_ADDRESS`, `PUBLIC_TOKEN_ADDRESS`, `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_SIGNER`, `PUBLIC_CLAIM_BYTECODE` and `PUBLIC_CLAIM_INPUT_TOKEN`. `rotate-claim-signer.sh record <block>` prints them all as a deploy record once the order is added, reading from `<block>` on (a block before the `order-via-vault` step); so does `cast` on the order's `AddOrderV3` event. `record` is written for a signer rotation and refuses while `ORDER_HASH`, the order a rotation replaces, is still on the orderbook. A first deploy has no previous order, so pass a zero hash, which overrides the one in `.env`:
 
 ```bash
 NETWORK=base-sepolia VALID_SIGNER=0x8E72b7568738da52ca3DCd9b24E178127A4E7d37 \
@@ -215,13 +215,14 @@ The first signs with the keys of owners 1 and 2, the second at the three service
 
 | Contract | Address on Base Sepolia |
 |----------|---------|
-| Mock HOT | `0x916A830d1603252152fE17258bb10A393F173a72` |
-| HoloLockVault | `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937` |
-| ClaimInputToken | `0xfd7F9439C8f57Bf68619BcFFe0790b2628fa5928` |
-| Claim order hash (owner: the vault) | `0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb` |
-| Claim order signer | the test signer |
+| Mock HOT | `0x48c47491e4B424896a9FB9F23ff8119B67DADff4` |
+| HoloLockVault | `0xEdDdBEF1b6dEb820888661829ecF70e9621328B4` |
+| Vault admin | the Safe `0x66338910D819897450c694d7944744E02b2dcfAb`, 2 of 5 |
+| ClaimInputToken | `0xcd93874448155B54FbA986bd0081836956623278` |
+| Claim order hash (owner: the vault) | `0x98a13365e5b43eebe38053830636bb132cddd0b14cef82c9c6c8d79cf823623e` |
+| Claim order signer | the coupon Safe `0x46F873c3ed0Fd059e2052cA3ac5835Bf6E997EE3`, 2 of 3 |
 
-Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). The test signer is `0x8E72b7568738da52ca3DCd9b24E178127A4E7d37`. `broadcast/*/84532/run-latest.json` records each transaction.
+Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). `deploy-base-sepolia.sh all-safe` deployed these in one `HoloBridgeDeployer` transaction, at block 48367313 ([docs/m-of-n-test-run.md](./docs/m-of-n-test-run.md)), and `rotate-claim-signer.sh` replaced its claim order with this one, whose signer is the coupon Safe ([docs/enable-multisig.md](./docs/enable-multisig.md#move-the-coupon-signer-to-another-signer)). `broadcast/*/84532/run-latest.json` records the previous Base Sepolia TestNet, vault `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937`.
 
 The previous TestNet, on Ethereum Sepolia against OrderBookV3 (vault `0xE3E064e3C2EEf66cb93dA8D8114F5084E92F48D6`, orderbook `0xfca89cD12Ba1346b1ac570ed988AB43b812733fe`), does not carry over: its vault, order and coupons are V3's.
 
@@ -273,7 +274,7 @@ The rehearsal runs the orchestrator binary, so build it first: `cargo build` in 
 
 ### Website
 
-One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui` for Base Sepolia, and `hot-bridge-ui-mainnet`, the wrangler env `mainnet`. Each Workers Builds project sets `PUBLIC_NETWORK` and the `PUBLIC_*` build variables the deploy record prints, and its RPC secret: `BASE_SEPOLIA_RPC_URL` and `FAUCET_PRIVATE_KEY`, or `ETH_RPC_URL`. `PUBLIC_NETWORK` defaults to `base-sepolia`, and a base-sepolia build takes TestNet's value, in `ui/src/lib/network.ts`, for what is the same on every chain (`PUBLIC_ORDERBOOK_ADDRESS`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE`, `PUBLIC_CLAIM_SIGNER`), and for TestNet's deploy on Base Sepolia (`PUBLIC_TOKEN_ADDRESS`, `PUBLIC_LOCK_VAULT_ADDRESS`, `PUBLIC_CLAIM_INPUT_TOKEN`, `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_BYTECODE`), and logs which. A build for a new TestNet deploy names all five: one given alone pairs with the old order's hash, which the order hash check refuses. A mainnet build takes none: it fails when a variable is missing or malformed. Either fails when the claim order the variables describe does not hash to `PUBLIC_CLAIM_ORDER_HASH`, and a mainnet build when the signer is the test signer. The MainNet Workers Builds project must set `PUBLIC_NETWORK=mainnet`. The build cannot check that `PUBLIC_CLAIM_SIGNER` is the order's signer, so take it from the deploy record. The mainnet website has no faucet.
+One SvelteKit build per network, each its own Cloudflare Worker: `hot-bridge-ui` for Base Sepolia, and `hot-bridge-ui-mainnet`, the wrangler env `mainnet`. Each Workers Builds project sets `PUBLIC_NETWORK` and the `PUBLIC_*` build variables the deploy record prints, and its RPC secret: `BASE_SEPOLIA_RPC_URL` and `FAUCET_PRIVATE_KEY`, or `ETH_RPC_URL`. `PUBLIC_NETWORK` defaults to `base-sepolia`, and a base-sepolia build takes TestNet's value, in `ui/src/lib/network.ts`, for what is the same on every chain (`PUBLIC_ORDERBOOK_ADDRESS`, `PUBLIC_CLAIM_INTERPRETER`, `PUBLIC_CLAIM_STORE`), and for TestNet's deploy on Base Sepolia (`PUBLIC_TOKEN_ADDRESS`, `PUBLIC_LOCK_VAULT_ADDRESS`, `PUBLIC_CLAIM_INPUT_TOKEN`, `PUBLIC_CLAIM_SIGNER`, `PUBLIC_CLAIM_ORDER_HASH`, `PUBLIC_CLAIM_BYTECODE`), and logs which. A build for a new TestNet deploy names all six: the order hash check refuses any of them given alone but `PUBLIC_CLAIM_SIGNER`. A mainnet build takes none: it fails when a variable is missing or malformed. Either fails when the claim order the variables describe does not hash to `PUBLIC_CLAIM_ORDER_HASH`, and a mainnet build when the signer is the test signer. The MainNet Workers Builds project must set `PUBLIC_NETWORK=mainnet`. The build cannot check that `PUBLIC_CLAIM_SIGNER` is the order's signer, so take it from the deploy record. The mainnet website has no faucet.
 
 The website waits for a sent transaction by polling every 2 seconds, Base's block time, for up to 5 minutes, as before: that is about 150 Base blocks, and 25 on mainnet.
 

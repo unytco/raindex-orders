@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { pad } from 'viem'
 import {
 	BASE_SEPOLIA_DEFAULTS,
 	BUILD_VARIABLES,
@@ -74,17 +75,20 @@ describe('parseBridgeConfig', () => {
 		).toBe('0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0b')
 	})
 
-	it('reads a build with nothing set as TestNet: its deploy on Base Sepolia, which the order hash check accepts', () => {
+	it('reads a build with nothing set as TestNet: its deploy on Base Sepolia, which the order hash check accepts, its order taking coupons from its Safe', () => {
 		const config = parseBridgeConfig({})
 
 		expect(config.network).toBe('base-sepolia')
-		expect(config.tokenAddress).toBe('0x916A830d1603252152fE17258bb10A393F173a72')
-		expect(config.lockVaultAddress).toBe('0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937')
+		expect(config.tokenAddress).toBe('0x48c47491e4B424896a9FB9F23ff8119B67DADff4')
+		expect(config.lockVaultAddress).toBe('0xEdDdBEF1b6dEb820888661829ecF70e9621328B4')
 		expect(config.claimOrder.orderHash).toBe(
-			'0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb'
+			'0x98a13365e5b43eebe38053830636bb132cddd0b14cef82c9c6c8d79cf823623e'
 		)
-		expect(config.claimOrder.inputToken).toBe('0xfd7F9439C8f57Bf68619BcFFe0790b2628fa5928')
-		expect(config.claimOrder.signer).toBe(TEST_SIGNER)
+		expect(config.claimOrder.inputToken).toBe('0xcd93874448155B54FbA986bd0081836956623278')
+		expect(config.claimOrder.signer).toBe('0x46F873c3ed0Fd059e2052cA3ac5835Bf6E997EE3')
+		expect(config.claimOrder.bytecode).toContain(
+			pad(config.claimOrder.signer).slice(2).toLowerCase()
+		)
 		expect(parseBridgeConfig({ PUBLIC_NETWORK: '', PUBLIC_CLAIM_STORE: '' })).toEqual(config)
 		expect(withTestnetDefaults({}).defaulted).toEqual([
 			'PUBLIC_NETWORK',

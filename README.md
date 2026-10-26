@@ -96,13 +96,14 @@ The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, a
 
 | Contract | Address on Base Sepolia |
 |----------|---------|
-| Mock HOT | `0x916A830d1603252152fE17258bb10A393F173a72` |
-| HoloLockVault | `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937` |
-| ClaimInputToken | `0xfd7F9439C8f57Bf68619BcFFe0790b2628fa5928` |
-| Claim order hash (owner: the vault) | `0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb` |
-| Claim order signer | the test signer |
+| Mock HOT | `0x48c47491e4B424896a9FB9F23ff8119B67DADff4` |
+| HoloLockVault | `0xEdDdBEF1b6dEb820888661829ecF70e9621328B4` |
+| Vault admin | the Safe `0x66338910D819897450c694d7944744E02b2dcfAb`, 2 of 5 |
+| ClaimInputToken | `0xcd93874448155B54FbA986bd0081836956623278` |
+| Claim order hash (owner: the vault) | `0x98a13365e5b43eebe38053830636bb132cddd0b14cef82c9c6c8d79cf823623e` |
+| Claim order signer | the coupon Safe `0x46F873c3ed0Fd059e2052cA3ac5835Bf6E997EE3`, 2 of 3 |
 
-`deploy-base-sepolia.sh` wrote these to `.env`, and `broadcast/*/84532/run-latest.json` records each transaction. A TestNet website build takes them from `ui/src/lib/network.ts` when it is not given them. For a `.env` for this deploy, copy `.env.base-sepolia.example`, which has them filled in. For the website, copy `ui/.env.base-sepolia.example` to `ui/.env.local` and set `FAUCET_PRIVATE_KEY`, the one value it needs that is not committed. The old Sepolia bridge ran on OrderBookV3 and does not carry over.
+`deploy-base-sepolia.sh all-safe` deployed these in one `HoloBridgeDeployer` transaction, at block 48367313 ([docs/m-of-n-test-run.md](./docs/m-of-n-test-run.md)), and `rotate-claim-signer.sh` replaced its claim order with this one, whose signer is the coupon Safe ([docs/enable-multisig.md](./docs/enable-multisig.md#move-the-coupon-signer-to-another-signer)). `broadcast/*/84532/run-latest.json` records the previous Base Sepolia TestNet, vault `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937`. A TestNet website build takes them from `ui/src/lib/network.ts` when it is not given them. For a `.env` for this deploy, copy `.env.base-sepolia.example`, which has them filled in. For the website, copy `ui/.env.base-sepolia.example` to `ui/.env.local` and set `FAUCET_PRIVATE_KEY`, the one value it needs that is not committed. The old Sepolia bridge ran on OrderBookV3 and does not carry over.
 
 ## Documentation
 

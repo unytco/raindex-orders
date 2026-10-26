@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - the claim expression (`src/holo-claim.rain`) marks a used nonce at the nonce alone, no longer at `hash(order-hash() nonce)`. Raindex keeps the store under the order's owner, the vault, so a nonce claimed on one claim order is used on every claim order the vault adds after a rotation: one burn pays once, on chain, whatever the signer becomes. The signer services' `already_signed` records and the threshold rule stand behind that. The website's coupon status reads a nonce at both keys, so a coupon redeemed on either expression of its order reads as redeemed. A TestNet deployed before this runs the old expression until its claim order is rotated (`rotate-claim-signer.sh`), which also changes its deploy record; the rotation carries none of the old order's used nonces over, as its key named the old order's hash (`docs/enable-multisig.md`).
+- the TestNet website runs on a new vault and mock HOT, and claims coupons that its 2 of 3 coupon Safe signs.
 
 ## [0.7.1] - 2026-10-18
 
