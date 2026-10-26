@@ -139,7 +139,8 @@ const BASE_SEPOLIA_CLAIM_BYTECODE: Hex =
  * rest are TestNet's deploy on Base Sepolia (README.md, TestNet on Base Sepolia):
  * mock HOT, the lock vault, its ClaimInputToken, and the claim order and its signer.
  * A build that names a new deploy names all of it: the order hash check refuses a
- * vault or token given alone, but not a signer left out.
+ * vault or token given alone, and the build refuses a claim signer or order hash
+ * without the other.
  * Mainnet has no defaults.
  */
 export const BASE_SEPOLIA_DEFAULTS: Partial<
@@ -177,13 +178,9 @@ export function withTestnetDefaults(env: BuildEnv): { env: BuildEnv; defaulted: 
 	return { env: filled, defaulted }
 }
 
-/**
- * The website's network values, or an error naming every build variable that is
- * missing or malformed, and the test signer on mainnet. A base-sepolia build takes
- * TestNet's value for any it is not given.
- */
+/** The website's network values, or an error naming every fault in its build variables. */
 export function parseBridgeConfig(given: BuildEnv): BridgeConfig {
-	const { env } = withTestnetDefaults(given)
+	const { env, defaulted } = withTestnetDefaults(given)
 	const faults: string[] = []
 	const network = env.PUBLIC_NETWORK
 	if (network !== 'base-sepolia' && network !== 'mainnet') {
@@ -215,6 +212,11 @@ export function parseBridgeConfig(given: BuildEnv): BridgeConfig {
 	if (network === 'mainnet' && signer && isAddressEqual(signer, TEST_SIGNER)) {
 		faults.push(
 			`PUBLIC_CLAIM_SIGNER is the test signer ${TEST_SIGNER}, whose key is public: mainnet refuses it`
+		)
+	}
+	if (defaulted.includes('PUBLIC_CLAIM_SIGNER') !== defaulted.includes('PUBLIC_CLAIM_ORDER_HASH')) {
+		faults.push(
+			"PUBLIC_CLAIM_SIGNER and PUBLIC_CLAIM_ORDER_HASH name one claim order: give both from one deploy record, or neither for TestNet's"
 		)
 	}
 

@@ -96,13 +96,23 @@ describe('parseBridgeConfig', () => {
 		])
 	})
 
-	it('refuses a TestNet build that names part of a new deploy: the rest is the old one, and the order hash says so', () => {
+	it('refuses a TestNet build that names part of a new deploy: the rest is the old one, and the order hash says so, or a claim signer and order hash not given together', () => {
 		const hashFault = 'PUBLIC_CLAIM_ORDER_HASH is not the hash of the order'
+		const pairFault = 'PUBLIC_CLAIM_SIGNER and PUBLIC_CLAIM_ORDER_HASH name one claim order'
+		const neither = without(
+			without(BASE_SEPOLIA_BUILD, 'PUBLIC_CLAIM_ORDER_HASH'),
+			'PUBLIC_CLAIM_SIGNER'
+		)
 		expect(() => parseBridgeConfig({ PUBLIC_LOCK_VAULT_ADDRESS: VECTOR_ORDER_VAULT })).toThrow(
 			hashFault
 		)
+		expect(() => parseBridgeConfig(neither)).toThrow(hashFault)
+		expect(() => parseBridgeConfig({ PUBLIC_CLAIM_SIGNER: TEST_SIGNER })).toThrow(pairFault)
 		expect(() => parseBridgeConfig(without(BASE_SEPOLIA_BUILD, 'PUBLIC_CLAIM_ORDER_HASH'))).toThrow(
-			hashFault
+			pairFault
+		)
+		expect(() => parseBridgeConfig(without(BASE_SEPOLIA_BUILD, 'PUBLIC_CLAIM_SIGNER'))).toThrow(
+			pairFault
 		)
 	})
 
