@@ -1,8 +1,9 @@
 use holo_hash::{AgentPubKey, AgentPubKeyB64};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// A mainnet node whose Ethereum RPC refuses every connection.
 fn node(dir: &Path) -> Vec<(&'static str, String)> {
@@ -34,14 +35,17 @@ fn listed() -> String {
 }
 
 fn durable_conductor(dir: &Path) -> (&'static str, String) {
-    let config = dir.join("conductor-config.yaml");
-    std::fs::write(
-        &config,
-        "keystore:\n  type: lair_server\n  connection_url: unix:///x/socket?k=abc\ndb_sync_level: Full\n",
-    )
-    .unwrap();
-    ("CONDUCTOR_CONFIG", config.display().to_string())
+    conductor(dir, &format!("{LAIR_CONDUCTOR}db_sync_level: Full\n"))
 }
+
+fn conductor(dir: &Path, config: &str) -> (&'static str, String) {
+    let path = dir.join("conductor-config.yaml");
+    std::fs::write(&path, config).unwrap();
+    ("CONDUCTOR_CONFIG", path.display().to_string())
+}
+
+const LAIR_CONDUCTOR: &str =
+    "keystore:\n  type: lair_server\n  connection_url: unix:///x/socket?k=abc\n";
 
 fn signer() -> Vec<(&'static str, String)> {
     [
@@ -87,14 +91,39 @@ fn db(dir: &Path) -> std::path::PathBuf {
     dir.join("bridge_orchestrator.db")
 }
 
-fn orchestrator(dir: &Path, env: &[(&str, String)], args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_bridge-orchestrator"))
+fn command(dir: &Path, env: &[(&str, String)], args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bridge-orchestrator"));
+    command
         .args(args)
         .current_dir(dir)
         .env_clear()
-        .envs(env.iter().map(|(key, value)| (key, value)))
-        .output()
+        .envs(env.iter().map(|(key, value)| (key, value)));
+    command
+}
+
+fn orchestrator(dir: &Path, env: &[(&str, String)], args: &[&str]) -> Output {
+    command(dir, env, args).output().unwrap()
+}
+
+fn spawned(dir: &Path, env: &[(&str, String)], args: &[&str]) -> Child {
+    command(dir, env, args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap()
+}
+
+fn exited(mut child: Child, still_running: &str) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("{still_running}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().unwrap()
 }
 
 #[test]
@@ -459,12 +488,6 @@ fn run_with_ethereum_off_checks_no_chain_takes_no_testnet_value_and_names_what_i
 #[test]
 fn run_refuses_a_conductor_a_power_loss_can_roll_back() {
     let dir = tempfile::tempdir().unwrap();
-    let conductor_config = dir.path().join("conductor-config.yaml");
-    std::fs::write(
-        &conductor_config,
-        "keystore:\n  type: lair_server\n  connection_url: unix:///x/socket?k=abc\n",
-    )
-    .unwrap();
     let passphrase = dir.path().join("lair-passphrase");
     std::fs::write(&passphrase, "deadbeef\n").unwrap();
     let agent: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1; 32]).into();
@@ -472,29 +495,14 @@ fn run_refuses_a_conductor_a_power_loss_can_roll_back() {
         ("NETWORK", "none".to_string()),
         ("HOLOCHAIN_BRIDGING_AGENT_PUBKEY", agent.to_string()),
         ("DB_PATH", db(dir.path()).display().to_string()),
-        ("CONDUCTOR_CONFIG", conductor_config.display().to_string()),
+        conductor(dir.path(), LAIR_CONDUCTOR),
         ("LAIR_PASSPHRASE_FILE", passphrase.display().to_string()),
     ];
 
-    let mut run = Command::new(env!("CARGO_BIN_EXE_bridge-orchestrator"))
-        .arg("run")
-        .current_dir(dir.path())
-        .env_clear()
-        .envs(env.iter().map(|(key, value)| (key, value)))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while run.try_wait().unwrap().is_none() {
-        if std::time::Instant::now() > deadline {
-            run.kill().unwrap();
-            run.wait().unwrap();
-            panic!("run went on with a conductor a power loss can roll back");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let output = run.wait_with_output().unwrap();
+    let output = exited(
+        spawned(dir.path(), &env, &["run"]),
+        "run went on with a conductor a power loss can roll back",
+    );
 
     let logged = format!(
         "{}{}",
@@ -611,4 +619,176 @@ fn screen_answers_from_the_configured_list_and_records_nothing() {
     let output = orchestrator(dir.path(), &off, &["screen", &listed()]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("SCREENING=off"));
+}
+
+/// The signer service of the worked example's owner (docs/signer-service.md),
+/// on mainnet at `port`. Its conductor config leaves `db_sync_level` unset,
+/// which only `run` refuses, and nothing listens on its ports.
+fn signer_service(dir: &Path, port: u16) -> Vec<(&'static str, String)> {
+    let passphrase = dir.join("lair-passphrase");
+    std::fs::write(&passphrase, "deadbeef\n").unwrap();
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed.local_addr().unwrap().port().to_string();
+    drop(closed);
+    let order = [
+        "ORDER_HASH",
+        "ORDER_OWNER",
+        "ORDERBOOK_ADDRESS",
+        "TOKEN_ADDRESS",
+        "VAULT_ID",
+    ];
+    let mut env: Vec<_> = signer()
+        .into_iter()
+        .filter(|(key, _)| order.contains(key))
+        .collect();
+    let agent: AgentPubKeyB64 = AgentPubKey::from_raw_32(vec![1; 32]).into();
+    env.extend([
+        ("NETWORK", "mainnet".to_string()),
+        (
+            "CLAIM_SIGNER",
+            "0x3838Fc4E0cba211c3D6D202539bB2dc2B72C7a22".to_string(),
+        ),
+        ("SAFE_OWNER_KEY", SIGNER_KEY.to_string()),
+        ("SIGNER_BEARER_TOKEN", "startup-token".to_string()),
+        ("SIGNER_BIND_PORT", port.to_string()),
+        ("SIGNER_DB_PATH", signer_db(dir).display().to_string()),
+        ("SCREENING", "on".to_string()),
+        ("SCREENING_DENYLIST", listed()),
+        ("HOLOCHAIN_BRIDGING_AGENT_PUBKEY", agent.to_string()),
+        ("HOLOCHAIN_ADMIN_PORT", closed_port.clone()),
+        ("HOLOCHAIN_APP_PORT", closed_port),
+        conductor(dir, LAIR_CONDUCTOR),
+        ("LAIR_PASSPHRASE_FILE", passphrase.display().to_string()),
+    ]);
+    env
+}
+
+const SIGNER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+fn signer_db(dir: &Path) -> std::path::PathBuf {
+    dir.join("signer.db")
+}
+
+#[test]
+fn signer_names_each_fault_of_its_own_settings_and_reads_none_of_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = with(
+        &signer_service(dir.path(), 0),
+        &[
+            ("CLAIM_SIGNER", ""),
+            ("SIGNER_BEARER_TOKEN", ""),
+            ("SIGNER_BIND_PORT", ""),
+            ("POLL_INTERVAL_MS", "often"),
+        ],
+    );
+
+    let output = orchestrator(dir.path(), &env, &["signer"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    for fault in [
+        "CLAIM_SIGNER is required",
+        "SIGNER_BEARER_TOKEN is required",
+        "SIGNER_BIND_PORT is required",
+    ] {
+        assert!(stderr.contains(fault), "{fault}: {stderr}");
+    }
+    assert!(!stderr.contains("POLL_INTERVAL_MS"), "{stderr}");
+    assert!(!signer_db(dir.path()).exists());
+}
+
+#[test]
+fn signer_refuses_a_conductor_without_lair_before_it_creates_its_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let without_lair = dir.path().join("without-lair.yaml");
+    std::fs::write(&without_lair, "keystore:\n  type: danger_test_keystore\n").unwrap();
+    let env = with(
+        &signer_service(dir.path(), 0),
+        &[("CONDUCTOR_CONFIG", &without_lair.display().to_string())],
+    );
+
+    let output = exited(
+        spawned(dir.path(), &env, &["signer"]),
+        "signer went on with a conductor without lair",
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("external lair_server"), "{stderr}");
+    assert!(!signer_db(dir.path()).exists());
+}
+
+fn ask(port: u16, request: &str) -> Option<(String, String)> {
+    let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .ok()?;
+    socket.write_all(request.as_bytes()).ok()?;
+    let mut answer = String::new();
+    socket.read_to_string(&mut answer).ok()?;
+    let (head, body) = answer.split_once("\r\n\r\n")?;
+    Some((head.lines().next()?.to_string(), body.to_string()))
+}
+
+#[test]
+fn signer_logs_the_port_it_bound_and_serves_there_while_its_conductor_is_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = signer_service(dir.path(), 0);
+
+    let mut service = spawned(dir.path(), &env, &["signer"]);
+    let stdout = service.stdout.take().unwrap();
+    let (send, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut logged = Vec::new();
+    let started = loop {
+        match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) if line.contains("signer.started") => break line,
+            Ok(line) => logged.push(line),
+            Err(_) => break String::new(),
+        }
+    };
+    let port = started
+        .split("at 127.0.0.1:")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(0);
+    let health = ask(
+        port,
+        "GET /healthz HTTP/1.1\r\nHost: signer\r\nConnection: close\r\n\r\n",
+    );
+    let identity = ask(
+        port,
+        "GET /signer HTTP/1.1\r\nHost: signer\r\nAuthorization: Bearer startup-token\r\nConnection: close\r\n\r\n",
+    );
+    service.kill().unwrap();
+    let output = service.wait_with_output().unwrap();
+    logged.push(started);
+    logged.extend(lines.iter());
+    let logged = logged.join("\n") + &String::from_utf8_lossy(&output.stderr);
+
+    assert_ne!(port, 0, "{logged}");
+    let (status, body) = health.expect("the signer does not serve at the port it logged");
+    assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+    assert_eq!(body, "");
+    let (status, body) = identity.unwrap();
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "owner": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+            "safe": "0x3838fc4e0cba211c3d6d202539bb2dc2b72c7a22",
+            "chainId": 1,
+        })
+    );
+    assert!(signer_db(dir.path()).exists());
+    assert!(!logged.contains("startup-token"), "{logged}");
+    assert!(!logged.contains(&SIGNER_KEY[2..]), "{logged}");
 }

@@ -96,13 +96,14 @@ The orchestrator watches Lock events on Ethereum, drives the Holochain bridge, a
 
 | Contract | Address on Base Sepolia |
 |----------|---------|
-| Mock HOT | `0x916A830d1603252152fE17258bb10A393F173a72` |
-| HoloLockVault | `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937` |
-| ClaimInputToken | `0xfd7F9439C8f57Bf68619BcFFe0790b2628fa5928` |
-| Claim order hash (owner: the vault) | `0x788f1663131e3010290f4f6995a5013a1ac557428b181f598c38d5e1be965ccb` |
-| Claim order signer | the test signer |
+| Mock HOT | `0x48c47491e4B424896a9FB9F23ff8119B67DADff4` |
+| HoloLockVault | `0xEdDdBEF1b6dEb820888661829ecF70e9621328B4` |
+| Vault admin | the Safe `0x66338910D819897450c694d7944744E02b2dcfAb`, 2 of 5 |
+| ClaimInputToken | `0xcd93874448155B54FbA986bd0081836956623278` |
+| Claim order hash (owner: the vault) | `0x98a13365e5b43eebe38053830636bb132cddd0b14cef82c9c6c8d79cf823623e` |
+| Claim order signer | the coupon Safe `0x46F873c3ed0Fd059e2052cA3ac5835Bf6E997EE3`, 2 of 3 |
 
-`deploy-base-sepolia.sh` wrote these to `.env`, and `broadcast/*/84532/run-latest.json` records each transaction. A TestNet website build takes them from `ui/src/lib/network.ts` when it is not given them. For a `.env` for this deploy, copy `.env.base-sepolia.example`, which has them filled in. For the website, copy `ui/.env.base-sepolia.example` to `ui/.env.local` and set `FAUCET_PRIVATE_KEY`, the one value it needs that is not committed. The old Sepolia bridge ran on OrderBookV3 and does not carry over.
+`deploy-base-sepolia.sh all-safe` deployed mock HOT, the vault admin Safe as 2 of 3, and, in one `HoloBridgeDeployer` transaction at block 48367313, the vault, its ClaimInputToken and its first claim order ([docs/m-of-n-test-run.md](./docs/m-of-n-test-run.md)). `rotate-claim-signer.sh` replaced that claim order with this one, whose signer is the coupon Safe ([docs/enable-multisig.md](./docs/enable-multisig.md#move-the-coupon-signer-to-another-signer)). `broadcast/*/84532/run-latest.json` records the previous Base Sepolia TestNet, vault `0xF9ca23d23E92C3D7BD08AfCED901Df2Ddb173937`. A TestNet website build takes them from `ui/src/lib/network.ts` when it is not given them. For a `.env` for this deploy, copy `.env.base-sepolia.example`, which has them filled in. For the website, copy `ui/.env.base-sepolia.example` to `ui/.env.local` and set `FAUCET_PRIVATE_KEY`, the one value it needs that is not committed. The old Sepolia bridge ran on OrderBookV3 and does not carry over.
 
 ## Documentation
 
@@ -153,7 +154,7 @@ nix develop -c test/fork-rehearsal.sh
 
 - Test signer key in repo is for testing only, and every mainnet input refuses it
 - The coupon signer is a key with no EIP-7702 delegation, or a Safe: Raindex V6 asks a delegated key's delegate for a coupon's signature, so the scripts and the orchestrator refuse one ([docs/enable-multisig.md](./docs/enable-multisig.md))
-- On mainnet the vault admin is a Safe multisig from the deploy's first transaction, and the coupon signer is a key or a Safe: [docs/enable-multisig.md](./docs/enable-multisig.md). Each key holder follows [docs/key-holder.md](./docs/key-holder.md). A Safe coupon signer whose owner keys one orchestrator holds is still one party; M-of-N needs the signer service of [docs/signer-service.md](./docs/signer-service.md), which is not built
+- On mainnet the vault admin is a Safe multisig from the deploy's first transaction, and the coupon signer is a key or a Safe: [docs/enable-multisig.md](./docs/enable-multisig.md). Each key holder follows [docs/key-holder.md](./docs/key-holder.md). A Safe coupon signer whose owner keys one orchestrator holds is still one party; M-of-N needs the signer service of [docs/signer-service.md](./docs/signer-service.md)
 - Each coupon has a unique nonce (prevents replay)
 - Coupons have expiry timestamps
 - Admin functions protected by access control

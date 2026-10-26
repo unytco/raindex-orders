@@ -1,5 +1,5 @@
 import { vi } from 'vitest'
-import { BASE_SEPOLIA_DEFAULTS, orderHashOf } from '$lib/network'
+import { BASE_SEPOLIA_DEFAULTS, orderHashOf, TEST_SIGNER } from '$lib/network'
 
 /**
  * The claim order of the test vectors (test/TestCouponSignature.t.sol): a two-byte
@@ -21,7 +21,8 @@ const VECTOR_ORDER = {
 export const BASE_SEPOLIA_BUILD: Record<string, string> = {
 	PUBLIC_NETWORK: 'base-sepolia',
 	...(BASE_SEPOLIA_DEFAULTS as Record<string, string>),
-	...VECTOR_ORDER
+	...VECTOR_ORDER,
+	PUBLIC_CLAIM_SIGNER: TEST_SIGNER
 }
 
 /** A MainNet Worker's build variables: the vector's order, accepting anvil's third account. */

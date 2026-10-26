@@ -1,9 +1,10 @@
 use crate::config::{checksum_matches, log_testnet_defaults, with_network_defaults, Network};
 use alloy::primitives::{address, keccak256, Address, Bytes, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::signers::Signer;
+use alloy::signers::{Signer, SignerSync};
 use anyhow::{Context, Result};
 use holo_hash::ActionHash;
+use std::collections::BTreeMap;
 use std::env;
 use std::future::Future;
 use std::num::NonZeroU64;
@@ -12,6 +13,7 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod safe;
+pub(crate) mod service;
 #[cfg(test)]
 pub use safe::safe_message_hash;
 pub use safe::{disjoint_quorums, safe_domain_separator, ISafe, Owner, OwnerService, SafeOwners};
@@ -49,6 +51,7 @@ pub(crate) fn env_variables() -> impl Iterator<Item = &'static str> {
         "SIGNER_PRIVATE_KEY",
         "SAFE_OWNER_KEYS",
         "SAFE_OWNER_SERVICES",
+        "SAFE_OWNER_SERVICE_TOKENS",
         ONE_PARTY_OVERRIDE,
         "EXPIRY_SECONDS",
     ])
@@ -97,7 +100,7 @@ pub struct SignRequest {
 pub type Signing<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 
 /// How long a signer, or a Safe owner's signer service, has to sign a coupon.
-pub const SIGN_TIMEOUT: Duration = Duration::from_secs(20);
+pub const SIGN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The claim order's `valid-signer`. Raindex checks its signature of the
 /// coupon's digest with OpenZeppelin's `SignatureChecker`: a key's 65-byte
@@ -119,15 +122,13 @@ impl CouponKey for PrivateKeySigner {
     }
 
     fn sign<'a>(&'a self, request: &'a SignRequest) -> Signing<'a> {
-        Box::pin(async move {
-            let signature = self.sign_hash(&request.digest).await?;
-            let mut bytes = Vec::with_capacity(65);
-            bytes.extend_from_slice(&signature.r().to_be_bytes::<32>());
-            bytes.extend_from_slice(&signature.s().to_be_bytes::<32>());
-            bytes.push(if signature.v() { 28 } else { 27 });
-            Ok(bytes)
-        })
+        Box::pin(std::future::ready(signature_of(self, &request.digest)))
     }
+}
+
+/// `key`'s 65-byte signature of `hash`: r, s, then v as 27 or 28.
+pub(crate) fn signature_of(key: &PrivateKeySigner, hash: &B256) -> Result<Vec<u8>> {
+    Ok(key.sign_hash_sync(hash)?.as_bytes().to_vec())
 }
 
 pub struct CouponSigner {
@@ -155,19 +156,9 @@ impl CouponSigner {
         let store = parsed(&setting, "CLAIM_STORE", "an address", &mut faults);
         let bytecode = parsed(&setting, "CLAIM_BYTECODE", "hex bytecode", &mut faults);
         let input_token = parsed(&setting, "CLAIM_INPUT_TOKEN", "an address", &mut faults);
-        let expiry_seconds = match setting("EXPIRY_SECONDS") {
-            None => Some(DEFAULT_EXPIRY_SECONDS),
-            Some(raw) => match raw.parse::<NonZeroU64>() {
-                Ok(seconds) if seconds.get() <= MAX_EXPIRY_SECONDS => Some(seconds),
-                _ => {
-                    faults.push(format!(
-                        "EXPIRY_SECONDS={raw} is not a number of seconds from 1 to {MAX_EXPIRY_SECONDS}"
-                    ));
-                    None
-                }
-            },
-        };
+        let expiry_seconds = expiry_seconds(&setting, &mut faults);
 
+        let mut tokens = service_tokens(setting("SAFE_OWNER_SERVICE_TOKENS"), &mut faults);
         let key: Option<Box<dyn CouponKey>> = match (
             setting("SIGNER_PRIVATE_KEY"),
             setting("SAFE_OWNER_KEYS"),
@@ -177,12 +168,16 @@ impl CouponSigner {
                 faults.push("SIGNER_PRIVATE_KEY is required, or SAFE_OWNER_KEYS or SAFE_OWNER_SERVICES, or both, when CLAIM_SIGNER is a Safe".to_string());
                 None
             }
-            (Some(_), Some(_), _) => {
+            (Some(_), Some(_), services) => {
                 faults.push("SIGNER_PRIVATE_KEY and SAFE_OWNER_KEYS are both set: a key signs with the first, a Safe with the second".to_string());
+                if services.is_some() {
+                    tokens.clear();
+                }
                 None
             }
             (Some(_), None, Some(_)) => {
                 faults.push("SIGNER_PRIVATE_KEY and SAFE_OWNER_SERVICES are both set: a key signs with the first, a Safe's owners with the second".to_string());
+                tokens.clear();
                 None
             }
             (Some(raw), None, None) => match raw.parse::<PrivateKeySigner>() {
@@ -204,12 +199,15 @@ impl CouponSigner {
                 signer.unwrap_or(Address::ZERO),
                 keys,
                 services,
-                setting(network.rpc_url_var()),
-                setting(ONE_PARTY_OVERRIDE),
+                &mut tokens,
+                &setting,
                 &mut faults,
             )
             .map(|owners| Box::new(owners) as Box<dyn CouponKey>),
         };
+        faults.extend(tokens.keys().map(|owner| {
+            format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner}, which SAFE_OWNER_SERVICES does not name")
+        }));
 
         let order = match (
             order_hash,
@@ -279,15 +277,14 @@ impl CouponSigner {
     }
 
     async fn coupon_at(&self, terms: Payout, withdrawal: &ActionHash, now: u64) -> Result<String> {
-        let coupon = self
-            .sign(
-                terms.recipient,
-                terms.wei,
-                U256::from(now) + U256::from(self.expiry_seconds.get()),
-                withdrawal_nonce(withdrawal),
-                Some(withdrawal.clone()),
-            )
-            .await?;
+        let context = coupon_context(
+            terms.recipient,
+            terms.wei,
+            U256::from(now) + U256::from(self.expiry_seconds.get()),
+            self.order.words(),
+            withdrawal_nonce(withdrawal),
+        )?;
+        let coupon = self.sign(context, Some(withdrawal.clone())).await?;
         Ok(serialize(&coupon))
     }
 
@@ -297,42 +294,19 @@ impl CouponSigner {
         self.key.new_cycle();
     }
 
-    /// A coupon for one wei to the signer itself, which expires at the latest
-    /// second a float of exponent 0 can hold, with a nonce no withdrawal has.
-    /// Simulated, it shows whether the claim order accepts the signer. A Safe's
-    /// owners sign it too, at their signer services, which know it by those
-    /// words and its missing withdrawal (docs/signer-service.md).
+    /// Simulated, the probe shows whether the claim order accepts the signer.
+    /// Its words are fixed by docs/signer-service.md: every signer service
+    /// checks them.
     pub async fn probe_coupon(&self) -> Result<SignedCoupon> {
-        self.sign(
-            self.key.address(),
-            U256::from(1),
-            MAX_EXPIRY,
-            probe_nonce(),
-            None,
-        )
-        .await
+        let context = probe_context(self.key.address(), self.order.words())?;
+        self.sign(context, None).await
     }
 
     async fn sign(
         &self,
-        recipient: Address,
-        amount: U256,
-        expiry: U256,
-        nonce: B256,
+        context: Vec<B256>,
         withdrawal: Option<ActionHash>,
     ) -> Result<SignedCoupon> {
-        let order = &self.order;
-        let context: Vec<B256> = vec![
-            pad_address(recipient),
-            amount_word(amount)?,
-            B256::from(expiry),
-            order.order_hash,
-            pad_address(order.order_owner),
-            pad_address(order.orderbook),
-            pad_address(order.token),
-            order.vault_id,
-            nonce,
-        ];
         let request = SignRequest {
             digest: context_digest(&context),
             context,
@@ -347,9 +321,110 @@ impl CouponSigner {
     }
 }
 
+fn expiry_seconds(
+    setting: &impl Fn(&str) -> Option<String>,
+    faults: &mut Vec<String>,
+) -> Option<NonZeroU64> {
+    match setting("EXPIRY_SECONDS") {
+        None => Some(DEFAULT_EXPIRY_SECONDS),
+        Some(raw) => match raw.parse::<NonZeroU64>() {
+            Ok(seconds) if seconds.get() <= MAX_EXPIRY_SECONDS => Some(seconds),
+            _ => {
+                faults.push(format!(
+                    "EXPIRY_SECONDS={raw} is not a number of seconds from 1 to {MAX_EXPIRY_SECONDS}"
+                ));
+                None
+            }
+        },
+    }
+}
+
 /// The startup probe's nonce, which no withdrawal's is.
 pub fn probe_nonce() -> B256 {
     keccak256(b"bridge-orchestrator startup probe")
+}
+
+fn coupon_context(
+    recipient: Address,
+    amount: U256,
+    expiry: U256,
+    order: [B256; 5],
+    nonce: B256,
+) -> Result<Vec<B256>> {
+    let mut context = vec![
+        pad_address(recipient),
+        amount_word(amount)?,
+        B256::from(expiry),
+    ];
+    context.extend(order);
+    context.push(nonce);
+    Ok(context)
+}
+
+fn probe_context(signer: Address, order: [B256; 5]) -> Result<Vec<B256>> {
+    coupon_context(signer, U256::from(1), MAX_EXPIRY, order, probe_nonce())
+}
+
+/// Words 3 to 7 of a coupon: its claim order.
+fn order_words(
+    order_hash: B256,
+    order_owner: Address,
+    orderbook: Address,
+    token: Address,
+    vault_id: B256,
+) -> [B256; 5] {
+    [
+        order_hash,
+        pad_address(order_owner),
+        pad_address(orderbook),
+        pad_address(token),
+        vault_id,
+    ]
+}
+
+impl ClaimOrder {
+    fn words(&self) -> [B256; 5] {
+        order_words(
+            self.order_hash,
+            self.order_owner,
+            self.orderbook,
+            self.token,
+            self.vault_id,
+        )
+    }
+}
+
+fn is_visible_ascii(token: &str) -> bool {
+    token.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+/// A fault never quotes the entry, which holds a token.
+fn service_tokens(raw: Option<String>, faults: &mut Vec<String>) -> BTreeMap<Address, String> {
+    let mut tokens = BTreeMap::new();
+    for entry in raw.iter().flat_map(|raw| raw.split(',')) {
+        let Some((owner, token)) = entry
+            .split_once('=')
+            .and_then(|(owner, token)| Some((owner.trim().parse::<Address>().ok()?, token.trim())))
+        else {
+            faults.push(
+                "SAFE_OWNER_SERVICE_TOKENS holds an entry that is not <owner address>=<token>"
+                    .to_string(),
+            );
+            continue;
+        };
+        if token.is_empty() {
+            faults.push(format!(
+                "SAFE_OWNER_SERVICE_TOKENS holds an empty token for {owner}"
+            ));
+        } else if !is_visible_ascii(token) {
+            faults.push(format!(
+                "SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a character outside visible ASCII"
+            ));
+        } else if tokens.insert(owner, token.to_string()).is_some() {
+            faults.push(format!("SAFE_OWNER_SERVICE_TOKENS names {owner} twice"));
+        }
+    }
+    tokens
 }
 
 /// The Safe CLAIM_SIGNER signing as the owners SAFE_OWNER_KEYS holds the keys
@@ -360,12 +435,12 @@ fn safe_owners_from(
     safe: Address,
     keys: Option<String>,
     services: Option<String>,
-    rpc_url: Option<String>,
-    one_party: Option<String>,
+    tokens: &mut BTreeMap<Address, String>,
+    setting: &impl Fn(&str) -> Option<String>,
     faults: &mut Vec<String>,
 ) -> Option<SafeOwners> {
     let before = faults.len();
-    let one_party_allowed = match one_party.as_deref() {
+    let one_party_allowed = match setting(ONE_PARTY_OVERRIDE).as_deref() {
         None | Some("") => false,
         Some("yes") => true,
         Some(other) => {
@@ -414,13 +489,16 @@ fn safe_owners_from(
                 ));
                 continue;
             };
-            match OwnerService::new(network, owner, url.trim()) {
+            let token = tokens.remove(&owner);
+            match OwnerService::new(network, owner, url.trim())
+                .and_then(|service| service.with_token(token))
+            {
                 Ok(service) => owners.push(Owner::Service(service)),
                 Err(err) => faults.push(format!("{err:#}")),
             }
         }
     }
-    let Some(rpc_url) = rpc_url else {
+    let Some(rpc_url) = setting(network.rpc_url_var()) else {
         faults.push(format!(
             "{} is required: the Safe CLAIM_SIGNER's owners and each coupon's signatures are checked on chain",
             network.rpc_url_var()
@@ -460,6 +538,21 @@ fn serialize(coupon: &SignedCoupon) -> String {
         hex::encode(&coupon.signature),
         context.join(",")
     )
+}
+
+#[cfg(test)]
+impl SignedCoupon {
+    pub fn parse(coupon: &str) -> Self {
+        let fields: Vec<&str> = coupon.split(',').collect();
+        Self {
+            signer: fields[0].parse().unwrap(),
+            signature: hex::decode(&fields[1][2..]).unwrap(),
+            context: fields[2..]
+                .iter()
+                .map(|field| B256::from(field.parse::<U256>().unwrap()))
+                .collect(),
+        }
+    }
 }
 
 /// The amount word of a coupon: the decimal float Raindex V6 pays out, with the
@@ -606,7 +699,8 @@ fn hot_in_wei(amount: &str) -> Option<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::test_settings;
+    use crate::config::{changed_settings, test_settings};
+    use crate::signer::safe::tests::{owner_service, FakeService};
     use holo_hash::ActionHashB64;
 
     const NOW: u64 = 1_750_000_000;
@@ -726,13 +820,8 @@ mod tests {
         let coupon = coupon(&signer, &ActionHash::from_raw_32(vec![7; 32]), NOW).await;
 
         assert_eq!(coupon, GOLDEN_COUPON);
-        let fields: Vec<&str> = coupon.split(',').collect();
-        let words: Vec<B256> = fields[2..]
-            .iter()
-            .map(|field| B256::from(field.parse::<U256>().unwrap()))
-            .collect();
         assert_eq!(
-            context_digest(&words),
+            context_digest(&SignedCoupon::parse(&coupon).context),
             "0xf32a9e86bb3d75c00acec45f208001679a5f2a7976c5ce3327b6de7cecb0781f"
                 .parse::<B256>()
                 .unwrap()
@@ -761,11 +850,7 @@ mod tests {
 
         let coupon = coupon(&signer, &withdrawal, NOW).await;
         let fields: Vec<&str> = coupon.split(',').collect();
-        let context: Vec<B256> = fields[2..]
-            .iter()
-            .map(|f| B256::from(f.parse::<U256>().unwrap()))
-            .collect();
-        let digest = context_digest(&context);
+        let digest = context_digest(&SignedCoupon::parse(&coupon).context);
 
         assert_eq!(fields[0], format!("{:?}", ContractSigner.address()));
         assert_eq!(
@@ -812,21 +897,11 @@ mod tests {
     ];
 
     fn settings_with(changes: &[(&'static str, Option<&str>)]) -> impl Fn(&str) -> Option<String> {
-        let mut set: Vec<(&'static str, String)> = VECTOR_SIGNER_SETTINGS
+        let set = VECTOR_SIGNER_SETTINGS
             .iter()
             .map(|(key, value)| (*key, value.to_string()))
             .collect();
-        for (key, value) in changes {
-            set.retain(|(set_key, _)| set_key != key);
-            if let Some(value) = value {
-                set.push((key, value.to_string()));
-            }
-        }
-        let set: Vec<(&str, &str)> = set
-            .iter()
-            .map(|(key, value)| (*key, value.as_str()))
-            .collect();
-        test_settings(&set)
+        changed_settings(set, changes)
     }
 
     fn refusal(network: Network, setting: impl Fn(&str) -> Option<String>) -> String {
@@ -871,12 +946,8 @@ mod tests {
         }
     }
 
-    /// TestNet's values are the ones the same on every chain: the orderbook, the
-    /// interpreter, the store, the vault ID and the test signer. Its mock HOT,
-    /// vault and claim order are chain-specific and have no defaults, so a
-    /// base-sepolia run names those as mainnet does.
     #[test]
-    fn base_sepolia_takes_testnet_values_for_what_is_the_same_on_every_chain() {
+    fn base_sepolia_takes_testnet_values_but_its_token_vault_and_order() {
         let key = test_settings(&[("SIGNER_PRIVATE_KEY", TEST_SIGNER_KEY)]);
 
         assert_eq!(
@@ -895,7 +966,13 @@ mod tests {
             ("CLAIM_STORE", None),
         ]);
         let signer = CouponSigner::from_settings(Network::BaseSepolia, given).unwrap();
-        assert_eq!(signer.order(), &ClaimOrder::vector());
+        assert_eq!(
+            signer.order(),
+            &ClaimOrder {
+                signer: address!("46F873c3ed0Fd059e2052cA3ac5835Bf6E997EE3"),
+                ..ClaimOrder::vector()
+            }
+        );
     }
 
     #[test]
@@ -1107,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn each_fault_in_the_safe_owner_services_is_named() {
+    fn each_fault_in_the_safe_owner_services_and_their_tokens_is_named() {
         let refused =
             |services: &str| refusal(Network::Mainnet, safe_settings_with(None, Some(services)));
         let owner = owner_key(0).address();
@@ -1127,7 +1204,10 @@ mod tests {
         assert_eq!(
             refusal(
                 Network::Mainnet,
-                settings_with(&[("SAFE_OWNER_SERVICES", Some(&format!("{owner}=https://holo.example")))])
+                with_tokens(
+                    format!("{owner}=secret-1"),
+                    settings_with(&[("SAFE_OWNER_SERVICES", Some(&format!("{owner}=https://holo.example")))])
+                )
             ),
             "SIGNER_PRIVATE_KEY and SAFE_OWNER_SERVICES are both set: a key signs with the first, a Safe's owners with the second"
         );
@@ -1139,6 +1219,118 @@ mod tests {
             refusal(Network::Mainnet, no_rpc),
             "ETH_RPC_URL is required: the Safe CLAIM_SIGNER's owners and each coupon's signatures are checked on chain"
         );
+
+        let services = format!(
+            "{owner}=https://holo.example,{}=https://unyt.example",
+            owner_key(1).address()
+        );
+        let tokens =
+            |tokens: String| with_tokens(tokens, safe_settings_with(None, Some(&services)));
+        let refused_tokens = |given: String| refusal(Network::Mainnet, tokens(given));
+        let plain_http = format!(
+            "{owner}=http://holo.example,{}=https://unyt.example",
+            owner_key(1).address()
+        );
+        let testnet_tokens =
+            |tokens: String| with_tokens(tokens, safe_settings_with(None, Some(&plain_http)));
+        let stranger = owner_key(2).address();
+        let not_an_entry =
+            "SAFE_OWNER_SERVICE_TOKENS holds an entry that is not <owner address>=<token>";
+        let refusals = [
+            (
+                refused_tokens(format!("{stranger}=secret-1")),
+                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {stranger}, which SAFE_OWNER_SERVICES does not name"),
+            ),
+            (
+                refusal(
+                    Network::Mainnet,
+                    with_tokens(format!("{owner}=secret-1"), mainnet_settings_with(&[])),
+                ),
+                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner}, which SAFE_OWNER_SERVICES does not name"),
+            ),
+            (
+                refused_tokens(format!("{owner}=secret-1, {owner}=secret-2")),
+                format!("SAFE_OWNER_SERVICE_TOKENS names {owner} twice"),
+            ),
+            (
+                refused_tokens(format!("{owner}= ")),
+                format!("SAFE_OWNER_SERVICE_TOKENS holds an empty token for {owner}"),
+            ),
+            (
+                refused_tokens(format!("{owner}=secret 1")),
+                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a character outside visible ASCII"),
+            ),
+            (
+                refused_tokens(format!("{owner}=sécret")),
+                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a character outside visible ASCII"),
+            ),
+            (
+                refusal(Network::BaseSepolia, testnet_tokens(format!("{owner}=secret-1"))),
+                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner}, whose service is plain http at holo.example: a token takes https, or http on this machine"),
+            ),
+            (refused_tokens(format!("{owner}=secret,1")), not_an_entry.to_string()),
+            (refused_tokens("secret-1".to_string()), not_an_entry.to_string()),
+            (refused_tokens("0x12=secret-1".to_string()), not_an_entry.to_string()),
+        ];
+        for (message, expected) in refusals {
+            assert_eq!(message, expected);
+            assert!(!message.contains("secret"), "{message}");
+        }
+        assert!(CouponSigner::from_settings(
+            Network::Mainnet,
+            tokens(format!(
+                "{owner}=secret-1 , {}=secret-2",
+                owner_key(1).address()
+            ))
+        )
+        .is_ok());
+        assert!(CouponSigner::from_settings(
+            Network::BaseSepolia,
+            testnet_tokens(format!("{}=secret-2", owner_key(1).address()))
+        )
+        .is_ok());
+    }
+
+    fn with_tokens(
+        tokens: String,
+        base: impl Fn(&str) -> Option<String>,
+    ) -> impl Fn(&str) -> Option<String> {
+        move |key| match key {
+            "SAFE_OWNER_SERVICE_TOKENS" => Some(tokens.clone()),
+            other => base(other),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_signer_service_is_sent_its_owners_token_alone() {
+        let (a, b) = (
+            owner_service(owner_key(0)).await,
+            owner_service(owner_key(1)).await,
+        );
+        let services = format!(
+            "{}={},{}={}",
+            owner_key(0).address(),
+            a.url,
+            owner_key(1).address(),
+            b.url
+        );
+        let settings = with_tokens(
+            format!("{}=secret-b", owner_key(1).address()),
+            safe_settings_with(None, Some(&services)),
+        );
+        let signer = CouponSigner::from_settings(Network::Mainnet, settings).unwrap();
+
+        for owner in signer.safe().unwrap().owners() {
+            let Owner::Service(service) = owner else {
+                unreachable!()
+            };
+            service.identity().await.unwrap();
+        }
+
+        let authorization =
+            |service: &FakeService| service.requests.lock().unwrap()[0].authorization.clone();
+        assert_eq!(authorization(&a), None);
+        assert_eq!(authorization(&b).as_deref(), Some("Bearer secret-b"));
     }
 
     #[test]
@@ -1182,11 +1374,21 @@ mod tests {
     #[test]
     fn a_key_and_safe_owner_keys_together_are_refused() {
         let both = settings_with(&[("SAFE_OWNER_KEYS", Some(OWNER_KEYS[0]))]);
-
-        assert_eq!(
-            refusal(Network::BaseSepolia, both),
-            "SIGNER_PRIVATE_KEY and SAFE_OWNER_KEYS are both set: a key signs with the first, a Safe with the second"
+        let owner = owner_key(1).address();
+        let all = with_tokens(
+            format!("{owner}=secret-1"),
+            settings_with(&[
+                ("SAFE_OWNER_KEYS", Some(OWNER_KEYS[0])),
+                (
+                    "SAFE_OWNER_SERVICES",
+                    Some(&format!("{owner}=https://holo.example")),
+                ),
+            ]),
         );
+
+        let refused = "SIGNER_PRIVATE_KEY and SAFE_OWNER_KEYS are both set: a key signs with the first, a Safe with the second";
+        assert_eq!(refusal(Network::BaseSepolia, both), refused);
+        assert_eq!(refusal(Network::BaseSepolia, all), refused);
     }
 
     #[test]

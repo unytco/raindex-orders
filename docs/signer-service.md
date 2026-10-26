@@ -2,7 +2,7 @@
 
 This is the contract for the signer services Unyt builds. One Safe is the bridge's vault admin and its coupon signer ([enable-multisig.md](./enable-multisig.md)). The Safe has N owners and a threshold M. Each owner is a signer service run by a separate party, holding that owner's key. A HOT claim on Ethereum pays only with a coupon that M owners signed.
 
-The orchestrator's side is built and tested (`bridge-orchestrator/src/signer/safe.rs`). The rehearsal runs it against mock services (`ui/scripts/mock-signer-service.mjs`) that speak this API but check nothing on Holochain. The real services are not built.
+The orchestrator's side is built and tested (`bridge-orchestrator/src/signer/safe.rs`). The rehearsal runs it against mock services (`ui/scripts/mock-signer-service.mjs`) that speak this API but take no token and check nothing on Holochain. The service itself is `bridge-orchestrator signer` ([its configuration](../bridge-orchestrator/README.md#signer-service-signer-only)).
 
 ## Why each service checks for itself
 
@@ -13,6 +13,8 @@ A coupon pays HOT out of the vault to the address it names, for the amount it na
 ## Endpoints
 
 Each service has a base URL. The orchestrator names it in `SAFE_OWNER_SERVICES` as `<owner address>=<base URL>`, separated by commas. On mainnet the URL must be https, or http to the same machine.
+
+Each service has its own token. The orchestrator takes it from `SAFE_OWNER_SERVICE_TOKENS` as `<owner address>=<token>`, separated by commas, and sends it to that service alone, on both endpoints, as `Authorization: Bearer <token>`. A service answers a request without its token with 401.
 
 ### `GET <base URL>/signer`
 
@@ -69,6 +71,7 @@ A refusal is HTTP 409 with a `code` from this list and a `reason` for people. Th
 | `not_a_withdrawal` | the spend is not a bridge withdrawal (role, lane or unit, below), is no longer parked, or its HOT amount is not one a coupon can carry ([the amount](#the-amount)) |
 | `amount_mismatch` | word 1 is not the word the service makes of the spend's amount |
 | `recipient_mismatch` | word 0 is not the spend's withdraw-to address |
+| `recipient_listed` | the service screens the spend's withdraw-to address, and its denylist names it |
 | `expiry_out_of_range` | word 2 is outside the window in [the expiry](#the-expiry) |
 | `nonce_mismatch` | word 8 is not keccak256 of the withdrawal's 39 bytes |
 | `order_mismatch` | words 3 to 7 are not the service's own copy of the deploy record |
@@ -256,14 +259,13 @@ The orchestrator simulates a claim with M owner signatures of the probe, which m
 ## What the orchestrator does
 
 - **At startup**, it reads the Safe's threshold M and its N owners, and refuses to start if M is half of N or fewer ([one order per withdrawal](#one-order-per-withdrawal)). It asks every owner's service `GET /signer` at once, each within 5 seconds, and refuses to start if a service answers for another owner, Safe or chain, or if an owner it names is not an owner of the Safe. A service that does not answer is logged and left out of the probe. The first cycle asks it again. Startup passes while the owners that can sign are at least M. Then it runs the probe, which ends once M owners have signed it.
-- **For each withdrawal**, it reads the Safe's threshold M and its owners from the chain (an RPC read has 30 seconds, as every read of the chain does; past that the withdrawal stays parked for the cycle), refuses a threshold of half the owners or fewer before it asks any owner, then asks every owner's service at once. Each has 20 seconds. A service that does not answer in time is not asked again for the rest of that cycle while the other owners are at least M, so it costs one timeout a cycle rather than one for each withdrawal; the next cycle asks it again. It checks every answer: 65 bytes, a signature by that owner over the coupon's SafeMessage hash, and the owner still one of the Safe's. It takes the M lowest owner addresses among those that signed, sorts them, joins them, and asks the Safe's own `isValidSignature`, on chain, whether it accepts them. Only then does the coupon go out.
+- **For each withdrawal**, it reads the Safe's threshold M and its owners from the chain (an RPC read has 30 seconds, as every read of the chain does; past that the withdrawal stays parked for the cycle), refuses a threshold of half the owners or fewer before it asks any owner, then asks every owner's service at once. Each has 60 seconds. A service that does not answer in time is not asked again for the rest of that cycle while the other owners are at least M, so it costs one timeout a cycle rather than one for each withdrawal; the next cycle asks it again. It checks every answer: 65 bytes, a signature by that owner over the coupon's SafeMessage hash, and the owner still one of the Safe's. It takes the M lowest owner addresses among those that signed, sorts them, joins them, and asks the Safe's own `isValidSignature`, on chain, whether it accepts them. Only then does the coupon go out.
 - **With fewer than M signatures**, or a Safe that does not accept them, the withdrawal stays parked. It is logged once, with each owner's reason, and asked again on the next cycle, every `BRIDGE_CYCLE_INTERVAL_MS` (3 minutes by default). There is no retry within a cycle.
 - **The same withdrawal can be asked more than once while it is parked**: after a cycle where fewer than M signed, or where the RAVE that delivers its coupon failed. A service signs it again for the same order hash if the checks pass. For another order hash it refuses with `already_signed` until an operator clears it ([one order per withdrawal](#one-order-per-withdrawal)).
-- **Logs** name a service by its host and port, never its URL path, which may hold a credential.
+- **Logs** name a service by its host and port, never its URL path, which may hold a credential, and never its token.
 
 ## Open questions
 
-- **Authentication** between the orchestrator and the services. Options: mutual TLS, a bearer token in a header (the orchestrator sends none today; it supports only a token in the URL path, which it never logs), or a private network such as WireGuard. A service should not be on the open internet without one of these.
 - **Key custody** in each service: an HSM, a cloud KMS, or a Ledger. The service signs a 32-byte hash (or the typed data above), so any of them works.
 - **Who the owners are.** N about 3 at launch, maybe 5 later; M to be agreed, more than half of N ([one order per withdrawal](#one-order-per-withdrawal)): 2 of 3, then 3 of 5. Owners change through an ordinary Safe owner change, which the owners sign in the Safe app. The claim order does not change. A coupon whose signatures came from a removed owner must be signed again.
 - **The values of `EXPIRY_SECONDS` and `EXPIRY_TOLERANCE_SECONDS`**, if not the defaults in [the expiry](#the-expiry), and **a cap per coupon or per day**, as a limit on what M compromised owners could take at once.

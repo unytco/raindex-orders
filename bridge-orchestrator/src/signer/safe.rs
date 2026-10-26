@@ -5,7 +5,7 @@
 
 use super::{SignRequest, Signing, SIGN_TIMEOUT};
 use crate::config::Network;
-use crate::preflight::RPC_TIMEOUT;
+use crate::preflight::{rpc_failure, RPC_TIMEOUT};
 use alloy::primitives::{keccak256, Address, Bytes, PrimitiveSignature, B256, U256};
 use alloy::providers::{ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
@@ -13,11 +13,11 @@ use alloy::signers::Signer;
 use alloy::sol;
 use alloy::sol_types::SolValue;
 use alloy::transports::http::{Client, Http};
+use alloy::transports::RpcError;
 use anyhow::{anyhow, bail, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use holo_hash::ActionHashB64;
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -127,14 +127,7 @@ impl Owner {
 
     async fn sign(&self, request: &OwnerRequest<'_>) -> Result<Vec<u8>> {
         match self {
-            Owner::Key(key) => {
-                let signature = key.sign_hash(&request.safe_message_hash).await?;
-                let mut bytes = Vec::with_capacity(65);
-                bytes.extend_from_slice(&signature.r().to_be_bytes::<32>());
-                bytes.extend_from_slice(&signature.s().to_be_bytes::<32>());
-                bytes.push(if signature.v() { 28 } else { 27 });
-                Ok(bytes)
-            }
+            Owner::Key(key) => super::signature_of(key, &request.safe_message_hash),
             Owner::Service(service) => service.request_signature(request).await,
         }
     }
@@ -424,9 +417,18 @@ impl SafeOwners {
             .await?;
         match answer {
             Ok(answer) => Ok(answer._0.0 == EIP1271_MAGIC_VALUE),
-            Err(alloy::contract::Error::TransportError(
-                alloy::transports::RpcError::ErrorResp(_),
-            )) => Ok(false),
+            Err(alloy::contract::Error::TransportError(RpcError::ErrorResp(payload)))
+                if payload.as_revert_data().is_some() =>
+            {
+                Ok(false)
+            }
+            Err(alloy::contract::Error::TransportError(err @ RpcError::ErrorResp(_))) => {
+                Err(rpc_failure(
+                    &format!("CLAIM_SIGNER {}", self.safe),
+                    "isValidSignature(...)",
+                    &err,
+                ))
+            }
             Err(_) => Err(anyhow!(
                 "CLAIM_SIGNER {}: isValidSignature(...) could not be asked",
                 self.safe
@@ -679,18 +681,35 @@ fn checked(
 pub struct OwnerService {
     owner: Address,
     url: String,
+    token: Option<String>,
     client: reqwest::Client,
 }
 
+/// What a signer service is sent on `POST /sign`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SignBody {
+    pub safe: Address,
+    pub chain_id: u64,
+    pub owner: Address,
+    /// Null for the startup probe, never missing: `deserialize_with` stops serde
+    /// reading a missing field as `None`.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub withdrawal: Option<String>,
+    pub context: Vec<B256>,
+    pub coupon_digest: B256,
+    pub safe_message_hash: B256,
+}
+
 /// A signer service's answer to `POST /sign`.
-#[derive(Deserialize)]
-struct Signed {
-    owner: Address,
-    signature: Bytes,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Signed {
+    pub owner: Address,
+    pub signature: Bytes,
 }
 
 /// A signer service's answer to `GET /signer`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Identity {
     pub owner: Address,
     pub safe: Address,
@@ -698,12 +717,12 @@ pub struct Identity {
     pub chain_id: u64,
 }
 
-/// A signer service's refusal, `409 { "code": "...", "reason": "..." }`.
-#[derive(Deserialize)]
-struct Refused {
-    code: String,
+/// A signer service's refusal of `GET /signer` or `POST /sign`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Refused {
+    pub code: String,
     #[serde(default)]
-    reason: String,
+    pub reason: String,
 }
 
 impl OwnerService {
@@ -730,6 +749,7 @@ impl OwnerService {
         let service = Self {
             owner,
             url: url.trim_end_matches('/').to_string(),
+            token: None,
             client,
         };
         anyhow::ensure!(
@@ -738,6 +758,24 @@ impl OwnerService {
             service.host()
         );
         Ok(service)
+    }
+
+    pub fn with_token(self, token: Option<String>) -> Result<Self> {
+        anyhow::ensure!(
+            token.is_none() || !self.is_plain_http_off_host(),
+            "SAFE_OWNER_SERVICE_TOKENS holds a token for {}, whose service is plain http at {}: a token takes https, or http on this machine",
+            self.owner,
+            self.host()
+        );
+        Ok(Self { token, ..self })
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let request = self.client.request(method, format!("{}/{path}", self.url));
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     /// Where the service is, for logs: its host and port, never its path, which
@@ -754,8 +792,6 @@ impl OwnerService {
             .unwrap_or_default()
     }
 
-    /// Whether the URL is plain http to another machine: a signature crosses it,
-    /// so mainnet takes https or this machine only.
     fn is_plain_http_off_host(&self) -> bool {
         reqwest::Url::parse(&self.url).is_ok_and(|url| {
             url.scheme() == "http"
@@ -781,8 +817,7 @@ impl OwnerService {
 
     async fn ask_identity(&self) -> Result<Identity> {
         let answer = self
-            .client
-            .get(format!("{}/signer", self.url))
+            .request(reqwest::Method::GET, "signer")
             .send()
             .await
             .map_err(|err| self.unreachable(&err))?;
@@ -812,22 +847,21 @@ impl OwnerService {
     }
 
     async fn request_signature(&self, request: &OwnerRequest<'_>) -> Result<Vec<u8>> {
-        let body = json!({
-            "safe": request.safe,
-            "chainId": request.chain_id,
-            "owner": self.owner,
-            "withdrawal": request
+        let body = SignBody {
+            safe: request.safe,
+            chain_id: request.chain_id,
+            owner: self.owner,
+            withdrawal: request
                 .sign
                 .withdrawal
                 .as_ref()
                 .map(|w| ActionHashB64::from(w.clone()).to_string()),
-            "context": request.sign.context.iter().map(|word| word.to_string()).collect::<Vec<_>>(),
-            "couponDigest": request.sign.digest,
-            "safeMessageHash": request.safe_message_hash,
-        });
+            context: request.sign.context.clone(),
+            coupon_digest: request.sign.digest,
+            safe_message_hash: request.safe_message_hash,
+        };
         let answer = self
-            .client
-            .post(format!("{}/sign", self.url))
+            .request(reqwest::Method::POST, "sign")
             .json(&body)
             .send()
             .await
