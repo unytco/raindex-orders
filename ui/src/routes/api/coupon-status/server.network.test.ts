@@ -96,10 +96,8 @@ function chain(build: Build, chainId: bigint, flags = new Map<bigint, bigint>())
 	})
 }
 
-const nonceKey = (build: Build, nonce: bigint) =>
-	BigInt(
-		keccak256(encodePacked(['uint256', 'uint256'], [BigInt(build.PUBLIC_CLAIM_ORDER_HASH), nonce]))
-	)
+// The claim order marks a nonce used at the nonce itself, under the owner's namespace.
+const nonceKey = (nonce: bigint) => nonce
 
 type Post = (typeof import('./+server'))['POST']
 
@@ -140,7 +138,7 @@ afterEach(() => {
 describe('a mainnet build', () => {
 	it('reads Ethereum through ETH_RPC_URL and reports chain 1', async () => {
 		env.ETH_RPC_URL = 'https://eth.rpc.test/key'
-		const rpc = chain(MAINNET_BUILD, 1n, new Map([[nonceKey(MAINNET_BUILD, 1n), 1n]]))
+		const rpc = chain(MAINNET_BUILD, 1n, new Map([[nonceKey(1n), 1n]]))
 
 		const { response, body } = await post(MAINNET_BUILD, [
 			await keySigned(MAINNET_BUILD, KEY_SIGNER, 1n),
@@ -156,7 +154,7 @@ describe('a mainnet build', () => {
 
 	it('refuses the read, and caches nothing, when the RPC answers for Base Sepolia', async () => {
 		env.ETH_RPC_URL = 'https://eth.rpc.test/key'
-		chain(MAINNET_BUILD, 84532n, new Map([[nonceKey(MAINNET_BUILD, 1n), 1n]]))
+		chain(MAINNET_BUILD, 84532n, new Map([[nonceKey(1n), 1n]]))
 
 		const { response } = await post(MAINNET_BUILD, [await keySigned(MAINNET_BUILD, KEY_SIGNER, 1n)])
 
@@ -203,7 +201,7 @@ describe('a Safe as the claim signer', () => {
 	})
 
 	it('is asked, in the one eth_call, whether it signed the digest the orderbook checks', async () => {
-		const rpc = chain(SAFE_BUILD, 1n, new Map([[nonceKey(SAFE_BUILD, 1n), 1n]]))
+		const rpc = chain(SAFE_BUILD, 1n, new Map([[nonceKey(1n), 1n]]))
 		const signed = await safeSigned(1n)
 
 		const { body } = await post(SAFE_BUILD, [signed, await safeSigned(2n)])
@@ -230,7 +228,7 @@ describe('a Safe as the claim signer', () => {
 	})
 
 	it('answers a redeemed coupon it accepted from the cache, with no RPC call', async () => {
-		const rpc = chain(SAFE_BUILD, 1n, new Map([[nonceKey(SAFE_BUILD, 1n), 1n]]))
+		const rpc = chain(SAFE_BUILD, 1n, new Map([[nonceKey(1n), 1n]]))
 		const signed = await safeSigned(1n)
 		await post(SAFE_BUILD, [signed])
 

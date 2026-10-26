@@ -34,9 +34,12 @@ using-words-from orderbook-subparser
 :ensure(binary-equal-to(signed-context<0 6>() output-token()) "Wrong output token"),
 :ensure(binary-equal-to(signed-context<0 7>() output-vault-id()) "Wrong output vault id"),
 
-/* check the nonce has not been used before */
-:ensure(is-zero(get(hash(order-hash() signed-context<0 8>()))) "Nonce already used"),
-:set(hash(order-hash() signed-context<0 8>()) 1),
+/* check the nonce has not been used before. The key is the nonce alone: Raindex
+   keeps the store under the order's owner, the vault, not under the order, so
+   a nonce claimed on one claim order stays used on every claim order the vault
+   adds after a rotation. One burn pays once, whatever the signer becomes. */
+:ensure(is-zero(get(signed-context<0 8>())) "Nonce already used"),
+:set(signed-context<0 8>() 1),
 
 output-amount: signed-context<0 1>(),
 /* Raindex V6 takes an order only at a positive ratio: the claimer pays 1e-30

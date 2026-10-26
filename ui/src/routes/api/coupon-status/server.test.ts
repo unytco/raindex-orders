@@ -14,9 +14,11 @@ import { OPTIONS, POST } from './+server'
 
 // The TestNet build's claim order: the Rainlang store, the namespace Raindex evaluates
 // the order under (keccak256 of the order owner and Raindex, as LibNamespace qualifies
-// it), and the store key the order marks a nonce at (hash(order-hash() nonce)).
+// it), and the store key the order marks a nonce at: the nonce itself, under the owner's
+// namespace, so a nonce stays used across claim order rotations. An order deployed
+// before that change marked it at hash(order hash, nonce), the legacy key, which is
+// read as well.
 const STORE = '0x1aa775533e28b1d843e1a589034984e3a62005dc'
-const ORDER_HASH = 0xaa24ef105ecbfc39695b240de6baeb09278fd4ebf75674b29bcbd2c7ef72ff0bn
 const CLAIM_NAMESPACE = BigInt(
 	keccak256(
 		encodeAbiParameters(
@@ -25,13 +27,16 @@ const CLAIM_NAMESPACE = BigInt(
 		)
 	)
 )
-const storeKey = (nonce: bigint) =>
+const storeKey = (nonce: bigint) => nonce
+const ORDER_HASH = 76958440712206607560379240569074999120371888444883451443154037264025912540939n
+const legacyKey = (nonce: bigint) =>
 	BigInt(keccak256(encodePacked(['uint256', 'uint256'], [ORDER_HASH, nonce])))
 const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n
 
 const [A, B, C] = TESTNET_COUPONS
 const KEY_A = storeKey(1775867941n)
 const KEY_B = storeKey(1775867943n)
+const LEGACY_KEY_A = legacyKey(1775867941n)
 const EXPIRY_A = 1_776_472_741
 const EXPIRY_B = 1_776_472_743
 const EXPIRY_C = 1_776_472_922
@@ -209,7 +214,8 @@ describe('POST /api/coupon-status', () => {
 		expect(body.results).toHaveLength(20)
 		expect(body.results.every((r: { status: string }) => r.status === 'unredeemed')).toBe(true)
 		expect(rpc.requests).toHaveLength(1)
-		expect(new Set(rpc.storeReads[0]).size).toBe(20)
+		// Each nonce at its key and at its legacy key.
+		expect(new Set(rpc.storeReads[0]).size).toBe(40)
 	})
 
 	it('reads a nonce once for coupons that share it', async () => {
@@ -218,7 +224,20 @@ describe('POST /api/coupon-status', () => {
 		const { body } = await post({ coupons: [A, padded(A, A.length + 1)] })
 
 		expect(body.results.map((r: { status: string }) => r.status)).toEqual(['redeemed', 'redeemed'])
-		expect(rpc.storeReads).toEqual([[KEY_A]])
+		expect(rpc.storeReads).toEqual([[KEY_A, LEGACY_KEY_A]])
+	})
+
+	it('reads a coupon redeemed on the order deployed before the nonce key changed, at hash(order hash, nonce), as redeemed', async () => {
+		const chain = unclaimed()
+		chain.flags.set(LEGACY_KEY_A, 1n)
+		fakeRpc(chain)
+
+		const { body } = await post({ coupons: [A, B] })
+
+		expect(body.results.map((r: { status: string }) => r.status)).toEqual([
+			'redeemed',
+			'unredeemed'
+		])
 	})
 
 	it('reads a coupon as long as one can be, every context field 78 digits', async () => {
@@ -233,7 +252,7 @@ describe('POST /api/coupon-status', () => {
 		const { body } = await post({ coupons: [longest] })
 
 		expect(body.results).toEqual([{ status: 'redeemed', nonce: '1775867941', expiry: EXPIRY_A }])
-		expect(rpc.storeReads).toEqual([[KEY_A]])
+		expect(rpc.storeReads).toEqual([[KEY_A, LEGACY_KEY_A]])
 	})
 
 	it('makes no RPC call, and answers block null, when no coupon is valid', async () => {
@@ -544,8 +563,9 @@ describe('POST /api/coupon-status cache', () => {
 		])
 		expect(rpc.requests).toHaveLength(2)
 		expect(rpc.storeReads).toHaveLength(1)
-		expect(rpc.storeReads[0]).toHaveLength(1)
+		expect(rpc.storeReads[0]).toHaveLength(2)
 		expect(rpc.storeReads[0]).not.toContain(KEY_A)
+		expect(rpc.storeReads[0]).not.toContain(LEGACY_KEY_A)
 	})
 
 	it('answers another spelling of a cached coupon from the cache, with no RPC call', async () => {

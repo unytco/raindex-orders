@@ -401,7 +401,7 @@ The bridge-orchestrator also handles coupon generation for claims:
 ### Key Management
 - **Test Key**: Included in repo for testing only
 - **Coupon signer**: [docs/enable-multisig.md](./docs/enable-multisig.md)
-- **Admin Key**: Protects emergency withdrawal. It can move to a Safe multisig: [docs/enable-multisig.md](./docs/enable-multisig.md)
+- **Vault admin**: Protects emergency withdrawal. On mainnet it is a Safe multisig from the deploy's first transaction: [docs/enable-multisig.md](./docs/enable-multisig.md)
 
 ---
 

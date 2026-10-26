@@ -26,6 +26,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
+futures = "0.3"
 ham = { git = "https://github.com/unytco/ham.git", rev = "fbb4b6eb8a79a507e9453b709ed00f15c5618fb4" }
 hex = "0.4"
 hmac = "0.12"
@@ -50,6 +51,8 @@ zfuel = "=0.9.1"
 [dev-dependencies]
 # Temp conductor-config / passphrase fixtures for the lair-signing tests.
 tempfile = "3"
+# A paused clock, for the signer timeout's tests.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [profile.release]
 # Every node re-downloads this on provision; symbols are ~6 MB of that and are

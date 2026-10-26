@@ -2,72 +2,21 @@
 pragma solidity =0.8.25;
 
 import {Vm} from "forge-std/Vm.sol";
+import {
+    ISafe,
+    ISafeProxyFactory,
+    ICompatibilityFallbackHandler,
+    LibSafeSetup,
+    SAFE_PROXY_FACTORY,
+    SAFE_SINGLETON,
+    SAFE_FALLBACK_HANDLER
+} from "script/Safe.sol";
 
-/// The parts of Safe 1.4.1 the rehearsal uses, at its Ethereum mainnet addresses.
-interface ISafe {
-    function setup(
-        address[] calldata owners,
-        uint256 threshold,
-        address to,
-        bytes calldata data,
-        address fallbackHandler,
-        address paymentToken,
-        uint256 payment,
-        address payable paymentReceiver
-    ) external;
-
-    function execTransaction(
-        address to,
-        uint256 value,
-        bytes calldata data,
-        uint8 operation,
-        uint256 safeTxGas,
-        uint256 baseGas,
-        uint256 gasPrice,
-        address gasToken,
-        address payable refundReceiver,
-        bytes memory signatures
-    ) external payable returns (bool success);
-
-    function getTransactionHash(
-        address to,
-        uint256 value,
-        bytes calldata data,
-        uint8 operation,
-        uint256 safeTxGas,
-        uint256 baseGas,
-        uint256 gasPrice,
-        address gasToken,
-        address refundReceiver,
-        uint256 nonce
-    ) external view returns (bytes32);
-
-    function nonce() external view returns (uint256);
-    function getOwners() external view returns (address[] memory);
-    function getThreshold() external view returns (uint256);
-}
-
-interface ISafeProxyFactory {
-    function createProxyWithNonce(address singleton, bytes memory initializer, uint256 saltNonce)
-        external
-        returns (address proxy);
-}
-
-interface ICompatibilityFallbackHandler {
-    function getMessageHashForSafe(address safe, bytes memory message) external view returns (bytes32);
-}
-
-ISafeProxyFactory constant SAFE_PROXY_FACTORY = ISafeProxyFactory(0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67);
-address constant SAFE_SINGLETON = 0x41675C099F32341bf84BFc5382aF534df5C7461a;
-ICompatibilityFallbackHandler constant SAFE_FALLBACK_HANDLER =
-    ICompatibilityFallbackHandler(0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99);
-
+/// Owner signatures for the rehearsal and the fork tests. The Safe interfaces,
+/// addresses and setup are script/Safe.sol's.
 library LibSafe {
     function setupCall(address[] memory owners, uint256 threshold) internal pure returns (bytes memory) {
-        return abi.encodeCall(
-            ISafe.setup,
-            (owners, threshold, address(0), "", address(SAFE_FALLBACK_HANDLER), address(0), 0, payable(address(0)))
-        );
+        return LibSafeSetup.setupCall(owners, threshold);
     }
 
     /// The hash the owners sign for `safe` to call `data` on `to`, at its next nonce.
@@ -83,6 +32,13 @@ library LibSafe {
         returns (bytes memory)
     {
         return sign(vm, ownerKeys, SAFE_FALLBACK_HANDLER.getMessageHashForSafe(safe, abi.encode(digest)));
+    }
+
+    /// The SafeMessage hash of `digest` for `safe` on `chainId`, computed as
+    /// Safe 1.3.0 and later do, and as bridge-orchestrator/src/signer.rs does
+    /// offline: `getMessageHashForSafe(safe, abi.encode(digest))`.
+    function messageHash(uint256 chainId, address safe, bytes32 digest) internal pure returns (bytes32) {
+        return LibSafeSetup.messageHash(chainId, safe, digest);
     }
 
     /// Each owner's 65-byte signature of `hash`, in ascending owner order as Safe
