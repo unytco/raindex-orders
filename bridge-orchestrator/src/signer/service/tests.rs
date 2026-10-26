@@ -866,6 +866,8 @@ fn the_settings_name_every_fault_and_never_the_key_or_the_token() {
 
     assert!(refused_config(&[("SIGNER_BEARER_TOKEN", None)])
         .contains("SIGNER_BEARER_TOKEN is required"));
+    assert!(refused_config(&[("SIGNER_BEARER_TOKEN", Some("token "))])
+        .contains("SIGNER_BEARER_TOKEN holds a character outside visible ASCII"));
     assert!(refused_config(&[("SAFE_OWNER_KEY", None)]).contains("SAFE_OWNER_KEY is required"));
     assert_eq!(
         refused_config(&[

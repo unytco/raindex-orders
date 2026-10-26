@@ -3,7 +3,7 @@ use crate::config::{
     with_network_defaults, Holochain, Network,
 };
 use crate::screening::Screener;
-use crate::signer::{expiry_seconds, order_words, parsed, TEST_SIGNER};
+use crate::signer::{expiry_seconds, is_visible_ascii, order_words, parsed, TEST_SIGNER};
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Result;
@@ -81,8 +81,11 @@ impl ServiceConfig {
             }
         };
         let bearer = given("SIGNER_BEARER_TOKEN");
-        if bearer.is_none() {
-            faults.push("SIGNER_BEARER_TOKEN is required".to_string());
+        match &bearer {
+            None => faults.push("SIGNER_BEARER_TOKEN is required".to_string()),
+            Some(token) if !is_visible_ascii(token) => faults
+                .push("SIGNER_BEARER_TOKEN holds a character outside visible ASCII".to_string()),
+            Some(_) => {}
         }
         let bind_addr = parsed_or(
             &given,

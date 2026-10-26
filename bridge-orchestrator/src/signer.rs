@@ -394,6 +394,10 @@ impl ClaimOrder {
     }
 }
 
+fn is_visible_ascii(token: &str) -> bool {
+    token.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 /// A fault never quotes the entry, which holds a token.
 fn service_tokens(raw: Option<String>, faults: &mut Vec<String>) -> BTreeMap<Address, String> {
     let mut tokens = BTreeMap::new();
@@ -412,7 +416,7 @@ fn service_tokens(raw: Option<String>, faults: &mut Vec<String>) -> BTreeMap<Add
             faults.push(format!(
                 "SAFE_OWNER_SERVICE_TOKENS holds an empty token for {owner}"
             ));
-        } else if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        } else if !is_visible_ascii(token) {
             faults.push(format!(
                 "SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a character outside visible ASCII"
             ));
