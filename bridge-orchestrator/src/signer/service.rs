@@ -24,7 +24,8 @@ use records::Records;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::instrument::WithSubscriber;
+use tracing::{info, warn};
 
 const HEALTH_WINDOW: Duration = Duration::from_secs(5);
 
@@ -119,14 +120,27 @@ impl Service {
             return health.healthy;
         }
         // Spawned so a check still finishes and is kept when its request disconnects.
-        tokio::spawn(async move {
-            let healthy = self.records.readable().is_ok() && self.cell.answers().await.is_ok();
-            *last = Some(Health {
-                checked: Instant::now(),
-                healthy,
-            });
-            healthy
-        })
+        tokio::spawn(
+            async move {
+                let failure = match self.records.readable() {
+                    Err(err) => Some(("records", err)),
+                    Ok(()) => self.cell.answers().await.err().map(|err| ("node", err)),
+                };
+                if let Some((failed, err)) = &failure {
+                    warn!(
+                        event = "signer.unhealthy",
+                        failed, "/healthz answers 503, the {failed} check failed: {err:#}"
+                    );
+                }
+                let healthy = failure.is_none();
+                *last = Some(Health {
+                    checked: Instant::now(),
+                    healthy,
+                });
+                healthy
+            }
+            .with_current_subscriber(),
+        )
         .await
         .unwrap_or(false)
     }

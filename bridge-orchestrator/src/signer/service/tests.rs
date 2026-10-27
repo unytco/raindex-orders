@@ -686,6 +686,15 @@ async fn the_orchestrator_gets_its_coupons_signed_here() {
     assert!(err.contains("refused: unknown_withdrawal"), "{err}");
 }
 
+fn lost_records() -> Service {
+    let lost = service(FakeCell::holding(spend()), &[]);
+    rusqlite::Connection::open(&lost.config.db_path)
+        .unwrap()
+        .execute("DROP TABLE records", [])
+        .unwrap();
+    lost
+}
+
 async fn age_past_the_window(service: &Service) {
     let mut last = service.health.lock().await;
     last.as_mut().expect("an answer is kept").checked -= HEALTH_WINDOW;
@@ -705,12 +714,7 @@ async fn the_endpoints_answer_as_the_contract_says() {
     let down_checks = down_node.checks.clone();
     let down = serve(service(down_node, &[])).await;
 
-    let lost = service(FakeCell::holding(spend()), &[]);
-    rusqlite::Connection::open(&lost.config.db_path)
-        .unwrap()
-        .execute("DROP TABLE records", [])
-        .unwrap();
-    let without_records = serve(lost).await;
+    let without_records = serve(lost_records()).await;
 
     let healthz = |url: &str| client.get(format!("{url}/healthz")).send();
     let checked = |checks: &AtomicUsize| checks.load(Ordering::SeqCst);
@@ -784,6 +788,15 @@ async fn the_endpoints_answer_as_the_contract_says() {
 
 #[tokio::test]
 async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
+    let down = FakeCell {
+        up: false,
+        ..FakeCell::holding(spend())
+    };
+    let health = [
+        Arc::new(service(FakeCell::holding(spend()), &[])),
+        Arc::new(service(down, &[])),
+        Arc::new(lost_records()),
+    ];
     let service = service(FakeCell::holding(spend()), &[]);
     let good = bytes(&coupon(|_| {}));
 
@@ -805,6 +818,9 @@ async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
         let _ = refused(&unheld, &coupon(|_| {})).await;
         let silent = service_with(None);
         let _ = refused(&silent, &coupon(|_| {})).await;
+        for service in &health {
+            service.clone().healthy().await;
+        }
     })
     .await;
 
@@ -819,6 +835,16 @@ async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
     assert_eq!(at("ERROR", "signer.refused"), 3, "{logged}");
     assert_eq!(at("WARN", "signer.waiting"), 2, "{logged}");
     assert_eq!(at("INFO", "signer.signed"), 2, "{logged}");
+    assert_eq!(at("WARN", "signer.unhealthy"), 2, "{logged}");
+    for (failed, err) in [("node", "down"), ("records", "no such table: records")] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("failed=\"{failed}\""))
+                    && line.contains(&format!("the {failed} check failed: {err}"))),
+            "{failed}: {logged}"
+        );
+    }
     for code in [
         "bad_request",
         "amount_mismatch",
