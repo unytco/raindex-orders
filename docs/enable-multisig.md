@@ -61,7 +61,7 @@ cast call "$MAINNET_LOCK_VAULT_ADDRESS" 'admin()(address)' --rpc-url "$ETH_RPC_U
 
 ## Change the Safe's owners
 
-The owners of the Safe change through an ordinary Safe owner change (add, remove or swap an owner, change the threshold), which the current owners sign in the Safe app. The change must leave the threshold more than half the owners, and each owner after it must hold the records of every owner before it ([signer-service.md](./signer-service.md#one-order-per-withdrawal)). An owner that stays is on both sides.
+The owners of the Safe change through an ordinary Safe owner change (add, remove or swap an owner, change the threshold), which the current owners sign in the Safe app. The change must leave the threshold more than half the owners, and each owner after it must hold the records of every owner before it ([signer-service.md](./signer-service.md#one-order-per-withdrawal)). An owner that stays is on both sides. The steps need the `sqlite3` CLI on each service's host.
 
 1. Stop the orchestrator.
 2. Each owner before the change stops its service, so it signs nothing the copy misses, then copies its records and sends the file to every owner after the change:

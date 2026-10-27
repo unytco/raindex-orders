@@ -182,7 +182,7 @@ export async function signAsOwner(key, hash) {
 
 Each check uses the service's own sources: its own Holochain node, or one it trusts, and a copy of the deploy record it was given when it was set up, never the request.
 
-1. **The burn is real.** `withdrawal` names a spend on the Unyt network that the service's node holds. It is a parked spend whose counterparty role is `withdrawer`, in the bridging agent's lane for HOT: the one spend the bridge's template pays a withdrawal from. **Parked means parked when the service signs**: not yet accepted on Holochain, by the RAVE that delivers its coupon or otherwise. A parked spend is final for its spender: the Unyt transactor zome's integrity validation lets only the link's executor, the bridging agent, delete it, and nothing expires it (`validate_deleting_parked_link` in unyt-app). Signing at `Parked` is safe only while that holds. A withdrawal that is accepted already has its coupon, and the service does not sign it again. The orchestrator makes the same check (`bridging_spend` in `bridge-orchestrator/src/orchestrator.rs`), and each service must make it again on its own node. Otherwise `unknown_withdrawal` or `not_a_withdrawal`.
+1. **The burn is real.** `withdrawal` names a spend on the Unyt network that the service's node holds. It is a parked spend whose counterparty role is `withdrawer`, in the bridging agent's lane for HOT: the one spend the bridge's template pays a withdrawal from. **Parked means parked when the service signs**: not yet accepted on Holochain, by the RAVE that delivers its coupon or otherwise. The spender cannot retract a parked spend, and nothing expires it (`dnas/alliance/zomes/integrity/transactor/src/links/parked_link/delete.rs` in unytco/unyt-app at `cc085848`). This is one of the conditions signing at `Parked` rests on. A withdrawal that is accepted already has its coupon, and the service does not sign it again. The orchestrator makes the same check (`bridging_spend` in `bridge-orchestrator/src/orchestrator.rs`), and each service must make it again on its own node. Otherwise `unknown_withdrawal` or `not_a_withdrawal`.
 2. **The amount.** Word 1 is exactly the spend's amount in the HOT unit, converted as in [the amount](#the-amount) below. Not more, not another unit.
 3. **The recipient.** Word 0 is the `withdraw_to_address` in the spend's attached payload.
 4. **The expiry.** Word 2 is within the window in [the expiry](#the-expiry) below.
@@ -238,8 +238,12 @@ A service **must**:
 
   Then the operator clears it, with `NONCE` the coupon's word 8. The command prints the number of records it cleared, 1:
 
-  ```sh
-  sqlite3 "${SIGNER_DB_PATH:?}" "DELETE FROM records WHERE nonce = lower('$NONCE'); SELECT changes();"
+  ```bash
+  if [[ $NONCE =~ ^0x[0-9a-fA-F]{64}$ ]]; then
+    sqlite3 "${SIGNER_DB_PATH:?}" "DELETE FROM records WHERE nonce = lower('$NONCE'); SELECT changes();"
+  else
+    echo "NONCE is not 0x and 64 hex digits: $NONCE" >&2; false
+  fi
   ```
 
 The startup probe has no withdrawal, so the service keeps no record of it.
