@@ -2,7 +2,7 @@ use super::cell::{Cell, Reading};
 use super::checks::Code;
 use super::config::ServiceConfig;
 use super::records::Records;
-use super::{router, Service, HEALTH_WINDOW};
+use super::{healthz, router, Service, HEALTH_WINDOW};
 use crate::config::{changed_settings, with_network_defaults, Network};
 use crate::orchestrator::tests::screening::Down;
 use crate::orchestrator::tests::{
@@ -19,6 +19,8 @@ use crate::signer::{
 };
 use alloy::primitives::{Address, B256, U256};
 use anyhow::anyhow;
+use axum::extract::State;
+use axum::http::StatusCode;
 use futures::FutureExt;
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey, AgentPubKeyB64};
 use rave_engine::types::{ParkedLinkStanding, Transaction, TransactionDetails, UnitMap};
@@ -38,6 +40,7 @@ const VAULT: &str = "0xe3e064e3c2eef66cb93da8d8114f5084e92f48d6";
 /// counts its calls in `checks` and yields once, so that callers overlap.
 struct FakeCell {
     up: bool,
+    panics: bool,
     checks: Arc<AtomicUsize>,
     standing: Option<ParkedLinkStanding>,
     parked: Vec<Transaction>,
@@ -52,6 +55,7 @@ impl FakeCell {
     fn answering(standing: Option<ParkedLinkStanding>) -> Self {
         Self {
             up: true,
+            panics: false,
             checks: Arc::default(),
             standing,
             parked: Vec::new(),
@@ -63,6 +67,9 @@ impl FakeCell {
 impl Cell for FakeCell {
     fn answers(&self) -> Reading<'_, ()> {
         self.checks.fetch_add(1, Ordering::SeqCst);
+        if self.panics {
+            panic!("the node panicked");
+        }
         let answer = if self.up {
             Ok(())
         } else {
@@ -792,13 +799,19 @@ async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
         up: false,
         ..FakeCell::holding(spend())
     };
+    let panicking = FakeCell {
+        panics: true,
+        ..FakeCell::holding(spend())
+    };
     let health = [
         Arc::new(service(FakeCell::holding(spend()), &[])),
         Arc::new(service(down, &[])),
         Arc::new(lost_records()),
+        Arc::new(service(panicking, &[])),
     ];
     let service = service(FakeCell::holding(spend()), &[]);
     let good = bytes(&coupon(|_| {}));
+    let mut answered = Vec::new();
 
     let logged = logged_at(tracing::Level::INFO, async {
         let _ = service.sign(Some("Bearer wrong"), b"{}", NOW).await;
@@ -819,10 +832,16 @@ async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
         let silent = service_with(None);
         let _ = refused(&silent, &coupon(|_| {})).await;
         for service in &health {
-            service.clone().healthy().await;
+            answered.push(healthz(State(service.clone())).await);
         }
     })
     .await;
+
+    let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+    assert_eq!(
+        answered,
+        [StatusCode::OK, unavailable, unavailable, unavailable]
+    );
 
     let lines: Vec<&str> = logged.lines().collect();
     let at = |level: &str, event: &str| {
@@ -835,7 +854,7 @@ async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
     assert_eq!(at("ERROR", "signer.refused"), 3, "{logged}");
     assert_eq!(at("WARN", "signer.waiting"), 2, "{logged}");
     assert_eq!(at("INFO", "signer.signed"), 2, "{logged}");
-    assert_eq!(at("WARN", "signer.unhealthy"), 2, "{logged}");
+    assert_eq!(at("WARN", "signer.unhealthy"), 3, "{logged}");
     for (failed, err) in [("node", "down"), ("records", "no such table: records")] {
         assert!(
             lines
@@ -845,6 +864,13 @@ async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
             "{failed}: {logged}"
         );
     }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("the check failed: task")
+                && line.contains("panicked with message \"the node panicked\"")),
+        "{logged}"
+    );
     for code in [
         "bad_request",
         "amount_mismatch",

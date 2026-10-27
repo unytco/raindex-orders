@@ -142,7 +142,13 @@ impl Service {
             .with_current_subscriber(),
         )
         .await
-        .unwrap_or(false)
+        .unwrap_or_else(|err| {
+            warn!(
+                event = "signer.unhealthy",
+                "/healthz answers 503, the check failed: {err}"
+            );
+            false
+        })
     }
 }
 
