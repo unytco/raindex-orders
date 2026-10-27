@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `bridge-orchestrator signer` refuses a `SIGNER_BEARER_TOKEN` with a comma.
+- `bridge-orchestrator signer` answers `GET /healthz` from a check made at most once every 5 seconds.
 
 ## [0.8.0] - 2026-10-26
 

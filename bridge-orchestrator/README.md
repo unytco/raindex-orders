@@ -520,7 +520,7 @@ that cycle only. A `HAM_REQUEST_TIMEOUT_SECS` under 60 would instead answer
 | `ORDERBOOK_ADDRESS`, `VAULT_ID` | mainnet | as for `run` |
 | `SAFE_OWNER_KEY` | Yes | -- (the owner's private key. Mainnet refuses the test signer's) |
 | `SIGNER_BEARER_TOKEN` | Yes | -- (the token the orchestrator sends this service as `Authorization: Bearer <token>`: visible ASCII with no comma) |
-| `SIGNER_BIND_ADDR` | No | `127.0.0.1` (reached from another machine, the service runs behind an https proxy or tunnel that times out slow clients and forwards only `GET /signer` and `POST /sign`, the two that take its token. `GET /healthz` is for the host itself) |
+| `SIGNER_BIND_ADDR` | No | `127.0.0.1` (reached from another machine, the service runs behind an https proxy or tunnel that times out slow clients. `GET /healthz` takes no token and checks the records and the node at most once every 5 seconds) |
 | `SIGNER_BIND_PORT` | Yes | -- |
 | `SIGNER_DB_PATH` | Yes | -- (the record of each withdrawal signed, as SQLite, for [one order per withdrawal](../docs/signer-service.md#one-order-per-withdrawal): keep it across redeploys. An in-memory database, `:memory:` or a `mode=memory` URI, keeps nothing. A missing file is created) |
 | `EXPIRY_SECONDS` | No | `604800`, as for `run` |
