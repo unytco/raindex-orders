@@ -273,6 +273,6 @@ The orchestrator simulates a claim with M owner signatures of the probe, which m
 ## Open questions
 
 - **Key custody** in each service: an HSM, a cloud KMS, or a Ledger. The service signs a 32-byte hash (or the typed data above), so any of them works.
-- **Who the owners are.** N about 3 at launch, maybe 5 later; M to be agreed, more than half of N ([one order per withdrawal](#one-order-per-withdrawal)): 2 of 3, then 3 of 5. Owners change through an ordinary Safe owner change, which the owners sign in the Safe app. The claim order does not change. A coupon whose signatures came from a removed owner must be signed again.
+- **Who the owners are.** N about 3 at launch, maybe 5 later; M to be agreed, more than half of N ([one order per withdrawal](#one-order-per-withdrawal)): 2 of 3, then 3 of 5. Owners change through an ordinary Safe owner change, which the owners sign in the Safe app once each new owner holds the records of every old one ([the steps](./enable-multisig.md#change-the-safes-owners)). The claim order does not change. A coupon whose signatures came from a removed owner must be signed again.
 - **The values of `EXPIRY_SECONDS` and `EXPIRY_TOLERANCE_SECONDS`**, if not the defaults in [the expiry](#the-expiry), and **a cap per coupon or per day**, as a limit on what M compromised owners could take at once.
 - **What happens while services are down.** Withdrawals stay parked while fewer than M sign; a limit on how long is policy.
