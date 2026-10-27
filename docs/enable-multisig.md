@@ -59,7 +59,29 @@ cast call "$MAINNET_LOCK_VAULT_ADDRESS" 'admin()(address)' --rpc-url "$ETH_RPC_U
 - **A Safe**, the admin Safe at launch. The orchestrator runs with `SAFE_OWNER_SERVICES`, each owner's signer service as `<owner>=<base URL>`, separated by commas, and may hold some owner keys itself in `SAFE_OWNER_KEYS`; not `SIGNER_PRIVATE_KEY`. For each coupon it reads the Safe's threshold and owners, asks every owner at once, checks each answer, takes M owner signatures, and has the Safe's own `isValidSignature` accept them before the coupon goes out; with fewer than M the withdrawal stays parked until the next cycle ([signer-service.md](./signer-service.md#what-the-orchestrator-does)). At startup it reads the Safe's threshold, owners and EIP-712 domain, asks each service who it signs for, refuses a threshold of half the owners or fewer on every network, a key that is not an owner's, more keys than the threshold, or a key twice, and simulates a claim with M owner signatures, which must pass, and M-1, which must fail. **Owner keys in the orchestrator are one party, however many**: holding M of them adds no protection. When the Safe is also the vault admin, each of those keys approves admin transactions too, so a compromise of the orchestrator's host would reach `adminWithdraw`. On mainnet the orchestrator therefore refuses to start with M owner keys, with any owner key of a Safe that is also the vault admin, or with a Safe of threshold 1, unless `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes` is set, which it logs. Off mainnet it logs them and starts. A threshold of half the owners or fewer it refuses on every network, at startup and for each coupon, and that override does not change this. The protection comes from owners at independent signer services, each checking the withdrawal on its own Holochain node.
 - **A key.** The orchestrator runs with `SIGNER_PRIVATE_KEY`, that key. At startup it refuses unless the claim order on chain accepts coupons signed with it.
 
-The owners of the Safe change through an ordinary Safe owner change (add, remove or swap an owner, change the threshold), which the current owners sign in the Safe app. The change must leave the threshold more than half the owners, and before the owners sign it, the services of the owners after it take in the records of the services of the owners before it ([signer-service.md](./signer-service.md#one-order-per-withdrawal)). The claim order, the website and the deploy record do not change. Each coupon is checked at claim time, so a coupon whose signatures came from a removed owner must be signed again, and the orchestrator reads the owners for each coupon it signs.
+## Change the Safe's owners
+
+The owners of the Safe change through an ordinary Safe owner change (add, remove or swap an owner, change the threshold), which the current owners sign in the Safe app. The change must leave the threshold more than half the owners, and each owner after it must hold the records of every owner before it ([signer-service.md](./signer-service.md#one-order-per-withdrawal)). An owner that stays is on both sides. The steps need the `sqlite3` CLI on each service's host.
+
+1. Stop the orchestrator.
+2. Each owner before the change stops its service, so it signs nothing the copy misses, then copies its records and sends the file to every owner after the change:
+
+   ```sh
+   sqlite3 "${SIGNER_DB_PATH:?}" ".backup records-<owner>.db"
+   ```
+
+3. Each owner after the change, with its service stopped, takes in one file from each owner before the change. A service creates its records at its first start, so a new owner's service starts once before this.
+
+   ```sh
+   sqlite3 "${SIGNER_DB_PATH:?}" "ATTACH 'records-<owner>.db' AS old; INSERT INTO main.records SELECT nonce, order_hash, withdrawal, signed_at FROM old.records AS o WHERE NOT EXISTS (SELECT 1 FROM main.records AS m WHERE m.nonce = o.nonce AND m.order_hash = o.order_hash);"
+   ```
+
+   A file with a withdrawal this service holds under another order hash is refused whole: the stale record is cleared at its source under [the rule for clearing one](./signer-service.md#one-order-per-withdrawal), and that file is copied and taken in again.
+
+4. The owners sign the change in the Safe app and execute it.
+5. The owners after the change start their services. Name them in the orchestrator's `SAFE_OWNER_SERVICES` and `SAFE_OWNER_SERVICE_TOKENS`, then start it.
+
+The claim order, the website and the deploy record do not change. Each coupon is checked at claim time, so a coupon whose signatures came from a removed owner must be signed again, and the orchestrator reads the owners for each coupon it signs.
 
 ## Move the coupon signer to another signer
 

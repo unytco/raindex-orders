@@ -221,7 +221,7 @@ impl Service {
         {
             return Err(Refusal::new(
                 Code::ProbeMismatch,
-                "withdrawal is null and the words are not the startup probe's",
+                "withdrawal is null and word 0, 1, 2 or 8 is not the startup probe's",
             ));
         }
         let hash = self.own_hash(request)?;

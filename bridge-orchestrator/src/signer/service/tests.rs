@@ -2,7 +2,7 @@ use super::cell::{Cell, Reading};
 use super::checks::Code;
 use super::config::ServiceConfig;
 use super::records::Records;
-use super::{router, Service};
+use super::{healthz, router, Service, HEALTH_WINDOW};
 use crate::config::{changed_settings, with_network_defaults, Network};
 use crate::orchestrator::tests::screening::Down;
 use crate::orchestrator::tests::{
@@ -19,9 +19,13 @@ use crate::signer::{
 };
 use alloy::primitives::{Address, B256, U256};
 use anyhow::anyhow;
+use axum::extract::State;
+use axum::http::StatusCode;
+use futures::FutureExt;
 use holo_hash::{ActionHash, ActionHashB64, AgentPubKey, AgentPubKeyB64};
 use rave_engine::types::{ParkedLinkStanding, Transaction, TransactionDetails, UnitMap};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const TOKEN: &str = "signer-test-token";
@@ -32,9 +36,12 @@ const VAULT: &str = "0xe3e064e3c2eef66cb93da8d8114f5084e92f48d6";
 
 /// The signer's cell, which answers `standing` for `withdrawal()`, holds
 /// each of `parked` as parked, and finds the bridging agreement of
-/// `bridging_agent()` at HOT unit 1. `None` is a call that fails.
+/// `bridging_agent()` at HOT unit 1. `None` is a call that fails. `answers`
+/// counts its calls in `checks` and yields once, so that callers overlap.
 struct FakeCell {
     up: bool,
+    panics: bool,
+    checks: Arc<AtomicUsize>,
     standing: Option<ParkedLinkStanding>,
     parked: Vec<Transaction>,
     agreement: Option<ActionHashB64>,
@@ -48,6 +55,8 @@ impl FakeCell {
     fn answering(standing: Option<ParkedLinkStanding>) -> Self {
         Self {
             up: true,
+            panics: false,
+            checks: Arc::default(),
             standing,
             parked: Vec::new(),
             agreement: Some(action_hash(BR_EA).into()),
@@ -57,12 +66,19 @@ impl FakeCell {
 
 impl Cell for FakeCell {
     fn answers(&self) -> Reading<'_, ()> {
+        self.checks.fetch_add(1, Ordering::SeqCst);
+        if self.panics {
+            panic!("the node panicked");
+        }
         let answer = if self.up {
             Ok(())
         } else {
             Err(anyhow!("down"))
         };
-        Box::pin(std::future::ready(answer))
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            answer
+        })
     }
 
     fn standing<'a>(&'a self, link: &'a ActionHash) -> Reading<'a, ParkedLinkStanding> {
@@ -147,6 +163,7 @@ fn service_at(db: &str, cell: FakeCell, changes: &[(&'static str, Option<&str>)]
         records: Records::open(&config.db_path).unwrap(),
         config,
         cell: Arc::new(cell),
+        health: Arc::default(),
     }
 }
 
@@ -622,10 +639,10 @@ async fn a_signer_that_cannot_write_its_record_does_not_sign() {
     );
 }
 
-async fn serve(service: Service) -> String {
+async fn serve(service: impl Into<Arc<Service>>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let router = router(Arc::new(service));
+    let router = router(service.into());
     tokio::spawn(async move { axum::serve(listener, router).await });
     url
 }
@@ -676,34 +693,66 @@ async fn the_orchestrator_gets_its_coupons_signed_here() {
     assert!(err.contains("refused: unknown_withdrawal"), "{err}");
 }
 
-#[tokio::test]
-async fn the_endpoints_answer_as_the_contract_says() {
-    let client = reqwest::Client::new();
-    let up = serve(service(FakeCell::holding(spend()), &[])).await;
-    let down = serve(service(
-        FakeCell {
-            up: false,
-            ..FakeCell::holding(spend())
-        },
-        &[],
-    ))
-    .await;
-
+fn lost_records() -> Service {
     let lost = service(FakeCell::holding(spend()), &[]);
     rusqlite::Connection::open(&lost.config.db_path)
         .unwrap()
         .execute("DROP TABLE records", [])
         .unwrap();
-    let without_records = serve(lost).await;
+    lost
+}
+
+async fn age_past_the_window(service: &Service) {
+    let mut last = service.health.lock().await;
+    last.as_mut().expect("an answer is kept").checked -= HEALTH_WINDOW;
+}
+
+#[tokio::test]
+async fn the_endpoints_answer_as_the_contract_says() {
+    let client = reqwest::Client::new();
+    let node = FakeCell::holding(spend());
+    let checks = node.checks.clone();
+    let answering = Arc::new(service(node, &[]));
+    let up = serve(answering.clone()).await;
+    let down_node = FakeCell {
+        up: false,
+        ..FakeCell::holding(spend())
+    };
+    let down_checks = down_node.checks.clone();
+    let down = serve(service(down_node, &[])).await;
+
+    let without_records = serve(lost_records()).await;
 
     let healthz = |url: &str| client.get(format!("{url}/healthz")).send();
-    let healthy = healthz(&up).await.unwrap();
-    assert_eq!(healthy.status(), 200);
-    for url in [&down, &without_records] {
-        let unhealthy = healthz(url).await.unwrap();
-        assert_eq!(unhealthy.status(), 503, "{url}");
-        assert_eq!(unhealthy.text().await.unwrap(), "");
+    let checked = |checks: &AtomicUsize| checks.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        let healthy = healthz(&up).await.unwrap();
+        assert_eq!(healthy.status(), 200);
+        for url in [&down, &without_records] {
+            let unhealthy = healthz(url).await.unwrap();
+            assert_eq!(unhealthy.status(), 503, "{url}");
+            assert_eq!(unhealthy.text().await.unwrap(), "");
+        }
     }
+    assert_eq!((checked(&checks), checked(&down_checks)), (1, 1));
+
+    age_past_the_window(&answering).await;
+    assert_eq!(healthz(&up).await.unwrap().status(), 200);
+    assert_eq!(checked(&checks), 2);
+
+    age_past_the_window(&answering).await;
+    assert_eq!(answering.clone().healthy().now_or_never(), None);
+    let kept = answering
+        .health
+        .lock()
+        .await
+        .as_ref()
+        .map(|health| health.healthy && health.checked.elapsed() < HEALTH_WINDOW);
+    assert_eq!((kept, checked(&checks)), (Some(true), 3));
+
+    age_past_the_window(&answering).await;
+    let waiting = tokio::join!(answering.clone().healthy(), answering.clone().healthy());
+    assert_eq!((waiting, checked(&checks)), ((true, true), 4));
 
     for answer in [
         client.get(format!("{up}/signer")).send().await.unwrap(),
@@ -746,8 +795,23 @@ async fn the_endpoints_answer_as_the_contract_says() {
 
 #[tokio::test]
 async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
+    let down = FakeCell {
+        up: false,
+        ..FakeCell::holding(spend())
+    };
+    let panicking = FakeCell {
+        panics: true,
+        ..FakeCell::holding(spend())
+    };
+    let health = [
+        Arc::new(service(FakeCell::holding(spend()), &[])),
+        Arc::new(service(down, &[])),
+        Arc::new(lost_records()),
+        Arc::new(service(panicking, &[])),
+    ];
     let service = service(FakeCell::holding(spend()), &[]);
     let good = bytes(&coupon(|_| {}));
+    let mut answered = Vec::new();
 
     let logged = logged_at(tracing::Level::INFO, async {
         let _ = service.sign(Some("Bearer wrong"), b"{}", NOW).await;
@@ -767,8 +831,17 @@ async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
         let _ = refused(&unheld, &coupon(|_| {})).await;
         let silent = service_with(None);
         let _ = refused(&silent, &coupon(|_| {})).await;
+        for service in &health {
+            answered.push(healthz(State(service.clone())).await);
+        }
     })
     .await;
+
+    let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+    assert_eq!(
+        answered,
+        [StatusCode::OK, unavailable, unavailable, unavailable]
+    );
 
     let lines: Vec<&str> = logged.lines().collect();
     let at = |level: &str, event: &str| {
@@ -781,6 +854,23 @@ async fn each_answer_is_logged_at_its_level_without_the_token_or_the_key() {
     assert_eq!(at("ERROR", "signer.refused"), 3, "{logged}");
     assert_eq!(at("WARN", "signer.waiting"), 2, "{logged}");
     assert_eq!(at("INFO", "signer.signed"), 2, "{logged}");
+    assert_eq!(at("WARN", "signer.unhealthy"), 3, "{logged}");
+    for (failed, err) in [("node", "down"), ("records", "no such table: records")] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("failed=\"{failed}\""))
+                    && line.contains(&format!("the {failed} check failed: {err}"))),
+            "{failed}: {logged}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("the check failed: task")
+                && line.contains("panicked with message \"the node panicked\"")),
+        "{logged}"
+    );
     for code in [
         "bad_request",
         "amount_mismatch",
@@ -866,8 +956,10 @@ fn the_settings_name_every_fault_and_never_the_key_or_the_token() {
 
     assert!(refused_config(&[("SIGNER_BEARER_TOKEN", None)])
         .contains("SIGNER_BEARER_TOKEN is required"));
-    assert!(refused_config(&[("SIGNER_BEARER_TOKEN", Some("token "))])
-        .contains("SIGNER_BEARER_TOKEN holds a character outside visible ASCII"));
+    for token in ["token ", "tok,en"] {
+        assert!(refused_config(&[("SIGNER_BEARER_TOKEN", Some(token))])
+            .contains("SIGNER_BEARER_TOKEN holds a comma or a character outside visible ASCII"));
+    }
     assert!(refused_config(&[("SAFE_OWNER_KEY", None)]).contains("SAFE_OWNER_KEY is required"));
     assert_eq!(
         refused_config(&[

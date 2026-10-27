@@ -22,13 +22,23 @@ use checks::Refusal;
 use config::ServiceConfig;
 use records::Records;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
+use tracing::instrument::WithSubscriber;
+use tracing::{info, warn};
+
+const HEALTH_WINDOW: Duration = Duration::from_secs(5);
 
 struct Service {
     config: ServiceConfig,
     cell: Arc<dyn Cell>,
     records: Records,
+    health: Arc<Mutex<Option<Health>>>,
+}
+
+struct Health {
+    checked: Instant,
+    healthy: bool,
 }
 
 pub async fn run() -> Result<()> {
@@ -73,6 +83,7 @@ pub async fn run() -> Result<()> {
         config,
         cell,
         records,
+        health: Arc::default(),
     };
     axum::serve(listener, router(Arc::new(service)))
         .with_graceful_shutdown(async move {
@@ -92,10 +103,52 @@ fn router(service: Arc<Service>) -> Router {
 }
 
 async fn healthz(State(service): State<Arc<Service>>) -> StatusCode {
-    if service.records.readable().is_ok() && service.cell.answers().await.is_ok() {
+    if service.healthy().await {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+impl Service {
+    async fn healthy(self: Arc<Self>) -> bool {
+        let mut last = self.health.clone().lock_owned().await;
+        if let Some(health) = last
+            .as_ref()
+            .filter(|health| health.checked.elapsed() < HEALTH_WINDOW)
+        {
+            return health.healthy;
+        }
+        // Spawned so a check still finishes and is kept when its request disconnects.
+        tokio::spawn(
+            async move {
+                let failure = match self.records.readable() {
+                    Err(err) => Some(("records", err)),
+                    Ok(()) => self.cell.answers().await.err().map(|err| ("node", err)),
+                };
+                if let Some((failed, err)) = &failure {
+                    warn!(
+                        event = "signer.unhealthy",
+                        failed, "/healthz answers 503, the {failed} check failed: {err:#}"
+                    );
+                }
+                let healthy = failure.is_none();
+                *last = Some(Health {
+                    checked: Instant::now(),
+                    healthy,
+                });
+                healthy
+            }
+            .with_current_subscriber(),
+        )
+        .await
+        .unwrap_or_else(|err| {
+            warn!(
+                event = "signer.unhealthy",
+                "/healthz answers 503, the check failed: {err}"
+            );
+            false
+        })
     }
 }
 

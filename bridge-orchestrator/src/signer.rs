@@ -394,9 +394,14 @@ impl ClaimOrder {
     }
 }
 
-fn is_visible_ascii(token: &str) -> bool {
-    token.bytes().all(|byte| byte.is_ascii_graphic())
+/// No comma: SAFE_OWNER_SERVICE_TOKENS separates its entries with commas.
+fn is_bearer_token(token: &str) -> bool {
+    token
+        .bytes()
+        .all(|byte| byte.is_ascii_graphic() && byte != b',')
 }
+
+const NOT_A_BEARER_TOKEN: &str = "a comma or a character outside visible ASCII";
 
 /// A fault never quotes the entry, which holds a token.
 fn service_tokens(raw: Option<String>, faults: &mut Vec<String>) -> BTreeMap<Address, String> {
@@ -416,9 +421,9 @@ fn service_tokens(raw: Option<String>, faults: &mut Vec<String>) -> BTreeMap<Add
             faults.push(format!(
                 "SAFE_OWNER_SERVICE_TOKENS holds an empty token for {owner}"
             ));
-        } else if !is_visible_ascii(token) {
+        } else if !is_bearer_token(token) {
             faults.push(format!(
-                "SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a character outside visible ASCII"
+                "SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with {NOT_A_BEARER_TOKEN}"
             ));
         } else if tokens.insert(owner, token.to_string()).is_some() {
             faults.push(format!("SAFE_OWNER_SERVICE_TOKENS names {owner} twice"));
@@ -1258,11 +1263,11 @@ mod tests {
             ),
             (
                 refused_tokens(format!("{owner}=secret 1")),
-                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a character outside visible ASCII"),
+                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a comma or a character outside visible ASCII"),
             ),
             (
                 refused_tokens(format!("{owner}=sécret")),
-                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a character outside visible ASCII"),
+                format!("SAFE_OWNER_SERVICE_TOKENS holds a token for {owner} with a comma or a character outside visible ASCII"),
             ),
             (
                 refusal(Network::BaseSepolia, testnet_tokens(format!("{owner}=secret-1"))),
