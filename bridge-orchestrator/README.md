@@ -517,9 +517,9 @@ required on `base-sepolia` as on `mainnet`, TestNet's from the [README](../READM
 | `ORDERBOOK_ADDRESS`, `VAULT_ID` | mainnet | as for `run` |
 | `SAFE_OWNER_KEY` | Yes | -- (the owner's private key. Mainnet refuses the test signer's) |
 | `SIGNER_BEARER_TOKEN` | Yes | -- (the token the orchestrator sends this service as `Authorization: Bearer <token>`: visible ASCII with no comma) |
-| `SIGNER_BIND_ADDR` | No | `127.0.0.1` |
+| `SIGNER_BIND_ADDR` | No | `127.0.0.1` (reached from another machine, the service runs behind an https proxy that times out slow clients and forwards only `GET /signer` and `POST /sign`, the two that take its token) |
 | `SIGNER_BIND_PORT` | Yes | -- |
-| `SIGNER_DB_PATH` | Yes | -- (the record of each withdrawal signed, as SQLite, for [one order per withdrawal](../docs/signer-service.md#one-order-per-withdrawal): keep it across redeploys. A missing file is created) |
+| `SIGNER_DB_PATH` | Yes | -- (the record of each withdrawal signed, as SQLite, for [one order per withdrawal](../docs/signer-service.md#one-order-per-withdrawal): keep it across redeploys. An in-memory database, `:memory:` or a `mode=memory` URI, keeps nothing. A missing file is created) |
 | `EXPIRY_SECONDS` | No | `604800`, as for `run` |
 | `EXPIRY_TOLERANCE_SECONDS` | No | `600` (the slack for the two clocks, added to both ends of [the expiry](../docs/signer-service.md#the-expiry) window) |
 

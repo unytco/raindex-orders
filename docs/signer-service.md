@@ -77,7 +77,7 @@ A refusal is HTTP 409 with a `code` from this list and a `reason` for people. Th
 | `order_mismatch` | words 3 to 7 are not the service's own copy of the deploy record |
 | `wrong_safe_or_chain` | `safe` or `chainId` is not what the service signs for |
 | `wrong_owner` | `owner` is not the service's owner |
-| `probe_mismatch` | `withdrawal` is null and the words are not the startup probe's |
+| `probe_mismatch` | `withdrawal` is null and word 0, 1, 2 or 8 is not the startup probe's |
 | `hash_mismatch` | the service's own digest or SafeMessage hash differs from the one sent |
 | `already_signed` | the service signed this withdrawal for another order hash, and no operator has cleared that ([one order per withdrawal](#one-order-per-withdrawal)) |
 | `not_ready` | the service cannot check now, for example its node is not in sync (HTTP 503 works too) |
@@ -260,7 +260,7 @@ At startup the orchestrator sends one request with `"withdrawal": null`. Its wor
 | 3–7 | the deploy record's order, as for a withdrawal |
 | 8 | `0x7031e3d46970cee5696244e787b00837a2271c3769d176fc13934b96fe76265b`: keccak256 of `bridge-orchestrator startup probe` |
 
-The orchestrator simulates a claim with M owner signatures of the probe, which must succeed, and with M-1, which must fail with Raindex's `InvalidSignature(0)`, the Safe refusing the signatures; any other revert stops the startup. Nothing is sent to the chain. A signed probe is a real coupon, but it pays 1 wei of HOT to the Safe, once. If the Safe's owners ever claim it, its fixed nonce is used and the claim order answers `Nonce already used`. The orchestrator takes that answer as the order accepting the Safe: the nonce is the claim expression's last check, after the signer and every other word, and Raindex checks the signatures before the expression runs. A service that gets a request with no withdrawal whose words differ refuses with `probe_mismatch`.
+The orchestrator simulates a claim with M owner signatures of the probe, which must succeed, and with M-1, which must fail with Raindex's `InvalidSignature(0)`, the Safe refusing the signatures; any other revert stops the startup. Nothing is sent to the chain. A signed probe is a real coupon, but it pays 1 wei of HOT to the Safe, once. If the Safe's owners ever claim it, its fixed nonce is used and the claim order answers `Nonce already used`. The orchestrator takes that answer as the order accepting the Safe: the nonce is the claim expression's last check, after the signer and every other word, and Raindex checks the signatures before the expression runs. A service that gets a request with no withdrawal whose word 0, 1, 2 or 8 differs refuses with `probe_mismatch`.
 
 ## What the orchestrator does
 
