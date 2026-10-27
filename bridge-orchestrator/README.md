@@ -485,7 +485,7 @@ required on `base-sepolia` as on `mainnet`, TestNet's from the [README](../READM
 |----------|----------|-----------------|
 | `SIGNER_PRIVATE_KEY` | For a key | -- (the test signer's is `TEST_SIGNER_KEY` in `src/Constants.sol`). The key of `CLAIM_SIGNER`, when it is a key |
 | `SAFE_OWNER_SERVICES` | For a Safe | -- The signer services of owners of `CLAIM_SIGNER`, when it is a Safe, as `<owner address>=<base URL>`, separated by commas: https, or http on this machine, on mainnet. For each coupon the orchestrator asks them all at once, 60 seconds each (one that timed out is not asked again that cycle while the others are at least M), takes M owner signatures and has the Safe accept them; a withdrawal fewer than M sign stays parked until the next cycle ([docs/signer-service.md](../docs/signer-service.md)) |
-| `SAFE_OWNER_SERVICE_TOKENS` | No | -- The token of each signer service in `SAFE_OWNER_SERVICES`, as `<owner address>=<token>`, separated by commas. Each service is sent its own as `Authorization: Bearer <token>`, and a service with none is sent no header. A token is visible ASCII with no comma. Refused: an owner `SAFE_OWNER_SERVICES` does not name, an owner named twice, an empty token, or a token for a service at plain http on another machine |
+| `SAFE_OWNER_SERVICE_TOKENS` | No | -- The token of each signer service in `SAFE_OWNER_SERVICES`, as `<owner address>=<token>`, separated by commas. Each service is sent its own, its [`SIGNER_BEARER_TOKEN`](#signer-service-signer-only), as `Authorization: Bearer <token>`, and a service with none is sent no header. Refused: an owner `SAFE_OWNER_SERVICES` does not name, an owner named twice, an empty token, or a token for a service at plain http on another machine |
 | `SAFE_OWNER_KEYS` | For a Safe | -- Keys of owners of `CLAIM_SIGNER` this orchestrator holds, separated by commas, alone or with `SAFE_OWNER_SERVICES`, and no more than its threshold. Holding the threshold's worth of keys is one party, however many keys ([docs/signer-service.md](../docs/signer-service.md)). On mainnet it needs `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes` when it holds the threshold's worth, or any key of a Safe that is also the vault admin |
 | `UNSAFE_ALLOW_ONE_PARTY_SIGNER` | No | -- `yes` lets a mainnet orchestrator start although it alone can sign as the Safe `CLAIM_SIGNER` (a threshold of 1, or the threshold's worth of `SAFE_OWNER_KEYS`), or holds owner keys of a Safe that is also the vault admin. It logs that, as `startup.one_party`. It does not let through a Safe whose threshold is half its owners or fewer, on any network. Any value other than `yes` is refused |
 | `ORDER_HASH` | Yes | -- |
@@ -516,7 +516,7 @@ required on `base-sepolia` as on `mainnet`, TestNet's from the [README](../READM
 | `ORDER_HASH`, `ORDER_OWNER`, `TOKEN_ADDRESS` | Yes | -- (the claim order's) |
 | `ORDERBOOK_ADDRESS`, `VAULT_ID` | mainnet | as for `run` |
 | `SAFE_OWNER_KEY` | Yes | -- (the owner's private key. Mainnet refuses the test signer's) |
-| `SIGNER_BEARER_TOKEN` | Yes | -- (the token the orchestrator sends this service as `Authorization: Bearer <token>`) |
+| `SIGNER_BEARER_TOKEN` | Yes | -- (the token the orchestrator sends this service as `Authorization: Bearer <token>`: visible ASCII with no comma) |
 | `SIGNER_BIND_ADDR` | No | `127.0.0.1` |
 | `SIGNER_BIND_PORT` | Yes | -- |
 | `SIGNER_DB_PATH` | Yes | -- (the record of each withdrawal signed, as SQLite, for [one order per withdrawal](../docs/signer-service.md#one-order-per-withdrawal): keep it across redeploys. A missing file is created) |
