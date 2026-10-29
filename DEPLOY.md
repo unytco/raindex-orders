@@ -261,12 +261,15 @@ VALID_SIGNER=<the Safe; or a key, or another Safe> \
 | HOT | `0x6c6EE5e31d828De241282B9606C8e98Ea48526E2` |
 | HoloLockVault | `0x8334C5F8fdB1200D80210c9cCC314664b51a0BcD` |
 | Vault ID | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
-| Vault admin and claim order signer | the Safe `0x4DAb851A56aaAa13615CD7FC397EC09B15cf9000`, 2 of 2: `0x8f41D3e400A9b26BB97bDf025328822da8f69bAe`, `0xdf0aA6A049b32E30486380F7F8e1dA3B1BfC64e6` |
+| Vault admin | the Safe `0x4DAb851A56aaAa13615CD7FC397EC09B15cf9000`, 2 of 2: `0x8f41D3e400A9b26BB97bDf025328822da8f69bAe`, `0xdf0aA6A049b32E30486380F7F8e1dA3B1BfC64e6` |
+| Claim order signer | the coupon Safe `0x9543FcF48aA0134724E302240F36CBCf988F19bc`, 2 of 3: `0xC436E452AB7F41078Da54B72E95Ac8055a5ecdC1`, `0x890DEB42efC72ec289c7d781c777A01C48C13C42`, `0xd2164D2733d79c9c053481C5F6f050cC698cA20f` |
 | ClaimInputToken | `0x781083cFB3664ed34781B81937E990A6950B2984` |
-| Claim order hash (owner: the vault) | `0x96c820bf02809dad0a07fc112aef9444d274e3c3fb17988fcfd47b2423644795` |
+| Claim order hash (owner: the vault) | `0x92033a916d19f5e477f630c96a82cb72cdc446ca01de8586a9cae9de6ddcc32f` |
 | HoloBridgeDeployer | `0x4BC87067387B526e4F684B6A43EB32E021Ee1188` |
 
 Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). `deploy-mainnet.sh safe` created the Safe at block 26298736, and `deploy-mainnet.sh`, in one `HoloBridgeDeployer` transaction at block 26298741, the vault, its ClaimInputToken and its claim order, with the Safe as `ADMIN_ADDRESS` and `VALID_SIGNER`. `broadcast/CreateSafe.s.sol/1/run-latest.json` and `broadcast/DeployMainnet.s.sol/1/run-latest.json` record the two transactions, and `deploy-mainnet-record.log` the deploy record. The Safe launches with two owners; a third joins as [docs/enable-multisig.md](./docs/enable-multisig.md#change-the-safes-owners) describes, which keeps the Safe's address and the claim order.
+
+One admin Safe transaction at block 26299652 then created the coupon Safe and moved the claim order to it ([docs/enable-multisig.md](./docs/enable-multisig.md#move-the-coupon-signer-to-another-signer)), replacing claim order `0x96c820bf02809dad0a07fc112aef9444d274e3c3fb17988fcfd47b2423644795`. The coupon Safe's owners are the fleet's bridging signers, so the vault admin's keys never run on the fleet. `deploy-mainnet-rotation-batch.json` is that transaction as a Safe Transaction Builder batch, and `deploy-mainnet-rotation-record.log` the deploy record it produced.
 
 ### Rehearse it first
 
