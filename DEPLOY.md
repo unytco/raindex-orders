@@ -254,6 +254,20 @@ VALID_SIGNER=<the Safe; or a key, or another Safe> \
 - **The coupon signer.** The Safe: the orchestrator runs with `SAFE_OWNER_SERVICES`, each owner's signer service, which checks each withdrawal on its own Holochain node before it signs ([docs/signer-service.md](./docs/signer-service.md)). It can also hold owner keys itself, `SAFE_OWNER_KEYS`; holding M of them is one party signing as the Safe, and when the Safe is also the vault admin each such key also approves admin transactions. On mainnet the orchestrator refuses either unless `UNSAFE_ALLOW_ONE_PARTY_SIGNER=yes`. A key: it runs with `SIGNER_PRIVATE_KEY`. When `VALID_SIGNER` is `ADMIN_ADDRESS`, the deploy logs that one Safe holds both roles.
 - **Failure.** A run that sends its transaction and sees it revert, or not land, prints it. A new run deploys a new vault.
 
+### Deployed Contract Addresses (Mainnet)
+
+| Contract | Address on Ethereum mainnet |
+|----------|---------|
+| HOT | `0x6c6EE5e31d828De241282B9606C8e98Ea48526E2` |
+| HoloLockVault | `0x8334C5F8fdB1200D80210c9cCC314664b51a0BcD` |
+| Vault ID | `0xeede83a4244afae4fef82c8f5b97df1f18bfe3193e65ba02052e37f6171b334b` |
+| Vault admin and claim order signer | the Safe `0x4DAb851A56aaAa13615CD7FC397EC09B15cf9000`, 2 of 2: `0x8f41D3e400A9b26BB97bDf025328822da8f69bAe`, `0xdf0aA6A049b32E30486380F7F8e1dA3B1BfC64e6` |
+| ClaimInputToken | `0x781083cFB3664ed34781B81937E990A6950B2984` |
+| Claim order hash (owner: the vault) | `0x96c820bf02809dad0a07fc112aef9444d274e3c3fb17988fcfd47b2423644795` |
+| HoloBridgeDeployer | `0x4BC87067387B526e4F684B6A43EB32E021Ee1188` |
+
+Rain's contracts are at [their addresses above](#raindex-v6-and-rainlang). `deploy-mainnet.sh safe` created the Safe at block 26298736, and `deploy-mainnet.sh`, in one `HoloBridgeDeployer` transaction at block 26298741, the vault, its ClaimInputToken and its claim order, with the Safe as `ADMIN_ADDRESS` and `VALID_SIGNER`. `broadcast/CreateSafe.s.sol/1/run-latest.json` and `broadcast/DeployMainnet.s.sol/1/run-latest.json` record the two transactions, and `deploy-mainnet-record.log` the deploy record. The Safe launches with two owners; a third joins as [docs/enable-multisig.md](./docs/enable-multisig.md#change-the-safes-owners) describes, which keeps the Safe's address and the claim order.
+
 ### Rehearse it first
 
 `test/fork-rehearsal.sh` runs `deploy-mainnet.sh` and `rotate-claim-signer.sh`, unchanged, against an anvil fork of mainnet. Every transaction goes to an anvil it starts on 127.0.0.1.
