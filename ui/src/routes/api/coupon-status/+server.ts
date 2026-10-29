@@ -32,9 +32,10 @@ import {
 } from '$lib/server/couponStatusCache'
 import { logRpcError } from '$lib/server/rpcError'
 
-// hot-bridge-ui runs on the Workers Free plan: 50 subrequests per request, Cache API
-// calls included, and 10 ms of CPU. N uncached coupons cost N cache matches, one RPC
-// fetch and N cache puts, so 20 costs at most 41 subrequests and 20 signature checks.
+// hot-bridge-ui-testnet and hot-bridge-ui-mainnet run on the Workers Free plan: 50
+// subrequests per request, Cache API calls included, and 10 ms of CPU. N uncached coupons
+// cost N cache matches, one RPC fetch and N cache puts, so 20 costs at most 41
+// subrequests and 20 signature checks.
 const MAX_COUPONS = 20
 const KEY_SIGNATURE_BYTES = 65
 // A Safe's signature holds 65 bytes for each owner signature its threshold asks for.

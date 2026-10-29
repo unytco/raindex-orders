@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Workers Builds "Deploy command" (`npm run cf:deploy`) for hot-bridge-ui, built with
+# Workers Builds "Deploy command" (`npm run cf:deploy`) for hot-bridge-ui-testnet, built with
 # PUBLIC_NETWORK=base-sepolia, and hot-bridge-ui-mainnet, built with PUBLIC_NETWORK=mainnet
 # as the wrangler env `mainnet`. Runs from ui/, after `npm run build`.
 #

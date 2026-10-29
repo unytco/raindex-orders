@@ -3,7 +3,7 @@
 	// Each `name` must match its existing Worker, or the deploy publishes to another one.
 	// The build inlines its network values from the Workers Builds build variables, and
 	// scripts/cf-deploy.sh sets its secrets, so no network value lives here.
-	"name": "hot-bridge-ui",
+	"name": "hot-bridge-ui-testnet",
 	"compatibility_date": "2026-05-30",
 	// SvelteKit server code + viem rely on Node built-ins (Buffer, crypto, etc.).
 	"compatibility_flags": ["nodejs_compat"],

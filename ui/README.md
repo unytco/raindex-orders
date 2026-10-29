@@ -49,7 +49,7 @@ Run these from `ui/`. Each deploys a new version of the Worker immediately, with
 
 | Worker                            | Pause                                                 | Resume                                                   |
 | --------------------------------- | ----------------------------------------------------- | -------------------------------------------------------- |
-| `hot-bridge-ui` (TestNet)         | `npx wrangler secret put BRIDGE_PAUSED`               | `npx wrangler secret delete BRIDGE_PAUSED`               |
+| `hot-bridge-ui-testnet` (TestNet) | `npx wrangler secret put BRIDGE_PAUSED`               | `npx wrangler secret delete BRIDGE_PAUSED`               |
 | `hot-bridge-ui-mainnet` (MainNet) | `npx wrangler secret put BRIDGE_PAUSED --env mainnet` | `npx wrangler secret delete BRIDGE_PAUSED --env mainnet` |
 
 `secret put` asks for the value: enter `true`. `GET /api/status` answers `{"paused":true}` once the pause is live.
