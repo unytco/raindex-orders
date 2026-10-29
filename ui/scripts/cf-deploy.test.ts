@@ -37,7 +37,16 @@ beforeEach(() => {
 afterEach(() => rmSync(bin, { recursive: true }))
 
 describe('cf-deploy.sh', () => {
-	it('deploys hot-bridge-ui with its Base Sepolia RPC and faucet key', () => {
+	it('deploys to the Workers that serve each network', () => {
+		const config = JSON.parse(
+			readFileSync(join(__dirname, '..', 'wrangler.jsonc'), 'utf8').replace(/^\s*\/\/.*$/gm, '')
+		)
+
+		expect(config.name).toBe('hot-bridge-ui-testnet')
+		expect(config.env.mainnet.name).toBe('hot-bridge-ui-mainnet')
+	})
+
+	it('deploys hot-bridge-ui-testnet with its Base Sepolia RPC and faucet key', () => {
 		const { status, calls } = deploy({
 			PUBLIC_NETWORK: 'base-sepolia',
 			BASE_SEPOLIA_RPC_URL: 'https://base-sepolia.rpc.test',
@@ -53,7 +62,7 @@ describe('cf-deploy.sh', () => {
 		})
 	})
 
-	it('deploys hot-bridge-ui when PUBLIC_NETWORK is unset', () => {
+	it('deploys hot-bridge-ui-testnet when PUBLIC_NETWORK is unset', () => {
 		const { status, calls } = deploy({
 			BASE_SEPOLIA_RPC_URL: 'https://base-sepolia.rpc.test',
 			FAUCET_PRIVATE_KEY: '0xfaucet'
